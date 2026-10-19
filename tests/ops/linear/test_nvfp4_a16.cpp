@@ -32,6 +32,17 @@ int run_nvfp4_a16() {
         Invocation{30, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
+    // One width inside every DFlash feature-projection prefill tier
+    // (nvfp4_dflash_feature_a16_tile).
+    constexpr std::array feature_prefill_invocations{
+        Invocation{60, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{100, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{200, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{300, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{450, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{600, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{1000, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
     int failures = 0;
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {14336, 5120, 701U, Comparison::Sampled, true, attn_invocations});
@@ -45,6 +56,9 @@ int run_nvfp4_a16() {
                           {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 25600, 709U, Comparison::Sampled, true, new_problem_invocations});
+    failures +=
+        run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                  {5120, 25600, 710U, Comparison::Sampled, true, feature_prefill_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {6144, 5120, 711U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
@@ -55,16 +69,24 @@ int run_nvfp4_a16() {
                           {256, 5120, 721U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 10240, 723U, Comparison::Sampled, true, new_problem_invocations});
-    constexpr std::array<std::int32_t, 3> dflash_batches{2, 3, 4};
-    failures += run_packed_sequences_matches_panels(
-        "NVFP4_A16 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 727U, 5,
-        dflash_batches);
-    failures += run_packed_sequences_matches_panels(
-        "NVFP4_A16 DFlash attention-output packed", make_nvfp4_weight, 5120, 4096, 729U, 5,
-        dflash_batches);
-    failures += run_packed_sequences_matches_panels(
-        "NVFP4_A16 DFlash conv packed", make_nvfp4_weight, 1280, 5120, 731U, 5,
-        dflash_batches);
+    constexpr std::array<std::int32_t, 5> dflash_batches{2, 3, 4, 5, 6};
+    // W=1 must remain GEMV panels; widths 2..6 share the same MMA reduction.
+    for (const std::int32_t width : {1, 2, 3, 4, 5, 6}) {
+        failures +=
+            run_packed_sequences_matches_panels("NVFP4_A16 DFlash QKV packed", make_nvfp4_weight,
+                                                6144, 5120, 727U, width, dflash_batches);
+        failures += run_packed_sequences_matches_panels("NVFP4_A16 DFlash attention-output packed",
+                                                        make_nvfp4_weight, 5120, 4096, 729U, width,
+                                                        dflash_batches);
+        failures += run_packed_sequences_matches_panels("NVFP4_A16 DFlash feature packed",
+                                                        make_nvfp4_weight, 5120, 25600, 739U, width,
+                                                        dflash_batches, ops::LinearPolicy::AllowA4);
+    }
+    for (const std::int32_t width : {2, 3, 4, 5, 6, 7, 8}) {
+        failures +=
+            run_packed_sequences_matches_panels("NVFP4_A16 DFlash conv packed", make_nvfp4_weight,
+                                                1280, 5120, 731U, width, dflash_batches);
+    }
     return failures;
 }
 

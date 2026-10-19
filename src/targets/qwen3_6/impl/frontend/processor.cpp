@@ -104,6 +104,14 @@ Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pix
     return {h, w};
 }
 
+// Pillow's precompute_coeffs bounds the filter window with (int)(x + 0.5): truncation toward zero
+// after a half offset, not round-half-away-from-zero. Reference preprocessing parity requires the
+// identical window bounds, including for negative x before the caller clamps to zero.
+int pil_window_bound(double x) {
+    // NOLINTNEXTLINE(bugprone-incorrect-roundings): exact Pillow window-bound arithmetic.
+    return static_cast<int>(x + 0.5);
+}
+
 double cubic(double x) {
     // Torchvision's antialiased bicubic path uses the Keys/Pillow coefficient.
     constexpr double a = -0.5;
@@ -122,14 +130,14 @@ struct Coefficients {
 Coefficients coefficients(int input, int output) {
     Coefficients out;
     out.starts.resize(static_cast<std::size_t>(output));
-    out.offsets.resize(static_cast<std::size_t>(output + 1));
+    out.offsets.resize(static_cast<std::size_t>(output) + 1);
     const double scale    = static_cast<double>(input) / output;
     const double invscale = scale >= 1.0 ? 1.0 / scale : 1.0;
     const double support  = 2.0 * (scale >= 1.0 ? scale : 1.0);
     for (int dst = 0; dst < output; ++dst) {
         const double center = scale * (dst + 0.5);
-        const int begin     = std::max(static_cast<int>(center - support + 0.5), 0);
-        const int size      = std::min(static_cast<int>(center + support + 0.5), input) - begin;
+        const int begin     = std::max(pil_window_bound(center - support), 0);
+        const int size      = std::min(pil_window_bound(center + support), input) - begin;
         out.starts[static_cast<std::size_t>(dst)]  = begin;
         out.offsets[static_cast<std::size_t>(dst)] = static_cast<int>(out.weights.size());
         double sum                                 = 0.0;
@@ -156,7 +164,7 @@ media::decode::Image resize_bicubic(const media::decode::Image& input, Size size
     for (int y = 0; y < input.height; ++y) {
         for (int x = 0; x < size.w; ++x) {
             const int first = horizontal.offsets[static_cast<std::size_t>(x)];
-            const int last  = horizontal.offsets[static_cast<std::size_t>(x + 1)];
+            const int last  = horizontal.offsets[static_cast<std::size_t>(x) + 1];
             for (int c = 0; c < 3; ++c) {
                 float value = 0.0f;
                 for (int i = first; i < last; ++i) {
@@ -179,7 +187,7 @@ media::decode::Image resize_bicubic(const media::decode::Image& input, Size size
     out.rgb.resize(static_cast<std::size_t>(size.h) * size.w * 3);
     for (int y = 0; y < size.h; ++y) {
         const int first = vertical.offsets[static_cast<std::size_t>(y)];
-        const int last  = vertical.offsets[static_cast<std::size_t>(y + 1)];
+        const int last  = vertical.offsets[static_cast<std::size_t>(y) + 1];
         for (int x = 0; x < size.w; ++x) {
             for (int c = 0; c < 3; ++c) {
                 float value = 0.0f;
@@ -276,15 +284,16 @@ Prepared prepare_video(const ChatPart& part, const ProcessorOptions& options,
         timestamp_indices.push_back(timestamp_indices.back());
     }
     for (int t = 0; t < gt; ++t) {
-        out.item.timestamps.push_back(
-            static_cast<double>(timestamp_indices[2 * t] + timestamp_indices[2 * t + 1]) /
-            (2.0 * video.fps));
+        const std::size_t first_index = static_cast<std::size_t>(t) * kTemporal;
+        out.item.timestamps.push_back(static_cast<double>(timestamp_indices[first_index] +
+                                                          timestamp_indices[first_index + 1]) /
+                                      (2.0 * video.fps));
     }
     out.patches.reserve(static_cast<std::size_t>(gt) * gh * gw * kPatchFeatures);
     for (int t = 0; t < gt; ++t) {
         const std::vector<const media::decode::Image*> frames{
-            &video.frames[static_cast<std::size_t>(2 * t)],
-            &video.frames[static_cast<std::size_t>(2 * t + 1)]};
+            &video.frames[static_cast<std::size_t>(t) * kTemporal],
+            &video.frames[(static_cast<std::size_t>(t) * kTemporal) + 1]};
         for (int block_y = 0; block_y < gh / kMerge; ++block_y) {
             for (int block_x = 0; block_x < gw / kMerge; ++block_x) {
                 for (int merge_y = 0; merge_y < kMerge; ++merge_y) {
@@ -349,33 +358,59 @@ std::string placeholder(const VisionItem& item) {
     return out;
 }
 
+// First occurrence of template markup at or after `from`; client text that merely spells a
+// placeholder is literal and never binds media.
+std::size_t find_markup(const RenderedChat& rendered, std::string_view needle, std::size_t from) {
+    std::size_t position = rendered.text.find(needle, from);
+    while (position != std::string::npos) {
+        const std::size_t end  = position + needle.size();
+        const auto overlapping = std::find_if(
+            rendered.literal_spans.begin(), rendered.literal_spans.end(),
+            [&](const ByteSpan& span) { return span.begin < end && position < span.end; });
+        if (overlapping == rendered.literal_spans.end()) { return position; }
+        position = rendered.text.find(needle, overlapping->end);
+    }
+    return std::string::npos;
+}
+
 RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<VisionItem>& items) {
     std::size_t search = 0;
     for (const VisionItem& item : items) {
         const std::string_view needle    = item.modality == Modality::Image ? kImagePad : kVideoPad;
-        const std::size_t position       = rendered.text.find(needle, search);
+        const std::size_t position       = find_markup(rendered, needle, search);
         const std::string_view other     = item.modality == Modality::Image ? kVideoPad : kImagePad;
-        const std::size_t other_position = rendered.text.find(other, search);
+        const std::size_t other_position = find_markup(rendered, other, search);
         if (position == std::string::npos ||
             (other_position != std::string::npos && other_position < position)) {
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
         const std::string replacement = placeholder(item);
-        if (rendered.rewrite_checkpoint) {
-            const std::size_t boundary = rendered.rewrite_checkpoint->offset;
-            const std::size_t end      = position + needle.size();
+        const auto shift_boundary     = [&](std::size_t boundary) {
+            const std::size_t end = position + needle.size();
             if (position < boundary && boundary < end) {
                 throw std::logic_error("rewrite checkpoint intersects a media placeholder");
             }
-            if (end <= boundary) {
-                rendered.rewrite_checkpoint->offset = boundary - needle.size() + replacement.size();
-            }
+            if (end <= boundary) { return boundary - needle.size() + replacement.size(); }
+            return boundary;
+        };
+        if (rendered.rewrite_checkpoint) {
+            rendered.rewrite_checkpoint->offset =
+                shift_boundary(rendered.rewrite_checkpoint->offset);
+        }
+        for (std::size_t& offset : rendered.turn_closure_offsets) {
+            offset = shift_boundary(offset);
         }
         rendered.text.replace(position, needle.size(), replacement);
+        for (ByteSpan& span : rendered.literal_spans) {
+            if (span.begin >= position + needle.size()) {
+                span.begin = span.begin - needle.size() + replacement.size();
+                span.end   = span.end - needle.size() + replacement.size();
+            }
+        }
         search = position + replacement.size();
     }
-    if (rendered.text.find(kImagePad, search) != std::string::npos ||
-        rendered.text.find(kVideoPad, search) != std::string::npos) {
+    if (find_markup(rendered, kImagePad, search) != std::string::npos ||
+        find_markup(rendered, kVideoPad, search) != std::string::npos) {
         throw std::invalid_argument("rendered chat has unbound vision placeholders");
     }
     return rendered;
@@ -387,7 +422,7 @@ void add_budget(PreprocessStats& stats, const VisionItem& item) {
     const std::uint64_t patches =
         checked_mul(static_cast<std::uint64_t>(item.grid.t), spatial, "vision raw patches");
     stats.raw_patches += patches;
-    stats.vision_tokens += patches / (kMerge * kMerge);
+    stats.vision_tokens += patches / (static_cast<std::uint64_t>(kMerge) * kMerge);
     stats.attention_pairs += checked_mul(static_cast<std::uint64_t>(item.grid.t),
                                          checked_mul(spatial, spatial, "vision attention pairs"),
                                          "vision attention pairs");
@@ -498,6 +533,63 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
     }
 }
 
+// Literal spans of text.substr(begin, end - begin), rebased to begin.
+std::vector<ByteSpan> literal_spans_between(std::span<const ByteSpan> spans, std::size_t begin,
+                                            std::size_t end) {
+    std::vector<ByteSpan> out;
+    for (const ByteSpan span : spans) {
+        if (span.end <= begin) { continue; }
+        if (span.begin >= end) { break; }
+        out.push_back(ByteSpan{.begin = std::max(span.begin, begin) - begin,
+                               .end   = std::min(span.end, end) - begin});
+    }
+    return out;
+}
+
+void append_turn_closure_frontiers(EncodedChat& encoded, const Tokenizer& tokenizer,
+                                   const RenderedChat& rendered) {
+    encoded.turn_closure_frontiers.reserve(rendered.turn_closure_offsets.size());
+    std::size_t byte_begin  = 0;
+    std::size_t token_begin = 0;
+    for (const std::size_t offset : rendered.turn_closure_offsets) {
+        if (offset < byte_begin || offset > rendered.text.size()) {
+            throw std::logic_error("turn closure byte offsets are outside the ordered chat");
+        }
+        if (rendered.rewrite_checkpoint && encoded.rewrite_checkpoint &&
+            offset == rendered.rewrite_checkpoint->offset) {
+            encoded.turn_closure_frontiers.push_back(encoded.rewrite_checkpoint->frontier);
+            byte_begin  = offset;
+            token_begin = encoded.rewrite_checkpoint->frontier;
+            continue;
+        }
+        if (offset == 0) { continue; }
+        // Each boundary ends the assistant header's newline, a Qwen tokenization
+        // boundary. Encode disjoint intervals, including NFC normalization, and
+        // check them against the full encoding instead of re-encoding history for
+        // every assistant turn.
+        const std::vector<int> interval = tokenizer.encode(
+            std::string_view(rendered.text).substr(byte_begin, offset - byte_begin), {},
+            literal_spans_between(rendered.literal_spans, byte_begin, offset));
+        if (interval.size() > encoded.input_ids.size() - token_begin ||
+            !std::equal(interval.begin(), interval.end(),
+                        encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(token_begin))) {
+            throw std::logic_error("turn closure is not an exact token prefix");
+        }
+        byte_begin = offset;
+        token_begin += interval.size();
+        if (token_begin == 0) {
+            throw std::logic_error("turn closure is not an exact token prefix");
+        }
+        if (token_begin > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("turn closure token frontier exceeds uint32");
+        }
+        const auto frontier = static_cast<std::uint32_t>(token_begin);
+        if (frontier < encoded.input_ids.size()) {
+            encoded.turn_closure_frontiers.push_back(frontier);
+        }
+    }
+}
+
 } // namespace
 
 std::string PreprocessStats::summary() const {
@@ -516,43 +608,56 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
         static_cast<std::size_t>(axis) * input_ids.size(), input_ids.size());
 }
 
+std::optional<std::size_t> checkpoint_prefix_tokens(const Tokenizer& tokenizer,
+                                                    std::string_view text, std::size_t offset,
+                                                    std::span<const ByteSpan> literal_spans,
+                                                    const EncodedText& encoded) {
+    if (encoded.prefix_tokens && *encoded.prefix_tokens != 0 &&
+        *encoded.prefix_tokens <= encoded.ids.size()) {
+        return *encoded.prefix_tokens;
+    }
+    const std::vector<int> prefix = tokenizer.encode(
+        text.substr(0, offset), {}, literal_spans_between(literal_spans, 0, offset));
+    if (prefix.empty() || prefix.size() > encoded.ids.size() ||
+        !std::equal(prefix.begin(), prefix.end(), encoded.ids.begin())) {
+        return std::nullopt;
+    }
+    return prefix.size();
+}
+
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
     EncodedChat encoded;
     if (!rendered.rewrite_checkpoint) {
-        encoded.input_ids = tokenizer.encode(rendered.text);
+        encoded.input_ids = tokenizer.encode(rendered.text, {}, rendered.literal_spans);
+        append_turn_closure_frontiers(encoded, tokenizer, rendered);
         return encoded;
     }
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
         throw std::logic_error("rewrite checkpoint byte offset exceeds rendered chat");
     }
-    EncodedText tokens = tokenizer.encode(rendered.text, rendered.rewrite_checkpoint->offset);
-    encoded.input_ids  = std::move(tokens.ids);
-    std::uint32_t frontier = 0;
-    if (tokens.prefix_tokens && *tokens.prefix_tokens != 0 &&
-        *tokens.prefix_tokens <= encoded.input_ids.size()) {
-        frontier = *tokens.prefix_tokens;
-    } else {
-        const std::vector<int> prefix = tokenizer.encode(
-            std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset));
-        if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
-            !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
-            throw std::logic_error("rewrite checkpoint is not an exact token prefix");
-        }
-        if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
-        }
-        frontier = static_cast<std::uint32_t>(prefix.size());
+    EncodedText tokens = tokenizer.encode(rendered.text, rendered.rewrite_checkpoint->offset, {},
+                                          rendered.literal_spans);
+    const std::optional<std::size_t> prefix =
+        checkpoint_prefix_tokens(tokenizer, rendered.text, rendered.rewrite_checkpoint->offset,
+                                 rendered.literal_spans, tokens);
+    if (!prefix) { throw std::logic_error("rewrite checkpoint is not an exact token prefix"); }
+    if (*prefix > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
     }
+    const auto frontier        = static_cast<std::uint32_t>(*prefix);
+    encoded.input_ids          = std::move(tokens.ids);
     encoded.rewrite_checkpoint = RewriteCheckpointSpec{
-        .kind     = rendered.rewrite_checkpoint->kind,
-        .frontier = frontier,
+        .kind              = rendered.rewrite_checkpoint->kind,
+        .frontier          = frontier,
+        .generation_opener = rendered.rewrite_checkpoint->generation_opener,
     };
+    append_turn_closure_frontiers(encoded, tokenizer, rendered);
     return encoded;
 }
 
 Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
                      ProcessorOptions options)
-    : tokenizer_(tokenizer), chat_template_(chat_template), options_(std::move(options)) {
+    : tokenizer_(tokenizer), chat_template_(chat_template), options_(options) {
     if (options_.max_media_items == 0 || options_.max_media_bytes == 0 ||
         options_.max_decoded_pixels == 0 || options_.max_decoded_video_pixels == 0 ||
         options_.image_min_pixels == 0 || options_.image_max_pixels < options_.image_min_pixels ||
@@ -568,13 +673,13 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
 }
 
 ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
-                                  ChatRenderOptions render_options) const {
+                                  const ChatRenderOptions& render_options) const {
     const std::vector<const ChatPart*> parts = media_parts(messages);
     if (parts.size() > options_.max_media_items) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "media item count exceeds processor budget");
     }
-    RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
+    RenderedChat rendered = chat_template_.render(messages, render_options);
     const media::decode::Policy policy{
         .max_bytes                  = options_.max_media_bytes,
         .max_decoded_pixels         = options_.max_decoded_pixels,
@@ -613,10 +718,11 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
         throw std::logic_error("preprocessed patch count does not match processor budget");
     }
 
-    rendered                  = expand_placeholders(std::move(rendered), items);
-    EncodedChat encoded       = encode_rendered_chat(tokenizer_, rendered);
-    output.input_ids          = std::move(encoded.input_ids);
-    output.rewrite_checkpoint = encoded.rewrite_checkpoint;
+    rendered                      = expand_placeholders(std::move(rendered), items);
+    EncodedChat encoded           = encode_rendered_chat(tokenizer_, rendered);
+    output.input_ids              = std::move(encoded.input_ids);
+    output.rewrite_checkpoint     = encoded.rewrite_checkpoint;
+    output.turn_closure_frontiers = std::move(encoded.turn_closure_frontiers);
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

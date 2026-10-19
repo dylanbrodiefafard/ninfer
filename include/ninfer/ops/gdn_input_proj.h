@@ -4,6 +4,8 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
+#include "ninfer/ops/a8_activation.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -15,7 +17,7 @@ namespace ninfer::ops {
 
 // FP8 single-parent domain: FP8_E4M3FN_ROW_BF16S RowScale [16384,5120], ordered
 // [Q(2048),K(2048),V(6144),Z(6144)], exact BF16 row multipliers. Projection admits
-// A16Only/AllowA8 at every positive T. Snapshot and record admit B=1..4, record
+// A16Only/AllowA8 at every positive T. Snapshot and record admit B=1..6, record
 // W=2..16, snapshot W>=1 (B>1 requires W<=16). Both retain A16 for W<=16;
 // long B=1 AllowA8 snapshot may quantize activations privately. Record preserves
 // the optional tree-parent operand in fused and materialized routes. Complete
@@ -82,6 +84,18 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  */
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
                     cudaStream_t stream);
+
+/**
+ * The NVFP4 AllowA4 single-parent projection of an already quantized activation
+ * (ninfer/ops/a4_activation.h) of [5120,T], T >= kA4GdnInputMinTokens (the widths at which
+ * AllowA4 selects W4A4), whose input scale divisor equals the weight's. For the same BF16
+ * activation qkv and z are bit-identical to the policy form's with AllowA4. The weight is NVFP4
+ * [16384,5120]; qkv/z are as above. The activation, qkv, and z must not overlap. The oracle is the
+ * policy form's, evaluated on the represented activation. Invalid arguments throw
+ * std::invalid_argument. No workspace.
+ */
+void gdn_input_proj(const A4Activation& x, const Weight& query_key_value_z_weight, Tensor& qkv,
+                    Tensor& z, cudaStream_t stream);
 
 /**
  * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent W8
@@ -175,7 +189,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 
 /**
  * Returns the transient capacity for the registered Q4/Q5 or W8 record-producing profile.
- * `batch_size` is exact, and the inclusive T interval must lie within ReplaySSM's B=1..4,
+ * `batch_size` is exact, and the inclusive T interval must lie within ReplaySSM's B=1..6,
  * T=2..16 execution domain. These profiles require no transient storage because materialized
  * projection writes directly to caller-owned conv_record.
  */
@@ -184,11 +198,14 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
- * Returns the transient capacity for the [16384,5120] NVFP4 record-producing profile. Ordinary
- * B=1 fused T=1-reduction, B=1 W=4 fused SmallT, and B=2..4 request-indexed SmallT routes require
- * no storage. B=1 W=5/6 and qualified B>1 W=2/5 grouped replay use a private FP32 projection.
- * AllowA4 otherwise returns only the activation-quantization workspace selected by the
- * corresponding projection route; conv_record is caller-owned.
+ * Returns the transient capacity for the [16384,5120] NVFP4 record-producing profile. Under A16,
+ * B=1 fused T=1-reduction, B=1 W=4 fused SmallT, and B=2..6 request-indexed SmallT routes require
+ * no storage. B=1 W=5/6, B>1 W=2/5, and B=2/4 W=6 grouped replay use a private FP32 projection.
+ * AllowA8 W=4..6 fuses projection/convolution through a CTA-local FP32 tile and needs only
+ * caller-owned activation codes/scales. AllowA4 W=5..16 and AllowA8 W=7..16 also need private
+ * FP32 q/k/value storage. AllowA4 W=2..4 and AllowA8 W=2..3 retain the A16 profile.
+ * An interval containing W=2 includes its A16 scratch even when its A8 endpoint uses less.
+ * conv_record is caller-owned.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
@@ -203,7 +220,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * representation to conv_record [C,T,B] for subsequent history/replay. Query, key, and value are
  * zero in each row's invalid tail; z is projected for every physical column.
  *
- * The execution domain is B=1..4 and T=2..16. valid_columns is empty for dense input or device
+ * The execution domain is B=1..6 and T=2..16. valid_columns is empty for dense input or device
  * I32 [B], with each caller-supplied extent in [1,T]. conv_states is a read-only BF16 [C,3,S]
  * state-pool view, and initial_state_slots contains absolute slots in [0,S). Source state is not
  * modified. Only the valid prefix of conv_record is semantically defined.
@@ -212,11 +229,18 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * [T,B] (or [T] when B=1) parent tensor used by gated_delta_net_replay_record: token 0 loads the
  * checkpoint history, every other valid token j loads the width-three history saved after its
  * parent, and the kernel saves the post-convolution history for j so siblings can share a parent.
- * NVFP4 B=1 W=4 uses one fused same-reduction SmallT weight pass. B=1 W=5/6 and qualified B=2..4
- * W=2/5 profiles use one grouped SmallT weight pass with a private FP32 projection, including one
- * direct W=5 C=3 group. Other B=1 widths use the fused T=1-reduction GEMV+FP32-convolution route;
- * other B>1 widths use same-reduction request-indexed CTAs. All routes round saved three-tap
- * history through BF16 at each valid column and avoid the BF16 projected compose-record route.
+ * Under NVFP4 AllowA4 W=5..16 or AllowA8 W=4..16, the Op aggregates B requests in the respective
+ * A4/A8 MMA family and supplies FP32 current projections to convolution, without a BF16
+ * intermediate. A8 W=4..6 keeps those projections in a CTA-local tile and fuses convolution/record
+ * publication; other quantized widths use private FP32 storage. A8 uses row-scaled E4M3 activations
+ * and separately scaled K16 partials without requantizing weights. The A16 profile (including
+ * AllowA4 W=2..4 and AllowA8 W=2..3) uses the following routes: B=1 W=4 uses one fused
+ * same-reduction SmallT weight pass. B=1 W=5/6 and qualified B=2..6 W=2/5 profiles use one grouped
+ * SmallT weight pass with a private FP32 projection, including one direct W=5 C=3 group. W=6 B=2/4
+ * uses request pairs; W=6 B=3 remains request-indexed. Other B=1 widths use the fused T=1-reduction
+ * GEMV+FP32-convolution route; other B>1 widths use same-reduction request-indexed CTAs. All routes
+ * round saved three-tap history through BF16 at each valid column and avoid the BF16 projected
+ * compose-record route.
  *
  * The two-parent form registers Q4 q/k [4096,5120] and the Q5 value/z parent [12288,5120]. All
  * tensor operands, outputs, conv_record, source state, and live workspace must be disjoint.
@@ -231,9 +255,9 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
 
 /**
  * Single-parent record-producing form. Registered parents are W8G32_F16S [12288,2048], NVFP4
- * and FP8_E4M3FN_ROW_BF16S [16384,5120]. W8 admits A16Only. NVFP4 admits A16Only and AllowA4.
- * FP8 admits A16Only/AllowA8 but uses qualified A16 arithmetic throughout W=2..16.
- * FP8 batches preserve the C=1 panel reduction and fused/materialized convolution profile.
+ * and FP8_E4M3FN_ROW_BF16S [16384,5120]. W8 admits A16Only. NVFP4 admits A16Only, AllowA4 and
+ * AllowA8. FP8 admits A16Only/AllowA8 but uses qualified A16 arithmetic throughout W=2..16. FP8
+ * batches preserve the C=1 panel reduction and fused/materialized convolution profile.
  */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,
@@ -241,6 +265,20 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream, const Tensor* parent_index = nullptr);
+
+/**
+ * NVFP4 AllowA8 single-parent record-producing form over an already quantized activation
+ * (ninfer/ops/a8_activation.h): x.codes is [5120,W,B] and x.scales [W,B], with W in [2,16] and B
+ * in [1,6]. For the same BF16 activation every output is bit-identical to the policy form with
+ * LinearPolicy::AllowA8; all other operands, the workspace capacity, and the oracle (evaluated on
+ * the represented activation codes * scales) are that form's.
+ */
+void gdn_input_proj_conv_record(const A8Activation& x, const Weight& query_key_value_z_weight,
+                                const Tensor& conv_weight, const Tensor& conv_states,
+                                const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
+                                const Tensor* parent_index = nullptr);
 
 /** Applies the A16-only single-parent record-producing form. */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

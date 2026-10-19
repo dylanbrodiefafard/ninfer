@@ -28,10 +28,9 @@ void l2norm_run(const Tensor& x, float eps, Tensor& out, cudaStream_t stream, L2
         constexpr int kWarpsPerBlock = kBlock / kWarpSize;
         const auto blocks =
             static_cast<unsigned int>(div_up(rows, static_cast<std::int64_t>(kWarpsPerBlock)));
-        l2norm_warp_bf16x2_kernel<kBlock>
-            <<<blocks, kBlock, 0, stream>>>(static_cast<const __nv_bfloat162*>(x.data),
-                                             static_cast<__nv_bfloat162*>(out.data), d, rows, eps,
-                                             dump);
+        l2norm_warp_bf16x2_kernel<kBlock><<<blocks, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(x.data), static_cast<__nv_bfloat162*>(out.data), d,
+            rows, eps, dump);
     } else {
         constexpr int kBlock        = 512;
         constexpr int kRowsPerBlock = kBlock / kWarpSize;

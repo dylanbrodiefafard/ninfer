@@ -9,10 +9,10 @@ from tools.bench.run_serve_corpus import (
 )
 
 
-def test_request_log_v17_identity_is_accepted() -> None:
+def test_request_log_v21_identity_is_accepted() -> None:
     current = {
         "artifact_type": "ninfer_serve_request_log",
-        "schema_version": 17,
+        "schema_version": 21,
         "event": "server_start",
     }
     require_server_log_identity(current, "server_start")
@@ -29,7 +29,7 @@ def test_summary_retains_one_canonical_weights_id() -> None:
         "qwen3_6_27b",
         "fixture",
         "fixture",
-        "mtp0",
+        "ordinary",
         "greedy",
         records,
     )
@@ -41,7 +41,7 @@ def test_summary_retains_one_canonical_weights_id() -> None:
             "qwen3_6_27b",
             "fixture",
             "fixture",
-            "mtp0",
+            "ordinary",
             "greedy",
             [*records, {"weights_id": "groupwise-int", "metrics": {}}],
         )

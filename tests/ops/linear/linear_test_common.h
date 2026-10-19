@@ -75,6 +75,6 @@ int run_packed_sequences_matches_panels(std::string_view label, WeightGenerator 
                                         std::int32_t sequence_width,
                                         std::span<const std::int32_t> batch_sizes,
                                         ops::LinearPolicy policy = ops::LinearPolicy::A16Only,
-                                        bool verify_convenience = true);
+                                        bool verify_convenience  = true);
 
 } // namespace ninfer::test::linear

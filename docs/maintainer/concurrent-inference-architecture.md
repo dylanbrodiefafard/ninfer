@@ -1,7 +1,11 @@
 # NInfer 小规模并发推理架构
 
+Current product execution supports ordinary decoding and DFlash2 only. MTP execution is
+rejected at Engine admission. MTP algorithms and layouts below describe dormant private
+machinery, not an available product backend.
+
 本文定义 NInfer 在单 GPU、单模型实例下支持少量并发请求的执行架构。典型
-`max_concurrency` 为 1–4。
+`max_concurrency` 为 1–6。
 
 设计目标不是让多个请求轮流执行，而是让所有处于 decode 阶段的请求形成一次真正的 batched
 model execution：一次 model traversal、一次 CUDA Graph replay 和一组 batched operators 同时为
@@ -18,7 +22,7 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 ### 1.1 Supported workload
 
 - 单 GPU、单 resident model instance；
-- 启动时固定 `max_concurrency=C`，支持 `C=1..4`；
+- 启动时固定 `max_concurrency=C`，支持 `C=1..6`；
 - 运行时 `0..C` 个 admitted requests；
 - Text 与 image/video prompt；
 - ordinary decoding 与 engine-wide speculative decoding；
@@ -28,8 +32,9 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 
 ### 1.2 Non-goals
 
-- request preemption、swap、pause/resume，或把 **active** request 的 KV 迁出 GPU；
-- 多请求 batched prefill 或 prefill/decode mixed forward；
+- General request preemption, swapping or active KV offload. The sole exception is the
+  bounded spare-lane short-prefill interruption in §7.3; it keeps all active state resident.
+- 多请求 batched prefill；
 - 多 GPU 或 distributed inference；
 - priority、tenant QoS 或 deadline-aware GPU scheduling；
 - 面向数十至数百请求的通用 continuous batching；
@@ -81,14 +86,24 @@ metadata 和一份 shared executor workspace；否则该 `max_concurrency` 无�
 
 ### 2.4 Admission guarantees completion capacity
 
-NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最大生成长度和必要的临时增长都能
-获得完整资源承诺后才可 admission。已经 admitted 的 request 不会因为后来请求到达而被截断或逐出。
+Admission requires capacity for the complete prompt, declared output bound and transient growth.
+A spare-lane prefill interruption changes execution order without releasing the suspended
+request's reservations. Later arrivals never truncate or evict an active request.
 
-### 2.5 One prefill owner
+### 2.5 Executing and suspended prefill owners
 
-同一时刻最多有一个 admitted request 拥有 prefill/finalization path。Suffix prefill 以 bounded chunk 为
-单位连续运行到 finalization；只在整个 owner 完成、取消或失败后选择下一次 admission 或 decode。
-其他等待请求仍留在 host queue，不占 slot 或 model state。
+At most one request executes prefill/finalization at a time. One additional text owner may
+be suspended at a completed chunk boundary while a short request prefills on a spare lane.
+Both retain their stable lane, KV/GDN/checkpoint allocations and request-local cursor; a
+suspended owner is not decode-ready. No transient-bearing or media owner is suspended.
+The suspended owner resumes before ordinary admission or recovery and must complete another
+nonzero chunk before another short interruption. The spare-lane path performs no eviction,
+active-state offload or host restore; otherwise ordinary admission waits for the owner.
+
+The default remaining-work policy uses prefill-first below 4096 uncached tokens and
+W4096/rounds12 at or above 4096. Remaining work is `prompt_tokens - cursor`, not total
+conversation length or the best pre-admission reuse estimate. Section 7.3 defines cadence,
+explicit tuning and the protected spare-lane admission exception.
 
 ### 2.6 Single GPU execution owner
 
@@ -99,13 +114,16 @@ NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最�
 RAM 第二层的 D2H/H2D 走独立的 copy engine（`DeviceContext::copy_stream`），不是 GPU scheduling
 unit，也不占用 compute owner。Copy 可以与**另一条** lane 的合法 compute unit 重叠；当前
 PrefillChunk / DecodeRound 正在读写的 pages 不得作为 copy source 或 destination。MTP/DFlash prefill
-context-checkpoint 冻结是例外：staging GDN（slot `2C`，与 lane current 不相交）、staging hidden，
-以及 DFlash staging cyclic state 的 D2H 可以与**同一条** lane 的下一 prefill chunk 重叠。冻结期间 `2C` 从 turn-rollback occupant
+context-checkpoint 冻结是例外：staging GDN（slot `C`，与 lane current 不相交）、staging hidden，
+以及 DFlash staging cyclic state 的 D2H 可以与**同一条** lane 的下一 prefill chunk 重叠。冻结期间 `C` 从 turn-rollback occupant
 借出，pack 后 H2D 把 rollback 装回；`occupied=false` 必须发生在 clobber D2D 之前。`device.stream`
-上的 `synchronize()` 只排空 compute，不排空 copy_stream。Checkpoint host images 使用 Program-owned
-high-water pinned pool；head 离队后回池，后续相同 layout 的 freeze 复用 allocation 与 completion event，
-不在 prefill boundary 重复 `cudaMallocHost`/`cudaFreeHost`。Pool 只保留实际到达过的 high-water image，
-不按 `C * mark-count` 预分配。
+上的 `synchronize()` 只排空 compute，不排空 copy_stream。Checkpoint host images（每条 lane 的 rewrite
+image 与 MTP/DFlash context-checkpoint head pool）在启动时从一块 prefault 并注册的 pinned slab 切出，
+由 Program 拥有；head 离队后回池，后续 freeze、turn-rollback 与 RAM/disk restore 复用同一 image 与
+completion event，serving 期间不调用 `cudaMallocHost`/`cudaFreeHost`。Pool 容量是每 lane 一个 rollback
+head，加上所有 lane 在共享 KV capacity 内能同时持有的 ladder head 数（`--max-context` 之上的 mark
+不可达）；pool 用尽时跳过可选的 capture 或 restored head。复用 head 前等待其上一个 DMA/host-copy
+owner 一律是 stream wait（copy_stream 或 compute stream 等 head fence），scheduler 线程不 host wait。
 
 ### 2.7 Bounded ingress and output
 
@@ -133,15 +151,32 @@ Backfill 只改变 waiting request 的 admission order。它不取得 active req
 资源，不产生 partial admission，不抢占已经 admitted 的 request，也不建立第二套 decode priority。所有
 backfilled decode-ready requests 仍进入同一个 maximal compact batch。
 
-### 2.10 Constrained calls and bounded recovery
+### 2.10 Constrained output and bounded recovery
 
-The Qwen frontend owns compiled tool schemas, transactional grammar state and typed
-completed calls. Program owns planner-accounted device masks and pinned host exchange
+The Qwen frontend owns compiled tool/response schemas and EBNF constraints, transactional grammar
+state, and typed completed calls. `PromptOptions::output_constraint` constrains answer content
+without injecting schema text into the prompt. Response schemas use JSON Schema defaults and
+fixed property order; unsupported assertions fail preparation. Reasoning remains unconstrained
+until `</think>`. Constrained content preserves literal special-token bytes and EBNF whitespace;
+ignored model-stop bytes retain their ordinary publication policy. Tool definitions and response
+constraints cannot be combined. Tool-call parsing is enabled only for tool grammars. Program owns planner-accounted device masks and pinned host exchange
 storage. Ordinary sampling uses one mask per compact row; speculative verification uses
 one mask per row and actual chain/tree node. CUDA Graph host nodes fork grammar state
 after draft IDs/parents have arrived on the host, then upload masks for target sampling.
 Proposal sampling does not advance the grammar. Only the accepted publication transaction
 advances committed grammar; callback failures are surfaced before publication.
+
+Every MTP and DFlash2 verify round selects its schedule from stable session grammar
+presence at the synchronized round boundary, not from the matcher's current token
+phase, draft length or startup concurrency. A compact batch with no grammar row skips
+the exchange entirely and samples from its ingress configs. A batch with any grammar
+row forks the exchange from completed proposal production onto a dedicated
+host-callback stream; target verification proceeds and joins only before target
+sampling consumes masks/configs. Uploads cover only the batch's own rows. Fixed-pitch
+device staging uses update-safe one-dimensional row copies; pinned host transfers keep
+fixed addresses. DeviceContext's complete drain includes the callback stream, and
+Program drains before destroying borrowed sessions, including an exception after a
+fork but before its join. DFlash V1 keeps one exchanging schedule.
 
 Runtime may withhold a completed repeated call, or pause persistent thinking after a
 committed decode round, and rebuild that request on its existing
@@ -157,19 +192,23 @@ of repeated work, not a generated-reasoning length limit.
 The state resets on retry and cannot use original prompt tokens or another attempt.
 There is no reasoning length limit. Runtime enables recovery for p-less, non-raw text-only
 thinking input; reasoning retries additionally require positive temperature. The family
-retains owning original input, removes historical and failed generated reasoning on repair,
-and supplies an explicitly labeled system notice without inventing a call/result/user turn.
-Planning reserves two additional cold prefills up to the original context entitlement
-(consumed completion space can accommodate the notice). A repair must fit the original
-resource commitment and preserve the
-remaining output budget; otherwise recovery fails explicitly for that request.
+retains the owning original input. The retry splices onto the resident prompt, keeps
+historical reasoning, closes the open think turn, and supplies an explicitly labeled
+system notice or rejected-call feedback. It does not invent a call, result, or user turn.
+Planning reserves service work for up to two retries, each within the original
+context entitlement (consumed completion space can accommodate the notice). A
+repair must fit the original resource commitment and preserve the remaining
+output budget; otherwise recovery fails explicitly for that request.
 
-At the committed round boundary the retry leaves the decode-ready set. With no other prefill
-owner or conflicting copy hold, the executor clears the old lane's complete KV/recurrent/
-speculative state and performs a fresh prefill without prefix reuse or checkpoint capture.
-It never attempts an arbitrary KV truncation with stale GDN state. Retry queue entries are
-bounded by admitted slots and checked against current lane ownership. Other decode-ready
-requests retain the usual maximal-batch semantics outside the exclusive retry prefill.
+At the committed round boundary the retry leaves the decode-ready set. It stays on its
+admitted lane, closes the open think turn, and splices the notice or rejected-call
+feedback onto the resident prompt, including historical reasoning. Only the failed
+generation is omitted. A ready checkpoint that is a prefix is restored and the suffix is
+prefilled. The retry does not take a new admission and does not trim at an arbitrary
+token. Retry queue entries are bounded by admitted slots and checked against current lane
+ownership. Other lanes still decode outside the exclusive retry prefill; a resident-miss
+host restore holds its lane in copy-hold like an admission, so they keep decoding while the
+RAM or disk image copies, and a failed host restore cold-prefills the same lane.
 
 Calls remain unpublished until recovery accepts the terminal result. Already streamed prose
 and reasoning cannot be retracted. All generated attempts consume the original token budget;
@@ -330,18 +369,37 @@ lane 的 backing 中，但不再存在 active request control，也不计入 act
 - prefix identity 和 target-defined reusable checkpoints。
 
 `SequenceState` 不包含 stop/output/transport state，不拥有 batch row、round activations、logits、shared
-workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：retained state 不搬到另一 lane，planner 在
+workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：ordinary consuming reuse 留在同一 lane，planner 在
 所有 free lanes 中寻找可复用 continuation，选中后在同一 lane 建立新的 request control；需要 active
 capacity 时可以先驱逐其他 free lanes 上的 retained state。新 request 的 sampling、RNG、stop 和 output
-state 始终重新创建。
+state 始终重新创建。Disposable forks copy into an independently owned destination lane under
+the source-preserving transaction described in §6.4.
 
 Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
-`[0,C)` 作为各 lane 的 current committed state，使用 `[C,2C)` 作为各 lane 的 rewrite-checkpoint
-state；MTP 或 DFlash 引擎额外保留 slot `2C` 作为 Engine-wide GDN：默认热 occupant 是 turn-rollback（append
-occupy 在 suffix prefill 之前把 current+`tail_hidden` 钉在上一完成 `E`），ladder freeze 借走后再
-装回。它不是 rewrite slot。一份 slot 同时选择全部 GDN layers 的 convolution history
-和 recurrent state。Decode round
+`[0,C)` 作为各 lane 的 current committed state；MTP 或 DFlash 引擎额外保留 slot `C` 作为 Engine-wide
+GDN：默认热 occupant 是 turn-rollback（append occupy 在 suffix prefill 之前把 current+`tail_hidden` 钉在
+上一完成 `E`），ladder freeze 借走后再装回；rewrite checkpoint capture 借走后不装回（同一 step 内的 freeze
+也因此不装回），之后的 rollback restore 走 host image H2D。一份 slot 同时选择全部 GDN layers 的 convolution history
+和 recurrent state。
+
+Rewrite checkpoint 不占 device slot：每条 lane 拥有一份 pinned host image（GDN slot 与 DFlash cyclic local
+lane 的 host-image layout），随 Program 在启动时分配，之后随 lane 复用。Prefill chunk 恰好结束在
+checkpoint frontier 时，MTP/DFlash 在 compute stream 上把 current（及 DFlash local lane）D2D 进
+Engine-wide staging slot，再由 copy_stream 把 staging drain 进该 image，与后续 prefill/decode 重叠；
+staging 仍持有该 lane 当前 generation 的 image 时，rewrite restore 从 staging D2D 回 current，否则等待
+image copy 后 H2D。其他 staging writer 或 RAM/SSD tier restore（在 host 上替换 image）结束该 staging hit。
+无 MTP/DFlash 时没有 staging slot，capture 在 compute stream 上 D2H。RAM/SSD tier 与该 image 之间只做 host copy。
+Checkpoint hidden `[hidden,1]` 仍在 device。因此 per-lane device fixed state 只剩 current GDN 与 DFlash
+current local，不随 rewrite checkpoint 翻倍。Decode round
 不在 `SequenceState` 中维护随 speculative position 变化的 state selector。
+
+The Program initializes the text and speculative backend pools' physical KV payload planes and
+every DFlash local K/V lane's complete padded payload once at startup, even when CUDA Graph capture
+is disabled. Tier images and disposable forks copy whole pages and complete fixed images; unused
+page tails and cyclic positions therefore contain defined bytes without extending valid frontiers
+or the live attention window. Block tables and unrelated arena storage are outside this initialization.
+The Program also initializes each complete ordinary, MTP, and DFlash decode egress frame once, so
+full-frame host transfers include defined inactive entries and padding.
 
 ### 4.4 Batch row
 
@@ -419,9 +477,10 @@ frame 和权重是 engine-fixed resources；owning result capacity 已在 ingres
 1. 存在可用 control lane；
 2. request 对固定 model、frontend 和 selected execution backend 合法；
 3. active-priority retained eviction 后，每个 entitlement dimension 都能承诺 request 的完整生命周期需求；
-4. 当前没有其他 prefill owner，也没有未完成的 copy-hold admission；admission 会立即建立该
-   request 的 suffix-prefill 或 exact-hit finalization ownership，或先进入 copy-hold 直到
-   相关 RAM copies 允许 `start_prefill_lane`。
+4. Ordinary admission requires no other prefill owner or unfinished copy-hold. The only
+   exception is the FIFO-head spare-lane short-prefill path in §7.3, which preserves the
+   existing owner's lane and resources. Admission establishes suffix-prefill or exact-hit
+   finalization ownership, or parks a copy-hold until RAM copies permit `start_prefill_lane`.
 
 Selected backend 的差异只体现在 target 给出的 typed entitlement；Scheduler 不为 ordinary、MTP 或 DFlash
 建立不同 queue policy。即使 startup sizing 保证 backend 不会早于 Main pool 成为正常 backpressure，
@@ -455,6 +514,8 @@ oldest head is exclusively feasible but blocked by active lane/entitlement
 head waiting，不建立 protection epoch，也不扫描 later candidates；prefill owner 清除后的下一个有
 admission budget 的 boundary 先重试该 head。Protection 只在没有 prefill owner、head 确实需要现有 active request 释放
 lane 或 entitlement 时建立，因此 frozen donor set 非空。
+An eligible short FIFO head may instead take the spare-lane exception in §7.3; it still
+cannot bypass an earlier live head or establish a backfill protection epoch while interrupting.
 
 同一时刻只保护一个最老 head。Protection 绑定稳定的 request generation identity，不绑定可回收的 lane、
 slot index 或 compact batch row。它只是一份 Scheduler shadow state，不为 waiting request 预占真实 pages、
@@ -580,13 +641,16 @@ qualification 会自然保守，仍可使用可证明的 persistent-safe backfil
 
 ### 5.6 Admission burst and progress rules
 
-只有满足以下条件的 boundary 才能尝试 admission：
+Ordinary admission requires:
 
 ```text
 no prefill owner
 and no copy-hold admission
 and (no decode-ready request or decode-admission budget > 0)
 ```
+
+Section 7.3 permits one short FIFO head to use a resource-feasible spare lane while a large
+text owner is suspended. That bind spends the same budget and never evicts retained state.
 
 copy-hold 与 prefill owner 一样独占 admission/prefill opportunity：它不是 GPU unit，但在 D2H/H2D
 完成并调用 `start_prefill_lane` 之前不得再 admission 第二个 request。held lane 不是 decode-ready，
@@ -622,7 +686,8 @@ cancelled、expired 或 permanent-invalid entries 可以继续检查同一 snaps
 已经释放，或当前非-temporal shadow resources 已足以容纳 `H`，但 `H` 仍被 temporal borrower 或现有
 prefill owner 阻塞，protection 立即进入 `PROTECTED_DRAIN`。Drain 不抢占 borrower；它禁止 later/backfill
 admission，但 protected head 仍在每个 eligible boundary 优先重试。Persistent-safe borrower 尚在 prefill 时也可能
-短暂阻止 head admission，但 one-prefill-owner work 有限且此期间不能再接纳其他请求。
+短暂阻止 head admission。Its work is finite; the only nested admission is the bounded short-head
+spare-lane exception, which must allow another nonzero owner chunk before repeating.
 
 Frontier member completion/cancellation 只在其 state 于 boundary 真正释放后计为 release。该 boundary 若有
 admission budget 就立即 head-first retry；否则更新 maturity。只要 decode membership 仍存活，就在下一次
@@ -777,7 +842,10 @@ committed prefill chunk 末尾的 current GDN 与该 chunk 最后一列 hidden�
 Qwen frontend 从有效 `preserve_thinking` 语义发布 desired checkpoint：`false` 选择最后一个真实 user
 之后第一条 assistant opener 的末尾；`true` 选择本次完整 deterministic generation prologue 的末尾，
 即当前 prompt frontier。Thinking generation 包含 `<think>\n`，non-thinking generation 包含完整 empty
-thinking block。Boundary 先作为 byte offset 产生，再独立 tokenize 并验证为完整 prompt token prefix；
+thinking block。例外：thinking 请求的最新 assistant turn 没有 reasoning（client 丢弃）时，下一轮
+re-render 在 opener 之后即分叉（effort template 省略空 wrapper；toggle template 的
+`<think>\n\n` 另行 tokenize），因此 checkpoint 放在 generation opener（`<think>\n` 之前），代价是多一个
+很短的 prefill unit。Boundary 先作为 byte offset 产生，再独立 tokenize 并验证为完整 prompt token prefix；
 schema adapter 不推断或改写这些 target-private 语义。
 
 Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState ownership 转移给新 request：
@@ -811,14 +879,16 @@ reuse frontier 之前且该位置没有快照，则本次保留合法 reuse 并�
 主动 full reset。只有 incoming prefix 不匹配任何完整 checkpoint 时才 full reset。
 
 一个 retained entry 同时只能被一个 active request 消费。多个 active requests 不共享同一份可写
-sequence state，也不使用 copy-on-write branching。Request-local RNG、sampling、stop、generation
+sequence state，也不使用 copy-on-write branching。`cache_write: false` uses independent copied state
+and a protected cache source as described below. Request-local RNG、sampling、stop、generation
 limit 和 output state 始终由新 request 创建。
 
 Retained state 占用实际 state-pool memory，但不占 active control slot，也不保留 future growth
 reservation。Active admission 优先；cache occupancy 阻塞原本可行的 request 前，先驱逐 free lanes 上的
 retained entries。VRAM retained physical state 仍留在原 lane，Planner 在 free lanes 中选择最大合法
-reuse，不在 GPU 上复制或迁移 page mapping。Equal reuse prefers a free lane with no retained
-bundle; among equal-reuse dirty free lanes it covers the least-recently-admitted retained chat
+reuse。Ordinary consuming hits do not copy or migrate GPU page mappings; disposable forks
+copy payloads into independently owned mappings. Equal reuse prefers a free lane with no retained
+bundle; among equal-reuse dirty free lanes disposable state precedes ordinary state, then it covers the least-recently-admitted retained chat
 (monotonic occupy tick assigned after the first non-throwing `advance_prefill` in
 `start_prefill_lane`), then lowest lane index. An
 optional host-RAM second tier snapshots a completed
@@ -831,6 +901,43 @@ Prefix lookup 只改变 uncached prompt work 和 prospective reuse plan，不自
 缩短 §5.5 的 service projection，但仍须通过相同 protected-head qualification；无论是否命中，最终 active
 request 都进入相同 prefill/decode schedule 和 compact batch formation。
 
+#### Disposable cache reads
+
+`ExecutionOptions.cache_write` defaults to true. False selects a source-preserving fork, with
+source identity and destination lane planned independently. Longest preservation-feasible reuse
+wins, with direct VRAM, RAM, and disk tie preference; full-original RAM preservation is attempted
+when direct VRAM admission cannot coexist with its source. Reclaim unrelated idle retention
+before giving up. An infeasible longer hit does not exclude a shorter feasible hit or preserving
+cold path. Active lanes keep ordinary FIFO/deadline/head-protection semantics.
+
+The family Program composes the selected current/checkpoint state into independent main/backend
+KV allocations, GDN state, hidden state, and DFlash cyclic state. Sampling and output control are
+request-local. Source mutation, page reclamation, and image/staging reuse wait through its readers;
+the single executor copy-hold owns initialization and cancellation. No page sharing or copy-on-write
+is used. The fork's durable disk association is cleared before execution.
+
+An ordinary original may be captured to RAM when its lane or pages must be freed. This capture
+bypasses preserve-off rewrite cutting and preserves the complete original resume frontier plus
+existing checkpoints. Before eviction, failed/deferred admission can release the source claim and
+roll back that capture; after eviction, the saved original is committed and cancellation cannot
+remove its only image. A fork releases successful RAM restores instead of consuming them and
+keeps RAM-to-disk bookkeeping intact. Disk restore completion keeps the inclusive durable entry.
+A disposable original cannot be offloaded. Permanently impossible preservation on an idle Engine
+returns a request-local overload; temporary active/copy/reclaim pressure queues and replans.
+
+False requests suppress future-reuse captures while retaining required execution transaction
+state. Their valid terminal state carries disposable retention. Empty eligible lanes are preferred;
+among retained victims disposable state precedes ordinary state, then admission recency and lane
+index decide. Apply the same order to destination replacement and shared-page reclamation.
+All capture entry points and both shutdown passes reject disposable persistence. A later true
+continuation sets ordinary retention for its resulting state.
+
+Restore failure disposition distinguishes invalid source, stale plan, and destination resource
+failure. Only invalid source discards/quarantines the entry. Stale disk generation/claim races
+release pins and replan; destination resource failures keep a healthy source and can cold-prefill.
+Device-integrity failures remain Engine-wide. Request logs carry the write flag; saving an original
+is billed to its triggering request, without counting it as a disposable checkpoint capture.
+
 ### 6.5 Host RAM second tier
 
 `--kv-ram-capacity` enables a startup-fixed pinned-host budget that stores **already completed**
@@ -841,7 +948,7 @@ does not change GPU pool capacity, active-set
 accounting, or CUDA Graph addresses, and it does not move an in-flight request off the GPU.
 
 MTP 或 DFlash prefill may freeze current GDN into an Engine-wide staging slot during an in-flight prefill
-(after the Program prefill step compute-syncs that chunk). That freeze borrows slot `2C` from the
+(after the Program prefill step compute-syncs that chunk). That freeze borrows slot `C` from the
 turn-rollback occupant: `occupied=false` before the clobber D2D, pack the ladder head, then H2D
 rollback GDN and hidden back. DFlash also D2Ds that lane's cyclic local into a 1-lane Engine-wide
 staging window before the same `d2d_done` fence; host-pack D2H reads that frozen window, not live
@@ -876,14 +983,38 @@ Capture queues D2H on `copy_stream` and **holds the source pages mapped** until 
 Admit is two-phase: bind records the request in its lane and the retained victims awaiting release
 as copy-hold (including victims whose optional capture was dropped); other decode-ready lanes may
 run a DecodeRound while that D2H (and later restore H2D) is in flight. Admit-complete waits with `cudaEventQuery` (and `EventSynchronize` on copy
-only when membership is empty), then `evict_retained_lane` / `kv.reset()`, optional restore H2D,
+only when membership is empty), then `evict_retained_lane` / `kv.reset()`, optional restore H2D
+(a RAM restore starts only once its entry's own capture copies are ready, polled while others
+decode),
 `wait_kv_ram_copies_on_compute` immediately before this lane's `start_prefill_lane`, and harvest.
 Harvest of D2H/H2D elapsed happens after that wait, not on an overlapping DecodeRound launch.
+A cancellation while other lanes decode does not drain at once: `begin_copy_hold_cancel` stops
+further disk restore work and records a fence on the copy stream behind the copies already queued,
+the hold stays parked while DecodeRounds continue, and the drain below runs once
+`copy_hold_cancel_settled` (or membership is empty), so it no longer waits on in-flight SSD reads.
+A shutdown with such a hold parked finishes it as cancelled.
+A `CacheRestoreFailure` before prefill consumes the prompt parks the hold the same way. Once it
+settles, cleanup releases the claims. An invalid source is discarded and the request falls back
+to cold prefill; a stale plan preserves the source and replans admission; an unavailable destination
+preserves the source and falls back to cold prefill. Generation recovery keeps its lane and output
+while restoring or cold-prefilling the retry. It refreshes a stale host lookup once, then cold-prefills
+if that refreshed restore is also stale. Other request-local failures drain and fail only the
+request; other exceptions remain Engine-fatal.
 If the held request is cancelled or fails before admit-complete, drain waits for those copies,
-harvests, releases an unused RAM claim, and calls `evict_retained_lane` on every selected victim.
+harvests, releases unused RAM/disk claims, discards only sources classified invalid, and calls
+`evict_retained_lane` on every selected victim not yet evicted. A failed restore releases those
+victims the same way.
 If capture succeeded, the completed D2H image is the only remaining copy. A later RAM hit
-exclusive-claims the matching host entry (pinned entries are invisible to later `plan_match`). `capture` and `unpack` record a start CUDA event before the copies and a done event
-after them so other-lane decode can overlap the DMA. Consume then erases that entry wherever it
+claims the matching host entry (pinned entries are invisible to later `plan_match`). `capture` and `unpack` record a start CUDA event before the copies and a done event
+after them so other-lane decode can overlap the DMA. The pinned rewrite-checkpoint and ladder
+images (GDN conv/recurrent, about 150 MB per image, plus DFlash cyclic) copy host-to-host through
+`enqueue_host_copies`, a stream-ordered `cudaLaunchHostFunc` callback, because a host-to-host
+`cudaMemcpyAsync` is synchronous with respect to the calling thread. Each image's `copies_done`
+fence is stream-waited before and re-recorded after those copies; disk restore does the same on
+its state stream. A RAM restore's installed ladder heads copy out of the entry on that host-copy
+stream behind only their own fences: no stream joins them and the entry's copy fence, which gates
+the lane's first prefill chunk, excludes them; a separate block fence keeps the entry's block
+allocated until they land. Ordinary consume then erases that entry wherever it
 sits in the FIFO and retires the host block, including after an incomplete first chunk; a throw
 before consume releases the claim and leaves the host row in place. After consume the bundle lives
 only in VRAM until a later spill recaptures it. Occupancy `used`/`entries` (human `kv-ram=` / `n=`)
@@ -894,8 +1025,8 @@ occupancy looks low.
 The planner picks the larger `reusable_prompt_tokens` between VRAM and RAM; equal reuse keeps
 VRAM. VRAM `FullReset` and RAM restore both prefer a free lane with no retained bundle and cover a
 dirty lane only when no empty lane is feasible. Among those equal-reuse dirty lanes, the victim is
-the least-recently-admitted retained bundle, then lowest lane index. Page-reclaim eviction of
-other free retained lanes uses the same recency order and never captures the selected lane twice.
+disposable before ordinary retention, then the least-recently-admitted bundle and lowest lane
+index. Page-reclaim eviction of other free retained lanes uses the same order and never captures the selected lane twice.
 The admitted `RequestPlan` is the winner: RAM pass 1 keeps `evict_retained=false` even if the
 target lane is dirty, and restore captures that lane's old bundle. `GenerationResult` uses
 `prefix_reuse_source` for `none` / `vram_resident` / `host_ram` / `host_disk`; `prefix_reuse_path` still describes
@@ -909,18 +1040,27 @@ retained VRAM, flushes not-durable RAM, and fsyncs before aborting occupied lane
 `kv-disk save cache entries`, and `kv-disk finish disk writes` during shutdown.
 
 One restore coordinator and the startup-fixed reader pool own disk restore. A claimed request pins
-its immutable entry and pack generation while readers fill the bounded pinned/page-device window.
+its immutable entry while per-extent reader leases protect locations as readers fill the bounded pinned/page-device window.
 The coordinator may overlap validated page H2D/scatter with later SSD reads and may load independent
 state objects in parallel, but it publishes no partially restored lane. Admit-complete waits for
 the restore state owners and copy-stream event immediately before `start_prefill_lane`; cancellation
 drains those owners and releases the claim without consuming the durable entry.
 
-Disk work has three scheduling classes. Restore reads yield only to an emergency spill needed to
+Disk request work has three scheduling classes. Restore reads yield only to an emergency spill needed to
 make the selected admission feasible. Emergency spill excludes all restore payload I/O. Idle spill
 uses separate staging and may duplex with restore, but every page job rechecks its spill epoch and
 RAM residency before capture so eviction/cancellation cannot publish a stale bundle. Commit and
 fsync preserve pack-namespace → map → entry → manifest order. Shutdown promotes unfinished idle
 work as needed, waits for all payload jobs, publishes durable metadata, then synchronizes the store.
+
+The Executor separately grants disk maintenance permission only when pending ingress, all request
+lanes (including disposable requests), and copy holds are empty and tier copies are ready. It
+revokes permission before admitting or executing request work. RAM write-behind does not grant
+this permission. Idle defragmentation yields to every request I/O class, uses throttled copy
+chunks into existing holes, and preserves old locations for readers across durable Move journal
+publication. Shutdown cancels maintenance and waits for its location handoff or cancellation
+before reporting the disk tier synchronized. The exact budgets and recovery order are defined in
+`paged-kv-cache.md`.
 
 ---
 
@@ -935,14 +1075,18 @@ PrefillChunk(request)
 DecodeRound(all decode-ready requests)
 ```
 
-完整 request 不是 scheduling unit。所有 **compute** GPU work 在 `device.stream` 上串行执行。
+完整 request 不是 scheduling unit。Ordinary decode and exclusive prefill execute on
+`device.stream`. Eligible DFlash mixed rounds also use one startup-owned nonblocking owner
+stream; matching-layer event joins preserve the single round boundary (§8.8).
 Host-RAM D2H/H2D 在 `copy_stream` 上，不是 scheduling unit，不得进入 CUDA Graph，也不得与当前
 compute unit 的 pages 别名。
 
-Model Runtime 拥有一份地址稳定的 shared workspace，由串行的 GPU units 复用，不按 request
-复制。Prefill owner 可在 Vision/Text phases 及多个 chunks 之间持有一份 request-transient lease；
-final prefill、cancellation 或 failure 后释放。copy-hold 与 prefill owner 一样独占 admission
-opportunity，直到该 lane 的 copies 允许 `start_prefill_lane`。
+Model Runtime 拥有一份地址稳定的 shared workspace，不按 request 复制。Serial units reuse
+the allocation; a mixed round uses disjoint bounded owner and verify views within that same
+startup allocation (§8.8). Prefill owner 可在 Vision/Text phases 及多个 chunks 之间持有一份 request-transient lease；
+final prefill、cancellation 或 failure 后释放。A copy-hold blocks further admission until its copies
+permit `start_prefill_lane`. A transient-bearing owner cannot use the interruption exception;
+a suspended text owner retains no transient lease.
 
 ### 7.2 Boundary processing
 
@@ -960,7 +1104,10 @@ opportunity，直到该 lane 的 copies 允许 `start_prefill_lane`。
 6. choose, prepare and launch one next GPU unit
 ```
 
-copy-hold 在 admission gate 之前检查：membership 非空且 copies 未就绪时先跑其他 lane 的
+已取消或 restore 失败而 parked 的 copy-hold 最先检查：其 fenced copies settle 之前，只要 membership
+非空就只跑该 membership 的 DecodeRound，generation recovery、admission 和 prefill 都不推进；settle 后
+（或 membership 为空）才 cancel 该 lane，或丢弃失败 entry 并走 cold fallback。其余 copy-hold 在
+admission gate 之前检查：membership 非空且 copies 未就绪时先跑其他 lane 的
 DecodeRound（不 harvest、不 `EventSynchronize` copy）；membership 空则 `EventSynchronize` copy
 并 complete。Capture D2H ready 后 `admit_complete` 可能排入 restore H2D；若 frozen membership 非空，
 同一 boundary transaction 立即运行该 membership 的 DecodeRound，不重新处理 control events。Harvest
@@ -973,13 +1120,55 @@ boundary 最多发布一个新 admitted request。
 
 ### 7.3 Decode/prefill policy
 
+The Engine and server default to `mixed_forward = 4096`, `mixed_forward_rounds = 12`,
+and `mixed_forward_min_tokens = 4096`. Suffixes below the threshold run exclusively,
+including checkpoint tails; zero threshold applies fixed cadence to every suffix and
+disables short-prefill interruption.
+Concurrency and speculative backend selection remain independent. A smaller explicit
+`prefill_chunk` requires a compatible mixed width or `mixed_forward = 0`; single-request
+CLI and perplexity execution explicitly select prefill-first. Benchmark defaults remain
+prefill-first for control measurements. User tuning is documented in `docs/serving.md`.
+
+
+The spare-lane exception checks the FIFO head's exact selected resident plans before
+suspension. It never bypasses a live queued head, creates a protection epoch or borrows
+backfill credit. Every successful short bind consumes the same frozen decode-admission budget
+as ordinary admission. Cancelling a suspended owner releases only its state; cancelling the
+short owner resumes the large one at the next legal boundary. Statistics count both staged
+owners as prefilling requests. The single request-transient lease remains exclusive to the
+executing owner.
+
 调度策略为：
 
 ```text
-if a prefill owner exists:
-    run the next PrefillChunk
-else if an admitted copy-hold is ready:
-    complete it and start its prefill
+if a parked copy-hold was cancelled or its restore failed:
+    if its fenced copies have not settled and requests are DECODE_READY:
+        run one DecodeRound containing them (nothing else advances)
+    else:
+        cancel it, or drop the failed entry and fall back to cold prefill
+else if an admitted copy-hold exists:
+    if its copies are not ready and requests are DECODE_READY:
+        run one DecodeRound containing them
+    else:
+        complete it and start its prefill
+else if a suspended prefill exists and no current owner/copy-hold exists:
+    restore its shared KV-row, RoPE, logprob and sampling-mask bindings; resume its cursor
+else if a prefill owner exists:
+    if its last chunk completed, interruption allowance exists, remaining >= threshold,
+       and decode-admission debt allows another bind:
+        consider only the live FIFO head from one bounded queue snapshot
+        require a spare lane, no transient lease, direct resident feasibility and no eviction
+        respect protected-head persistent safety; suspend the large owner and admit the short one
+    if mixed_forward > 0 and remaining >= mixed_forward_min_tokens and requests are DECODE_READY:
+        if the target can mix the owner's next chunk into DFlash verification:
+            run mixed_forward_rounds - 1 ordinary DecodeRounds, then one DecodeRound
+            containing the owner's next Shared-pace chunk
+        else:
+            run mixed_forward_rounds ordinary DecodeRounds, then the next Shared-pace chunk
+    else:
+        run the next Exclusive-pace PrefillChunk (at most prefill_chunk)
+else if a generation-recovery retry is queued:
+    start it (a host restore parks it as a copy-hold)
 else if a pending request is admissible and decode-admission budget permits:
     admit it and start its prefill
 else if one or more requests are DECODE_READY:
@@ -988,7 +1177,8 @@ else:
     remain idle
 ```
 
-因此 startup 有三个 cold requests 时：
+With prefill-first pacing (`mixed_forward = 0`, or every remaining suffix below the threshold),
+three cold startup requests follow:
 
 ```text
 Prefill[A, all chunks] -> Prefill[B, all chunks] -> Prefill[C, all chunks]
@@ -999,6 +1189,9 @@ Prefill[A, all chunks] -> Prefill[B, all chunks] -> Prefill[C, all chunks]
 C；B/C 都 decode-ready 后才运行 `DecodeRound[A,B,C]`。若 B 在 prefill token terminal，其 bind 仍消费
 budget，持续 ingress 不能跳过 mandatory donor decode。
 
+Request plan 以 Shared-pace step 宽度投影 prefill service work：`mixed_forward` 不超过 4096
+（irregular-split extent），因此任何 Shared/Exclusive 交替都不会比投影多走一步。
+
 Prefill chunk profile 限制一次不可取消 GPU unit 的时间；完整 admission burst 的 wall time 可以包含最多
 `C-1` 个完整 request prefills。其具体 token/media extent 是经过 target 和 hardware qualification 的配置，
 不属于 scheduler semantic。Vision 和其他 prefill GPU phases 必须本身构成 bounded unit，或已被计入该
@@ -1006,8 +1199,9 @@ chunk 的 latency bound；不存在 scheduler 之外的 unbounded prefill work�
 
 ### 7.4 Joining and leaving decode
 
-- request 在 final prefill/finalization 完成后加入 active decode set；exact retained hit 只省略 suffix work，
-  不绕过现有 prefill owner；
+- request 在 final prefill/finalization 完成后加入 active decode set。Exact retained hits skip
+  suffix work; a short FIFO head may use the spare-lane exception, subject to the same resources
+  and interruption allowance as other short prefills;
 - newly ready request 首次出现在下一个 boundary 构建的 batch；
 - protected-head policy 只影响 admission；backfill 一旦 decode-ready，不得为了保护 waiting head 而从
   maximal batch 中排除；
@@ -1051,6 +1245,7 @@ Resident Model Runtime 是 model-instance object，不是 request object。它�
 - 一份 shared execution workspace；
 - 一份最大容量为 `C` 的 `DecodeBatchFrame`；
 - speculative backend 启用时，一份容量为 `C`、宽度为 `draft_window+1` 的 all-layer ReplaySSM record arena；
+- DFlash 的 capacity-four accepted-history planes、每行 provisional innovations 和每 lane retained length；
 - startup-captured graph definitions 和 topology executables。
 
 每个 request 的持久状态只存在于 slot control 和该 slot 当前拥有的 `SequenceState`。Model Runtime 不保存
@@ -1212,6 +1407,18 @@ Per-request KV/context、recurrent state、sampling state 和 output ownership �
 ### 8.7 Result resolution and commit
 
 Graph replay 后只回传 compact per-row result，例如 ordinary sampled token，不能回传 logits 或逐层状态。
+
+Token logprobs follow the same rule. A request that set `OutputOptions::top_logprobs` raises its
+row's `logprob_rows` flag in the round's control frame. Every decode schedule (ordinary, MTP, and
+DFlash, captured or eager) ends its token decision with `ops::token_logprobs`, which scores each
+produced token against the logits column that decided it (column `i` for a chain, node
+`fold_path[i]` for a packed tree) and writes a fixed-size record per token slot into the result
+frame: the token's log-probability and the 20 highest-ranked ids with theirs. The launch is part
+of every definition, so no graph variant or post-replay launch exists; a row whose flag is clear
+returns from the kernel before reading logits and its record slots are not written. The
+prefill-sampled first token uses the same Op on the scalar step logits, before the MTP bridge
+reuses them. The Engine turns the records of the committed token prefix into `TokenLogprob`
+values per output channel; tokens that publish to no channel are dropped there.
 GPU Executor 等待一次 whole-round completion，然后通过 frozen `RoundMembership` 对每行独立 resolve：
 
 ```text
@@ -1229,14 +1436,39 @@ row result
 prefix，不改变其他行的 commit result。
 
 A round sampled with model stop tokens excluded may commit only through the first completed
-`</tool_call>`; `resolve_pending_batch` then folds that shorter prefix.
+`</tool_call>`; `resolve_pending_batch` then folds that shorter prefix. A plain chat round also
+commits through its reasoning close before sampling the continuation with the dedicated closing
+token excluded. Tool grammars enforce the close boundary in their per-node matcher masks and reserve
+closing-think markup only in free prose; constrained argument values retain literal markup.
 
-Speculative backend 的 target GDN 使用 ReplaySSM 时，GPU graph 只读 lane 的 current state 并写
+MTP 的 target GDN 使用 ReplaySSM 时，GPU graph 只读 lane 的 current state 并写
 Program-owned raw records，不推进 committed GDN state。CPU output preview 得到每行最终提交长度后，
 `resolve_pending_batch` 先用原始 `B` 行执行一次 all-layer Fold，再完成必要的 hidden/backend correction，
 同步成功后才推进 host frontiers。取消行以 `commit_columns=0` 参与原始 row mapping，Fold 对该行严格
 no-op，随后 retain 该行已 commit 的 continuation，而不是释放 bundle。Executor 只能在这个 commit tail
 成功后提交 output preview，并在 streaming 模式发布 output event。
+
+DFlash target GDN uses a Program-owned FP32 checkpoint plus capacity-four accepted history.
+The startup arena contains shared normalized keys, per-value-head innovations and decay, one
+retained length per lane across all 48 layers, and separate provisional records at the captured
+verify-width ceiling. Record reads the checkpoint and retained history, then derives innovations
+from represented BF16 raw K/V and FP32 controls using the actual provisional parent. A commit
+consumes only that same invocation's chain prefix or ancestor-complete selected tree path,
+including the anchor. It appends history while the total length is below four; otherwise it
+materializes the complete FP32 checkpoint and publishes length zero. Conv3 commits every round.
+An abort commits zero and leaves the logical state unchanged. Arbitrary edited raw records or
+records derived from another parent cannot use this compound profile. MTP retains native Fold.
+
+All history work uses the main compute stream. All-layer state/ring writes finish before a
+separate count publication; the next verify cannot overwrite provisional records until commit
+finishes. Program mirrors the same validated accepted/path count on the host, including the
+anchor, with the same flush-to-zero rule. An already dense slot requires no materialization
+launch. Dense prefill, current-to-staging or host snapshots, and retained-prefix publication
+materialize first. Restoring or zeroing a dense checkpoint resets the device length in stream
+order. Lane discard clears host ownership; acquisition/reset or restore clears the device count
+before reuse. The single staging slot and RAM/disk images always contain dense FP32 state.
+Existing copy-stream completion events protect snapshot reads; history adds no stream or event.
+All storage addresses are fixed before graph warmup; ordinary/MTP execution has no history owner.
 
 全部 rows resolve 后，`RoundMembership` 销毁，frame 可以被下一 unit 覆盖。继续运行的 slots 在下一
 boundary 重新 compact；没有任何 row identity 从当前 frame 继承到下一 frame。
@@ -1246,9 +1478,24 @@ boundary 重新 compact；没有任何 row identity 从当前 frame 继承到下
 `B=1` 使用完全相同的 membership、frame、whole-model schedule 和 commit transaction，不保留独立的
 request-local ordinary decode path。
 
-Prefill 仍是单 sequence unit。它独占自己的 `SequenceState`，但复用 Model Runtime 和 shared workspace；
-它不占有一个长期 `DecodeBatchFrame` row。Final prefill 建立完整 decode cursor 后，该 request 只在下一
-boundary 通过正常 batch assembly 加入 ordinary decode。
+Prefill has one sequence owner. An eligible DFlash mixed round evaluates that owner alongside
+the decode rows while preserving separate state and activation storage. The Model Runtime owns
+one nonblocking owner stream and two completion events for its lifetime. A primary-stream event
+orders owner work after ingress. Each matching layer records both streams' completion events
+before either cross-stream wait, so the two branches can overlap within a layer and both finish
+before the next layer. The primary stream joins the owner tail before verify-head evaluation,
+acceptance, state publication, or owner-context append. Failure cleanup drains outstanding owner
+work before either branch's state or scratch can be released.
+
+The owner and verify branches borrow disjoint bounded views of the same startup-planned workspace
+allocation. Round scopes restore both cursors after stream completion, including failure cleanup;
+the views retain their observed peaks. Public workspace accounting reports the greatest observed
+allocation extent across the ordinary, verify, and offset owner views, and peak reset resets all
+three views. No mixed round allocates a second workspace or changes graph addresses.
+
+Exclusive prefill remains a single-sequence unit. The owner exclusively owns its `SequenceState`
+and does not hold a persistent `DecodeBatchFrame` row. After final prefill establishes its complete
+decode cursor, the request joins ordinary decode through batch assembly at the next boundary.
 
 ---
 
@@ -1288,9 +1535,22 @@ executable[family,B,topology class]
 kernel 参数和 launch shape 触发 `cudaGraphExecUpdate` 不兼容。资源数量因此是 exact `B` 的有限集合，而不是
 `B × context profile` 的完整笛卡尔积。
 
+Captured adaptive panels, proposal packing, fused QKV splits, and GDN replay-record packing
+use one raw device-copy kernel per panel. CUDA Graph updates cannot change multidimensional
+memcpy parameters, including workspace addresses. The kernel copies exact row payload bytes
+with independent pitches; profile changes can update addresses and extents without changing
+copy-node topology or adding a launch per row.
+
 Profile 在 capture 前按 configured context ceiling 截断，只有实际 reachable 的 topology classes 才实例化
 executable。Backend-specific proposal shape 只有在真实改变 CUDA node topology 时才形成每个 exact `B`
 下的 topology class，不生成 ordinary-tail 或额外 `B=1` compatibility graph。
+
+Grammar-exchange presence is also an explicit profile/topology field. Every MTP and
+DFlash2 `(k, B, planned topology)` has separately captured variants without and with
+the exchange; their executables are distinct because the host branch changes CUDA node
+topology. Startup graph accounting includes both. A round selects the variant from its
+actual compact sessions; switching between ordinary, all-grammar and mixed batches never
+captures a new graph or updates an executable across variants.
 
 Startup 对 graph family 的准备顺序固定为：
 
@@ -1494,6 +1754,9 @@ shared round 中某一行可以安全继续。
 ## 12. End-to-end examples
 
 ### 12.1 Prefill burst joins an existing decode
+
+This example uses prefill-first pacing. Shared large owners instead yield the decode cadence
+in §7.3, and an eligible short FIFO head may use its spare-lane interruption.
 
 ```text
 time ───────────────────────────────────────────────────────────►

@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -36,6 +37,45 @@ constexpr std::string_view kXHighReasoningInstructions =
     "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
     "clarity in the final answer.";
 
+// Appends template markup and client text while recording which bytes are literal.
+class RenderBuffer {
+public:
+    void markup(std::string_view text) { text_ += text; }
+
+    void literal(std::string_view text) {
+        if (text.empty()) { return; }
+        const std::size_t begin = text_.size();
+        text_ += text;
+        if (!spans_.empty() && spans_.back().end == begin) {
+            spans_.back().end = text_.size();
+        } else {
+            spans_.push_back(ByteSpan{.begin = begin, .end = text_.size()});
+        }
+    }
+
+    void append(const RenderedFragment& fragment) {
+        const std::size_t base = text_.size();
+        text_ += fragment.text;
+        for (const ByteSpan span : fragment.literal_spans) {
+            if (!spans_.empty() && spans_.back().end == base + span.begin) {
+                spans_.back().end = base + span.end;
+            } else {
+                spans_.push_back(ByteSpan{.begin = base + span.begin, .end = base + span.end});
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept { return text_.size(); }
+
+    [[nodiscard]] RenderedFragment take() && {
+        return RenderedFragment{.text = std::move(text_), .literal_spans = std::move(spans_)};
+    }
+
+private:
+    std::string text_;
+    std::vector<ByteSpan> spans_;
+};
+
 bool is_instruction_role(ChatRole role) noexcept {
     return role == ChatRole::System || role == ChatRole::Developer;
 }
@@ -62,6 +102,26 @@ std::string trim_ascii_whitespace(const std::string& text) {
     return text.substr(begin, end - begin);
 }
 
+RenderedFragment trim_ascii_whitespace(const RenderedFragment& fragment) {
+    const std::string& text = fragment.text;
+    std::size_t begin       = 0;
+    while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
+        ++begin;
+    }
+    std::size_t end = text.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) { --end; }
+    RenderedFragment trimmed{.text = text.substr(begin, end - begin), .literal_spans = {}};
+    for (const ByteSpan span : fragment.literal_spans) {
+        const std::size_t clipped_begin = std::max(span.begin, begin);
+        const std::size_t clipped_end   = std::min(span.end, end);
+        if (clipped_begin < clipped_end) {
+            trimmed.literal_spans.push_back(
+                ByteSpan{.begin = clipped_begin - begin, .end = clipped_end - begin});
+        }
+    }
+    return trimmed;
+}
+
 bool starts_with(const std::string& text, std::string_view prefix) {
     return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
 }
@@ -75,7 +135,7 @@ long last_real_user_query(const std::vector<ChatMessage>& messages) {
     for (long i = static_cast<long>(messages.size()) - 1; i >= 0; --i) {
         const ChatMessage& message = messages[static_cast<std::size_t>(i)];
         if (message.role != ChatRole::User) { continue; }
-        const std::string content = trim_ascii_whitespace(message.rendered_content());
+        const std::string content = trim_ascii_whitespace(message.rendered_content().text);
         if (!(starts_with(content, "<tool_response>") && ends_with(content, "</tool_response>"))) {
             return i;
         }
@@ -83,46 +143,49 @@ long last_real_user_query(const std::vector<ChatMessage>& messages) {
     throw std::invalid_argument("no user query found in chat messages");
 }
 
-std::string lstrip_newlines(std::string text) {
-    std::size_t begin = 0;
-    while (begin < text.size() && text[begin] == '\n') { ++begin; }
-    return text.substr(begin);
-}
-
-std::string rstrip_newlines(std::string text) {
-    std::size_t end = text.size();
-    while (end > 0 && text[end - 1] == '\n') { --end; }
-    return text.substr(0, end);
-}
-
 // Split an assistant turn into (reasoning, content) exactly as the Qwen3.6 jinja
 // does when reasoning_content is not provided: reasoning is the text between the
 // last <think> and the first </think>; content is everything after the last
 // </think>. When there is no </think> the whole thing is content and reasoning is
-// empty.
-struct ThinkParts {
-    std::string reasoning;
-    std::string content;
+// empty. The parts are byte ranges of the input so its literal spans (and any
+// media markup) carry over to each part.
+struct ThinkSplit {
+    std::size_t reasoning_begin = 0;
+    std::size_t reasoning_end   = 0;
+    std::size_t content_begin   = 0;
 };
 
-ThinkParts derive_think_parts(const std::string& content) {
-    ThinkParts parts;
-    const std::size_t first_close = content.find("</think>");
-    if (first_close == std::string::npos) {
-        parts.content = content;
-        return parts;
-    }
+ThinkSplit derive_think_split(const std::string& content) {
+    constexpr std::string_view kOpen  = "<think>";
+    constexpr std::string_view kClose = "</think>";
+    const std::size_t first_close     = content.find(kClose);
+    if (first_close == std::string::npos) { return {}; }
     // reasoning = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')
-    std::string before          = rstrip_newlines(content.substr(0, first_close));
-    const std::size_t last_open = before.rfind("<think>");
-    std::string reasoning       = (last_open == std::string::npos)
-                                      ? before
-                                      : before.substr(last_open + std::string("<think>").size());
-    parts.reasoning             = lstrip_newlines(std::move(reasoning));
+    std::size_t reasoning_end = first_close;
+    while (reasoning_end > 0 && content[reasoning_end - 1] == '\n') { --reasoning_end; }
+    const std::size_t last_open = std::string_view(content).substr(0, reasoning_end).rfind(kOpen);
+    std::size_t reasoning_begin = last_open == std::string::npos ? 0 : last_open + kOpen.size();
+    while (reasoning_begin < reasoning_end && content[reasoning_begin] == '\n') {
+        ++reasoning_begin;
+    }
     // content = content.split('</think>')[-1].lstrip('\n')
-    const std::size_t last_close = content.rfind("</think>");
-    parts.content = lstrip_newlines(content.substr(last_close + std::string("</think>").size()));
-    return parts;
+    std::size_t content_begin = content.rfind(kClose) + kClose.size();
+    while (content_begin < content.size() && content[content_begin] == '\n') { ++content_begin; }
+    return {reasoning_begin, reasoning_end, content_begin};
+}
+
+RenderedFragment slice_fragment(const RenderedFragment& fragment, std::size_t begin,
+                                std::size_t end) {
+    RenderedFragment out{.text = fragment.text.substr(begin, end - begin), .literal_spans = {}};
+    for (const ByteSpan span : fragment.literal_spans) {
+        const std::size_t clipped_begin = std::max(span.begin, begin);
+        const std::size_t clipped_end   = std::min(span.end, end);
+        if (clipped_begin < clipped_end) {
+            out.literal_spans.push_back(
+                ByteSpan{.begin = clipped_begin - begin, .end = clipped_end - begin});
+        }
+    }
+    return out;
 }
 
 constexpr std::string_view kToolInstructions =
@@ -329,7 +392,7 @@ void append_tojson_value(std::string& out, std::string_view text, std::size_t& i
                 if (index < text.size() && text[index] == '}') { throw JsonWalkError{}; }
                 out += ", ";
             }
-            first               = false;
+            first                 = false;
             const std::string key = decode_json_string(text, index);
             append_json_escaped(out, key);
             skip_json_ws(text, index);
@@ -397,13 +460,17 @@ void append_tojson_value(std::string& out, std::string_view text, std::size_t& i
     }
     if (index < text.size() && text[index] == '.') {
         ++index;
-        if (index >= text.size() || text[index] < '0' || text[index] > '9') { throw JsonWalkError{}; }
+        if (index >= text.size() || text[index] < '0' || text[index] > '9') {
+            throw JsonWalkError{};
+        }
         while (index < text.size() && text[index] >= '0' && text[index] <= '9') { ++index; }
     }
     if (index < text.size() && (text[index] == 'e' || text[index] == 'E')) {
         ++index;
         if (index < text.size() && (text[index] == '+' || text[index] == '-')) { ++index; }
-        if (index >= text.size() || text[index] < '0' || text[index] > '9') { throw JsonWalkError{}; }
+        if (index >= text.size() || text[index] < '0' || text[index] > '9') {
+            throw JsonWalkError{};
+        }
         while (index < text.size() && text[index] >= '0' && text[index] <= '9') { ++index; }
     }
     out.append(text.data() + start, index - start);
@@ -451,17 +518,19 @@ std::string parameter_text(const OrderedJson& value) {
     return tojson_text(value);
 }
 
-std::string render_tool_call_from_json(const ToolCall& call) {
+// Tool-call markup is structural; the function name, parameter keys and values came from the
+// client and stay literal.
+void render_tool_call_from_json(RenderBuffer& out, const ToolCall& call) {
     std::size_t index = 0;
     skip_json_ws(call.arguments_json, index);
     if (index >= call.arguments_json.size() || call.arguments_json[index] != '{') {
         throw JsonWalkError{};
     }
     ++index;
-    std::string rendered;
-    rendered += "<tool_call>\n<function=";
-    rendered += call.name;
-    rendered += ">\n";
+    RenderBuffer rendered;
+    rendered.markup("<tool_call>\n<function=");
+    rendered.literal(call.name);
+    rendered.markup(">\n");
     skip_json_ws(call.arguments_json, index);
     bool first = true;
     while (index < call.arguments_json.size() && call.arguments_json[index] != '}') {
@@ -473,7 +542,7 @@ std::string render_tool_call_from_json(const ToolCall& call) {
                 throw JsonWalkError{};
             }
         }
-        first = false;
+        first                 = false;
         const std::string key = decode_json_string(call.arguments_json, index);
         skip_json_ws(call.arguments_json, index);
         if (index >= call.arguments_json.size() || call.arguments_json[index] != ':') {
@@ -487,11 +556,11 @@ std::string render_tool_call_from_json(const ToolCall& call) {
         } else {
             append_tojson_value(value, call.arguments_json, index);
         }
-        rendered += "<parameter=";
-        rendered += key;
-        rendered += ">\n";
-        rendered += value;
-        rendered += "\n</parameter>\n";
+        rendered.markup("<parameter=");
+        rendered.literal(key);
+        rendered.markup(">\n");
+        rendered.literal(value);
+        rendered.markup("\n</parameter>\n");
         skip_json_ws(call.arguments_json, index);
     }
     if (index >= call.arguments_json.size() || call.arguments_json[index] != '}') {
@@ -500,59 +569,58 @@ std::string render_tool_call_from_json(const ToolCall& call) {
     ++index;
     skip_json_ws(call.arguments_json, index);
     if (index != call.arguments_json.size()) { throw JsonWalkError{}; }
-    rendered += "</function>\n</tool_call>";
-    return rendered;
+    rendered.markup("</function>\n</tool_call>");
+    out.append(std::move(rendered).take());
 }
 
-std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
+void render_tool_call(RenderBuffer& out, const ToolCall& call, bool allow_empty_arguments) {
     if (allow_empty_arguments && call.arguments_json.empty()) {
-        return "<tool_call>\n<function=" + call.name + ">\n</function>\n</tool_call>";
+        out.markup("<tool_call>\n<function=");
+        out.literal(call.name);
+        out.markup(">\n</function>\n</tool_call>");
+        return;
     }
     try {
-        return render_tool_call_from_json(call);
+        render_tool_call_from_json(out, call);
     } catch (const JsonWalkError&) {
         OrderedJson args = OrderedJson::parse(call.arguments_json);
         if (!args.is_object()) {
             throw std::invalid_argument("tool call arguments must be a JSON object");
         }
-        std::string rendered;
-        rendered += "<tool_call>\n<function=";
-        rendered += call.name;
-        rendered += ">\n";
+        out.markup("<tool_call>\n<function=");
+        out.literal(call.name);
+        out.markup(">\n");
         for (auto it = args.begin(); it != args.end(); ++it) {
-            rendered += "<parameter=";
-            rendered += it.key();
-            rendered += ">\n";
-            rendered += parameter_text(it.value());
-            rendered += "\n</parameter>\n";
+            out.markup("<parameter=");
+            out.literal(it.key());
+            out.markup(">\n");
+            out.literal(parameter_text(it.value()));
+            out.markup("\n</parameter>\n");
         }
-        rendered += "</function>\n</tool_call>";
-        return rendered;
+        out.markup("</function>\n</tool_call>");
     }
 }
 
-std::string render_tools_system_block(const std::vector<std::string>& tool_jsons,
-                                      const std::string& leading_instruction,
-                                      std::string_view reasoning_instructions) {
-    std::string rendered;
-    rendered += "<|im_start|>system\n";
+void render_tools_system_block(RenderBuffer& out, const std::vector<std::string>& tool_jsons,
+                               const RenderedFragment& leading_instruction,
+                               std::string_view reasoning_instructions) {
+    out.markup("<|im_start|>system\n");
     if (!reasoning_instructions.empty()) {
-        rendered += reasoning_instructions;
-        rendered += "\n\n";
+        out.markup(reasoning_instructions);
+        out.markup("\n\n");
     }
-    rendered += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+    out.markup("# Tools\n\nYou have access to the following functions:\n\n<tools>");
     for (const std::string& tool : tool_jsons) {
-        rendered += "\n";
-        rendered += tojson_text_from_json(tool);
+        out.markup("\n");
+        out.literal(tojson_text_from_json(tool));
     }
-    rendered += "\n</tools>";
-    rendered += std::string(kToolInstructions);
-    if (!leading_instruction.empty()) {
-        rendered += "\n\n";
-        rendered += leading_instruction;
+    out.markup("\n</tools>");
+    out.markup(kToolInstructions);
+    if (!leading_instruction.text.empty()) {
+        out.markup("\n\n");
+        out.append(leading_instruction);
     }
-    rendered += "<|im_end|>\n";
-    return rendered;
+    out.markup("<|im_end|>\n");
 }
 
 std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
@@ -582,6 +650,97 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
     throw std::invalid_argument("invalid reasoning effort");
 }
 
+void append_rendered_messages(RenderBuffer& rendered, const std::vector<ChatMessage>& messages,
+                              std::size_t begin, const ChatRenderOptions& options,
+                              bool effort_template, bool preserve_thinking, long last_query_index,
+                              int& image_count, int& video_count,
+                              std::optional<RewriteCheckpointByteSpec>* rewrite_checkpoint,
+                              std::vector<std::size_t>* turn_closure_offsets,
+                              std::optional<bool>* latest_assistant_has_reasoning = nullptr) {
+    for (std::size_t i = begin; i < messages.size(); ++i) {
+        const ChatMessage& message = messages[i];
+        if (is_instruction_role(message.role)) { validate_instruction_message(message); }
+        const RenderedFragment content = trim_ascii_whitespace(
+            message.rendered_content(options.add_vision_id, &image_count, &video_count));
+        if (is_instruction_role(message.role)) {
+            rendered.markup("<|im_start|>system\n");
+            rendered.append(content);
+            rendered.markup("<|im_end|>\n");
+            continue;
+        }
+        if (message.role == ChatRole::User) {
+            rendered.markup("<|im_start|>user\n");
+            rendered.append(content);
+            rendered.markup("<|im_end|>\n");
+            continue;
+        }
+        if (message.role == ChatRole::Tool) {
+            const bool opens_group = i > 0 && messages[i - 1].role != ChatRole::Tool;
+            const bool closes_group =
+                i + 1 == messages.size() || messages[i + 1].role != ChatRole::Tool;
+            if (opens_group) { rendered.markup("<|im_start|>user"); }
+            rendered.markup("\n<tool_response>\n");
+            rendered.append(content);
+            rendered.markup("\n</tool_response>");
+            if (closes_group) { rendered.markup("<|im_end|>\n"); }
+            continue;
+        }
+
+        if (message.role != ChatRole::Assistant) {
+            throw std::invalid_argument("unsupported chat role value");
+        }
+
+        // assistant
+        RenderedFragment reasoning;
+        RenderedFragment body = content;
+        if (!message.reasoning_content.empty()) {
+            reasoning.text = message.reasoning_content;
+            reasoning.literal_spans.push_back(
+                ByteSpan{.begin = 0, .end = message.reasoning_content.size()});
+        } else if (!effort_template) {
+            const ThinkSplit split = derive_think_split(content.text);
+            reasoning = slice_fragment(content, split.reasoning_begin, split.reasoning_end);
+            body      = slice_fragment(content, split.content_begin, content.text.size());
+        }
+        reasoning = trim_ascii_whitespace(reasoning);
+        if (latest_assistant_has_reasoning != nullptr) {
+            *latest_assistant_has_reasoning = !reasoning.text.empty();
+        }
+
+        const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
+        rendered.markup("<|im_start|>assistant\n");
+        if (!preserve_thinking && turn_closure_offsets != nullptr) {
+            turn_closure_offsets->push_back(rendered.size());
+        }
+        if (rewrite_checkpoint != nullptr && !preserve_thinking &&
+            !rewrite_checkpoint->has_value() && static_cast<long>(i) > last_query_index) {
+            *rewrite_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+        }
+        // Official Qwen3.8 Jinja still wraps whenever keep_thinking. The C++ clone
+        // omits an empty reasoning wrapper so history does not inject the
+        // no-thinking cue `<think>\n\n</think>\n\n`.
+        if (keep_thinking && !(effort_template && reasoning.text.empty())) {
+            rendered.markup("<think>\n");
+            rendered.append(reasoning);
+            rendered.markup("\n</think>\n\n");
+        }
+        rendered.append(body);
+        if (!message.tool_calls.empty()) {
+            const bool body_has_text = !trim_ascii_whitespace(body.text).empty();
+            for (std::size_t call_index = 0; call_index < message.tool_calls.size(); ++call_index) {
+                if (call_index == 0) {
+                    if (body_has_text) { rendered.markup("\n\n"); }
+                } else {
+                    rendered.markup("\n");
+                }
+                render_tool_call(rendered, message.tool_calls[call_index], effort_template);
+            }
+        }
+        rendered.markup("<|im_end|>\n");
+    }
+}
+
 } // namespace
 
 bool ChatMessage::has_media() const noexcept {
@@ -591,31 +750,31 @@ bool ChatMessage::has_media() const noexcept {
     return false;
 }
 
-std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
-                                          int* video_count) const {
+RenderedFragment ChatMessage::rendered_content(bool add_vision_id, int* image_count,
+                                               int* video_count) const {
     int local_images = 0;
     int local_videos = 0;
     int& images      = image_count == nullptr ? local_images : *image_count;
     int& videos      = video_count == nullptr ? local_videos : *video_count;
-    std::string out;
+    RenderBuffer out;
     for (const ChatPart& part : parts) {
         switch (part.kind) {
         case ChatPartKind::Text:
-            out += part.text;
+            out.literal(part.text);
             break;
         case ChatPartKind::Image:
             ++images;
-            if (add_vision_id) { out += "Picture " + std::to_string(images) + ": "; }
-            out += "<|vision_start|><|image_pad|><|vision_end|>";
+            if (add_vision_id) { out.markup("Picture " + std::to_string(images) + ": "); }
+            out.markup("<|vision_start|><|image_pad|><|vision_end|>");
             break;
         case ChatPartKind::Video:
             ++videos;
-            if (add_vision_id) { out += "Video " + std::to_string(videos) + ": "; }
-            out += "<|vision_start|><|video_pad|><|vision_end|>";
+            if (add_vision_id) { out.markup("Video " + std::to_string(videos) + ": "); }
+            out.markup("<|vision_start|><|video_pad|><|vision_end|>");
             break;
         }
     }
-    return out;
+    return std::move(out).take();
 }
 
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
@@ -643,7 +802,7 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
 }
 
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
-                                          ChatRenderOptions options) const {
+                                          const ChatRenderOptions& options) const {
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
 
     const bool effort_template = semantics_ == ChatTemplateSemantics::ReasoningEffort;
@@ -651,135 +810,101 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         resolve_reasoning_instructions(semantics_, options);
 
     std::size_t message_begin = 0;
-    std::string leading_instruction;
+    RenderedFragment leading_instruction;
     if (is_instruction_role(messages[0].role)) {
         validate_instruction_message(messages[0]);
         leading_instruction = trim_ascii_whitespace(messages[0].rendered_content());
         message_begin       = 1;
     }
 
-    std::string rendered;
+    RenderBuffer rendered;
     const bool has_tools = !options.tool_jsons.empty();
     if (has_tools) {
-        rendered += render_tools_system_block(options.tool_jsons, leading_instruction,
-                                              reasoning_instructions);
+        render_tools_system_block(rendered, options.tool_jsons, leading_instruction,
+                                  reasoning_instructions);
     } else if (message_begin == 1) {
-        if (!effort_template || !leading_instruction.empty() || !reasoning_instructions.empty()) {
-            rendered += "<|im_start|>system\n";
+        if (!effort_template || !leading_instruction.text.empty() ||
+            !reasoning_instructions.empty()) {
+            rendered.markup("<|im_start|>system\n");
             if (!reasoning_instructions.empty()) {
-                rendered += reasoning_instructions;
-                if (!leading_instruction.empty()) { rendered += "\n\n"; }
+                rendered.markup(reasoning_instructions);
+                if (!leading_instruction.text.empty()) { rendered.markup("\n\n"); }
             }
-            rendered += leading_instruction;
-            rendered += "<|im_end|>\n";
+            rendered.append(leading_instruction);
+            rendered.markup("<|im_end|>\n");
         }
     } else if (!reasoning_instructions.empty()) {
-        rendered += "<|im_start|>system\n";
-        rendered += reasoning_instructions;
-        rendered += "<|im_end|>\n";
+        rendered.markup("<|im_start|>system\n");
+        rendered.markup(reasoning_instructions);
+        rendered.markup("<|im_end|>\n");
     }
 
     const long last_query_index  = last_real_user_query(messages);
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    std::vector<std::size_t> turn_closure_offsets;
+    std::optional<bool> latest_assistant_has_reasoning;
 
     int image_count = 0;
     int video_count = 0;
-    for (std::size_t i = 0; i < messages.size(); ++i) {
-        const ChatMessage& message = messages[i];
-        if (i < message_begin) { continue; }
-        if (is_instruction_role(message.role)) { validate_instruction_message(message); }
-        const std::string content = trim_ascii_whitespace(
-            message.rendered_content(options.add_vision_id, &image_count, &video_count));
-        if (is_instruction_role(message.role)) {
-            rendered += "<|im_start|>system\n";
-            rendered += content;
-            rendered += "<|im_end|>\n";
-            continue;
-        }
-        if (message.role == ChatRole::User) {
-            rendered += "<|im_start|>user\n";
-            rendered += content;
-            rendered += "<|im_end|>\n";
-            continue;
-        }
-        if (message.role == ChatRole::Tool) {
-            const bool opens_group = i > 0 && messages[i - 1].role != ChatRole::Tool;
-            const bool closes_group =
-                i + 1 == messages.size() || messages[i + 1].role != ChatRole::Tool;
-            if (opens_group) { rendered += "<|im_start|>user"; }
-            rendered += "\n<tool_response>\n";
-            rendered += content;
-            rendered += "\n</tool_response>";
-            if (closes_group) { rendered += "<|im_end|>\n"; }
-            continue;
-        }
-
-        if (message.role != ChatRole::Assistant) {
-            throw std::invalid_argument("unsupported chat role value");
-        }
-
-        // assistant
-        std::string reasoning;
-        std::string body = content;
-        if (!message.reasoning_content.empty()) {
-            reasoning = message.reasoning_content;
-        } else if (!effort_template) {
-            ThinkParts parts = derive_think_parts(content);
-            reasoning        = std::move(parts.reasoning);
-            body             = std::move(parts.content);
-        }
-        reasoning = trim_ascii_whitespace(reasoning);
-
-        const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
-        rendered += "<|im_start|>assistant\n";
-        if (!preserve_thinking && !rewrite_checkpoint && static_cast<long>(i) > last_query_index) {
-            rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
-        }
-        // Official Qwen3.8 Jinja still wraps whenever keep_thinking. The C++ clone
-        // omits an empty reasoning wrapper so history does not inject the
-        // no-thinking cue `<think>\n\n</think>\n\n`.
-        if (keep_thinking && !(effort_template && reasoning.empty())) {
-            rendered += "<think>\n";
-            rendered += reasoning;
-            rendered += "\n</think>\n\n";
-        }
-        rendered += body;
-        if (!message.tool_calls.empty()) {
-            const bool body_has_text = !trim_ascii_whitespace(body).empty();
-            for (std::size_t call_index = 0; call_index < message.tool_calls.size(); ++call_index) {
-                if (call_index == 0) {
-                    if (body_has_text) { rendered += "\n\n"; }
-                } else {
-                    rendered += "\n";
-                }
-                rendered += render_tool_call(message.tool_calls[call_index], effort_template);
-            }
-        }
-        rendered += "<|im_end|>\n";
-    }
+    append_rendered_messages(
+        rendered, messages, message_begin, options, effort_template, preserve_thinking,
+        last_query_index, image_count, video_count, &rewrite_checkpoint,
+        preserve_thinking ? nullptr : &turn_closure_offsets, &latest_assistant_has_reasoning);
 
     if (options.add_generation_prompt) {
-        rendered += "<|im_start|>assistant\n";
+        rendered.markup("<|im_start|>assistant\n");
+        const std::size_t generation_opener = rendered.size();
+        if (!preserve_thinking) { turn_closure_offsets.push_back(generation_opener); }
         if (!preserve_thinking && !rewrite_checkpoint) {
-            rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+            rewrite_checkpoint =
+                RewriteCheckpointByteSpec{.kind              = RewriteCheckpointKind::TurnClosure,
+                                          .offset            = rendered.size(),
+                                          .generation_opener = true};
         }
         if (options.enable_thinking) {
-            rendered += "<think>\n";
+            rendered.markup("<think>\n");
         } else {
-            rendered += "<think>\n\n</think>\n\n";
+            rendered.markup("<think>\n\n</think>\n\n");
         }
         if (preserve_thinking) {
-            // Response replay retains the deterministic generation prologue. This is the prompt
-            // frontier for both thinking modes, so capturing it does not split off a tiny final
-            // prefill unit. The complete rendered prefix is tokenized independently below.
-            rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
+            // Response replay normally retains the deterministic generation prologue: that is
+            // the prompt frontier, so capturing it does not split off a tiny final prefill unit.
+            // When the latest assistant turn carries no reasoning, the client drops it, so this
+            // response will re-render with empty reasoning: the effort template omits the
+            // wrapper and the toggle template's `<think>\n\n` tokenizes differently, so both
+            // diverge at most one token past the opener. Its checkpoint sits at the opener (one
+            // extra short prefill unit). A first turn keeps the prompt frontier, which exact
+            // replays and recovery retries resume from.
+            // The complete rendered prefix is tokenized independently below.
+            const bool replay_at_opener = options.enable_thinking &&
+                                          latest_assistant_has_reasoning.has_value() &&
+                                          !*latest_assistant_has_reasoning;
+            rewrite_checkpoint          = RewriteCheckpointByteSpec{
+                .kind   = RewriteCheckpointKind::ResponseReplay,
+                .offset = replay_at_opener ? generation_opener : rendered.size()};
         }
     }
-    return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
+    RenderedFragment fragment = std::move(rendered).take();
+    return RenderedChat{.text                 = std::move(fragment.text),
+                        .literal_spans        = std::move(fragment.literal_spans),
+                        .rewrite_checkpoint   = rewrite_checkpoint,
+                        .turn_closure_offsets = std::move(turn_closure_offsets)};
+}
+
+RenderedFragment CompiledChatTemplate::render_fragment(const std::vector<ChatMessage>& messages,
+                                                       const ChatRenderOptions& options) const {
+    if (messages.empty()) { return {}; }
+    const bool effort_template   = semantics_ == ChatTemplateSemantics::ReasoningEffort;
+    const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
+    RenderBuffer rendered;
+    int image_count = 0;
+    int video_count = 0;
+    // A fragment is appended after the closed conversation, so each assistant
+    // sits past the last user query. last_query_index -1 is that suffix.
+    append_rendered_messages(rendered, messages, 0, options, effort_template, preserve_thinking, -1,
+                             image_count, video_count, nullptr, nullptr);
+    return std::move(rendered).take();
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

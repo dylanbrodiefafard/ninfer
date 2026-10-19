@@ -2,6 +2,8 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
+#include "ninfer/ops/a8_activation.h"
 
 #include <cuda_runtime.h>
 
@@ -24,8 +26,9 @@ namespace ninfer::ops {
                                                                         std::int32_t min_tokens,
                                                                         std::int32_t max_tokens);
 
-// Transient capacity for the 27B packed-sequence form below. Batch is restricted to 1..4;
-// fallback panels reuse one workspace allocation.
+// Transient capacity for the 27B packed-sequence form below. Batch is restricted to 1..6;
+// fallback panels reuse one workspace allocation. Packed capacity must be queried here:
+// its per-sequence reduction can require more storage than an ordinary call at T=W*B.
 [[nodiscard]] std::size_t gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
     std::int32_t sequence_width, std::int32_t min_batch, std::int32_t max_batch);
 
@@ -84,14 +87,43 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           Tensor& beta, cudaStream_t stream);
 
 /**
- * Applies gdn_norm_gating_proj to B=1..4 packed independent 27B sequences. T must be positive and
+ * Applies gdn_norm_gating_proj to B=1..6 packed independent 27B sequences. T must be positive and
  * equal to `sequence_width * B`. The execution may aggregate qualified profiles or reuse one
  * panel workspace sequentially; both are private implementation choices.
  */
-void gdn_norm_gating_proj_packed_sequences(
-    const Tensor& x, const Tensor& norm_weight, float eps, const Weight& a_weight,
-    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-    Tensor& h, Tensor& g, Tensor& beta, cudaStream_t stream, std::int32_t sequence_width);
+void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_weight, float eps,
+                                           const Weight& a_weight, const Weight& b_weight,
+                                           const Tensor& A_log, const Tensor& dt_bias,
+                                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
+                                           cudaStream_t stream, std::int32_t sequence_width);
+
+/**
+ * The two-weight 27B forms above that also publish h as an A8 activation
+ * (ninfer/ops/a8_activation.h) of [5120,T]: h_activation encodes exactly the BF16 values written
+ * to h, which with g/beta are bit-identical to the forms without it. h_activation is
+ * caller-owned, 16-byte aligned for codes, and overlaps no other operand.
+ */
+void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
+                          const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                          const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h,
+                          A8Activation& h_activation, Tensor& g, Tensor& beta, cudaStream_t stream);
+void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_weight, float eps,
+                                           const Weight& a_weight, const Weight& b_weight,
+                                           const Tensor& A_log, const Tensor& dt_bias,
+                                           WorkspaceArena& ws, Tensor& h,
+                                           A8Activation& h_activation, Tensor& g, Tensor& beta,
+                                           cudaStream_t stream, std::int32_t sequence_width);
+
+/**
+ * The two-weight 27B form above that also publishes h as an NVFP4 activation
+ * (ninfer/ops/a4_activation.h) of [5120,T] for a weight with h_activation.input_scale_divisor:
+ * h_activation encodes exactly the BF16 values written to h, which with g/beta are bit-identical
+ * to the form without it. h_activation is caller-owned and overlaps no other operand.
+ */
+void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
+                          const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                          const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h,
+                          A4Activation& h_activation, Tensor& g, Tensor& beta, cudaStream_t stream);
 
 /** Qwen3.6-35B-A3B contiguous-parent storage form of gdn_norm_gating_proj. */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,

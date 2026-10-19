@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 
+#include <cmath>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -49,6 +50,32 @@ __device__ __forceinline__ void layer_norm_update(LayerNormMoments& moments, flo
     moments.m2 += delta * (value - moments.mean);
 }
 
+// One thread owns the row on this exceptional path. Finite BF16 values and their squared
+// deviations fit in FP64 even when the FP32 moments or variance-plus-epsilon overflow.
+// Keeping this out of line isolates its double temporaries from the ordinary FP32 route.
+__device__ __noinline__ void layer_norm_overflow_row(const __nv_bfloat16* x,
+                                                     const __nv_bfloat16* weight,
+                                                     const __nv_bfloat16* bias, __nv_bfloat16* out,
+                                                     std::int32_t d, float eps) {
+    double mean = 0.0;
+    for (std::int32_t i = 0; i < d; ++i) { mean += static_cast<double>(__bfloat162float(x[i])); }
+    mean /= static_cast<double>(d);
+    double variance = 0.0;
+    for (std::int32_t i = 0; i < d; ++i) {
+        const double centered = static_cast<double>(__bfloat162float(x[i])) - mean;
+        variance += centered * centered;
+    }
+    const double inv = 1.0 / sqrt(variance / static_cast<double>(d) + static_cast<double>(eps));
+    for (std::int32_t i = 0; i < d; ++i) {
+        const double normalized = (static_cast<double>(__bfloat162float(x[i])) - mean) * inv;
+        out[i]                  = __float2bfloat16_rn(
+            static_cast<float>(normalized * static_cast<double>(__bfloat162float(weight[i])) +
+                               static_cast<double>(__bfloat162float(bias[i]))));
+    }
+}
+
+// One CTA owns a D1152 row; threads stride over BF16 pairs. Warp moments occupy one shared
+// slot per warp. Two block barriers publish warp moments and the final row statistics.
 template <int Block>
 __launch_bounds__(Block) __global__
     void layer_norm_d1152_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
@@ -88,6 +115,16 @@ __launch_bounds__(Block) __global__
     }
     __syncthreads();
 
+    if (!isfinite(final_mean) || !isfinite(final_inv) || final_inv == 0.0f) {
+        if (threadIdx.x == 0) {
+            layer_norm_overflow_row(reinterpret_cast<const __nv_bfloat16*>(x + base),
+                                    reinterpret_cast<const __nv_bfloat16*>(weight),
+                                    reinterpret_cast<const __nv_bfloat16*>(bias),
+                                    reinterpret_cast<__nv_bfloat16*>(out + base), d, eps);
+        }
+        return;
+    }
+
     for (int pair = static_cast<int>(threadIdx.x); pair < pairs; pair += Block) {
         const float2 values = __bfloat1622float2(x[base + pair]);
         const float2 scales = __bfloat1622float2(weight[pair]);
@@ -98,6 +135,8 @@ __launch_bounds__(Block) __global__
     }
 }
 
+// Each warp owns one D1152 row and strides over aligned BF16 pairs. All communication uses
+// full-warp shuffles; there is no shared memory or synchronization between warps.
 template <int Block>
 __launch_bounds__(Block) __global__
     void layer_norm_d1152_warp_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
@@ -124,6 +163,16 @@ __launch_bounds__(Block) __global__
     const float m2          = __shfl_sync(mask, local.m2, 0);
     const float inv         = rsqrtf(m2 / static_cast<float>(d) + eps);
 
+    if (!isfinite(mean) || !isfinite(inv) || inv == 0.0f) {
+        if (lane == 0) {
+            layer_norm_overflow_row(reinterpret_cast<const __nv_bfloat16*>(x + base),
+                                    reinterpret_cast<const __nv_bfloat16*>(weight),
+                                    reinterpret_cast<const __nv_bfloat16*>(bias),
+                                    reinterpret_cast<__nv_bfloat16*>(out + base), d, eps);
+        }
+        return;
+    }
+
     for (int pair = lane; pair < pairs; pair += 32) {
         const float2 values = __bfloat1622float2(x[base + pair]);
         const float2 scales = __bfloat1622float2(weight[pair]);
@@ -133,6 +182,8 @@ __launch_bounds__(Block) __global__
     }
 }
 
+// One CTA owns a contiguous row; threads stride over D scalar BF16 values. Shared arrays
+// contain one Welford tuple per thread; every tree-reduction level ends in a block barrier.
 template <int Block>
 __global__ void layer_norm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                   const __nv_bfloat16* bias, __nv_bfloat16* out, std::int32_t d,
@@ -173,6 +224,12 @@ __global__ void layer_norm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* w
 
     const float mean = means[0];
     const float inv  = rsqrtf(m2s[0] / static_cast<float>(d) + eps);
+    if (!isfinite(mean) || !isfinite(inv) || inv == 0.0f) {
+        if (threadIdx.x == 0) {
+            layer_norm_overflow_row(x + base, weight, bias, out + base, d, eps);
+        }
+        return;
+    }
     for (std::int32_t i = static_cast<std::int32_t>(threadIdx.x); i < d; i += Block) {
         const float value = (__bfloat162float(x[base + i]) - mean) * inv;
         out[base + i] =

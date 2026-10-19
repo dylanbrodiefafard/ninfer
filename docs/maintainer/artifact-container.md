@@ -286,6 +286,18 @@ logical model views, schedules, kernels, GPU support, or runtime residency.
 The JSON and name index are cold-load data. A model binder resolves them once; inference does not
 reparse JSON or perform per-layer/per-token directory lookups.
 
+`Reader::tensor_content_identity(selections)` computes `tensor-sha256-v1:` followed by lowercase
+SHA-256 hex for caller-selected tensors or logical matrix rows. It orders tensors by name and
+merges overlapping/adjacent encoded byte ranges. For each tensor it hashes a compact JSON array
+`[name, shape, format, layout, [[offset, bytes], ...]]` followed by the selected encoded bytes in
+range order. Offsets are relative to that tensor's payload. Row selections include corresponding
+codes/scales and any shared divisor; NVFP4 selections must align to 128-row scale tiles.
+Resources, filesystem metadata, directory formatting, object placement, and unselected bytes
+are excluded. This is a content boundary for persistent numerical caches, not an on-disk
+artifact checksum; it reads the selected bytes only when requested. The caller owns the
+numerical dependency selection. An artifact must remain immutable for the lifetime of its
+Reader and Engine.
+
 ### 6.2 Registered model binder
 
 The binder selected for an executable target validates:

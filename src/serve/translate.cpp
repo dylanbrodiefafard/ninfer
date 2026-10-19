@@ -45,9 +45,9 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
         sampling.frequency_penalty = static_cast<float>(*request.frequency_penalty);
     }
     if (request.seed) {
-        sampling.seed = *request.seed;
+        sampling.seed = request.seed;
     } else if (server.sampling_overrides.seed) {
-        sampling.seed = *server.sampling_overrides.seed;
+        sampling.seed = server.sampling_overrides.seed;
     } else {
         sampling.seed = random_seed();
     }
@@ -171,7 +171,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         break;
     }
 
-    if (!capabilities.reasoning_effort.supports(*result.reasoning_effort)) {
+    if (!capabilities.reasoning_effort.supports(result.reasoning_effort.value())) {
         invalid_prompt_option("reasoning effort '" +
                                   std::string(requested_reasoning_effort_name(requested)) +
                                   "' is not supported by the loaded chat template",
@@ -235,6 +235,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking     = semantics.preserve_thinking;
     input.options.add_vision_id         = false;
     input.options.tool_jsons            = effective_tool_jsons(request);
+    input.options.output_constraint     = request.output_constraint;
     apply_leading_system_prepend(input.messages, system_prepend);
     return input;
 }
@@ -242,12 +243,16 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
 ninfer::RequestOptions to_request_options(const GenerationRequest& request,
                                           const ServeOptions& server) {
     ninfer::RequestOptions options;
-    options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
-    options.execution.allow_prefix_reuse      = server.allow_prefix_reuse;
+    options.execution.requested_output_tokens    = static_cast<std::uint32_t>(request.max_tokens);
+    options.execution.allow_prefix_reuse         = server.allow_prefix_reuse;
+    options.execution.cache_write                = request.cache_write;
     options.execution.capture_context_checkpoint = request.capture_context_checkpoint;
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    if (request.top_logprobs) {
+        options.output.top_logprobs = static_cast<std::uint32_t>(*request.top_logprobs);
+    }
     options.stop.strings.reserve(request.stop_strings.size());
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {

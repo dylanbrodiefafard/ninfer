@@ -18,14 +18,14 @@
 #                         container exists, else ninfer:local.
 #   NINFER_CONTAINER      Serve container name (default: ninfer).
 #   NINFER_DEV_CONTAINER  Builder name (default: ninfer-builder).
-#   NINFER_DEV_JOBS       Ninja parallelism (default: nproc).
+#   NINFER_DEV_JOBS       Ninja parallelism (default: 8).
 #   NINFER_HOT_OUT        Host export directory (default: <repo>/out/hot-patch).
 #   NINFER_HOT_ROLLBACK   0 skips tagging ${NINFER_IMAGE}-rollback before overwrite.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILDER="${NINFER_DEV_CONTAINER:-ninfer-builder}"
-JOBS="${NINFER_DEV_JOBS:-$(nproc)}"
+JOBS="${NINFER_DEV_JOBS:-8}"
 CONTAINER="${NINFER_CONTAINER:-ninfer}"
 OUT="${NINFER_HOT_OUT:-${ROOT}/out/hot-patch}"
 
@@ -142,7 +142,7 @@ if [[ "$(realpath -m "$src_mount")" != "$(realpath -m "$ROOT")" ]]; then
 fi
 
 if docker exec "$BUILDER" test -f /build/build.ninja; then
-  echo "Restatting /build ninja log for bind-mounted sources..."
+  echo "Refreshing /build ninja log timestamps for bind-mounted sources..."
   docker exec "$BUILDER" ninja -C /build -t restat
 fi
 

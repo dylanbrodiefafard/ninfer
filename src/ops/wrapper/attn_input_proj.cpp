@@ -1,4 +1,6 @@
 #include "ninfer/ops/attn_input_proj.h"
+#include "ops/common/a4_activation_check.h"
+#include "ops/common/a8_activation_check.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
@@ -112,7 +114,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         constexpr std::int32_t kRows   = 14336;
         const std::int32_t cols        = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
+            policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("NVFP4 attn_input_proj admits only A16 or A4");
         }
         require_matrix(x, kHidden, cols, "x");
@@ -129,10 +132,10 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        constexpr std::int32_t hidden = 5120;
+        constexpr std::int32_t hidden     = 5120;
         constexpr std::int32_t query_rows = 6144;
-        constexpr std::int32_t kv_rows = 1024;
-        const std::int32_t cols = x.ne[1];
+        constexpr std::int32_t kv_rows    = 1024;
+        const std::int32_t cols           = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("FP8 attn_input_proj admits only A16 or A8");
@@ -188,7 +191,8 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     case QType::NVFP4:
         if (parent_rows != detail::Nvfp4AttnInputGeometry::kOutputRows ||
             input_rows != detail::Nvfp4AttnInputGeometry::kInputRows ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
+             policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
@@ -247,6 +251,67 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     dispatch_single_parent(x, query_key_gate_value_weight, q, gate, k, v, LinearPolicy::A16Only,
                            nullptr, stream);
+}
+
+void attn_input_proj(const A8Activation& x, const Weight& query_key_gate_value_weight, Tensor& q,
+                     Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    constexpr std::int32_t kRows   = 14336;
+    const std::int64_t columns     = detail::validate_a8_activation(x, kHidden, "attn_input_proj");
+    const std::int32_t cols        = x.codes.ne[1];
+    if (columns != cols || cols < detail::kNvfp4FirstA8) {
+        throw std::invalid_argument("attn_input_proj: A8 activation must be [5120,T] with T >= 2");
+    }
+    const Weight& weight = query_key_gate_value_weight;
+    if (weight.qtype != QType::NVFP4) {
+        throw std::invalid_argument("attn_input_proj: an A8 activation requires an NVFP4 weight");
+    }
+    detail::validate_nvfp4_weight(weight, "nvfp4 attn_input_proj");
+    if (weight.n != kRows || weight.k != kHidden) {
+        throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
+    }
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(gate, kQRows, cols, "gate");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+    detail::nvfp4_attn_input_w4a8_project(
+        weight, cols,
+        {static_cast<std::uint8_t*>(x.codes.data), static_cast<float*>(x.scales.data)}, q, gate, k,
+        v, stream);
+}
+
+void attn_input_proj(const A4Activation& x, const Weight& query_key_gate_value_weight, Tensor& q,
+                     Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    constexpr std::int32_t kRows   = 14336;
+    const std::int32_t cols        = detail::validate_a4_activation(x, kHidden, "attn_input_proj");
+    if (cols < kA4AttnInputMinTokens) {
+        throw std::invalid_argument("attn_input_proj: A4 activation must be [5120,T] with T >= 4");
+    }
+    const Weight& weight = query_key_gate_value_weight;
+    if (weight.qtype != QType::NVFP4) {
+        throw std::invalid_argument("attn_input_proj: an A4 activation requires an NVFP4 weight");
+    }
+    detail::validate_nvfp4_weight(weight, "nvfp4 attn_input_proj");
+    if (weight.n != kRows || weight.k != kHidden) {
+        throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
+    }
+    if (x.input_scale_divisor != weight.input_scale_divisor) {
+        throw std::invalid_argument(
+            "attn_input_proj: A4 activation input scale divisor differs from the weight's");
+    }
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(gate, kQRows, cols, "gate");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+    detail::nvfp4_attn_input_w4a4_project(
+        weight, cols,
+        {static_cast<std::uint8_t*>(x.codes.data), static_cast<std::uint8_t*>(x.scales.data)}, q,
+        gate, k, v, stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,

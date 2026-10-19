@@ -2,20 +2,23 @@
 
 #include "core/device.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_conv_output.cuh"
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_small_t.cuh"
+#include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 
 namespace ninfer::ops::detail {
 namespace {
 
 using Launch       = void (*)(const Tensor&, const Weight&, const Tensor&, Tensor&, const Tensor&,
-                        const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
-                        cudaStream_t);
+                              const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
+                              cudaStream_t);
 using RecordLaunch = void (*)(const Tensor&, const Weight&, const Tensor&, const Tensor&,
                               const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
                               Tensor&, WorkspaceArena&, const std::int32_t*, cudaStream_t);
@@ -71,8 +74,8 @@ struct Nvfp4ContiguousGdnProjectionOutput {
         if (parent_row < kNvfp4GdnChannels) {
             projected[static_cast<std::int64_t>(token) * kNvfp4GdnChannels + parent_row] = value;
         } else {
-            z[static_cast<std::int64_t>(token) * kNvfp4GdnZRows + parent_row -
-              kNvfp4GdnChannels] = __float2bfloat16_rn(value);
+            z[static_cast<std::int64_t>(token) * kNvfp4GdnZRows + parent_row - kNvfp4GdnChannels] =
+                __float2bfloat16_rn(value);
         }
     }
 };
@@ -99,20 +102,18 @@ __global__ __launch_bounds__(256) void nvfp4_grouped_gdn_conv_kernel(
 template <int Width, int RequestsPerGroup, bool Tree, class Publish>
 void launch_grouped_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                            const Tensor& conv_states, const Tensor& valid_columns,
-                           const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
-                           Tensor& key, Tensor& value, Tensor& z, Publish publish,
-                           WorkspaceArena& workspace, cudaStream_t stream,
-                           const std::int32_t* parent_index) {
-    using Geometry                = Nvfp4GdnInputGeometry;
-    constexpr int kGroupedTokens  = RequestsPerGroup * Width;
-    constexpr int kRowsPerWarp    = 2;
+                           const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value,
+                           Tensor& z, Publish publish, WorkspaceArena& workspace,
+                           cudaStream_t stream, const std::int32_t* parent_index) {
+    using Geometry               = Nvfp4GdnInputGeometry;
+    constexpr int kGroupedTokens = RequestsPerGroup * Width;
+    constexpr int kRowsPerWarp   = 2;
     // Match the W-local GDN reduction exactly: 8 warps, 16 values/lane, four
     // accumulator chains. Only the token register panel widens to replay weights.
     using Schedule =
         Nvfp4SmallTSchedule<8, 1, kRowsPerWarp, 16, kGroupedTokens, 4,
-                            Nvfp4SmallTActivationAccess::TokenPacked,
-                            Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+                            Nvfp4SmallTActivationAccess::TokenPacked, Nvfp4ScaleAccess::StagedRaw,
+                            Nvfp4CodeCache::Default, 1, Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const int batch       = x.ne[2];
     const int columns     = batch * Width;
@@ -147,10 +148,9 @@ void launch_grouped_record(const Tensor& x, const Weight& weight, const Tensor& 
 template <int Width, int Batch, bool Tree, class Publish>
 void launch_contiguous_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                               const Tensor& conv_states, const Tensor& valid_columns,
-                              const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
-                              Tensor& key, Tensor& value, Tensor& z, Publish publish,
-                              WorkspaceArena& workspace, cudaStream_t stream,
-                              const std::int32_t* parent_index) {
+                              const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value,
+                              Tensor& z, Publish publish, WorkspaceArena& workspace,
+                              cudaStream_t stream, const std::int32_t* parent_index) {
     static_assert(Batch == 1 || Batch == 3);
     // B=1 needs no grouped address arithmetic. C=3 likewise owns one exact request-major
     // 3*W panel, avoiding the half-empty second pair.
@@ -158,9 +158,8 @@ void launch_contiguous_record(const Tensor& x, const Weight& weight, const Tenso
     constexpr int kContiguousTokens = Batch * Width;
     using Schedule =
         Nvfp4SmallTSchedule<8, 1, 2, 16, kContiguousTokens, 4,
-                            Nvfp4SmallTActivationAccess::TokenPacked,
-                            Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+                            Nvfp4SmallTActivationAccess::TokenPacked, Nvfp4ScaleAccess::StagedRaw,
+                            Nvfp4CodeCache::Default, 1, Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
 
@@ -190,7 +189,7 @@ void launch_contiguous_record(const Tensor& x, const Weight& weight, const Tenso
 
 // Packed snapshot T=2..16 GDN conv uses the SmallT production schedule (token-parallel
 // GEMM) with FP32 projected-conv in the epilogue. Record B=1 W=4 uses fused SmallT;
-// B=1 W=5/6 and qualified B>1 W=2/5 shapes use grouped weight-replay projection
+// B=1 W=5/6, B>1 W=2/5 and B=2/4 W=6 use grouped weight-replay projection
 // (single request, pairs, plus a direct W=5 triple at B=3) and separate FP32 conv.
 // Other B=1 widths retain the fused T=1 GEMV+conv route. Convolution history rounds
 // through BF16 at every column, matching it.
@@ -217,8 +216,8 @@ void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weig
                              Nvfp4SmallTFinalization::RowVector,
                              Nvfp4BatchedPackedActivation<Geometry>>
             <<<dim3(batch, kBlocks), Schedule::kThreads, 0, stream>>>(
-                Nvfp4BatchedPackedActivation<Geometry>{
-                    static_cast<const __nv_bfloat16*>(x.data), ActiveTokens},
+                Nvfp4BatchedPackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data),
+                                                       ActiveTokens},
                 static_cast<const std::uint8_t*>(weight.qdata),
                 static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
                 output);
@@ -250,10 +249,10 @@ void launch_snapshot_exact(const Tensor& x, const Weight& weight, const Tensor& 
             Tensor key_b   = key.slice(2, b, 1);
             Tensor value_b = value.slice(2, b, 1);
             Tensor z_b     = z.slice(2, b, 1);
-            launch_snapshot_exact<ActiveTokens>(
-                x.slice(2, b, 1), weight, conv_weight, conv_states, valid_b,
-                initial_slot.slice(0, b, 1), snapshot_base_slot.slice(0, b, 1), query_b, key_b,
-                value_b, z_b, stream);
+            launch_snapshot_exact<ActiveTokens>(x.slice(2, b, 1), weight, conv_weight, conv_states,
+                                                valid_b, initial_slot.slice(0, b, 1),
+                                                snapshot_base_slot.slice(0, b, 1), query_b, key_b,
+                                                value_b, z_b, stream);
         }
         return;
     }
@@ -278,13 +277,12 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
             if (x.ne[2] == 1) {
                 if (parent_index == nullptr) {
                     launch_contiguous_record<ActiveTokens, 1, false>(
-                        x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                        conv_record, query, key, value, z, publish, workspace, stream, nullptr);
+                        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
+                        key, value, z, publish, workspace, stream, nullptr);
                 } else {
                     launch_contiguous_record<ActiveTokens, 1, true>(
-                        x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                        conv_record, query, key, value, z, publish, workspace, stream,
-                        parent_index);
+                        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
+                        key, value, z, publish, workspace, stream, parent_index);
                 }
                 return;
             }
@@ -293,30 +291,29 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
             if constexpr (ActiveTokens == 5) {
                 if (x.ne[2] == 3) {
                     launch_contiguous_record<ActiveTokens, 3, false>(
-                        x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                        conv_record, query, key, value, z, publish, workspace, stream, nullptr);
+                        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
+                        key, value, z, publish, workspace, stream, nullptr);
                     return;
                 }
             }
             {
                 launch_grouped_record<ActiveTokens, 2, false>(
-                    x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record,
-                    query, key, value, z, publish, workspace, stream, nullptr);
+                    x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key,
+                    value, z, publish, workspace, stream, nullptr);
             }
         } else {
             if constexpr (ActiveTokens == 5) {
                 if (x.ne[2] == 3) {
                     launch_contiguous_record<ActiveTokens, 3, true>(
-                        x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                        conv_record, query, key, value, z, publish, workspace, stream,
-                        parent_index);
+                        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
+                        key, value, z, publish, workspace, stream, parent_index);
                     return;
                 }
             }
             {
                 launch_grouped_record<ActiveTokens, 2, true>(
-                    x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record,
-                    query, key, value, z, publish, workspace, stream, parent_index);
+                    x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key,
+                    value, z, publish, workspace, stream, parent_index);
             }
         }
         return;
@@ -330,6 +327,138 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
                                      initial_slot, query, key, value, z, publish, stream,
                                      parent_index);
 }
+
+template <int Width, bool Tree>
+struct A8RecordOutput {
+    static_assert(Width >= kNvfp4FirstA8 && Width <= kNvfp4GdnA8FusedRecordMaxWidth);
+    // W*B<=48 fits the launcher's single M16/M32/M48 tile, so every request's temporal columns
+    // are present here; larger launches retain global staging.
+    Nvfp4GdnConvOutput<Width, RecordColumnPublish, Tree> output;
+
+    template <class Schedule>
+    __device__ void store_tile(const float* tile, int row_begin, int tokens) const {
+        constexpr int BN = Schedule::kBlockN, stride = BN + 8;
+        for (int task = threadIdx.x; task < BN * (tokens / Width); task += Schedule::kThreads) {
+            const int row = task % BN, batch = task / BN;
+            float projected[Width];
+#pragma unroll
+            for (int t = 0; t < Width; ++t) {
+                projected[t] = tile[(batch * Width + t) * stride + row];
+            }
+            auto lane           = output;
+            lane.conv.batch_row = batch;
+            lane.store_row(row_begin + row, projected);
+        }
+    }
+};
+
+// Grouped convolution/record publication from a staged FP32 [channels, Width, batch] projection.
+template <int Width, bool Tree>
+void launch_record_conv(const Tensor& projected, const Tensor& conv_weight,
+                        const Tensor& conv_states, const Tensor& valid_columns,
+                        const Tensor& initial_slot, Tensor& conv_record, Tensor& query, Tensor& key,
+                        Tensor& value, Tensor& z, int batch, const std::int32_t* parent_index,
+                        cudaStream_t stream) {
+    const RecordColumnPublish publish{static_cast<__nv_bfloat16*>(conv_record.data),
+                                      kNvfp4GdnChannels, Width};
+    auto conv = make_nvfp4_gdn_conv_output<Width, Tree>(conv_weight, conv_states, valid_columns,
+                                                        initial_slot, query, key, value, z, publish,
+                                                        parent_index)
+                    .conv;
+    nvfp4_grouped_gdn_conv_kernel<Width, Tree>
+        <<<dim3(batch, (kNvfp4GdnChannels + 255) / 256), 256, 0, stream>>>(
+            static_cast<const float*>(projected.data), conv, batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// W4A8 record from an already quantized [5120, Width*batch] activation. Launches that fit the
+// single fused tile (Width <= kNvfp4GdnA8FusedRecordMaxWidth, Width*batch <=
+// kNvfp4GdnA8FusedRecordMaxTokens) publish from the MMA epilogue; others stage FP32.
+template <int Width, bool Tree>
+void project_a8_record(Fp8A8Workspace activation, int batch, const Weight& weight,
+                       const Tensor& conv_weight, const Tensor& conv_states,
+                       const Tensor& valid_columns, const Tensor& initial_slot, Tensor& conv_record,
+                       Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                       WorkspaceArena& workspace, const std::int32_t* parent_index,
+                       cudaStream_t stream) {
+    if constexpr (Width <= kNvfp4GdnA8FusedRecordMaxWidth) {
+        if (Width * batch <= kNvfp4GdnA8FusedRecordMaxTokens) {
+            const RecordColumnPublish publish{static_cast<__nv_bfloat16*>(conv_record.data),
+                                              kNvfp4GdnChannels, Width};
+            const auto output = make_nvfp4_gdn_conv_output<Width, Tree>(
+                conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
+                publish, parent_index);
+            launch_nvfp4_w4a8_mma<Nvfp4GdnInputGeometry>(
+                weight, Width * batch, activation, Nvfp4IdentityEpilogue{},
+                A8RecordOutput<Width, Tree>{output}, stream);
+            return;
+        }
+    }
+    auto scope       = workspace.scope();
+    Tensor projected = workspace.alloc(DType::FP32, {kNvfp4GdnChannels, Width, batch}, 256);
+    nvfp4_gdn_input_w4a8_fp32_project(weight, Width * batch, activation, projected, z, stream);
+    launch_record_conv<Width, Tree>(projected, conv_weight, conv_states, valid_columns,
+                                    initial_slot, conv_record, query, key, value, z, batch,
+                                    parent_index, stream);
+}
+
+template <int Width, bool Tree, bool A8 = false>
+void launch_quantized_record_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                                   const Tensor& conv_states, const Tensor& valid_columns,
+                                   const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
+                                   Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                                   const std::int32_t* parent_index, cudaStream_t stream) {
+    auto scope      = workspace.scope();
+    const int batch = x.ne[2];
+    if constexpr (A8) {
+        const auto quantized = allocate_fp8_a8_workspace(workspace, Width * batch, weight.k);
+        launch_fp8_a8_quantize(x.view({weight.k, Width * batch}), weight, quantized, stream);
+        project_a8_record<Width, Tree>(quantized, batch, weight, conv_weight, conv_states,
+                                       valid_columns, initial_slot, conv_record, query, key, value,
+                                       z, workspace, parent_index, stream);
+    } else {
+        Tensor projected     = workspace.alloc(DType::FP32, {kNvfp4GdnChannels, Width, batch}, 256);
+        const auto quantized = allocate_nvfp4_w4a4_workspace(workspace, Width * batch, weight.k);
+        nvfp4_gdn_input_w4a4_fp32_launch(x.view({weight.k, Width * batch}), weight, projected, z,
+                                         quantized, stream);
+        launch_record_conv<Width, Tree>(projected, conv_weight, conv_states, valid_columns,
+                                        initial_slot, conv_record, query, key, value, z, batch,
+                                        parent_index, stream);
+    }
+}
+
+using A8InputRecordLaunch = void (*)(Fp8A8Workspace, int, const Weight&, const Tensor&,
+                                     const Tensor&, const Tensor&, const Tensor&, Tensor&, Tensor&,
+                                     Tensor&, Tensor&, Tensor&, WorkspaceArena&,
+                                     const std::int32_t*, cudaStream_t);
+
+constexpr int kFirstA4RecordWidth       = 5;
+constexpr int kLastQuantizedRecordWidth = 16;
+constexpr std::size_t kA4RecordWidths   = kLastQuantizedRecordWidth - kFirstA4RecordWidth + 1;
+constexpr std::size_t kA8RecordWidths   = kLastQuantizedRecordWidth - kNvfp4FirstA8 + 1;
+
+template <bool A8, std::size_t... Offsets>
+constexpr auto make_quantized_record_launchers(std::index_sequence<Offsets...>) {
+    constexpr int first = A8 ? kNvfp4FirstA8 : kFirstA4RecordWidth;
+    return std::array<RecordLaunch, sizeof...(Offsets) * 2>{
+        &launch_quantized_record_exact<first + static_cast<int>(Offsets), false, A8>...,
+        &launch_quantized_record_exact<first + static_cast<int>(Offsets), true, A8>...};
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_a8_input_record_launchers(std::index_sequence<Offsets...>) {
+    return std::array<A8InputRecordLaunch, sizeof...(Offsets) * 2>{
+        &project_a8_record<kNvfp4FirstA8 + static_cast<int>(Offsets), false>...,
+        &project_a8_record<kNvfp4FirstA8 + static_cast<int>(Offsets), true>...};
+}
+
+constexpr auto kA8InputRecordLaunchers =
+    make_a8_input_record_launchers(std::make_index_sequence<kA8RecordWidths>{});
+
+constexpr auto kA4RecordLaunchers =
+    make_quantized_record_launchers<false>(std::make_index_sequence<kA4RecordWidths>{});
+constexpr auto kA8RecordLaunchers =
+    make_quantized_record_launchers<true>(std::make_index_sequence<kA8RecordWidths>{});
 
 template <std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
@@ -348,6 +477,36 @@ constexpr auto kRecordLaunchers =
     make_record_launchers(std::make_index_sequence<16 - kNvfp4FirstSmallT + 1>{});
 
 } // namespace
+
+void nvfp4_gdn_record_quantized_launch(const Tensor& x, const Weight& weight,
+                                       const Tensor& conv_weight, const Tensor& conv_states,
+                                       const Tensor& valid_columns, const Tensor& initial_slot,
+                                       Tensor& conv_record, Tensor& query, Tensor& key,
+                                       Tensor& value, Tensor& z, LinearPolicy policy,
+                                       WorkspaceArena& workspace, cudaStream_t stream,
+                                       const std::int32_t* parent_index) {
+    const auto launch =
+        policy == LinearPolicy::AllowA8
+            ? kA8RecordLaunchers[static_cast<std::size_t>(x.ne[1] - kNvfp4FirstA8) +
+                                 (parent_index ? kA8RecordWidths : 0)]
+            : kA4RecordLaunchers[static_cast<std::size_t>(x.ne[1] - kFirstA4RecordWidth) +
+                                 (parent_index ? kA4RecordWidths : 0)];
+    launch(x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record, query,
+           key, value, z, workspace, parent_index, stream);
+}
+
+void nvfp4_gdn_record_a8_input_launch(Fp8A8Workspace activation, std::int32_t width,
+                                      std::int32_t batch, const Weight& weight,
+                                      const Tensor& conv_weight, const Tensor& conv_states,
+                                      const Tensor& valid_columns, const Tensor& initial_slot,
+                                      Tensor& conv_record, Tensor& query, Tensor& key,
+                                      Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                                      cudaStream_t stream, const std::int32_t* parent_index) {
+    const auto launch = kA8InputRecordLaunchers[static_cast<std::size_t>(width - kNvfp4FirstA8) +
+                                                (parent_index ? kA8RecordWidths : 0)];
+    launch(activation, batch, weight, conv_weight, conv_states, valid_columns, initial_slot,
+           conv_record, query, key, value, z, workspace, parent_index, stream);
+}
 
 void nvfp4_gdn_snapshot_small_t_launch(const Tensor& x, const Weight& weight,
                                        const Tensor& conv_weight, Tensor& conv_states,

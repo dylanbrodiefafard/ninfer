@@ -11,9 +11,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <map>
 #include <mutex>
 #include <thread>
-#include <unordered_map>
+#include <tuple>
 
 namespace ninfer::ops::detail {
 
@@ -22,6 +23,7 @@ namespace {
 struct GqaS3TmaStuckWatch {
     std::uint32_t* host   = nullptr;
     std::uint32_t* device = nullptr;
+
     bool active() const { return device != nullptr; }
 };
 
@@ -49,13 +51,13 @@ __host__ GqaS3TmaStuckWatch& gqa_s3_tma_stuck_watch() {
             const steady_clock::time_point start = steady_clock::now();
             std::uint32_t last                   = *watch->host;
             steady_clock::time_point last_change = start;
-            auto ms_since = [&start](const steady_clock::time_point& t) {
+            auto ms_since                        = [&start](const steady_clock::time_point& t) {
                 return static_cast<long long>(duration_cast<milliseconds>(t - start).count());
             };
             for (;;) {
                 std::this_thread::sleep_for(milliseconds(250));
-                const std::uint32_t v                = *watch->host;
-                const steady_clock::time_point now   = steady_clock::now();
+                const std::uint32_t v              = *watch->host;
+                const steady_clock::time_point now = steady_clock::now();
                 if (v != last) {
                     last        = v;
                     last_change = now;
@@ -64,17 +66,16 @@ __host__ GqaS3TmaStuckWatch& gqa_s3_tma_stuck_watch() {
                         const int head   = (v >> 20) & 0x1F;
                         const int qblock = (v >> 25) & 0x1F;
                         const bool empty = (v >> 30) & 1u;
-                        std::fprintf(stderr,
-                                     "[s3-tma-watch] spin: %s ki=%d head=%d qblock=%d (t=%lld ms)\n",
-                                     empty ? "empty-wait" : "full-wait", ki, head, qblock,
-                                     ms_since(now));
+                        std::fprintf(
+                            stderr, "[s3-tma-watch] spin: %s ki=%d head=%d qblock=%d (t=%lld ms)\n",
+                            empty ? "empty-wait" : "full-wait", ki, head, qblock, ms_since(now));
                         std::fflush(stderr);
                     }
                 } else if (v != 0x7FFFFFFFu && now - last_change > seconds(2)) {
                     last_change = now;
                     std::fprintf(stderr,
-                                 "[s3-tma-watch] still spinning, last value 0x%08x (t=%lld ms)\n", v,
-                                 ms_since(now));
+                                 "[s3-tma-watch] still spinning, last value 0x%08x (t=%lld ms)\n",
+                                 v, ms_since(now));
                     std::fflush(stderr);
                 }
             }
@@ -106,23 +107,28 @@ inline int gqa_s3_tma_stages() {
     return stages;
 }
 
+// The descriptor bakes in every pool base and the page count, so all of them identify it: a
+// later KV pool allocated at a recycled K address must not reuse a stale descriptor.
+using GqaS3TmaDescKey = std::tuple<const void*, const void*, const void*, std::int32_t>;
+
 struct GqaS3TmaDescCache {
-    std::mutex* mutex                                     = nullptr;
-    std::unordered_map<const void*, void*>* entries       = nullptr;
+    std::mutex* mutex                         = nullptr;
+    std::map<GqaS3TmaDescKey, void*>* entries = nullptr;
 };
 
 __host__ inline GqaS3TmaDescCache& gqa_s3_tma_desc_cache() {
     static GqaS3TmaDescCache cache = [] {
-        return GqaS3TmaDescCache{new std::mutex, new std::unordered_map<const void*, void*>};
+        return GqaS3TmaDescCache{new std::mutex, new std::map<GqaS3TmaDescKey, void*>};
     }();
     return cache;
 }
 
 template <typename Geometry, typename CacheView>
-__host__ const GqaNvfp4s3TmaDesc* gqa_s3_tma_descriptor(const CacheView& cache) {
-    const Tensor& cache_k           = cache.k_pages;
-    const std::int64_t per_page     = static_cast<std::int64_t>(kGqaNvfp4CodeWidth) *
-                                  kPagedKVPageSize * Geometry::KVHeads;
+__host__ const GqaNvfp4s3TmaDesc* gqa_s3_tma_descriptor(const CacheView& cache,
+                                                        cudaStream_t stream) {
+    const Tensor& cache_k = cache.k_pages;
+    const std::int64_t per_page =
+        static_cast<std::int64_t>(kGqaNvfp4CodeWidth) * kPagedKVPageSize * Geometry::KVHeads;
     std::int64_t numel = 1;
     for (int i = 0; i < 4; ++i) { numel *= cache_k.ne[i]; }
     if (numel <= 0 || per_page <= 0 || numel % per_page != 0) { return nullptr; }
@@ -131,7 +137,7 @@ __host__ const GqaNvfp4s3TmaDesc* gqa_s3_tma_descriptor(const CacheView& cache) 
 
     GqaS3TmaDescCache& cache_store = gqa_s3_tma_desc_cache();
     std::lock_guard<std::mutex> lock(*cache_store.mutex);
-    const void* key = cache_k.data;
+    const GqaS3TmaDescKey key{cache_k.data, cache.v_pages.data, cache.k_scale_pages.data, pages};
     {
         const auto found = cache_store.entries->find(key);
         if (found != cache_store.entries->end()) {
@@ -147,7 +153,10 @@ __host__ const GqaNvfp4s3TmaDesc* gqa_s3_tma_descriptor(const CacheView& cache) 
     }
     void* device = nullptr;
     if (cudaMalloc(&device, sizeof(GqaNvfp4s3TmaDesc)) != cudaSuccess ||
-        cudaMemcpy(device, &desc, sizeof(desc), cudaMemcpyHostToDevice) != cudaSuccess) {
+        // Ordered before the launch on the same stream; a synchronous pageable cudaMemcpy may
+        // return before its DMA lands.
+        cudaMemcpyAsync(device, &desc, sizeof(desc), cudaMemcpyHostToDevice, stream) !=
+            cudaSuccess) {
         if (device != nullptr) { cudaFree(device); }
         return nullptr;
     }
@@ -163,7 +172,7 @@ bool gqa_s3_prefill_tma_try_launch(const Tensor& q, const Tensor& positions, flo
                                    cudaStream_t stream, float keep_frac, GqaS3PrefillDump* dump,
                                    std::uint32_t* dbg_regs, std::uint8_t* dbg_q) {
     if (!gqa_s3_tma_enabled() || keep_frac != 1.0f) { return false; }
-    const GqaNvfp4s3TmaDesc* desc_dev = gqa_s3_tma_descriptor<Geometry, CacheView>(cache);
+    const GqaNvfp4s3TmaDesc* desc_dev = gqa_s3_tma_descriptor<Geometry, CacheView>(cache, stream);
     if (desc_dev == nullptr) { return false; }
 
     const Tensor& cache_v_scale = cache.v_scale_pages;
@@ -175,7 +184,7 @@ bool gqa_s3_prefill_tma_try_launch(const Tensor& q, const Tensor& positions, flo
         std::fflush(stderr);
     }
     auto launch_tma = [&]<int Stages>() {
-        constexpr int kSmem = static_cast<int>(sizeof(GqaNvfp4s3TmaScratch<Stages>));
+        constexpr int kSmem           = static_cast<int>(sizeof(GqaNvfp4s3TmaScratch<Stages>));
         static const cudaError_t attr = cudaFuncSetAttribute(
             gqa_attention_prefill_nvfp4s3_tma_kernel<Geometry, Metadata, Stages>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
@@ -197,8 +206,11 @@ bool gqa_s3_prefill_tma_try_launch(const Tensor& q, const Tensor& positions, flo
             std::fflush(stderr);
         }
     };
-    if (gqa_s3_tma_stages() == 3) { launch_tma.template operator()<3>(); }
-    else { launch_tma.template operator()<2>(); }
+    if (gqa_s3_tma_stages() == 3) {
+        launch_tma.template operator()<3>();
+    } else {
+        launch_tma.template operator()<2>();
+    }
     return true;
 }
 

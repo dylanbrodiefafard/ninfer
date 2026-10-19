@@ -5,27 +5,32 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/gdn_history.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/generation_recovery.h>
 
 #include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
+#include "targets/qwen3_6/impl/runtime/p_less_draft_calibration.h"
 #include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
 #include "targets/qwen3_6/impl/runtime/context_checkpoint_image.h"
+#include "targets/qwen3_6/impl/runtime/kv_gpu_snapshot.h"
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/kv_disk_cache.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
-#include "targets/qwen3_6/impl/runtime/tool_masks.h"
+#include "targets/qwen3_6/impl/runtime/token_masks.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <cstdint>
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -78,9 +83,15 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
-    bool allow_prefix_reuse = false;
-    bool force_cold_prefill = false;
+    // prefix_hash_chain(prompt), computed once at submission for a reusable prompt when a
+    // checkpoint or host tier can key on it, and shared by every lane, RAM, and disk plan of
+    // the request and by the occupied sequence.
+    std::shared_ptr<const std::vector<PrefixHash128>> prompt_hashes;
+    bool cache_write                = true;
+    bool allow_prefix_reuse         = false;
+    bool force_cold_prefill         = false;
     bool capture_context_checkpoint = false;
+    bool token_logprobs             = false;
 };
 
 template <>
@@ -91,7 +102,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
-    std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
+    std::optional<qwen3_6::detail::VisionPrefillPlan> vision;
     NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
@@ -102,10 +113,13 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint64_t ram_entry_id                = 0;
     std::uint64_t disk_entry_id               = 0;
     PrefixHash128 disk_hash_f{};
-    std::uint32_t disk_execution_frontier     = 0;
-    std::uint64_t disk_committed_generation   = 0;
-    bool capture_context_checkpoints          = false;
-    bool capture_context_checkpoint           = false;
+    std::uint32_t disk_execution_frontier      = 0;
+    std::uint64_t disk_committed_generation    = 0;
+    runtime::CacheReadIntent cache_read_intent = runtime::CacheReadIntent::Consume;
+    bool capture_context_checkpoints           = false;
+    bool capture_context_checkpoint            = false;
+    bool token_logprobs                        = false;
+    std::shared_ptr<const std::vector<PrefixHash128>> prompt_hashes;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -150,6 +164,7 @@ struct RewriteCheckpoint {
 };
 
 using ContextCheckpointHead = qwen3_6::detail::ContextCheckpointHead;
+using PinnedImage           = qwen3_6::detail::PinnedImage;
 
 struct ContextCheckpointIndex {
     std::uint32_t frontier = 0;
@@ -169,6 +184,7 @@ struct DecodeGraphProfile {
     std::uint32_t topology_class         = 0;
     std::uint32_t draft_k                = 0;
     std::uint32_t verify_width           = 0;
+    bool grammar_exchange                = false;
     DecodeGraphDefinition definition;
 };
 
@@ -186,6 +202,8 @@ struct DecodeGraphFamily {
 // Target model continuation for one logical sequence. This state remains meaningful after the
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
+enum class CacheCaptureMode : std::uint8_t { ReachableTurn, CompleteOriginal };
+
 struct SequenceState {
     std::optional<SequenceKVBundle> kv;
     Tensor tail_hidden;
@@ -196,24 +214,45 @@ struct SequenceState {
     std::uint32_t ledger_frontier    = 0;
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+    // Hashes of (ledger, prefix_identity) prefixes; truncated wherever either is rewritten.
+    qwen3_6::detail::ResidentPrefixHashes prefix_hashes;
     std::int32_t rope_delta               = 0;
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> mtp_drafts{};
-    std::uint32_t mtp_draft_count = 0;
-    bool tail_hidden_valid        = false;
-    bool retained                 = false;
-    std::uint64_t use_tick        = 0;
-    std::uint64_t disk_entry_id   = 0;
+    std::uint32_t mtp_draft_count           = 0;
+    bool tail_hidden_valid                  = false;
+    bool retained                           = false;
+    runtime::CacheRetention cache_retention = runtime::CacheRetention::Ordinary;
+    // A fork has already installed the selected checkpoint as current state, without carrying
+    // auxiliary reuse images into the destination.
+    bool fork_initialized = false;
+    // The retained request stopped (stop token or string) without a tool call. With its own
+    // TurnClosure checkpoint at its generation opener (closure_frontier), the next preserve-off
+    // prompt re-renders the reply without reasoning and diverges there, so RAM/disk tiers store
+    // the lane cut at that checkpoint (capture_cuts_at_rewrite).
+    bool turn_closed = false;
+    // The latest request's own TurnClosure checkpoint when it sits at that request's generation
+    // opener (preserve off, outside a tool loop); 0 otherwise. Only that checkpoint is cut at.
+    std::uint32_t closure_frontier = 0;
+    std::uint64_t use_tick         = 0;
+    std::uint64_t disk_entry_id    = 0;
     RewriteCheckpoint rewrite_checkpoint;
+    // Lane-owned pinned image of the rewrite checkpoint's GDN slot and DFlash cyclic lane,
+    // carved from the Program's checkpoint-image slab; rewrite_checkpoint says whether its
+    // contents are valid. Its fence covers every asynchronous copy that reads or writes it.
+    ContextCheckpointHead rewrite_image;
+    // Advances whenever the image contents are replaced (capture or tier restore), so a
+    // staging slot still holding an older capture is never mistaken for it.
+    std::uint64_t rewrite_image_generation = 0;
     std::vector<ContextCheckpointHead> context_checkpoints;
     std::uint32_t next_context_mark = 0;
-    // Set by HostDisk staged restore after the matching head is unpacked into current.
-    // start_prefill skips a second unpack when occupy matches this (base, hash). Cleared
-    // at end of occupy and in clear_lane so a later VRAM/RAM staged restore still unpacks.
-    std::uint32_t disk_unpacked_context_base = 0;
-    qwen3_6::detail::PrefixHash128 disk_unpacked_context_hash{};
+    // Set by a HostRam or HostDisk staged restore, which unpacks the matching head into current
+    // with the entry's KV. Occupy skips a second unpack when it matches this (base, hash).
+    // Cleared at end of occupy and in clear_lane so a later VRAM staged restore still unpacks.
+    std::uint32_t tier_unpacked_context_base = 0;
+    qwen3_6::detail::PrefixHash128 tier_unpacked_context_hash{};
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -221,7 +260,7 @@ struct SequenceState {
 struct RequestControl {
     // Borrowed from the occupying Engine request until its lane is resolved.
     const qwen3_6::OutputSession* output = nullptr;
-    Lifecycle lifecycle = Lifecycle::Empty;
+    Lifecycle lifecycle                  = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
     ops::SamplingConfig prefill_sampling_host;
@@ -262,13 +301,15 @@ struct RequestControl {
     std::optional<Prefill> prefill;
     qwen3_6::AdaptiveDraftState adaptive;
     bool typical_cycle_reasoning = false;
-    std::uint32_t prompt_tokens  = 0;
+    // The occupying request reports token logprobs: its rounds set the frame's row flag.
+    bool token_logprobs         = false;
+    std::uint32_t prompt_tokens = 0;
 };
 
 class ProgramImplCore {
 public:
-    ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device, std::unique_ptr<HostPinnedArena> kv_ram_arena);
+    ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
+                    DeviceContext& device_in, std::unique_ptr<HostPinnedArena> kv_ram_arena);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan
@@ -276,32 +317,55 @@ public:
                       const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
-                                                    const RequestBasePlan& base);
+                                                    const RequestBasePlan& base_plan);
     [[nodiscard]] RequestPlan plan_ram_reuse(const PreparedPromptData& prompt,
-                                             const RequestBasePlan& base);
+                                             const RequestBasePlan& base_plan);
     [[nodiscard]] RequestPlan plan_disk_reuse(const PreparedPromptData& prompt,
-                                              const RequestBasePlan& base);
+                                              const RequestBasePlan& base_plan);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan& plan) const noexcept;
-    [[nodiscard]] bool can_admit_lane_after_releasing(std::uint32_t lane, const RequestPlan& plan,
-                                                      std::span<const std::uint32_t> release_lanes)
-        const noexcept;
+    [[nodiscard]] bool
+    can_admit_lane_after_releasing(std::uint32_t lane, const RequestPlan& plan,
+                                   std::span<const std::uint32_t> release_lanes) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
-    [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
-                                                                PreparedPromptData&& prompt,
-                                                                RequestPlan&& plan,
-                                                                runtime::TransientRegion transient,
-                                                                const qwen3_6::OutputSession* output = nullptr);
-    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
+    [[nodiscard]] runtime::PrefillStepResult
+    start_prefill_lane(std::uint32_t lane, PreparedPromptData&& prompt, RequestPlan&& plan,
+                       runtime::TransientRegion transient, runtime::PrefillPace pace,
+                       const qwen3_6::OutputSession* output = nullptr);
+    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane,
+                                                                  runtime::PrefillPace pace);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    // Current uncached suffix at the staged execution frontier. Requires a prefilling lane.
+    [[nodiscard]] std::uint32_t prefill_remaining_tokens(std::uint32_t lane) const;
+    // Only text owners without request-transient storage can yield to another prefill owner.
+    [[nodiscard]] bool prefill_suspendable(std::uint32_t lane) const;
+    // Restore shared sampling bindings after another owner's prefill without resetting this
+    // lane's RNG, penalties, speculative state or prompt cursor. Requires a suspendable lane.
+    void resume_prefill_lane(std::uint32_t lane);
+    // Whether the prefilling request on `lane` can advance its next step inside a DFlash decode
+    // round: DFlash with a mixed-forward width, a text-only prompt with tokens left, and no
+    // tool-grammar sampling in that step (its root mask shares tool-mask row 0 with verify).
+    [[nodiscard]] bool prefill_mixable(std::uint32_t lane) const;
+    // One mixed DFlash round: decodes `lanes` and advances the prefill owner on `owner_lane` by
+    // one Shared-pace step in the same target forward. Requires prefill_mixable(owner_lane) and
+    // an owner outside `lanes`.
+    [[nodiscard]] runtime::MixedGeneratedRound
+    decode_batch_with_prefill(std::span<const std::uint32_t> lanes,
+                              std::span<const runtime::RoundBudget> budgets,
+                              std::uint32_t owner_lane);
     void set_suppressed_tokens_lane(std::uint32_t lane, std::span<const TokenId> tokens);
     void clear_suppressed_tokens_lane(std::uint32_t lane);
     void set_typical_cycle_reasoning_lane(std::uint32_t lane, bool enabled);
-    void bind_tool_mask_batch(std::span<const std::uint32_t> lanes);
+    // Binds the batch's output sessions and the sampling configs the round runs with (its host
+    // ingress), so masked accept configs match the drafted rows.
+    void bind_tool_mask_batch(std::span<const std::uint32_t> lanes,
+                              std::span<const ops::SamplingConfig> configs);
+    [[nodiscard]] bool any_token_grammar(std::span<const std::uint32_t> lanes) const;
+    [[nodiscard]] bool any_token_logprobs(std::span<const std::uint32_t> lanes) const;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
@@ -309,17 +373,50 @@ public:
                                std::span<const std::uint8_t> cancelled,
                                std::span<const std::uint8_t> rejected = {});
     void abort_lane(std::uint32_t lane) noexcept;
-    void retain_lane(std::uint32_t lane);
+    // Active sequences are retained in place. An already retained lane stays.
+    // False leaves the caller to drop the lane; this does not clear it.
+    [[nodiscard]] bool retain_reusable_lane(std::uint32_t lane);
+    // Copies the prompt prefix of a live or retained lane. `rewrite_frontier` is 0
+    // when that lane has no rewrite checkpoint inside the prompt.
+    [[nodiscard]] bool copy_reusable_prompt(std::uint32_t lane, std::uint32_t prompt_tokens,
+                                            std::vector<TokenId>& tokens,
+                                            std::uint32_t& rewrite_frontier) const;
     [[nodiscard]] bool revert_cancelled_prefill_lane(std::uint32_t lane);
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool retained_lane_cache_writable(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool retained_lane_precedes(std::uint32_t left,
+                                              std::uint32_t right) const noexcept;
+    // Copies only the selected reusable prefix into an empty independently reserved lane.
+    // The executor protects the retained source until the compute stream completes the copy.
+    void fork_retained_lane(std::uint32_t destination, std::uint32_t source,
+                            const RequestPlan& plan);
+    // A full-original RAM capture preserves exactly the state described by the resident plan.
+    void retarget_plan_to_ram(RequestPlan& plan, std::uint64_t entry_id);
     void evict_retained_lane(std::uint32_t lane) noexcept;
-    [[nodiscard]] bool capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id = nullptr);
+    // The retained lane's request finished without a tool call (see SequenceState::turn_closed).
+    void mark_turn_closed(std::uint32_t lane) noexcept;
+    // `may_block` permits a synchronous disk spill to free RAM; callers pass
+    // false while other lanes are decoding. Without it a full RAM tier whose
+    // entries are not yet on disk starts their spill on the disk worker and
+    // returns false with `*deferred` set; retry after kv_ram_reclaim_pending() clears.
+    // `attempt_ram_ids` are this admission's earlier captures, which a deferral
+    // rolls back, so reclaim never targets them.
+    [[nodiscard]] bool
+    capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id = nullptr,
+                          bool may_block = true, bool* deferred = nullptr,
+                          std::span<const std::uint64_t> attempt_ram_ids = {},
+                          CacheCaptureMode mode = CacheCaptureMode::ReachableTurn);
+    [[nodiscard]] bool preserve_retained_lane(std::uint32_t lane, std::uint64_t& entry_id,
+                                              bool may_block, bool& deferred);
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
     void restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
+    [[nodiscard]] bool ram_restore_ready(std::uint64_t entry_id) const;
+    [[nodiscard]] bool disk_restore_ready(std::uint64_t entry_id) const;
+    [[nodiscard]] bool kv_ram_reclaim_pending() const;
     void claim_ram_entry(std::uint64_t entry_id);
     void release_ram_entry(std::uint64_t entry_id);
-    void consume_ram_entry(std::uint64_t entry_id);
+    void finish_ram_restore(std::uint64_t entry_id, runtime::CacheReadIntent intent);
     [[nodiscard]] bool claim_disk_entry(std::uint64_t entry_id, std::uint32_t expected_frontier,
                                         std::uint64_t hash_lo, std::uint64_t hash_hi,
                                         std::uint32_t expected_reuse_base,
@@ -333,14 +430,20 @@ public:
     void prefetch_disk_plan(std::uint64_t entry_id, const RequestPlan& plan);
     void pump_disk_restore();
     void cancel_disk_restore();
+    // A cancelled or failed copy-hold admission stops further restore work and fences the copies
+    // already queued, so the executor can keep decoding until they settle instead of draining them.
+    void begin_copy_hold_cancel();
+    [[nodiscard]] bool copy_hold_cancel_settled() const;
     void discard_ram_capture(std::uint64_t ram_id);
     void shutdown_kv_tiers(LoadProgress progress = {});
-    void request_idle_spill();
+    void set_cache_idle(bool idle);
     void install_pending_disk_restore_checkpoints();
     [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
     qwen3_6::detail::KvRamCopySeconds harvest_kv_ram_copy_seconds();
-    [[nodiscard]] qwen3_6::detail::KvDiskSnapshot kv_disk_snapshot() const noexcept;
+    [[nodiscard]] std::optional<qwen3_6::detail::KvDiskSnapshot>
+    try_kv_disk_snapshot() const noexcept;
     qwen3_6::detail::KvDiskCopySeconds harvest_kv_disk_copy_seconds();
+    [[nodiscard]] qwen3_6::detail::KvGpuSnapshot kv_gpu_snapshot() const noexcept;
     [[nodiscard]] bool kv_ram_copies_ready() const;
     [[nodiscard]] bool kv_disk_copies_ready() const;
     [[nodiscard]] bool kv_disk_restore_failed() const;
@@ -372,10 +475,34 @@ public:
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
     const std::uint32_t prefill_chunk;
+    // Shared-pace prefill step width; 0 runs Shared steps at the full prefill chunk.
+    const std::uint32_t mixed_forward;
     const std::uint32_t draft_window;
     const std::uint32_t dflash_verify_width;
     const bool adaptive_draft;
+    // Pinned DFlash2 p-less draft temperature; unset, chain rounds use p_less_calibration.
+    const std::optional<float> p_less_draft_temperature;
+    qwen3_6::PLessDraftCalibration p_less_calibration{};
+
+    [[nodiscard]] bool calibrates_p_less_drafts() const {
+        return !p_less_draft_temperature.has_value() &&
+               speculative_backend == SpeculativeBackend::DFlash &&
+               DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2;
+    }
+
+    // Engine-global adaptive DFlash hop hazards, learned from exploration rounds.
+    qwen3_6::AdaptiveHopRates adaptive_hop_rates{};
+
+    [[nodiscard]] qwen3_6::AdaptiveHopRates* hop_rates() {
+        return adaptive_draft && speculative_backend == SpeculativeBackend::DFlash
+                   ? &adaptive_hop_rates
+                   : nullptr;
+    }
+
     const std::vector<std::uint32_t> captured_ks;
+    const std::vector<DFlashRoundShape> dflash_shapes;
+    // Adaptive DFlash arm ids runnable at each batch size (index B-1).
+    const std::array<std::vector<std::uint32_t>, kMaximumConcurrency> dflash_arms_by_batch;
     std::array<qwen3_6::AdaptiveRoundTimeState, kMaximumConcurrency> adaptive_t_by_batch{};
     std::array<qwen3_6::AdaptiveBatchKState, kMaximumConcurrency> adaptive_batch_k_by_c{};
     const SpeculativeBackend speculative_backend;
@@ -394,22 +521,33 @@ public:
     const std::size_t graph_allowance_bytes;
     std::size_t graph_observed_bytes = 0;
     const WorkspacePlan workspace_plan;
+    const std::size_t mixed_owner_workspace_offset;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
+    // Bounded views share the startup allocation and retain observed peaks across rounds.
+    std::optional<WorkspaceArena> mixed_verify_work;
+    std::optional<WorkspaceArena> mixed_owner_work;
+    std::unique_ptr<schedule::MixedForwardStreams> mixed_streams;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
+    std::optional<GdnHistory> gdn_history;
+    // Host frontier mirrors the validated main-stream count publications, including the anchor.
+    std::array<std::uint32_t, kMaximumConcurrency> gdn_history_lengths{};
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     Tensor sampling_config;
-    std::unique_ptr<qwen3_6::ToolMaskExchange> tool_masks;
+    std::unique_ptr<qwen3_6::TokenMaskExchange> token_masks;
     Tensor token_counts;
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
     Tensor staging_hidden;
 
+    // Every pinned checkpoint image (per-lane rewrite images and the context-checkpoint pool),
+    // prefaulted and registered at startup. Declared before every head that views it.
+    std::optional<HostPinnedArena> checkpoint_image_slab_;
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
 
@@ -417,8 +555,15 @@ public:
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
 
+    // Pinned landing area of the prefill-sampled token and its logprob record.
+    struct PrefillRoundHost {
+        TokenId token = 0;
+        qwen3_6::RoundLogprobRecords<1> logprobs;
+    };
+
     PinnedHostBuffer round_host;
-    TokenId* host_tokens = nullptr;
+    TokenId* host_tokens                                   = nullptr;
+    qwen3_6::RoundLogprobRecords<1>* host_prefill_logprobs = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;
@@ -435,22 +580,51 @@ public:
     std::uint64_t next_use_tick_ = 1;
     bool kv_tiers_shutdown_      = false;
     std::optional<std::uint32_t> pending_disk_checkpoint_lane_;
+    // Pool heads the disk restore workers decode into; the Program keeps them until the restore
+    // installs them or cancel_restore() has quiesced every writer.
+    std::vector<ContextCheckpointHead> pending_disk_checkpoint_heads_;
     std::uint64_t pending_disk_restore_ticket_ = 0;
 
 private:
+    friend struct VerificationQualification;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void retain_committed_sequence(SequenceState& sequence, RequestControl& request);
     void ordered_reset(SequenceState& sequence);
+    void materialize_gdn_history(std::uint32_t lane);
+    void reset_gdn_history(std::uint32_t lane);
+    void zero_dflash_local_cache(CyclicKVCache& cache);
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
+    void copy_prefill_logprobs();
     void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t accepted_tokens, bool terminal);
-    [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
-                                                             RequestControl& request);
+    // Runs one owner text chunk in place of the ordinary chunk launch.
+    using PrefillChunkRunner = std::function<schedule::PrefillChunkResult(
+        schedule::PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
+        std::optional<std::uint32_t> rewrite_checkpoint_frontier, bool finalize_at_end)>;
+
+    // The owner of a mixed DFlash round and its chunk.
+    struct MixedRoundOwner {
+        const SequenceState& sequence;
+        schedule::MixedPrefillOwner& chunk;
+    };
+
+    [[nodiscard]] runtime::PrefillStepResult
+    advance_prefill(SequenceState& sequence, RequestControl& request, runtime::PrefillPace pace,
+                    const PrefillChunkRunner* runner = nullptr);
+    // Rebinds the owner's first-token sampling, whose tool-grammar root mask lives in tool-mask
+    // row 0 that decode rounds between the owner's steps rebind.
+    void bind_prefill_sampling(const SequenceState& sequence, RequestControl& request);
+    // Writes the prefill owner's lane and DFlash KV row into the last DFlash ingress row, the row
+    // the DFlash prefill sink appends through. A verify batch beside an owner holds at most
+    // max_concurrency - 1 rows, so it never uses that row.
+    void stage_dflash_prefill_owner(const SequenceState& sequence);
+    // The most prompt tokens one prefill step at `pace` advances.
+    [[nodiscard]] std::uint32_t prefill_step_tokens(runtime::PrefillPace pace) const noexcept;
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
@@ -464,9 +638,11 @@ private:
                      std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
-                        std::span<const runtime::RoundBudget> budgets);
-    void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
-                             std::uint32_t backend_pages);
+                        std::span<const runtime::RoundBudget> budgets,
+                        const MixedRoundOwner* owner = nullptr);
+    // Reserves the lane's KV bundle and returns it; the lane must not already own one.
+    SequenceKVBundle& reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
+                                          std::uint32_t backend_pages);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
@@ -483,9 +659,9 @@ private:
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 
     struct ResidentStateView {
-        const std::vector<TokenId>* ledger                    = nullptr;
+        const std::vector<TokenId>* ledger                      = nullptr;
         const qwen3_6::detail::ResidentPrefixIdentity* identity = nullptr;
-        std::uint32_t execution_frontier                      = 0;
+        std::uint32_t execution_frontier                        = 0;
         RewriteCheckpoint rewrite_checkpoint;
         std::uint32_t text_kv_valid           = 0;
         std::uint32_t mtp_kv_valid            = 0;
@@ -499,9 +675,17 @@ private:
                               const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
     void finish_request_plan(RequestPlanImpl& plan, const ResidentStateView* view,
                              const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
-    [[nodiscard]] qwen3_6::detail::RamCaptureSource ram_capture_source(const SequenceState& sequence);
+    [[nodiscard]] bool capture_cuts_at_rewrite(const SequenceState& sequence) const noexcept;
+    [[nodiscard]] qwen3_6::detail::RamCaptureSource
+    ram_capture_source(SequenceState& sequence,
+                       qwen3_6::detail::ResidentPrefixIdentity& cut_identity,
+                       CacheCaptureMode mode);
+    [[nodiscard]] qwen3_6::detail::RamCaptureSource
+    cut_ram_capture_source(SequenceState& sequence,
+                           qwen3_6::detail::ResidentPrefixIdentity& cut_identity);
     void accumulate_prefill_nll(std::span<const TokenId> ids, std::uint32_t chunk_begin,
-                                std::uint32_t chunk_tokens, std::uint32_t skip, ScoreResult& result);
+                                std::uint32_t chunk_tokens, std::uint32_t skip,
+                                ScoreResult& result);
     void accumulate_decode_nll(const Tensor& logits, TokenId target, ScoreResult& result,
                                DeviceArena& score_workspace);
     void run_prefill_score(PreparedPromptData&& prompt, RequestPlan&& plan,
@@ -510,26 +694,32 @@ private:
     void run_decode_score(PreparedPromptData&& prompt, runtime::TransientRegion transient,
                           std::span<const TokenId> ids, std::uint32_t prefix, ScoreResult& result);
     void maybe_freeze_context_checkpoint(SequenceState& sequence, RequestControl& request,
-                                         std::uint32_t chunk_tokens);
+                                         std::uint32_t chunk_tokens, bool rewrite_capture_follows);
     void maybe_capture_turn_rollback(SequenceState& sequence, RequestControl& request,
                                      const PreparedPromptData& prompt, ReusePath reuse,
                                      std::uint32_t base, std::uint32_t prompt_tokens,
-                                     bool capture_enabled, bool request_pin);
+                                     bool capture_enabled, bool request_pin, bool cut_restore);
     void restore_context_checkpoint_state(SequenceState& sequence, std::uint32_t base);
-    void restore_dflash_cyclic_from_head(SequenceState& sequence, const ContextCheckpointHead& head);
+    void allocate_rewrite_image(SequenceState& sequence);
+    void capture_rewrite_image(SequenceState& sequence);
+    void restore_rewrite_checkpoint_state(SequenceState& sequence);
+    [[nodiscard]] qwen3_6::detail::RewriteStateHostTarget
+    rewrite_state_host_target(SequenceState& sequence);
+    void restore_dflash_cyclic_from_head(SequenceState& sequence,
+                                         const ContextCheckpointHead& head);
     void snapshot_dflash_cyclic_to_staging(std::int32_t lane);
     void pack_dflash_cyclic_to_head(ContextCheckpointHead& head);
-    [[nodiscard]] ContextCheckpointHead acquire_context_checkpoint_head(
-        std::size_t conv_bytes, std::size_t recurrent_bytes, std::size_t hidden_bytes,
-        std::size_t dflash_bytes);
+    [[nodiscard]] PinnedImage carve_checkpoint_image(std::size_t bytes);
+    // An unowned pool head, or none once every head is owned (the image is optional).
+    [[nodiscard]] std::optional<ContextCheckpointHead> acquire_context_checkpoint_head() noexcept;
     void record_context_checkpoint_head_use(ContextCheckpointHead& head, cudaStream_t stream);
     void recycle_context_checkpoint_head(ContextCheckpointHead&& head) noexcept;
     void drop_context_checkpoints_after(SequenceState& sequence, std::uint32_t frontier) noexcept;
     void clear_context_checkpoints(SequenceState& sequence) noexcept;
     void install_ram_context_checkpoints(SequenceState& sequence,
-                                         const qwen3_6::detail::RamRestoredHost& host);
-    void install_disk_context_checkpoints(SequenceState& sequence,
-                                          qwen3_6::detail::DiskRestoredHost&& host);
+                                         const qwen3_6::detail::RamRestoredHost& host,
+                                         std::uint64_t entry_id, std::uint32_t reuse_base);
+    void recycle_pending_disk_checkpoint_heads() noexcept;
     [[nodiscard]] bool staging_holds(std::uint32_t lane, qwen3_6::detail::PrefixHash128 hash,
                                      std::uint32_t frontier) const noexcept;
     [[nodiscard]] bool captures_context_checkpoints() const noexcept;
@@ -539,16 +729,24 @@ private:
                                            std::uint32_t frontier);
 
     struct ContextCheckpointStaging {
-        bool occupied             = false;
-        std::uint32_t lane        = 0;
-        std::uint32_t frontier    = 0;
+        bool occupied          = false;
+        std::uint32_t lane     = 0;
+        std::uint32_t frontier = 0;
         qwen3_6::detail::PrefixHash128 hash{};
         qwen3_6::detail::ContextCheckpointKind kind =
             qwen3_6::detail::ContextCheckpointKind::Ladder;
-        cudaEvent_t d2d_done    = nullptr;
-        cudaEvent_t copies_done = nullptr;
+        // Set instead of `occupied` while the slot and DFlash staging lane hold `lane`'s
+        // rewrite image at `rewrite_generation`, so a rewrite restore copies them on device.
+        bool rewrite                     = false;
+        std::uint64_t rewrite_generation = 0;
+        cudaEvent_t d2d_done             = nullptr;
+        cudaEvent_t copies_done          = nullptr;
     };
+
     ContextCheckpointStaging staging_;
+    cudaEvent_t copy_hold_cancel_fence_ = nullptr;
+    // Startup-carved heads of one layout (GDN, staging hidden, DFlash cyclic); capacity is
+    // context_checkpoint_image_pool_capacity and never grows.
     std::vector<ContextCheckpointHead> context_checkpoint_pool_;
 };
 

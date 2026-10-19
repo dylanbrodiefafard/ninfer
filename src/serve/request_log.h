@@ -17,14 +17,95 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 17;
+inline constexpr int kRequestLogSchemaVersion        = 21;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
+
+[[nodiscard]] inline const char* finish_reason_name(ninfer::FinishReason reason) {
+    switch (reason) {
+    case ninfer::FinishReason::None:
+        return "none";
+    case ninfer::FinishReason::OutputLimit:
+        return "output_limit";
+    case ninfer::FinishReason::ContextCapacity:
+        return "context_capacity";
+    case ninfer::FinishReason::StopToken:
+        return "stop_token";
+    case ninfer::FinishReason::StopString:
+        return "stop_string";
+    case ninfer::FinishReason::Cancelled:
+        return "cancelled";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] inline const char* kv_cache_name(ninfer::KvCacheStorage storage) {
+    switch (storage) {
+    case ninfer::KvCacheStorage::BFloat16:
+        return "bf16";
+    case ninfer::KvCacheStorage::Int8Group64:
+        return "int8-group64";
+    case ninfer::KvCacheStorage::Nvfp4:
+        return "nvfp4";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] inline const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
+    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+}
+
+[[nodiscard]] inline const char* proposal_head_name(ninfer::ProposalHead proposal) {
+    return proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full";
+}
+
+[[nodiscard]] inline const char* prefix_reuse_source_name(ninfer::PrefixReuseSource source) {
+    switch (source) {
+    case ninfer::PrefixReuseSource::None:
+        return "none";
+    case ninfer::PrefixReuseSource::VramResident:
+        return "vram_resident";
+    case ninfer::PrefixReuseSource::HostRam:
+        return "host_ram";
+    case ninfer::PrefixReuseSource::HostDisk:
+        return "host_disk";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] inline const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
+    switch (path) {
+    case ninfer::PrefixReusePath::FullReset:
+        return "full_reset";
+    case ninfer::PrefixReusePath::AppendAtFrontier:
+        return "append_frontier";
+    case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
+        return "restore_turn_checkpoint";
+    case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
+        return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::RestoreContextCheckpoint:
+        return "restore_context_checkpoint";
+    case ninfer::PrefixReusePath::RestoreTurnRollback:
+        return "restore_turn_rollback";
+    }
+    return "unknown";
+}
+
+// Emitted after parsing and before synchronous request preparation. Sampling is unresolved.
+struct RequestPreparationLogContext {
+    std::uint64_t id = 0;
+    std::string protocol;
+    std::size_t body_bytes    = 0;
+    std::size_t message_count = 0;
+    std::size_t tool_count    = 0;
+    double parse_seconds      = 0;
+};
 
 struct RequestLogContext {
     std::uint64_t id = 0;
     std::string protocol;
     std::string model;
     bool stream                             = false;
+    bool cache_write                        = true;
     std::size_t message_count               = 0;
     int requested_output_tokens             = 0;
     bool requested_output_tokens_client_set = false;
@@ -35,6 +116,7 @@ struct RequestLogContext {
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
     ninfer::ResolvedSamplingParameters sampling;
+    double synchronous_prepare_seconds = 0;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
@@ -45,6 +127,7 @@ struct RequestRejectionLogContext {
     std::string protocol;
     std::string model;
     bool stream                             = false;
+    bool cache_write                        = true;
     std::size_t message_count               = 0;
     std::size_t media_item_count            = 0;
     int requested_output_tokens             = 0;
@@ -74,27 +157,30 @@ struct ThroughputReport {
     std::uint64_t decode_rounds           = 0;
     std::uint64_t decode_row_rounds       = 0;
     ninfer::RuntimeStats scheduler;
-    std::size_t kv_ram_capacity_bytes = 0;
-    std::size_t kv_ram_used_bytes     = 0;
-    std::size_t kv_ram_entry_count    = 0;
-    double kv_ram_save_seconds        = 0;
-    double kv_ram_load_seconds        = 0;
+    std::size_t kv_ram_capacity_bytes  = 0;
+    std::size_t kv_ram_used_bytes      = 0;
+    std::size_t kv_ram_entry_count     = 0;
+    double kv_ram_save_seconds         = 0;
+    double kv_ram_load_seconds         = 0;
     std::size_t kv_disk_capacity_bytes = 0;
     std::size_t kv_disk_used_bytes     = 0;
     std::size_t kv_disk_entry_count    = 0;
     double kv_disk_save_seconds        = 0;
     double kv_disk_load_seconds        = 0;
+    double kv_disk_h2d_seconds         = 0;
 };
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
-                                           const PreparedRequest& prepared);
+                                           const PreparedRequest& prepared,
+                                           double synchronous_prepare_seconds);
 RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               std::string protocol,
                                                               const GenerationRequest& request,
                                                               ApiError error);
 
 // Compact console records retained for operator visibility.
+std::string format_request_prepare(const RequestPreparationLogContext& context);
 std::string format_request_start(const RequestLogContext& context);
 std::string format_recovery_event(std::uint64_t request_id, const ninfer::RecoveryEvent& event);
 std::string format_request_rejected(const RequestRejectionLogContext& context);
@@ -120,6 +206,9 @@ std::string format_server_start_json(const std::string& server_instance_id,
                                      const ninfer::MemorySummary& memory,
                                      const ServerLogEnvironment& environment,
                                      std::optional<std::uint64_t> artifact_size_bytes);
+std::string format_request_prepare_json(const std::string& server_instance_id,
+                                        std::uint64_t timestamp_unix_ms,
+                                        const RequestPreparationLogContext& context);
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context);
@@ -133,6 +222,9 @@ std::string format_request_done_json(const std::string& server_instance_id,
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context, const std::string& message);
+std::string format_recovery_event_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp_unix_ms, std::uint64_t request_id,
+                                       const ninfer::RecoveryEvent& event);
 std::string format_throughput_json(const std::string& server_instance_id,
                                    std::uint64_t timestamp_unix_ms, const ThroughputReport& report);
 
@@ -158,14 +250,16 @@ public:
                             const ninfer::ModelSamplingDefaults& sampling_defaults,
                             const std::string& public_model_id, const ninfer::LoadSummary& load,
                             const ninfer::MemorySummary& memory);
+    void write_request_prepare(const RequestPreparationLogContext& context);
     void write_request_start(const RequestLogContext& context);
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void write_request_error(const RequestLogContext& context, const std::string& message);
+    void write_recovery(std::uint64_t request_id, const ninfer::RecoveryEvent& event);
     void write_throughput(const ThroughputReport& report);
 
 private:
-    void append(std::string record);
+    void append(const std::string& record);
 
     std::string path_;
     std::string server_instance_id_;

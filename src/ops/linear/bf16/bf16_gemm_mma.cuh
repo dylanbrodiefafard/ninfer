@@ -235,7 +235,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
         }
         __syncthreads();
 
-        auto load_fragments = [&](int k_step, unsigned(&a_frag)[MT][4], unsigned(&b_frag)[NT][2]) {
+        auto load_fragments = [&](int k_step, unsigned (&a_frag)[MT][4],
+                                  unsigned (&b_frag)[NT][2]) {
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
                 const int row = wm * WM + mi * 16 + a_row_offset;

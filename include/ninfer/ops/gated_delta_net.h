@@ -87,7 +87,7 @@ void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
  * Evaluates B independent normalized Gated DeltaNet recurrences from absolute state-pool slots
  * without modifying any state. q/k are BF16 [128,Hq,T,B], v/out are BF16 [128,Hv,T,B], g/beta
  * are FP32 [Hv,T,B], and ssm_states is FP32 [128,128,Hv,S]. The ReplaySSM execution domain is
- * B=1..4 and T=2..16, with Hq=16 and Hv in {32,48}. scale is 1/sqrt(128).
+ * B=1..6 and T=2..16, with Hq=16 and Hv in {32,48}. scale is 1/sqrt(128).
  *
  * valid_columns is empty for dense rows or device I32 [B], with every caller-supplied extent in
  * [1,T]. initial_state_slots is device I32 [B] containing absolute slots in [0,S). For each valid
@@ -96,26 +96,46 @@ void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
  * unchanged, while the invalid out suffix is exact BF16 zero. Inputs, state, records, and out are
  * pairwise non-overlapping.
  *
- * `parent_index` is null or empty for sequential packed time: S_j = F(S_{j-1}, x_j) from the
- * checkpoint slot. When non-null it is contiguous I32 [T,B], or [T] when B=1, and the recurrence
- * is the tree rule S_j = F(S_parent[j], x_j). parent_index[0,b] is -1 and names the checkpoint
- * slot; every other valid column j has parent in [0,j). Packed order is not time. With a workspace
- * sized by gated_delta_net_replay_record_workspace_capacity_bytes(), one T=1 snapshot overlay on
- * scratch SSM both publishes the bit-preserving replay records consumed by Fold and produces
- * `out`, so each packed column matches ordinary width-one decode. Sequential execution ping-pongs
- * one work slot per row; tree execution loads the parent (or checkpoint) column from the scratch
- * pool. Without workspace there is no overlay and the tree record kernel uses the 1-warp
- * shared-memory tile.
+ * `tree_schedule` is null for sequential packed time: S_j = F(S_{j-1}, x_j) from the checkpoint
+ * slot. When non-null it is the I32 [kGdnTreeScheduleWords,B] schedule written by
+ * gated_delta_net_tree_schedule() for this round's parent_index and valid_columns, and the
+ * recurrence is the tree rule S_j = F(S_parent[j], x_j) with S_parent = checkpoint for column 0.
+ * Every column applies exactly the transitions of a sequential chain over its root path, in path
+ * order, with the width-one decode arithmetic, so each packed column's output is bit-identical
+ * to sequential execution of that path. No per-column state is materialized.
  */
-[[nodiscard]] std::size_t gated_delta_net_replay_record_workspace_capacity_bytes(
-    std::int32_t value_heads, std::int32_t batch, std::int32_t width);
-
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream, const Tensor* parent_index = nullptr,
-                                   WorkspaceArena* workspace = nullptr);
+                                   cudaStream_t stream, const Tensor* tree_schedule = nullptr);
+
+inline constexpr std::int32_t kGdnTreeMaxColumns = 16;
+// Column c emits one step and, when its parent is neither column c-1 nor slotted, first replays
+// its parent's root path (at most c steps, since a parent's depth is below c). The schedule
+// therefore never exceeds sum_{c<16} (1 + c) steps.
+inline constexpr std::int32_t kGdnTreeMaxSteps = kGdnTreeMaxColumns * (kGdnTreeMaxColumns + 1) / 2;
+inline constexpr std::int32_t kGdnTreeScheduleWords = 1 + kGdnTreeMaxSteps;
+
+/**
+ * Op: gated_delta_net_tree_schedule
+ *
+ * Compiles each row's packed draft tree into the step list gated_delta_net_replay_record
+ * executes. parent_index is device I32 [T,B] (T in [2,16]) in topological order: column 0 has
+ * parent -1 and every other valid column j has parent in [0,j). valid_columns is empty (all T
+ * columns valid) or device I32 [B] with extents in [1,T]. schedule is device I32
+ * [kGdnTreeScheduleWords,B]: word 0 is the step count, then one word per step,
+ * `column | code << 8`, where code bits 0-2 select the resume source (0 the live state, 1 the
+ * checkpoint, 2+s branch slot s), bits 3-5 the branch slot to save into (0 none, 1+s slot s), and
+ * bit 6 whether the step emits the column's records and output. Columns with two or more children
+ * save their state while a slot is free (three slots; a slot is released when its branch's last
+ * child starts); a column whose parent is neither the previous column nor slotted is preceded by
+ * non-emitting replay steps over its parent's root path. A depth-first column order makes every
+ * sibling resume from one slot load. The schedule depends only on parent_index and
+ * valid_columns, so one launch serves every GDN layer of a round.
+ */
+void gated_delta_net_tree_schedule(const Tensor& parent_index, const Tensor& valid_columns,
+                                   Tensor& schedule, cudaStream_t stream);
 
 } // namespace ninfer::ops

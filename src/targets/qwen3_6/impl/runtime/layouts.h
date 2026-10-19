@@ -5,6 +5,7 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/dtype.h"
 #include "core/gdn_replay_records.h"
+#include "core/gdn_history.h"
 #include "core/layout.h"
 #include "core/tensor.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
@@ -24,7 +25,6 @@ using TensorLayout = TensorRegion;
 
 struct DFlashPersistentLayout {
     CyclicKVCacheLayout local;
-    CyclicKVCacheLayout rewrite_checkpoint_local;
     CyclicKVCacheLayout staging_local;
     std::optional<qwen3_6::PagedKVCacheLayout> full;
     TensorLayout prefill_features;
@@ -32,21 +32,23 @@ struct DFlashPersistentLayout {
     TensorLayout pending_features;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
-        return local.payload_bytes() + rewrite_checkpoint_local.payload_bytes() +
-               staging_local.payload_bytes() + (full ? full->payload_bytes() : 0);
+        return local.payload_bytes() + staging_local.payload_bytes() +
+               (full ? full->payload_bytes() : 0);
     }
 };
 
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
     std::optional<GdnReplayRecordLayout> replay_records;
+    std::optional<GdnHistoryLayout> gdn_history;
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
     TensorLayout token_counts;
     TensorLayout sampling_config;
-    TensorLayout tool_token_masks;
-    TensorLayout tool_sampling_config;
+    TensorLayout grammar_masks;
+    TensorLayout grammar_sampling_config;
+    TensorLayout grammar_nodes;
     TensorLayout tail_hidden;
     TensorLayout rewrite_checkpoint_hidden;
     std::optional<TensorLayout> staging_hidden;
@@ -61,18 +63,22 @@ struct WorkspacePlan {
     std::size_t mtp_round      = 0;
     std::size_t dflash_context = 0;
     std::size_t dflash_round   = 0;
-    std::size_t vision_encode  = 0;
-    std::size_t capacity       = 0;
+    // A DFlash round whose verify forward also runs a prefill owner's mixed-forward chunk.
+    std::size_t dflash_mixed  = 0;
+    std::size_t vision_encode = 0;
+    std::size_t capacity      = 0;
 };
 
 struct SequencePlanningInputs {
     WeightsProfile weights_profile;
-    std::uint32_t capacity                 = 0;
-    std::uint32_t max_concurrency          = 1;
-    std::uint32_t prefill_chunk            = 0;
-    std::uint32_t draft_window             = 0;
-    std::uint32_t dflash_verify_width      = 0;
-    bool adaptive_draft                    = false;
+    std::uint32_t capacity            = 0;
+    std::uint32_t max_concurrency     = 1;
+    std::uint32_t prefill_chunk       = 0;
+    std::uint32_t mixed_forward       = 0;
+    std::uint32_t draft_window        = 0;
+    std::uint32_t dflash_verify_width = 0;
+    bool adaptive_draft               = false;
+    std::optional<float> p_less_draft_temperature;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
@@ -82,15 +88,15 @@ struct SequencePlanningInputs {
     std::int32_t xattn_min_len             = 8192;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
-    bool use_cuda_graph = true;
-    int device          = 0;
-    std::size_t kv_ram_capacity_bytes = 0;
+    bool use_cuda_graph                = true;
+    int device                         = 0;
+    std::size_t kv_ram_capacity_bytes  = 0;
     std::size_t kv_disk_capacity_bytes = 0;
     std::filesystem::path kv_disk_location;
     KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
     std::string model_id;
     std::string weights_id;
-    std::string artifact_file_identity;
+    std::string artifact_tensor_identity;
     std::vector<std::uint32_t> context_checkpoint_marks;
 };
 
@@ -101,15 +107,19 @@ namespace ninfer::targets::qwen3_6::detail {
 template <>
 struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     typename NINFER_QWEN36_VARIANT::WeightsProfile weights_profile;
-    std::uint32_t capacity                 = 0;
-    std::uint32_t kv_capacity              = 0;
-    std::uint32_t main_page_groups         = 0;
-    std::uint32_t max_concurrency          = 1;
-    std::uint32_t prefill_chunk            = 0;
-    std::uint32_t draft_window             = 0;
-    std::uint32_t dflash_verify_width      = 0;
-    bool adaptive_draft                    = false;
+    std::uint32_t capacity         = 0;
+    std::uint32_t kv_capacity      = 0;
+    std::uint32_t main_page_groups = 0;
+    std::uint32_t max_concurrency  = 1;
+    std::uint32_t prefill_chunk    = 0;
+    std::uint32_t mixed_forward    = 0;
+    std::uint32_t draft_window     = 0;
+    // Widest captured DFlash verify width (storage, ReplaySSM records, pending features).
+    std::uint32_t dflash_verify_width = 0;
+    bool adaptive_draft               = false;
+    std::optional<float> p_less_draft_temperature;
     std::vector<std::uint32_t> captured_ks;
+    std::vector<NINFER_QWEN36_RUNTIME_NS::DFlashRoundShape> dflash_shapes;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
@@ -119,15 +129,15 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::int32_t xattn_min_len             = 8192;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
-    bool use_cuda_graph = true;
-    int device          = 0;
-    std::size_t kv_ram_capacity_bytes = 0;
+    bool use_cuda_graph                = true;
+    int device                         = 0;
+    std::size_t kv_ram_capacity_bytes  = 0;
     std::size_t kv_disk_capacity_bytes = 0;
     std::filesystem::path kv_disk_location;
     KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
     std::string model_id;
     std::string weights_id;
-    std::string artifact_file_identity;
+    std::string artifact_tensor_identity;
     std::vector<std::uint32_t> context_checkpoint_marks;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;

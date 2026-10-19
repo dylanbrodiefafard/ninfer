@@ -107,20 +107,22 @@ int main() {
     failures += expect_shape(layer2.key, 128, 2, 4, 3, "layer key slice");
     failures += expect_shape(layer2.value, 128, 6, 4, 3, "layer value slice");
     failures += expect_shape(layer2.gate, 2, 6, 4, 3, "layer gate slice");
-    failures += expect(
-        static_cast<std::byte*>(layer2.conv.data) - static_cast<std::byte*>(records.conv.data) ==
-            static_cast<std::ptrdiff_t>(2 * spec.record_capacity * records.conv.nb[2]),
-        "layer conv slice offset differs");
+    failures += expect(static_cast<std::byte*>(layer2.conv.data) -
+                               static_cast<std::byte*>(records.conv.data) ==
+                           static_cast<std::ptrdiff_t>(std::int64_t{2} * spec.record_capacity *
+                                                       records.conv.nb[2]),
+                       "layer conv slice offset differs");
     failures += expect(
         static_cast<std::byte*>(layer2.key.data) - static_cast<std::byte*>(records.key.data) ==
-            static_cast<std::ptrdiff_t>(2 * spec.record_capacity * records.key.nb[3]),
+            static_cast<std::ptrdiff_t>(std::int64_t{2} * spec.record_capacity * records.key.nb[3]),
         "layer key slice offset differs");
     const auto layer2_row1 = records.layer(2, 1, 2);
     failures += expect_shape(layer2_row1.conv, 256, 4, 2, 1, "layer row_begin conv slice");
-    failures += expect(
-        static_cast<std::byte*>(layer2_row1.conv.data) - static_cast<std::byte*>(records.conv.data) ==
-            static_cast<std::ptrdiff_t>((2 * spec.record_capacity + 1) * records.conv.nb[2]),
-        "layer row_begin conv slice offset differs");
+    failures +=
+        expect(static_cast<std::byte*>(layer2_row1.conv.data) -
+                       static_cast<std::byte*>(records.conv.data) ==
+                   static_cast<std::ptrdiff_t>((2 * spec.record_capacity + 1) * records.conv.nb[2]),
+               "layer row_begin conv slice offset differs");
     failures += expect_throw([&] { (void)records.layer(0, 4, 2); }, "row window past capacity");
     failures += expect_throw([&] { (void)records.layer(-1, 1); }, "negative layer");
     failures += expect_throw([&] { (void)records.layer(3, 1); }, "past-end layer");
@@ -128,38 +130,38 @@ int main() {
     failures += expect_throw([&] { (void)records.layer(0, 5); }, "excess active rows");
 
     failures += expect_size(record_bytes({.layers          = 48,
-                                          .record_capacity = 4,
+                                          .record_capacity = 6,
                                           .width           = 6,
                                           .conv_channels   = 10240,
                                           .qk_heads        = 16,
                                           .value_heads     = 48,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            42909696, "48-layer T6 capacity");
+                            64364544, "48-layer T6 capacity");
     failures += expect_size(record_bytes({.layers          = 30,
-                                          .record_capacity = 4,
+                                          .record_capacity = 6,
                                           .width           = 6,
                                           .conv_channels   = 8192,
                                           .qk_heads        = 16,
                                           .value_heads     = 32,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            20828160, "30-layer T6 capacity");
+                            31242240, "30-layer T6 capacity");
     failures += expect_size(record_bytes({.layers          = 30,
-                                          .record_capacity = 4,
+                                          .record_capacity = 6,
                                           .width           = 16,
                                           .conv_channels   = 8192,
                                           .qk_heads        = 16,
                                           .value_heads     = 32,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            55541760, "30-layer T16 capacity");
+                            83312640, "30-layer T16 capacity");
 
     failures += expect_throw(
         [&] {
             ninfer::LayoutBuilder invalid;
             (void)ninfer::plan_gdn_replay_records(invalid, {.layers          = 1,
-                                                            .record_capacity = 5,
+                                                            .record_capacity = 7,
                                                             .width           = 2,
                                                             .conv_channels   = 1,
                                                             .qk_heads        = 1,
@@ -167,7 +169,7 @@ int main() {
                                                             .key_dim         = 1,
                                                             .value_dim       = 1});
         },
-        "record capacity above four");
+        "record capacity above six");
 
     ninfer::LayoutBuilder state_builder;
     const auto state_layout = ninfer::plan_linear_attention_state_pool(

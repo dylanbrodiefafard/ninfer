@@ -2,6 +2,8 @@
 
 #include "targets/qwen3_6_27b/impl/config.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
+#include "ninfer/ops/a4_activation.h"
+#include "ninfer/ops/a8_activation.h"
 #include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <cstddef>
@@ -29,17 +31,33 @@ struct Variant {
     using VisionWeights                  = qwen3_6::VisionWeights;
     using GraphExecutionProfile          = detail::GraphExecutionProfile;
 
-    static constexpr float attention_scale                     = kAttentionScale;
-    static constexpr float gdn_scale                           = kGdnScale;
-    static constexpr std::uint32_t prefill_chunk_alignment     = kPrefillChunkAlignment;
-    static constexpr std::uint32_t maximum_mtp_draft_tokens    = kMaximumMtpDraftTokens;
-    static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
-    static constexpr std::uint32_t maximum_context             = kNativeContext;
-    static constexpr bool supports_dflash                      = DFlashConfig::supported;
-    static constexpr std::int32_t draft_head_rows              = 131072;
+    static constexpr float attention_scale                              = kAttentionScale;
+    static constexpr float gdn_scale                                    = kGdnScale;
+    static constexpr std::uint32_t prefill_chunk_alignment              = kPrefillChunkAlignment;
+    static constexpr std::uint32_t maximum_mtp_draft_tokens             = kMaximumMtpDraftTokens;
+    static constexpr std::uint32_t maximum_dflash_draft_tokens          = kMaximumDFlashDraftTokens;
+    static constexpr std::uint32_t maximum_adaptive_dflash_draft_tokens = kMaximumDFlashDraftTokens;
 
-    [[nodiscard]] static constexpr bool supports_dflash_vision(
-        std::string_view model_id, std::string_view weights_id) {
+    // Cold-start DFlash2 p-less proposal temperature for a p-less target temperature T, used
+    // until the online proposal calibration has observed rounds at T. Offline replay of p-less
+    // selector dumps put the effective optimum near 0.3-0.45 at T=1.5 and 0.6-0.8 at T=2;
+    // 0.8*(T-1) passes through both, clamped to the calibration grid.
+    [[nodiscard]] static constexpr float dflash_p_less_draft_temperature_prior(float temperature) {
+        const float prior = 0.8f * (temperature - 1.0f);
+        return prior < 0.2f ? 0.2f : (prior > 1.25f ? 1.25f : prior);
+    }
+
+    // Per-parent softmax temperature for p-less tree drafting: p-less samples the target at T=2,
+    // so the tree's child probabilities track that flatter law (offline replay over p-less
+    // streams: +1.9% tree acceptance at 11 nodes against T=1; greedy is best at 1).
+    static constexpr float dflash_p_less_tree_temperature = 1.5f;
+
+    static constexpr std::uint32_t maximum_context = kNativeContext;
+    static constexpr bool supports_dflash          = DFlashConfig::supported;
+    static constexpr std::int32_t draft_head_rows  = 131072;
+
+    [[nodiscard]] static constexpr bool supports_dflash_vision(std::string_view model_id,
+                                                               std::string_view weights_id) {
         return model_id == "qwen3.8-27b" && weights_id == "nvfp4";
     }
 
@@ -48,15 +66,19 @@ struct Variant {
     // different T-specialized kernel than sequential C=1 (NVFP4 A16↔W4A4, Q4/W8 SmallT, and
     // 27B GDN control SmallT GEMV vs MMA at T>=17). Leaves either panel at that width or pin
     // the C=1 quantization family; see variant.cpp.
-    static void attention_projection(const Tensor& hidden,
-                                     const FullAttentionProjectionWeights& weights, Tensor& query,
-                                     Tensor& gate, Tensor& key, Tensor& value,
+    // Attention input: normalizes residual with norm_weight/eps (hidden is caller-owned BF16
+    // scratch that a route without a BF16 consumer may leave unwritten), then projects.
+    static void attention_projection(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                     Tensor& hidden, const FullAttentionProjectionWeights& weights,
+                                     Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                                      qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                      cudaStream_t stream, std::int32_t route_tokens = 0);
-    static void attention_output_projection(const Tensor& attention, const Weight& weight,
-                                            Tensor& residual, qwen3_6::TextPhase phase,
-                                            WorkspaceArena& workspace, cudaStream_t stream,
-                                            std::int32_t route_tokens = 0);
+    // Attention output: residual += W * (attention * sigmoid(gate)). `attention` is caller-owned
+    // scratch that may be overwritten with the gated values.
+    static void attention_output_projection(const Tensor& gate, Tensor& attention,
+                                            const Weight& weight, Tensor& residual,
+                                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
+                                            cudaStream_t stream, std::int32_t route_tokens = 0);
     static void mtp_attention_projection(const Tensor& hidden,
                                          const MtpAttentionProjectionWeights& weights,
                                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
@@ -67,14 +89,24 @@ struct Variant {
     static void mtp_q_gate_projection(const Tensor& hidden,
                                       const MtpAttentionProjectionWeights& weights, Tensor& query,
                                       Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm, const Weight& weight,
-                       Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
-                       std::int32_t route_tokens = 0);
+    static void mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm,
+                       const Weight& weight, Tensor& residual, WorkspaceArena& workspace,
+                       cudaStream_t stream, std::int32_t route_tokens = 0);
     static void mtp_attention_output(const Tensor& attention, const Weight& weight,
                                      Tensor& residual, WorkspaceArena& workspace,
                                      cudaStream_t stream, std::int32_t route_tokens = 0);
-    static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                     Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase phase,
+    // Prefill: when the GDN input projection consumes an A4 activation of the normalized hidden
+    // at this width, allocates it from `workspace` into `activation` and returns true. The layout
+    // reserves gdn_input_a4_activation_capacity_bytes for it.
+    [[nodiscard]] static bool allocate_gdn_input_a4(const GdnProjectionWeights& weights,
+                                                    qwen3_6::TextPhase phase, std::int32_t tokens,
+                                                    std::int32_t route_tokens,
+                                                    WorkspaceArena& workspace,
+                                                    ops::A4Activation& activation);
+    // hidden_a4 is null or the A4 activation gdn_norm_control_projection published for hidden.
+    static void gdn_input_projection(const Tensor& hidden, const ops::A4Activation* hidden_a4,
+                                     const GdnProjectionWeights& weights, Tensor& qkv,
+                                     Tensor& output_gate, qwen3_6::TextPhase phase,
                                      WorkspaceArena& workspace, cudaStream_t stream);
     static void
     gdn_input_projection_snapshot(const Tensor& hidden, const GdnProjectionWeights& weights,
@@ -83,23 +115,35 @@ struct Variant {
                                   const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& output_gate, qwen3_6::TextPhase phase,
                                   WorkspaceArena& workspace, cudaStream_t stream);
+    // hidden_activation is null or the A8 activation published by gdn_norm_control_projection
+    // for this hidden; the leaf consumes it exactly when it would quantize hidden itself.
     static void gdn_input_projection_record(
-        const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
-        const Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slots,
-        Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate,
-        qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream,
-        const Tensor* parent_index = nullptr);
-    static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
+        const Tensor& hidden, const ops::A8Activation* hidden_activation,
+        const GdnProjectionWeights& weights, const Tensor& conv_weight, const Tensor& conv_states,
+        const Tensor& valid_columns, const Tensor& initial_slots, Tensor& conv_record,
+        Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate, qwen3_6::TextPhase phase,
+        WorkspaceArena& workspace, cudaStream_t stream, const Tensor* parent_index = nullptr);
+    // GDN output: residual += W * gated_rmsnorm(output, norm_weight, gate, eps) per head.
+    // normalized is caller-owned BF16 scratch that a route without a BF16 consumer may leave
+    // unwritten.
+    static void gdn_output_projection(const Tensor& output, const Tensor& norm_weight,
+                                      const Tensor& gate, float eps, Tensor& normalized,
+                                      const Weight& weight, Tensor& residual,
                                       qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                       cudaStream_t stream, std::int32_t route_tokens = 0);
+    // Writes the normalized BF16 hidden and the control g/beta. When hidden_activation is
+    // non-null and the record leaf consumes an A8 activation in `phase`, also publishes it there.
     static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                             float eps, const GdnProjectionWeights& weights,
-                                            Tensor& hidden, Tensor& g, Tensor& beta,
-                                            WorkspaceArena& workspace, cudaStream_t stream,
-                                            std::int32_t route_tokens = 0);
-    static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                           qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                           cudaStream_t stream, std::int32_t route_tokens = 0);
+                                            Tensor& hidden, ops::A8Activation* hidden_activation,
+                                            ops::A4Activation* hidden_a4, Tensor& g, Tensor& beta,
+                                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
+                                            cudaStream_t stream, std::int32_t route_tokens = 0);
+    // Normalize the raw residual for the post-mixer; hidden is caller-owned scratch.
+    static void post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidden,
+                           const PostMixerWeights& weights, Tensor& residual,
+                           qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream,
+                           std::int32_t route_tokens = 0);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
                                std::int32_t route_tokens = 0);
@@ -137,6 +181,9 @@ struct Variant {
                                                    std::int32_t last);
     [[nodiscard]] static std::size_t
     gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t
+    gdn_input_a4_activation_capacity_bytes(WeightsProfile weights_profile, qwen3_6::TextPhase phase,
+                                           std::int32_t last);
     [[nodiscard]] static std::size_t
     post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, qwen3_6::TextPhase phase,
                                         std::int32_t first, std::int32_t last);

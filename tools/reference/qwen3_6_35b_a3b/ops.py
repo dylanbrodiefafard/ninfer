@@ -53,12 +53,7 @@ def rmsnorm(
 
 def l2norm(x: torch.Tensor) -> torch.Tensor:
     xf = x.float()
-    return bf16(
-        xf
-        * torch.rsqrt(
-            torch.sum(xf * xf, dim=-1, keepdim=True) + CFG.rms_eps
-        )
-    )
+    return bf16(xf * torch.rsqrt(torch.sum(xf * xf, dim=-1, keepdim=True) + CFG.rms_eps))
 
 
 def residual_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -150,11 +145,15 @@ def causal_conv1d(
     w = weight.contiguous().float()
     width = w.shape[1]
     sequence = torch.cat((state.float().t(), x.float()), dim=0)
-    out = F.conv1d(
-        sequence.t().unsqueeze(0),
-        w.unsqueeze(1),
-        groups=x.shape[1],
-    ).squeeze(0).t()
+    out = (
+        F.conv1d(
+            sequence.t().unsqueeze(0),
+            w.unsqueeze(1),
+            groups=x.shape[1],
+        )
+        .squeeze(0)
+        .t()
+    )
     next_state = sequence[-(width - 1) :].t().contiguous().to(torch.bfloat16)
     return bf16(F.silu(out)), next_state
 
@@ -188,16 +187,12 @@ def gated_delta_net(
         )
         kt = k[0].float().index_select(0, head_map)
         qt = q[0].float().index_select(0, head_map)
-        next_state = state.float() * torch.exp(g[0].float()).view(
-            1, CFG.gdn_v_heads, 1, 1
-        )
+        next_state = state.float() * torch.exp(g[0].float()).view(1, CFG.gdn_v_heads, 1, 1)
         prediction = torch.einsum("bhkv,hk->bhv", next_state, kt)
-        delta = beta[0].float().view(1, CFG.gdn_v_heads, 1) * (
-            v[0].float() - prediction
+        delta = beta[0].float().view(1, CFG.gdn_v_heads, 1) * (v[0].float() - prediction)
+        next_state = next_state + kt.view(1, CFG.gdn_v_heads, CFG.gdn_k_dim, 1) * delta.unsqueeze(
+            -2
         )
-        next_state = next_state + kt.view(
-            1, CFG.gdn_v_heads, CFG.gdn_k_dim, 1
-        ) * delta.unsqueeze(-2)
         out = torch.einsum("bhkv,hk->bhv", next_state, qt) * GDN_SCALE
         return bf16(out.squeeze(0).unsqueeze(0)), next_state
 
@@ -207,8 +202,7 @@ def gated_delta_net(
         )
     except ImportError as exc:
         raise RuntimeError(
-            "Qwen3.6-35B-A3B reference requires flash-linear-attention>=0.5.1 "
-            "for prefill GDN"
+            "Qwen3.6-35B-A3B reference requires flash-linear-attention>=0.5.1 for prefill GDN"
         ) from exc
     q, k, v, g, beta = (tensor.clone() for tensor in (q, k, v, g, beta))
     out, final = fla_chunk_gated_delta_net(
@@ -244,9 +238,7 @@ def _naive_gated_delta_net(
         qt = q[token].float().index_select(0, head_map)
         s.mul_(torch.exp(g[token].float()).view(CFG.gdn_v_heads, 1, 1))
         prediction = torch.einsum("hkv,hk->hv", s, kt)
-        delta = beta[token].float().unsqueeze(-1) * (
-            v[token].float() - prediction
-        )
+        delta = beta[token].float().unsqueeze(-1) * (v[token].float() - prediction)
         s.add_(kt.unsqueeze(-1) * delta.unsqueeze(-2))
         out[token] = torch.einsum("hkv,hk->hv", s, qt) * GDN_SCALE
     return bf16(out), s.unsqueeze(0)

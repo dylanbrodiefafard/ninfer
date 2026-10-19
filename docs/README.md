@@ -7,7 +7,7 @@ run the CLI or HTTP server.
 
 | Document | Purpose |
 |---|---|
-| [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
+| [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, DFlash, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
@@ -32,6 +32,14 @@ The executable `--help` output is the exact source for command-line option spell
 
 ## Maintainer references
 
+- [Remaining repository experiments](../research/inference-engine-triage/phase7-experiments.md)
+  records all 18 subsequent candidate decisions, five retained implementations,
+  numerical qualification and measured gains; `phase7-ledger.json` tracks completion.
+
+- [RTX 5090 inference research](../research/rtx5090-inference/README.md) preserves the external
+  investigation; [experimental applicability](../research/rtx5090-inference/experimental-review.md)
+  updates its local assumptions for Qwen3.8-27B NVFP4 on this branch.
+
 The active references under [`maintainer/`](maintainer/) record current architecture, model,
 artifact, and maintenance contracts. These files are not additional user workflows or installed
 API documentation.
@@ -47,6 +55,9 @@ Runtime and Op references:
 - [DFlash2 chain verify speed and historical tree A/Bs](maintainer/dflash2-tree-speed.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
+- [Code-quality gates: warnings, clang-tidy, formatters, linters, sanitizers](maintainer/code-quality.md)
+- [Merging into master: the full gate set and how to record it](maintainer/merging-to-master.md)
+- [Upstream (Neroued/ninfer) sync log and review watermark](maintainer/upstream-sync.md)
 
 Artifact and model references:
 
@@ -60,6 +71,12 @@ Artifact and model references:
 - [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
 
 Pending plans:
+
+- [DFlash A8 verification follow-ups](maintainer/dflash-a8-followups.md) lists measured
+  attribution and candidate speedups after the A8/A8 default, with per-candidate outcomes.
+
+- [Elastic concurrency lanes](maintainer/elastic-concurrency.md) records the measured per-lane
+  memory cost and candidate designs for trading idle lanes back to the KV pool.
 
 - [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the
   single target state for an unfinished source and public-contract cutover; it is not the current

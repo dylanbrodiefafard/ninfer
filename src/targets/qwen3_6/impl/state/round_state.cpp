@@ -1,5 +1,6 @@
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include "ninfer/ops/dflash2_path_select.h"
+#include "ninfer/ops/gated_delta_net.h"
 
 #include <algorithm>
 #include <limits>
@@ -21,6 +22,28 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
         throw std::invalid_argument(label);
     }
     return static_cast<std::int32_t>(value);
+}
+
+// Binds a frame's logprob views: `row_enabled` is the ingress flag array and `records` the
+// RoundLogprobRecords<Slots> egress member, addressed at the frame's configured [width,batch].
+template <std::size_t Slots>
+RoundLogprobTensors bind_round_logprobs(void* row_enabled, void* records, std::int32_t width,
+                                        std::int32_t batch) {
+    using Records = RoundLogprobRecords<Slots>;
+    static_assert(std::is_standard_layout_v<Records>);
+    if (static_cast<std::size_t>(width) * static_cast<std::size_t>(batch) > Slots) {
+        throw std::logic_error("round logprob records are smaller than their frame");
+    }
+    auto* base = static_cast<unsigned char*>(records);
+    RoundLogprobTensors tensors;
+    tensors.row_enabled = Tensor(row_enabled, DType::I32, {batch});
+    tensors.token_logprobs =
+        Tensor(base + offsetof(Records, token_logprobs), DType::FP32, {width, batch});
+    tensors.top_ids      = Tensor(base + offsetof(Records, top_ids), DType::I32,
+                                  {ops::kMaximumTopLogprobs, width, batch});
+    tensors.top_logprobs = Tensor(base + offsetof(Records, top_logprobs), DType::FP32,
+                                  {ops::kMaximumTopLogprobs, width, batch});
+    return tensors;
 }
 
 void validate_spec(const RoundStateSpec& spec) {
@@ -51,13 +74,26 @@ void validate_spec(const RoundStateSpec& spec) {
         }
     }
     if (spec.batch_capacity == 0 || spec.batch_capacity > kMaximumConcurrency) {
-        throw std::invalid_argument("RoundState batch capacity must be in [1,4]");
+        throw std::invalid_argument("RoundState batch capacity must be in [1,6]");
     }
     (void)checked_i32(static_cast<std::uint64_t>(spec.draft_window) + 1ULL,
                       "RoundState draft window exceeds int32");
 }
 
 } // namespace
+
+void record_round_logprobs(const RoundLogprobTensors& frame, const Tensor& logits,
+                           const Tensor& tokens, const Tensor* counts, const Tensor* columns,
+                           std::int32_t token_domain, cudaStream_t stream) {
+    const std::int32_t width = tokens.ne[0];
+    const std::int32_t batch = tokens.ne[1];
+    const Tensor row_enabled = frame.row_enabled.slice(0, 0, batch);
+    Tensor token_logprobs    = frame.token_logprobs.slice(0, 0, width).slice(1, 0, batch);
+    Tensor top_ids           = frame.top_ids.slice(1, 0, width).slice(2, 0, batch);
+    Tensor top_logprobs      = frame.top_logprobs.slice(1, 0, width).slice(2, 0, batch);
+    ops::token_logprobs(logits, tokens, row_enabled, counts, columns, token_domain, token_logprobs,
+                        top_ids, top_logprobs, stream);
+}
 
 RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundStateSpec& spec) {
     validate_spec(spec);
@@ -91,7 +127,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
                                          const OrdinaryDecodeStateLayout& layout,
                                          std::uint32_t batch_capacity) {
     if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency) {
-        throw std::invalid_argument("ordinary decode batch capacity must be in [1,4]");
+        throw std::invalid_argument("ordinary decode batch capacity must be in [1,6]");
     }
     static_assert(std::is_standard_layout_v<OrdinaryDecodeIngress>);
     static_assert(std::is_standard_layout_v<OrdinaryDecodeEgress>);
@@ -114,8 +150,12 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     sampled_tokens = Tensor(static_cast<unsigned char*>(egress.data) +
                                 offsetof(OrdinaryDecodeEgress, sampled_tokens),
                             DType::I32, {count});
-    logits         = layout.logits.bind(backing);
-    hidden         = layout.hidden.bind(backing);
+    logprobs       = bind_round_logprobs<kMaximumConcurrency>(
+        static_cast<unsigned char*>(ingress.data) + offsetof(OrdinaryDecodeIngress, logprob_rows),
+        static_cast<unsigned char*>(egress.data) + offsetof(OrdinaryDecodeEgress, logprobs), 1,
+        count);
+    logits = layout.logits.bind(backing);
+    hidden = layout.hidden.bind(backing);
 }
 
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout) {
@@ -188,11 +228,11 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder.add(sizeof(DFlashDecodeEgress), kArenaAlign, "DFlash decode egress");
         const auto batch = checked_i32(layout.spec.batch_capacity,
                                        "RoundState DFlash batch capacity exceeds int32");
-        const std::uint32_t resolved_width =
-            layout.spec.dflash_verify_width == 0 ? layout.spec.draft_window + 1U
-                                                : layout.spec.dflash_verify_width;
-        const auto dflash_width = checked_i32(resolved_width,
-                                              "RoundState DFlash verify width exceeds int32");
+        const std::uint32_t resolved_width = layout.spec.dflash_verify_width == 0
+                                                 ? layout.spec.draft_window + 1U
+                                                 : layout.spec.dflash_verify_width;
+        const auto dflash_width =
+            checked_i32(resolved_width, "RoundState DFlash verify width exceeds int32");
         decode.proposal_ids =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash proposal ids");
         decode.proposal_positions =
@@ -202,20 +242,21 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.append_positions =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash append positions");
         decode.append_counts = add_tensor(builder, DType::I32, {batch}, "DFlash append counts");
-        decode.draft_tokens =
-            add_tensor(builder, DType::I32, {dflash_width - 1, batch}, "DFlash proposal draft tokens");
+        decode.draft_tokens  = add_tensor(builder, DType::I32, {dflash_width - 1, batch},
+                                          "DFlash proposal draft tokens");
         decode.selector_ids =
-            add_tensor(builder, DType::I32,
-                       {ops::kDflash2PathSelectTopK, dflash_width - 1, batch},
+            add_tensor(builder, DType::I32, {ops::kDflash2PathSelectTopK, dflash_width - 1, batch},
                        "DFlash chain selector ids");
         decode.selector_q =
-            add_tensor(builder, DType::FP32,
-                       {ops::kDflash2PathSelectTopK, dflash_width - 1, batch},
+            add_tensor(builder, DType::FP32, {ops::kDflash2PathSelectTopK, dflash_width - 1, batch},
                        "DFlash chain selector q");
         decode.verify_ids =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash target verify ids");
         decode.parent_index =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash tree parent index");
+        decode.gdn_tree_schedule =
+            add_tensor(builder, DType::I32, {ops::kGdnTreeScheduleWords, batch},
+                       "DFlash tree GDN record schedule");
         decode.ancestor_mask =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash tree ancestor mask");
         decode.cache_positions =
@@ -225,11 +266,14 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.target_logits =
             add_tensor(builder, DType::BF16, {layout.spec.output_rows, dflash_width, batch},
                        "DFlash target logits");
-        decode.target_hidden = add_tensor(
-            builder, DType::BF16, {layout.spec.hidden, dflash_width, batch}, "DFlash target hidden");
+        decode.target_hidden =
+            add_tensor(builder, DType::BF16, {layout.spec.hidden, dflash_width, batch},
+                       "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
     }
+    layout.prefill_logprobs =
+        builder.add(sizeof(PrefillLogprobFrame), kArenaAlign, "prefill token logprobs");
     layout.complete = true;
 }
 
@@ -294,12 +338,16 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
         egress_tensor(offsetof(MtpDecodeEgress, accepted_drafts), DType::I32, {batch});
     next_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, drafts});
-    next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
-    verify_ids       = layout.verify_ids.bind(backing);
-    target_positions = layout.target_positions.bind(backing);
-    target_argmax    = layout.target_argmax.bind(backing);
-    target_logits    = layout.target_logits.bind(backing);
-    target_hidden    = layout.target_hidden.bind(backing);
+    next_extents = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
+    logprobs     = bind_round_logprobs<std::size_t{kMaximumConcurrency} * kMtpDecodeMaximumWidth>(
+        static_cast<unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, logprob_rows),
+        static_cast<unsigned char*>(egress.data) + offsetof(MtpDecodeEgress, logprobs), width,
+        batch);
+    verify_ids                 = layout.verify_ids.bind(backing);
+    target_positions           = layout.target_positions.bind(backing);
+    target_argmax              = layout.target_argmax.bind(backing);
+    target_logits              = layout.target_logits.bind(backing);
+    target_hidden              = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
     proposal_logits            = layout.proposal_logits.bind(backing);
     alignment_ids              = layout.alignment_ids.bind(backing);
@@ -355,10 +403,9 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     dflash_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, dflash_kv_table_rows), DType::I32, {batch});
-    lanes = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
-    rope_deltas =
-        ingress_tensor(offsetof(DFlashDecodeIngress, rope_deltas), DType::I32, {batch});
-    sampling = reinterpret_cast<const ops::SamplingConfig*>(
+    lanes       = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
+    rope_deltas = ingress_tensor(offsetof(DFlashDecodeIngress, rope_deltas), DType::I32, {batch});
+    sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, sampling));
     licensed_tokens =
         egress_tensor(offsetof(DFlashDecodeEgress, licensed_tokens), DType::I32, {width, batch});
@@ -369,6 +416,14 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     accepted_column =
         egress_tensor(offsetof(DFlashDecodeEgress, accepted_column), DType::I32, {batch});
     fold_path = egress_tensor(offsetof(DFlashDecodeEgress, fold_path), DType::I32, {width, batch});
+    proposal_calibration =
+        egress_tensor(offsetof(DFlashDecodeEgress, proposal_calibration), DType::FP32,
+                      {ops::kPLessProposalCalibrationTemperatureCount *
+                       static_cast<std::int32_t>(kDFlashDecodeMaximumDrafts) * batch});
+    logprobs = bind_round_logprobs<std::size_t{kMaximumConcurrency} * kDFlashDecodeMaximumWidth>(
+        static_cast<unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, logprob_rows),
+        static_cast<unsigned char*>(egress.data) + offsetof(DFlashDecodeEgress, logprobs), width,
+        batch);
     proposal_ids               = layout.proposal_ids.bind(backing);
     proposal_positions         = layout.proposal_positions.bind(backing);
     target_rope_positions      = layout.target_rope_positions.bind(backing);
@@ -379,6 +434,7 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     selector_q                 = layout.selector_q.bind(backing);
     verify_ids                 = layout.verify_ids.bind(backing);
     parent_index               = layout.parent_index.bind(backing);
+    gdn_tree_schedule          = layout.gdn_tree_schedule.bind(backing);
     ancestor_mask              = layout.ancestor_mask.bind(backing);
     cache_positions            = layout.cache_positions.bind(backing);
     target_argmax              = layout.target_argmax.bind(backing);
@@ -409,6 +465,11 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
         dflash_decode.emplace(backing, *layout.dflash_decode, layout.spec.batch_capacity,
                               layout.spec.draft_window);
     }
+    static_assert(std::is_standard_layout_v<PrefillLogprobFrame>);
+    prefill_logprob_frame = layout.prefill_logprobs.bind(backing);
+    auto* frame           = static_cast<unsigned char*>(prefill_logprob_frame.data);
+    prefill_logprobs = bind_round_logprobs<1>(frame + offsetof(PrefillLogprobFrame, enabled),
+                                              frame + offsetof(PrefillLogprobFrame, records), 1, 1);
 }
 
 } // namespace ninfer::targets::qwen3_6

@@ -10,7 +10,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
@@ -21,8 +20,8 @@ enum class ProcessorErrorKind {
 
 class ProcessorError final : public std::runtime_error {
 public:
-    ProcessorError(ProcessorErrorKind kind, std::string message)
-        : std::runtime_error(std::move(message)), kind_(kind) {}
+    ProcessorError(ProcessorErrorKind kind, const std::string& message)
+        : std::runtime_error(message), kind_(kind) {}
 
     [[nodiscard]] ProcessorErrorKind kind() const noexcept { return kind_; }
 
@@ -95,6 +94,7 @@ struct ProcessedInput {
     std::vector<float> patches;
     std::vector<VisionItem> vision_items;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    std::vector<std::uint32_t> turn_closure_frontiers;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -103,9 +103,17 @@ struct ProcessedInput {
 struct EncodedChat {
     std::vector<int> input_ids;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    std::vector<std::uint32_t> turn_closure_frontiers;
 };
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
+
+// Token count of text[0, offset) within `encoded`, the encoding of `text` with `offset` as its
+// prefix mark. When the encode reports no count (offset is not an encode-loop position), the
+// prefix is encoded separately and must be an exact token prefix; nullopt otherwise.
+[[nodiscard]] std::optional<std::size_t>
+checkpoint_prefix_tokens(const Tokenizer& tokenizer, std::string_view text, std::size_t offset,
+                         std::span<const ByteSpan> literal_spans, const EncodedText& encoded);
 
 class Processor {
 public:
@@ -113,7 +121,7 @@ public:
               ProcessorOptions options = {});
 
     ProcessedInput process(const std::vector<ChatMessage>& messages,
-                           ChatRenderOptions render_options = {}) const;
+                           const ChatRenderOptions& render_options = {}) const;
 
 private:
     const Tokenizer& tokenizer_;

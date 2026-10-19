@@ -1,0 +1,59 @@
+{
+  "scope": "Retained Phase7 production changes and their affected tests/build wiring/active references; broader untracked inventory is separate.",
+  "status": "complete",
+  "baseline": "945515ea",
+  "reviews": [
+    {
+      "reviewer": "phase6_gdn_readout",
+      "scope": "GDN history physical storage, public Op and device/host transition implementations, independent recurrence oracle/test",
+      "independent_of_author": true,
+      "verdict": "no_concrete_blockers",
+      "highlights": [
+        "Raw BF16/FP32 records distinct from derived history; sequential FP32 reconstruction and zero decay.",
+        "Licensed chain/tree path, cap4 flush, abort/materialize and count publication order.",
+        "Physical slots/layer strides/compact slices; FP64 oracle evaluates complete logical recurrence."
+      ]
+    },
+    {
+      "reviewer": "phase6_dflash_boundary",
+      "scope": "Family runtime/Variant integration, CMake, affected authorities and real short-terminal fixture",
+      "independent_of_author": true,
+      "verdict": "no_concrete_blockers",
+      "highlights": [
+        "Caller-owned A4 panels outlive producer/consumer and planner includes child peak.",
+        "DFlash-only startup geometry and fixed graph backing; host/device counts match including anchor.",
+        "Terminal/prefix/snapshot materialization, restore/reset/discard ordering and existing streams/events."
+      ]
+    },
+    {
+      "reviewer": "root",
+      "scope": "Short Exact NVFP4 attention tile/kernel launch and permanent fragmented cached-case fixture",
+      "verdict": "no_concrete_blockers",
+      "highlights": [
+        "Br64 selected only on native24-head unsplit short route; longer/split/Sage routing preserved.",
+        "Tile-sized warps, shared offsets, cooperative loops and row/column ownership remain consistent.",
+        "Full causal independent oracle and selected fragmented memcheck/racecheck logs passed."
+      ]
+    },
+    {
+      "reviewer": "phase6_replay_overlap",
+      "scope": "A4 activation contracts/validation, RMS and sigmoid producers, tiled projection consumers, packed SwiGLU and independent tests",
+      "independent_of_author": true,
+      "verdict": "no_concrete_blockers",
+      "highlights": [
+        "Explicit BF16 boundary and signed G16 codec, FP32 divisor/scale rounding, zero scales and tiled padding.",
+        "Complete producer groups and existing SwiGLU consumer barrier; unique output/padding scale ownership.",
+        "Tiled consumer guards, external panel ownership and existing scoped input-codec scratch.",
+        "Full FP64 mathematical chains/exact stored-weight decoding; supplementary diagnostic-codec checks distinguished from primary proof."
+      ]
+    }
+  ],
+  "qualification": "126 full-suite passes, two unavailable-artifact skips, zero failures; final affected rebuild/FP64/exact codec/state/lifecycle checks; selected memcheck/racecheck/initcheck and changed-line clang-tidy passed.",
+  "limits": [
+    "Review is read-only; prior measurement/test logs provide execution qualification.",
+    "Full repeated all-layer history racecheck exceeds16GiB; bounded unfiltered record racecheck passed.",
+    "Hard k4/W5 token comparison fails identically in native/candidate, not a passed gate.",
+    "Partial513 standalone SwiGLU fails primary criterion identically in native/candidate and is excluded from packed target selection."
+  ],
+  "commit_blockers": []
+}

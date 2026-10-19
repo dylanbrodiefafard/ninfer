@@ -7,6 +7,23 @@ benchmark-report, and external protocol behavior. Repository verification princi
 
 ## Organization
 
+The selected-row `ninfer_linear_kv_projection_test` evaluates complete FP64 dots
+from independently decoded original NVFP4/W8/Q4 weights, including packed rows,
+capture and exact storage preservation. `ninfer_dual_rmsnorm_test` applies the
+independent RMS oracle separately to both panels and both alignment routes.
+`ninfer_normalized_rope_kv_append_test` evaluates the complete FP64 norm/rotation
+formula and exact accepted-prefix V/cache state, including wrap, ring replacement
+and graph replay. Their contract headers define the admitted domains; their
+numerical criteria do not reproduce production staging casts.
+
+`ninfer_grouped_dynamic_conv_composite_test` evaluates convolution finish,
+residual addition and plain RMS normalization against complete FP64 mathematics
+from represented inputs. Its per-column condition bound propagates convolution
+and BF16 residual error; an additional tight oracle checks RMS directly from the
+published residual. Random and cancellation fixtures cover B1,2,6,8 and W1,3,8,12,16,
+plus B1/W32, signed/zero gains, eager execution, repeated graph replay, input
+preservation and guards. Its `--sanitizer` case covers B6/W12.
+
 - `artifact/` — Python container, registered layout, quantization, and resource behavior;
 - `ops/` — one identifiable qualification suite per semantic Op or closely related overload group,
   using independent numerical/state-transition oracles at real supported shapes;
@@ -26,6 +43,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
   and the opt-in real public-Engine route;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
+- `test_cache_tensor_identity.cpp` — retained-state fingerprint mutations across NVFP4, W8, and
+  Q4 codes/scales/divisors, excluding output heads and inactive/proposal-only speculative weights;
 - `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
   activation alignment, rejection, and peak semantics;
 - `test_openai_schema.cpp`, `test_responses_schema.cpp`, `test_response_store.cpp`,
@@ -36,12 +55,19 @@ benchmark-report, and external protocol behavior. Repository verification princi
   typed calls, and transactional publication preserving XML-valued arguments. The optional
   real-tokenizer probe compares masks with direct byte acceptance over the represented
   vocabulary at free-text and call-closing boundaries;
-- `targets/qwen3_6/test_generation_recovery.cpp` — contextual duplicate detection, truthful
-  reasoning-only retry notices, preservation of real messages/results, and legitimate
-  changed reads/results and polling;
+- `targets/qwen3_6/test_generation_recovery.cpp` — contextual duplicate detection, a
+  checkpoint-prefix retry that closes the open think turn, keeps historical reasoning,
+  and prefers a held ledger to the original prompt, preservation of real messages/results,
+  and legitimate changed reads/results and polling;
+- `targets/qwen3_6/test_recovery_executor.cpp` — executor cache policy: a resident prefix
+  is prefilled in place, the longer host checkpoint wins, a failed admission restore is
+  discarded and the requeued request is computed cold, and a failed recovery restore
+  cold-prefills the same lane without sticking that fallback. The live retain, copy,
+  abort, and RAM restore sequence is `targets/qwen3_6_27b/test_recovery_kv_real.cpp`;
 - `test_typical_cycle.cpp` — suffix-square boundaries, exact repeated-passage evidence,
   non-overlapping coverage, changing/large periods, and productive-length negative controls;
-- `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
+- `test_serve_metrics.cpp`, `test_request_log.cpp`, and `test_http_error_handler.cpp` — Prometheus
+  exposition, generation lifecycle records,
   live recovery stages and cumulative counts, preparation rejections, protocol-shaped
   payload-limit errors, and application-error preservation;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v14 reports;
@@ -60,6 +86,32 @@ presets.
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
 weight decoding.
 
+`ninfer_linear_nvfp4_a8_test` checks NVFP4-storage/E4M3-activation execution at the five
+principal text geometries and verification extents (including W4 at C1–4), with CUDA Graph replay with changed
+inputs. The canonical FP64 dot-product oracle uses the original BF16 activations and decoded
+weights. Independent E4M3 activation encoding supplies a supplementary codec-distortion and
+arithmetic/storage-residual check; its distortion-derived bound is not a model-quality budget.
+The existing attention-input, LinearAdd and LinearSwiGLU suites also check their A8 routes
+directly against their complete mathematical oracles.
+
+`ninfer_gdn_input_proj_conv_record_test` qualifies both A4 and A8 projections against the
+independent projection/convolution/history oracle and reports each profile separately. It
+checks exact activation encoding, zero rows, outliers, chain/tree parents, valid-prefix tails
+and carried BF16 history, including every retained prefix at the A8 W4 boundary.
+A16 W6 request pairing at C2/C4 is additionally required to match
+the legacy T1 outputs exactly; C3 retains the request-indexed route. The optional existing
+`NINFER_GDN_REAL_ACTIVATIONS` input supplies represented real-model activations while the
+fixture weights remain patterned test weights.
+
+`rmsnorm_linear_swiglu` is qualified in the NVFP4 SwiGLU executable against an independent
+FP64 normalization/projection/nonlinearity oracle, retaining the explicit normalized BF16
+boundary. Its canonical A8 criterion is supplemented by independently encoded/decoded FP8
+inputs and a per-output arithmetic bound: FP32 accumulation, BF16 gate/up materialization,
+SiLU conditioning and final BF16 rounding. The oracle itself does not round private projection
+intermediates. Fused/composed output equality is supplementary, including changed-input graph
+replay and zero rows. GDN record cases execute the A8 C4 `[2,6]` workspace interval at its fused W6
+high-water mark.
+
 ## Build and run
 
 One command for the full C++ unit suite (GPU builder container, excluding opt-in
@@ -71,13 +123,32 @@ real-artifact Engine tests):
 
 `./scripts/dev-setup.sh` starts `ninfer-builder` from this repository's Dockerfile
 `build` stage when the container is not already running. Extra arguments go to CTest
-(`./scripts/run-unit-tests.sh -R ninfer_sampling_test`). `--real` includes the
+(`./scripts/run-unit-tests.sh -R ninfer_sampling_test`). `--fast` skips the tests labelled
+`slow` (each runs for minutes) and is the run to repeat while working. Op tests carry the
+`kernel` label; the `sanitizer` and `racecheck` labels select the sets the compute-sanitizer
+gates run, including the `<test>_sanitizer` registrations that run a suite's reduced
+`--sanitizer` cases. `--real` includes the
 opt-in Engine tests and auto-finds exact `.ninfer` filenames in `models/`, `out/`,
 `/models`, the builder's models mount, and sibling folders of that mount. Override
 with environment variables or `models/weights.env`. `--print-weights` shows what
-`--real` would use without running tests. `--python` also runs the host pytest suite
+`--real` would use without running tests. `--compute-sanitizer TOOL` (`memcheck`,
+`racecheck`, `synccheck`, `initcheck`) runs the selected tests under compute-sanitizer; see
+[code-quality gates](../docs/maintainer/code-quality.md). `--python` also runs the host pytest suite
 when that interpreter can import `pytest` and `torch`. The script exits before CTest
 when the GPU has less than 20 GiB free and prints the processes holding VRAM.
+
+> **Warning: `ninfer_attn_input_proj_test` can hard-hang the host.** On the RTX 5090 development
+> host it has frozen the whole machine five times (drivers 580.178.04 and 595.91.07), most
+> recently inside its FP8 `AllowA8` section at T=127, with no kernel log and no recovery short
+> of a reset. The cause is not established. Until it is, exclude it when running the suite
+> unattended or remotely, and do not run it under compute-sanitizer:
+>
+> ```bash
+> ./scripts/run-unit-tests.sh -E '_real_test$|^ninfer_attn_input_proj_test$'
+> ```
+>
+> The test stays in the tree because it is the oracle for the attention input projection,
+> including the NVFP4 route of the supported model.
 
 Equivalent native commands:
 
@@ -145,16 +216,17 @@ artifact. The 35B-A3B reference binding test follows the same rule with
 `NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.ninfer`. The remaining Python
 target tests still run without either artifact.
 
-The C++ prefix/MTP, RAM-tier, and three-tier disk integration tests are separately opt-in because
-they load a full artifact and run the real Engine. Point `NINFER_QWEN3_6_27B_WEIGHTS` and/or
-`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` at any Engine-loadable 27B-family `.ninfer` of that weight
-profile; the artifact identity selects the target. Qwen3.6-27B and Qwen3.8-27B both work, so
-`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` may be `out/qwen3_6_27b_nvfp4.ninfer` or
-`qwen3_8_27b_nvfp4.ninfer`. `ninfer_qwen3_8_27b_mtp_nvfp4_real_test` additionally requires
-`NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS` (BF16-sourced NVFP4 MTP). C=1 greedy MTP must emit 24
-tokens with speculative rounds; overlapping C=2 and C=3 must complete the requested
-lengths with MTP decode (packed MTP verify is not C=1-token-identical). k=3 and k=5.
-The RAM-tier test covers capture sites 1–3, INT8 KV, MTP, oversize drop,
+The C++ prefix, RAM-tier, and three-tier disk integration tests load a full artifact and run
+the real Engine. Use `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` for the DFlash prefix,
+context-checkpoint, and speculative cache cases. Ordinary cases also accept
+`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS`. MTP execution is disabled; the CPU cache-tensor-identity
+test checks that Engine admission rejects it before artifact or device initialization.
+`ninfer_qwen3_8_27b_logprobs_real_test` (`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`) qualifies
+token logprobs through the public Engine on the ordinary, DFlash chain, packed-tree, adaptive,
+eager, and two-row concurrent routes: a greedy token must be rank 0 of its own record, records
+must agree with teacher-forced `Engine::score` on a non-speculative Engine, a row that did not
+ask must report nothing, and a streamed thinking turn's records must spell its published text.
+The RAM-tier test covers capture sites 1–3, INT8 KV, oversize drop,
 VRAM-wins-equal-reuse, longer-RAM-beats-shorter-VRAM, suffix prefill after RAM restore, RAM disabled, queued matcher,
 `allow_prefix_reuse=false`, rewrite-checkpoint restore, dirty-lane checkpoint restore, cancel-after-consume, consume-then-VRAM,
 overlapping `submit()` at `max_concurrency=2`, C=2/C=3 sequential FullReset onto an empty lane
@@ -180,13 +252,12 @@ explorations execute the real cache implementations:
 | --- | --- | --- |
 | `ninfer_kv_ram_cache_test` | 175 states / 1,101 transitions: capacities of one, two, and three equal-size slots, two keys (including duplicates), one claim, and queued/harvested copy ownership | FIFO matching and eviction, claim release/consume, exact counters, copy retirement, exact restored KV |
 | `ninfer_kv_disk_cache_test` | 320 schedules over two four-page entries: reader counts 1–16; prefetch dequeued, slot assigned, reading, or filled; promotion, cancellation, reclaim, or switch; injected in-flight read failures | Exact restored KV, obsolete work cannot affect a replacement restore, failure accounting, drained I/O pins |
-| `ninfer_qwen3_6_27b_cache_interleavings_real_test` | Every cancellation subset at C=1–4, RAM-only and RAM+disk, for ordinary, MTP, and DFlash execution (60 subsets per backend); ordinary cancellation after the first publication, speculative cancellation after the second with a per-request backend-round witness | Actual RAM reuse, concurrent decode, canceled/completed terminal states, next-token continuation against fresh computation of the same represented history |
+| `ninfer_qwen3_6_27b_cache_interleavings_real_test` | Every cancellation subset at C=1–4, RAM-only and RAM+disk, for ordinary and DFlash execution (60 subsets per backend); ordinary cancellation after the first publication, speculative cancellation after the second with a per-request backend-round witness | Actual RAM reuse, concurrent decode, canceled/completed terminal states, next-token continuation against fresh computation of the same represented history |
 
-The Engine matrix uses NVFP4 KV and `--backend ordinary|mtp|dflash`. Ordinary/MTP use
+The Engine matrix uses NVFP4 KV and `--backend ordinary|dflash`. Ordinary uses
 `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS`; DFlash uses
 `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`. Speculative cases require actual backend execution.
-MTP also retains eight C=2 first-publication cancellation cases that reproduce invalid-tail
-images shadowing a later usable cache entry. The opt-in real CTests register all three backends.
+The opt-in real CTests register ordinary and DFlash backends.
 Its cancellation
 trigger is after host-claim consumption; it does not prove cancellation during Engine copy-hold.
 Set `TMPDIR` to a writable NVMe scratch directory for the real cache tests: their temporary
@@ -225,15 +296,18 @@ and retire normally before a successful spill retry.
 Two branch-spill schedules fail the actual next C++ allocation on the preparing thread,
 preserve the parent's shared-object reference count,
 retry successfully, and require all references to retire when both owning entries are evicted.
-A two-gate RAM eviction schedule lets a disk-worker-style snapshot borrow the victim's CUDA
-event during eviction's unlocked wait. Completing the victim's DMA must not release its entry
-until the snapshot's second DMA finishes; the surviving image then restores exact KV.
+RAM retirement schedules gate the copy stream: consume (with a spill's I/O pin held), discard
+(while a disk-worker-style snapshot borrows the entry's fence) and eviction must return while
+the restore H2D or capture D2H is still gated, drop the entry from the index, and keep its
+block until the fence completes and the last I/O pin drops; the freed block then serves an
+exact recapture and restore. Restored ladder-head copies out of an entry, held behind a gated
+head fence, must leave the entry's copy readiness set, and a consumed or evicted entry must
+keep its block until they land and deliver its bytes.
 Two RAM teardown schedules deny C++ allocations on the destroying executor while D2H or H2D
 is incomplete, requiring DMA retirement and exact restored bytes. Three RAM event-exhaustion
 cases cover capture timing before DMA, capture completion after gated D2H, and restore timing
 before H2D; they require clean ownership and exact retry. A synthetic CUDA launch failure must
-retain its execution-error classification. The checkpoint pool retirement test also fails initial
-head-fence allocation, then retries before gated D2H and checks completed bytes at release. Six spill-batch schedules fail
+retain its execution-error classification. Six spill-batch schedules fail
 page-record allocation after acquiring two, four, or eight jobs, for idle and emergency spills;
 all payload claims must retire and a later eight-page spill must restore exactly. Idle-to-emergency
 promotion also runs with caller allocation denied. Eight publication schedules fail metadata
@@ -250,8 +324,14 @@ healthy sibling reuse, FIFO eviction, and later reopening of an entry skipped by
 allocation pressure.
 Backend-readiness regressions exercise seven RAM cases, nine disk ranking/reopen cases, and
 four resident-planner cases: invalid current tails or unsupported longer frontiers must not hide
-a usable alternative. Two same-prefix disk refresh schedules replace the selected generation before claim or while
-claim waits for idle publication; both reject the stale plan and permit a fresh claim.
+a usable alternative. Two same-prefix disk refresh schedules replace the selected generation before a
+claim, which rejects the stale plan, or after a claim that lands while the refresh commit is
+held after its meta rename; that claim returns without waiting, the failed meta rollback
+publishes the new generation, the stale claim's host load and restore setup must each be a
+`CacheRestoreFailure`, and a fresh plan claims the new generation. A disk-hit claim of an entry
+whose idle Extend has its page write, commit object sync, or post-rename commit held must
+likewise return at once; the abandoned Extend (before its rename, or by rollback) leaves the
+claimed generation in memory and, after reopening, on disk.
 These bounds do not exhaust arbitrary OS/CUDA instruction schedules, unbounded request histories,
 all prompt geometries, or every speculative backend combination. Passing them is evidence for
 the stated transitions, not a proof that all possible interleavings are correct.
@@ -278,13 +358,15 @@ and requires transparent cold continuation with the same next token as fresh com
 C=1–4, with C−1 healthy peers each decoding 128 tokens. The DFlash artifact environment runs
 the same four cases with DFlash and checkpoint capture enabled. The failed entry is invalidated;
 a later request must also succeed.
-Its `--case metadata` selection checks 32 allocation-failure recoveries: C=1–4 at host
-descriptor creation, partially published restore setup, post-copy checkpoint installation,
-and lazy CUDA completion-event creation after restore DMA. The eight event cases also run via
-`--case event`.
-Descriptor/setup/event cases use ordinary and DFlash execution; checkpoint cases use MTP and DFlash
-and require an actual captured checkpoint. Peers must finish and cold output must match fresh
-computation after the injected failure.
+Its `--case metadata` selection checks 24 allocation-failure recoveries: C=1–4 at host
+descriptor creation, partially published restore setup, and lazy CUDA completion-event creation
+after restore DMA, each with ordinary and DFlash execution. The eight event cases also run via
+`--case event`. Peers must finish and cold output must match fresh computation after the
+injected failure.
+Its `--case checkpoint-heads` selection seeds a 64-token DFlash ladder head, saves it through RAM to disk at shutdown, and requires a new Engine's HostDisk
+restore to install the decoded head on the lane; a later prompt diverging after the mark must
+reuse that head as a VRAM-resident context-checkpoint restore whose next token matches a cold
+prefill.
 The RAM Engine suite's `--case fallback` selection injects a one-shot restore metadata
 allocation failure after H2D submission for a 128-token NVFP4 KV image. Sixteen cases combine
 C=1–4, RAM-only or RAM+disk, and ordinary or DFlash execution. Each requires consumption of the
@@ -295,10 +377,6 @@ The RAM Engine suite's `--case planning` selection checks another 16 C=1–4 cas
 RAM-only/RAM+disk and ordinary/DFlash execution. A one-shot optional cache-lookup allocation
 failure must preserve cold admission, healthy peers, and fresh next-token behavior. Candidate
 version memoization prevents retrying the same failed lookup in a scheduler spin.
-The existing RAM Engine suite accepts `--case mtp` to run only its MTP suffix-cache case;
-that case checks the configured draft window and actual speculative execution without fixing
-the adaptive policy to a particular first-round draft length.
-
 `ninfer_kv_ram_cache_perf_test` checks host pack/unpack bandwidth against pinned memcpy.
 `ninfer_kv_disk_cache_perf_test` spills and restores a ~90 MiB 64-plane INT8 page image on the
 repository `out/` NVMe (override with `NINFER_KV_DISK_PERF_DIR`), against a 40 MB/s floor and
@@ -308,28 +386,24 @@ overlapped restore, fragmented vs contiguous PageMajor runs, and GDN/hidden RAM 
 `ninfer_kv_ram_cache_test` includes `test_copy_compute_stream_overlap`: callback-gated D2H/H2D
 on `copy_stream` remain incomplete while a compute-only event on `device.stream` completes.
 The same gates verify that eviction/consume fence unfinished copies before retiring and reusing
-their pinned storage. It also checks that `unpack_device` without an intervening harvest still reports
-both save and load elapsed, and that `consume` without harvest clears pending copy ids and folds
-D2H elapsed into save. Post-DMA capture and restore metadata allocation faults use the same
+their pinned storage. It also checks that `unpack_device` without an intervening harvest still
+bills its load and keeps the unharvested capture D2H in the lifetime save total, and that
+`consume` without harvest clears pending copy ids and counts the D2H only in that total. Post-DMA capture and restore metadata allocation faults use the same
 gates to verify incomplete-copy ownership, safe cleanup, exact subsequent restores, and reclaimed
 capacity. The arena suite checks fragmented retirement and full coalescing while preserving live
 bytes. `ninfer_device_test` checks `order_copy_after_compute`.
-The real checkpoint suite's `--case event-allocation` checks MTP or DFlash Program capture with
-head-event allocation failure at a prefill checkpoint. The request must complete without a
-capture and consume the injected failure; later capture and actual checkpoint restore must
-succeed, with next-token output matching fresh computation. The default real checkpoint run
-also includes this case.
-The runtime-mechanism suite fills the checkpoint recycling pool, then verifies that dropping
-an excess image waits for its gated D2H and releases the completed bytes without growing the pool.
-Twelve copy-snapshot allocation schedules cover both snapshot buffers, D2H/H2D, and CPU wait,
-compute-stream wait, or timing harvest. They require safe completion without leaked I/O pins,
-exact destination bytes, and successful consumption and capacity reclamation.
+The runtime-mechanism suite checks the startup checkpoint-image pool bound: one rollback image
+per lane plus the reachable marks all lanes can hold at once within the shared KV capacity.
+`ninfer_kv_ram_cache_test` runs eight copy-snapshot allocation schedules covering both
+snapshot buffers, D2H/H2D, and the CPU or compute-stream wait (harvest never waits and takes no
+snapshot). They require safe completion without leaked I/O pins, exact destination bytes, and
+successful consumption and capacity reclamation.
 `ninfer_kv_ram_cache_large_test` moves a 27B-shaped GDN slot (~147 MiB) and a
 64-plane ~100 MiB INT8 KV image both ways, including a two-slot GDN plus KV restore, and repeats
 that copy/compute overlap proof:
 
 ```bash
-NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
+NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=/path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
 NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_ram_real_test --output-on-failure
@@ -337,16 +411,92 @@ NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_disk_real_test --output-on-failure
 NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=/path/to/qwen3_8_27b_nvfp4_dflash.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_disk_real_test --output-on-failure
-NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
+NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=/path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_context_checkpoint_real_test --output-on-failure
 NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_context_checkpoint_real_test --output-on-failure
 NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \
   ctest --test-dir build -R ninfer_qwen3_8_27b_dflash_real_test --output-on-failure
-NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS=/path/to/models/qwen3.8-nvfp4-mtp-nvfp4-from-bf16/qwen3_8_27b_nvfp4.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_8_27b_mtp_nvfp4_real_test --output-on-failure
 NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_ram_real_test --output-on-failure
+```
+
+The prefix real test accepts `--case vision` to run image continuation, DFlash visual bridge,
+and many-turn image prefill admission checks without the text-only cache scenarios. Run
+`build/tests/ninfer_qwen3_6_27b_prefix_real_test --case vision` with
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` set to the DFlash artifact.
+
+`ninfer_qwen3_6_27b_recovery_kv_real_test` loads the DFlash artifact when set, otherwise
+an ordinary NVFP4 or groupwise artifact and drives the production Program. It prefills a
+thinking prompt, retains the lane, copies the prompt without its sampled token, and prefills
+only the recovery suffix from that resident checkpoint. It then captures the stacked prompt,
+aborts the lane three times, restores the RAM image onto the empty lane, and prefills again
+without recomputing the restored prefix. Disk restore uses the same empty-lane contract; its
+bytes stay in the disk cache tests. Two successive recovery prompts also run after four
+committed speculative decode rounds. Their checkpoint-restored GDN and hidden state must
+exactly match a control that appends the same suffix without the failed decode, using the
+same prefill decomposition. Greedy speculative continuation must match as well. Run with
+the ordinary and DFlash weight variables separately to check both restoration profiles.
+
+```bash
+NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
+  ./scripts/run-unit-tests.sh --real -R '^ninfer_qwen3_6_27b_recovery_kv_real_test$'
+```
+
+`ninfer_qwen3_6_panel_copy_test` checks exact device bytes for integer panels, BF16 width
+panels, fused QKV row splits, and every GDN replay-record plane. It exercises batches 1–6,
+changed addresses and widths, and graph updates in both directions, checking that graph
+capture/upload preserves destination bytes and that copies preserve padding and source bytes.
+Its replay gate fixture includes the 1536-byte row with a 4608-byte destination pitch at B=3.
+
+`ninfer_qwen3_8_27b_dflash_graph_update_real_test` uses
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` to construct a graph-enabled Engine with concurrency
+six, adaptive draft length seven, and automatic tree width. Startup validates every captured
+profile; three requests with 124-, 125-, and 127-token prompts exercise the short-context profile
+boundary during generation.
+
+`ninfer_qwen3_8_27b_dflash_capacity_real_test` uses the DFlash artifact named by
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` on an otherwise idle RTX 5090. It resolves automatic
+KV capacity at context 260000, concurrency 4, NVFP4 KV, and prefill chunk 4096. It checks that
+the graph allowance fits the measured allocation without stranding more than 128 MiB, executes
+full prefill chunks and partial tails up to 259744 tokens, then drives the production Program
+through `K=3,4,5,4,5,3,5,4,3` at every batch size 1–4. The test sets the host adaptive selection at
+round boundaries to make width transitions deterministic; it checks actual executed K, token
+counts, workspace bounds, and device-memory stability. Adaptive policy selection itself is
+covered by `ninfer_qwen3_6_adaptive_draft_test`.
+
+`ninfer_qwen3_8_27b_verify_score_real_test` is the actual-Verify qualification seam described
+in [tools/ppl](../tools/ppl/README.md). With `NINFER_VERIFY_DECODE_CHECK=greedy`, `p-less`, or
+`stochastic`, it instead runs 16 production draft/Verify/sample/commit rounds and checks
+licensed tokens against the candidate's represented logits. Greedy checks the exact argmax
+and tie rule; p-less and top-k/top-p check independent support formulas, accepted draft
+prefixes, and commit frontiers. Distribution probabilities, rejection/correction and RNG
+semantics additionally use the independent sampling/speculative Op tests. This real-data
+check is not a statistical distribution test.
+
+Concurrent generation controls use identical output budgets: a shorter request's ordinary
+final-token fallback can differ from a longer A4-verification continuation. Equality with a
+prefix of a differently budgeted request is not the same-profile isolation contract.
+Ordinary-scorer margins and scores of independently generated stochastic histories are
+diagnostics, not correctness thresholds for a changed target distribution or paired PPL.
+
+`ninfer_qwen3_6_27b_disk_real_test --case dflash` selects the existing real DFlash three-tier
+restart/HostDisk/continuation check using `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`.
+The case uses NVFP4 KV and compares restored continuation with a cold run using the same
+backend and generation budget.
+
+`ninfer_gqa_attention_test --model-inputs <capture.attn>` checks captured 27B represented
+Q/K/V with the existing independent attention oracle at the short-context partition
+regression shapes. The capture is a sequence of little-endian u32
+`{absolute_position, plane, element_count}` headers and BF16 elements, with Q/K/V planes
+0/1/2; captured output plane3 is ignored by the oracle. BF16 comparison uses a tensor-wide
+gross bound admitting BF16 unit roundoff. NVFP4 checks explicitly separate the existing
+private Q-codec distortion from arithmetic residual using the independent activation-codec
+reference; the canonical oracle still uses the original BF16 Q and exact stored KV codes/scales.
+
+```bash
+NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  ./scripts/run-unit-tests.sh --real -R '^ninfer_qwen3_8_27b_dflash_capacity_real_test$'
 ```
 
 `--system-prepend` is applied on every request, including follow-ups, so the leading system
@@ -356,13 +506,6 @@ turn 2 and a host-RAM restore after an unrelated chat spills the first turn:
 ```bash
 NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_serve_system_prepend_real_test --output-on-failure
-```
-
-Run the peer 35B-A3B route independently:
-
-```bash
-NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_real_test --output-on-failure
 ```
 
 Without the corresponding variable CTest marks each C++ integration test as skipped. These tests
@@ -398,7 +541,7 @@ inheritance:
 
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact out/qwen3_6_27b.ninfer --backend mtp
+  --artifact models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer --backend dflash
 
 python3 tools/smoke/serve_thinking_preservation.py \
   --artifact out/qwen3_6_35b_a3b.ninfer --backend dflash
@@ -421,3 +564,40 @@ A permanent test should protect one current risk, such as:
 Performance-only assertions belong in benchmarks and profiler review. Source scans,
 implementation-shape assertions, trivial getters/configuration, retired command surfaces, and
 broad additions without a concrete regression risk do not belong in the permanent suite.
+
+## Constrained-output Engine integration
+
+`ninfer_qwen3_8_27b_output_constraint_real_test` exercises JSON Schema and EBNF alongside an
+unconstrained request at concurrency three with NVFP4 KV, CUDA Graphs, ordinary decode, and each
+available DFlash backend. It checks parsed schema values, exact EBNF content, EOS completion,
+streaming/result agreement, and speculative verification. The plain request switches from
+no-thinking to thinking on the second pass and checks closing-token count and streamed logprobs
+across the reasoning boundary; the second pass also exercises compiler caching.
+Set `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` to an explicit local artifact and run:
+
+```bash
+./scripts/run-unit-tests.sh --real -R ninfer_qwen3_8_27b_output_constraint_real_test
+```
+
+The frontend CPU suite independently checks schema acceptance and JSON string/escape syntax,
+including special-token literals, reasoning transitions, ignored EOS, and speculative rollback.
+
+### Disposable-turn cache behavior
+
+`ninfer_qwen3_8_27b_cache_write_real_test` uses
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` to verify consuming continuation and disposable turns.
+It covers independent VRAM forks, one-lane and shared-page-pressure RAM preservation,
+checkpoint reads without capture, disposable-first eviction, bounded capacity rejection with
+multiple matching sources, promotion, disk reads, cancellation, and shutdown persistence.
+It exercises ordinary execution and each supplied speculative backend with NVFP4 KV.
+
+`ninfer_qwen3_8_27b_fork_state_real_test` checks exact main/backend KV, GDN convolution and FP32
+recurrent state, hidden state, and DFlash cyclic-state copies for current and rewrite frontiers.
+It also checks complete-original preservation of a closed preserve-off chat whose normal
+capture cuts at its rewrite checkpoint. This real-model route is in the sanitizer set; its
+GEMM-heavy inference exceeds racecheck host-memory capacity. The RAM-cache unit test is in
+both sanitizer and racecheck sets and checks the changed copies. The recovery executor tests cover non-consuming restores, stale-plan replanning,
+destination-failure cleanup, and cancelled readers beside decoding peers. The RAM-cache unit
+test verifies physical copies across storage layouts, source isolation, and restore/release
+followed by consuming continuation. Serving schema tests cover the strict flag and conflict
+in both response modes.

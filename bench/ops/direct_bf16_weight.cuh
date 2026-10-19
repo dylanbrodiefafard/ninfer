@@ -56,7 +56,7 @@ inline DirectBf16Weight make_direct_bf16_weight(std::int32_t n, std::int32_t k,
     const std::uint64_t elements = static_cast<std::uint64_t>(n) * k;
     const int blocks             = static_cast<int>(
         std::min<std::uint64_t>(65535, std::max<std::uint64_t>(1, (elements + 255) / 256)));
-    detail::fill_direct_bf16_weight_kernel<<<blocks, 256>>>(
+    detail::fill_direct_bf16_weight_kernel<<<blocks, 256, 0, cudaStreamLegacy>>>(
         static_cast<__nv_bfloat16*>(result.storage.p), elements, seed);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());

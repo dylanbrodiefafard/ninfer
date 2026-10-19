@@ -36,10 +36,10 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
                                             SamplingMode mode, const SamplingOverrides& overrides) {
     const SamplingPreset& preset = defaults.for_mode(mode);
     ResolvedSamplingParameters resolved{
-        .temperature       = overrides.temperature.value_or(preset.temperature),
-        .top_k             = overrides.top_k.value_or(preset.top_k),
-        .top_p             = overrides.top_p.value_or(preset.top_p),
-        .min_p             = overrides.min_p.value_or(preset.min_p),
+        .temperature = overrides.temperature.value_or(overrides.p_less ? 1.5F : preset.temperature),
+        .top_k       = overrides.top_k.value_or(preset.top_k),
+        .top_p       = overrides.top_p.value_or(preset.top_p),
+        .min_p       = overrides.min_p.value_or(preset.min_p),
         .presence_penalty  = overrides.presence_penalty.value_or(preset.presence_penalty),
         .frequency_penalty = overrides.frequency_penalty.value_or(preset.frequency_penalty),
         .seed              = overrides.seed.value_or(0),

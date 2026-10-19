@@ -25,9 +25,6 @@ void launch_kernel(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
     const auto* codes           = static_cast<const std::uint8_t*>(w.qdata);
     const auto* high            = static_cast<const std::uint8_t*>(w.qhigh);
     const auto* scales          = static_cast<const std::uint8_t*>(w.scales);
-    const auto* residual        = Epilogue == Q5MmaEpilogue::AddResidual
-                                      ? static_cast<const __nv_bfloat16*>(out.data)
-                                      : nullptr;
     auto* outp                  = static_cast<__nv_bfloat16*>(out.data);
     const std::int32_t rows     = out.ne[0];
     const std::int32_t k        = x.ne[0];
@@ -37,7 +34,7 @@ void launch_kernel(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
                     static_cast<unsigned>(div_up(cols, Schedule::kBlockCols)), 1u);
 
     q5_rowsplit_gemm_mma_kernel<Schedule, Full, Epilogue><<<grid, Schedule::kThreads, 0, stream>>>(
-        xp, codes, high, scales, residual, outp, rows, k, cols, padded_k);
+        xp, codes, high, scales, outp, rows, k, cols, padded_k);
     CUDA_CHECK(cudaGetLastError());
 }
 

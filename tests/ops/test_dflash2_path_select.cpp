@@ -50,9 +50,10 @@ void insert_topk(std::vector<float>& vals, std::vector<int>& idxs, float value, 
 
 std::vector<std::int32_t> path_oracle(const std::vector<float>& logits,
                                       const std::vector<float>& hidden, const HostWeight& weight,
-                                      const std::vector<float>& pred, const std::vector<float>& succ,
-                                      const std::vector<std::int32_t>& anchors,
-                                      std::int32_t vocab, std::int32_t tokens, std::int32_t batch,
+                                      const std::vector<float>& pred,
+                                      const std::vector<float>& succ,
+                                      const std::vector<std::int32_t>& anchors, std::int32_t vocab,
+                                      std::int32_t tokens, std::int32_t batch,
                                       std::int32_t codebook_rows) {
     std::vector<std::int32_t> path(static_cast<std::size_t>(tokens) * batch);
     for (std::int32_t b = 0; b < batch; ++b) {
@@ -83,13 +84,12 @@ std::vector<std::int32_t> path_oracle(const std::vector<float>& logits,
             for (std::int32_t c = 0; c < kTopK; ++c) {
                 const int cand = top_idx[static_cast<std::size_t>(c)];
                 double acc     = static_cast<double>(top_val[static_cast<std::size_t>(c)]);
-                const std::size_t pred_row =
-                    static_cast<std::size_t>(prev) * kRank;
-                const std::size_t succ_row =
-                    static_cast<std::size_t>(cand) * kRank;
+                const std::size_t pred_row = static_cast<std::size_t>(prev) * kRank;
+                const std::size_t succ_row = static_cast<std::size_t>(cand) * kRank;
                 for (std::int32_t r = 0; r < kRank; ++r) {
-                    acc += (static_cast<double>(pred[pred_row + r]) * h[static_cast<std::size_t>(r)]) *
-                           static_cast<double>(succ[succ_row + r]);
+                    acc +=
+                        (static_cast<double>(pred[pred_row + r]) * h[static_cast<std::size_t>(r)]) *
+                        static_cast<double>(succ[succ_row + r]);
                 }
                 if (c == 0 || acc > best_sc || (acc == best_sc && cand < best_id)) {
                     best_sc = acc;
@@ -97,7 +97,7 @@ std::vector<std::int32_t> path_oracle(const std::vector<float>& logits,
                 }
             }
             path[static_cast<std::size_t>(t) + static_cast<std::size_t>(b) * tokens] = best_id;
-            prev = best_id;
+            prev                                                                     = best_id;
             (void)codebook_rows;
         }
     }
@@ -155,9 +155,8 @@ int run_greedy_case(const char* label, std::int32_t vocab, std::int32_t tokens, 
         anchors[static_cast<std::size_t>(b)] = (17 + b * 13) % vocab;
     }
 
-    const auto expected =
-        path_oracle(logits, hidden, device_weight.host, pred, succ, anchors, vocab, tokens, batch,
-                    codebook_rows);
+    const auto expected = path_oracle(logits, hidden, device_weight.host, pred, succ, anchors,
+                                      vocab, tokens, batch, codebook_rows);
 
     const auto logit_bits  = encode_bf16(logits);
     const auto hidden_bits = encode_bf16(hidden);
@@ -168,11 +167,12 @@ int run_greedy_case(const char* label, std::int32_t vocab, std::int32_t tokens, 
     GuardedDeviceBuffer device_pred(pred_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_succ(succ_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_anchors(anchors.size() * sizeof(std::int32_t));
-    GuardedDeviceBuffer device_path(static_cast<std::size_t>(tokens) * batch * sizeof(std::int32_t));
-    GuardedDeviceBuffer device_sel_ids(
-        static_cast<std::size_t>(kTopK) * tokens * batch * sizeof(std::int32_t));
-    GuardedDeviceBuffer device_sel_q(
-        static_cast<std::size_t>(kTopK) * tokens * batch * sizeof(float));
+    GuardedDeviceBuffer device_path(static_cast<std::size_t>(tokens) * batch *
+                                    sizeof(std::int32_t));
+    GuardedDeviceBuffer device_sel_ids(static_cast<std::size_t>(kTopK) * tokens * batch *
+                                       sizeof(std::int32_t));
+    GuardedDeviceBuffer device_sel_q(static_cast<std::size_t>(kTopK) * tokens * batch *
+                                     sizeof(float));
     device_logits.copy_from_host(logit_bits.data(), device_logits.bytes());
     device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
     device_pred.copy_from_host(pred_bits.data(), device_pred.bytes());
@@ -182,49 +182,48 @@ int run_greedy_case(const char* label, std::int32_t vocab, std::int32_t tokens, 
     device_sel_ids.fill(0xcd);
     device_sel_q.fill(0xcd);
 
-    Tensor logits_t =
-        batch == 1 ? Tensor(device_logits.data(), DType::BF16, {vocab, tokens})
-                   : Tensor(device_logits.data(), DType::BF16, {vocab, tokens, batch});
-    Tensor hidden_t =
-        batch == 1 ? Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens})
-                   : Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens, batch});
+    Tensor logits_t = batch == 1
+                          ? Tensor(device_logits.data(), DType::BF16, {vocab, tokens})
+                          : Tensor(device_logits.data(), DType::BF16, {vocab, tokens, batch});
+    Tensor hidden_t = batch == 1
+                          ? Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens})
+                          : Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens, batch});
     Tensor pred_t(device_pred.data(), DType::BF16, {kRank, codebook_rows});
     Tensor succ_t(device_succ.data(), DType::BF16, {kRank, codebook_rows});
     Tensor anchors_t(device_anchors.data(), DType::I32, {batch});
-    Tensor path_t = batch == 1 ? Tensor(device_path.data(), DType::I32, {tokens})
-                               : Tensor(device_path.data(), DType::I32, {tokens, batch});
-    Tensor sel_ids_t =
-        batch == 1 ? Tensor(device_sel_ids.data(), DType::I32, {kTopK, tokens})
-                   : Tensor(device_sel_ids.data(), DType::I32, {kTopK, tokens, batch});
+    Tensor path_t    = batch == 1 ? Tensor(device_path.data(), DType::I32, {tokens})
+                                  : Tensor(device_path.data(), DType::I32, {tokens, batch});
+    Tensor sel_ids_t = batch == 1
+                           ? Tensor(device_sel_ids.data(), DType::I32, {kTopK, tokens})
+                           : Tensor(device_sel_ids.data(), DType::I32, {kTopK, tokens, batch});
     Tensor sel_q_t = batch == 1 ? Tensor(device_sel_q.data(), DType::FP32, {kTopK, tokens})
                                 : Tensor(device_sel_q.data(), DType::FP32, {kTopK, tokens, batch});
 
-    const std::size_t workspace_bytes = ops::dflash2_path_select_workspace_capacity_bytes(
-        QType::BF16_CTRL, tokens, tokens, batch);
+    const std::size_t workspace_bytes =
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, batch,
                      temperature, 0ull, path_t, workspace, nullptr, nullptr, nullptr, nullptr,
                      &sel_ids_t, &sel_q_t, force_greedy, p_less);
     cuda_synchronize();
 
-    int failures = verify_exact(label, from_device<std::int32_t>(device_path.data(),
-                                                               static_cast<std::size_t>(tokens) *
-                                                                   batch),
-                                expected);
-    const auto got_ids =
-        from_device<std::int32_t>(device_sel_ids.data(),
-                                  static_cast<std::size_t>(kTopK) * tokens * batch);
+    int failures = verify_exact(
+        label,
+        from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens) * batch),
+        expected);
+    const auto got_ids = from_device<std::int32_t>(
+        device_sel_ids.data(), static_cast<std::size_t>(kTopK) * tokens * batch);
     const auto got_q =
         from_device<float>(device_sel_q.data(), static_cast<std::size_t>(kTopK) * tokens * batch);
     for (std::int32_t b = 0; b < batch; ++b) {
         for (std::int32_t t = 0; t < tokens; ++t) {
             const std::size_t hop =
                 (static_cast<std::size_t>(b) * tokens + t) * static_cast<std::size_t>(kTopK);
-            const int chosen = expected[static_cast<std::size_t>(t) +
-                                        static_cast<std::size_t>(b) * tokens];
-            float qsum       = 0.0f;
-            int hot          = 0;
-            bool matched     = false;
+            const int chosen =
+                expected[static_cast<std::size_t>(t) + static_cast<std::size_t>(b) * tokens];
+            float qsum   = 0.0f;
+            int hot      = 0;
+            bool matched = false;
             for (std::int32_t c = 0; c < kTopK; ++c) {
                 const float qv = got_q[hop + static_cast<std::size_t>(c)];
                 qsum += qv;
@@ -294,12 +293,14 @@ int run_stochastic_support_case() {
     Tensor anchors_t(device_anchors.data(), DType::I32, {1});
     Tensor path_t(device_path.data(), DType::I32, {tokens});
     WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+        256,
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.6f,
                      42ull, path_t, workspace, nullptr);
     cuda_synchronize();
 
-    const auto got = from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens));
+    const auto got =
+        from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens));
     for (std::int32_t t = 0; t < tokens; ++t) {
         if (got[static_cast<std::size_t>(t)] < 0 || got[static_cast<std::size_t>(t)] >= kTopK) {
             std::cerr << "dflash2_path_select stochastic: token outside peaked top-16\n";
@@ -324,8 +325,7 @@ int run_stochastic_batch_row_invariance_case() {
         for (std::int32_t t = 0; t < tokens; ++t) {
             const std::size_t base = static_cast<std::size_t>(b * tokens + t) * vocab;
             for (std::int32_t c = 0; c < kTopK; ++c) {
-                logits[base + static_cast<std::size_t>(c)] =
-                    8.0f - 0.05f * static_cast<float>(c);
+                logits[base + static_cast<std::size_t>(c)] = 8.0f - 0.05f * static_cast<float>(c);
             }
         }
     }
@@ -357,14 +357,14 @@ int run_stochastic_batch_row_invariance_case() {
     Tensor succ_t(device_succ.data(), DType::BF16, {kRank, vocab});
     Tensor anchors_t(device_anchors.data(), DType::I32, {batch});
     Tensor path_t(device_path.data(), DType::I32, {tokens, batch});
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens,
-                                                               batch)));
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
+                                       QType::BF16_CTRL, tokens, tokens, batch)));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, batch,
                      0.6f, 42ull, path_t, workspace, nullptr);
 
-    const auto got = from_device<std::int32_t>(device_path.data(),
-                                                static_cast<std::size_t>(tokens) * batch);
+    const auto got =
+        from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens) * batch);
     if (!std::equal(got.begin(), got.begin() + tokens, got.begin() + tokens)) {
         std::cerr << "dflash2_path_select stochastic result depends on compact batch row\n";
         return 1;
@@ -422,7 +422,8 @@ int run_stochastic_selector_q_case() {
     Tensor sel_ids_t(device_sel_ids.data(), DType::I32, {kTopK, tokens});
     Tensor sel_q_t(device_sel_q.data(), DType::FP32, {kTopK, tokens});
     WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+        256,
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.6f,
                      42ull, path_t, workspace, nullptr, nullptr, nullptr, nullptr, &sel_ids_t,
                      &sel_q_t);
@@ -464,10 +465,10 @@ int run_stochastic_selector_q_case() {
 }
 
 int run_shortlist_remap_case() {
-    constexpr std::int32_t vocab          = 32;
-    constexpr std::int32_t tokens         = 2;
-    constexpr std::int32_t codebook_rows  = ops::kDflash2PathSelectCodebookRows;
-    HostWeight host_weight                = make_patterned(kRank, kHidden, 21u);
+    constexpr std::int32_t vocab         = 32;
+    constexpr std::int32_t tokens        = 2;
+    constexpr std::int32_t codebook_rows = ops::kDflash2PathSelectCodebookRows;
+    HostWeight host_weight               = make_patterned(kRank, kHidden, 21u);
     DeviceWeight device_weight(std::move(host_weight));
 
     std::vector<float> logits(static_cast<std::size_t>(vocab) * tokens, -12.0f);
@@ -509,15 +510,17 @@ int run_shortlist_remap_case() {
     Tensor anchors_t(device_anchors.data(), DType::I32, {1});
     Tensor path_t(device_path.data(), DType::I32, {tokens});
     WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+        256,
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.0f,
                      0ull, path_t, workspace, nullptr, &ids_t);
     cuda_synchronize();
 
-    const auto got = from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens));
+    const auto got =
+        from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens));
     if (got[0] != 1001 || got[1] != 1002) {
-        std::cerr << "dflash2_path_select shortlist remap: expected 1001,1002 got " << got[0]
-                  << "," << got[1] << "\n";
+        std::cerr << "dflash2_path_select shortlist remap: expected 1001,1002 got " << got[0] << ","
+                  << got[1] << "\n";
         return 1;
     }
     return 0;
@@ -567,14 +570,17 @@ int run_nan_logits_shortlist_case() {
     Tensor anchors_t(device_anchors.data(), DType::I32, {1});
     Tensor path_t(device_path.data(), DType::I32, {tokens});
     WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+        256,
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.0f,
                      0ull, path_t, workspace, nullptr, &ids_t);
     cuda_synchronize();
 
-    const auto got = from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens));
+    const auto got =
+        from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens));
     for (std::int32_t t = 0; t < tokens; ++t) {
-        if (got[static_cast<std::size_t>(t)] < 1000 || got[static_cast<std::size_t>(t)] >= 1000 + vocab) {
+        if (got[static_cast<std::size_t>(t)] < 1000 ||
+            got[static_cast<std::size_t>(t)] >= 1000 + vocab) {
             std::cerr << "dflash2_path_select NaN logits: path token out of shortlist map\n";
             return 1;
         }
@@ -640,22 +646,24 @@ int run_tree_layout_case(std::int32_t width) {
     Tensor mask_t(device_mask.data(), DType::I32, {width, 1});
     Tensor valid_t(device_valid.data(), DType::I32, {1});
     WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+        256,
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
     ops::dflash2_tree_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
                              frontiers_t, ids_t, parent_t, cache_t, rope_t, mask_t, valid_t,
                              workspace, nullptr);
     cuda_synchronize();
 
-    const auto ids    = from_device<std::int32_t>(device_ids.data(), width);
-    const auto parent = from_device<std::int32_t>(device_parent.data(), width);
-    const auto cache  = from_device<std::int32_t>(device_cache.data(), width);
-    const auto rope   = from_device<std::int32_t>(device_rope.data(), width);
-    const auto mask   = from_device<std::int32_t>(device_mask.data(), width);
-    const auto valid  = from_device<std::int32_t>(device_valid.data(), 1);
-    int failures      = 0;
-    const int live    = valid[0];
-    if (live != 1 + ops::kDflash2TreeFrontier * tokens) {
-        std::cerr << "dflash2_tree_select: expected live " << (1 + 2 * tokens) << " got " << live
+    const auto ids          = from_device<std::int32_t>(device_ids.data(), width);
+    const auto parent       = from_device<std::int32_t>(device_parent.data(), width);
+    const auto cache        = from_device<std::int32_t>(device_cache.data(), width);
+    const auto rope         = from_device<std::int32_t>(device_rope.data(), width);
+    const auto mask         = from_device<std::int32_t>(device_mask.data(), width);
+    const auto valid        = from_device<std::int32_t>(device_valid.data(), 1);
+    int failures            = 0;
+    const int live          = valid[0];
+    const int expected_live = std::min(width, 1 + ops::kDflash2PathSelectTopK * tokens);
+    if (live != expected_live) {
+        std::cerr << "dflash2_tree_select: expected live " << expected_live << " got " << live
                   << "\n";
         ++failures;
     }
@@ -668,8 +676,8 @@ int run_tree_layout_case(std::int32_t width) {
             std::cerr << "dflash2_tree_select: cache slot " << j << "\n";
             ++failures;
         }
-        if (j > 0 && (parent[static_cast<std::size_t>(j)] < 0 ||
-                      parent[static_cast<std::size_t>(j)] >= j)) {
+        if (j > 0 &&
+            (parent[static_cast<std::size_t>(j)] < 0 || parent[static_cast<std::size_t>(j)] >= j)) {
             std::cerr << "dflash2_tree_select: parent of " << j << " is not prefix-closed\n";
             ++failures;
         }
@@ -710,10 +718,14 @@ int run_tree_compact_case() {
     round_to_bf16(logits);
     round_to_bf16(hidden);
     const std::int32_t anchor = 1;
-    GuardedDeviceBuffer device_logits(vocab * tokens * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_hidden(kHidden * tokens * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_pred(kRank * vocab * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_succ(kRank * vocab * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_logits(static_cast<std::size_t>(vocab) * tokens *
+                                      sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_hidden(static_cast<std::size_t>(kHidden) * tokens *
+                                      sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_pred(static_cast<std::size_t>(kRank) * vocab *
+                                    sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_succ(static_cast<std::size_t>(kRank) * vocab *
+                                    sizeof(std::uint16_t));
     GuardedDeviceBuffer device_anchors(sizeof(std::int32_t));
     GuardedDeviceBuffer device_frontiers(sizeof(std::int32_t));
     GuardedDeviceBuffer device_ids(static_cast<std::size_t>(width) * sizeof(std::int32_t));
@@ -746,7 +758,8 @@ int run_tree_compact_case() {
     Tensor mask_t(device_mask.data(), DType::I32, {width, 1});
     Tensor valid_t(device_valid.data(), DType::I32, {1});
     WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+        256,
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
     ops::dflash2_tree_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
                              frontiers_t, ids_t, parent_t, cache_t, rope_t, mask_t, valid_t,
                              workspace, nullptr);
@@ -762,13 +775,19 @@ int run_tree_compact_case() {
                   << "\n";
         ++failures;
     }
-    if (live >= 3 && (parent[1] != 0 || parent[2] != 0)) {
-        std::cerr << "dflash2_tree_select compact: BFS prefix dropped a depth-1 sibling\n";
-        ++failures;
+    // Depth-first preorder: every column's parent lies on the root path of the previous column.
+    for (int j = 2; j < live; ++j) {
+        bool on_path = false;
+        for (int cur = j - 1; cur >= 0; cur = parent[static_cast<std::size_t>(cur)]) {
+            if (cur == parent[static_cast<std::size_t>(j)]) { on_path = true; }
+        }
+        if (!on_path) {
+            std::cerr << "dflash2_tree_select compact: column " << j << " breaks preorder\n";
+            ++failures;
+        }
     }
     for (int j = 1; j < live; ++j) {
-        if (parent[static_cast<std::size_t>(j)] < 0 ||
-            parent[static_cast<std::size_t>(j)] >= j ||
+        if (parent[static_cast<std::size_t>(j)] < 0 || parent[static_cast<std::size_t>(j)] >= j ||
             cache[static_cast<std::size_t>(j)] != e + j) {
             std::cerr << "dflash2_tree_select compact: invalid packed column " << j << "\n";
             ++failures;
@@ -778,7 +797,7 @@ int run_tree_compact_case() {
 }
 
 int run_nvfp4_codebook_greedy_case(const char* label, std::int32_t tokens, std::int32_t batch,
-                                  std::uint32_t seed) {
+                                   std::uint32_t seed) {
     constexpr std::int32_t vocab         = 128;
     constexpr std::int32_t codebook_rows = 128;
     HostWeight host_weight               = make_patterned(kRank, kHidden, seed);
@@ -787,12 +806,10 @@ int run_nvfp4_codebook_greedy_case(const char* label, std::int32_t tokens, std::
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 1.0F;
-    input_projection::DevicePackedWeight pred_packed(
-        quantized_weight::make_patterned_weight(QType::NVFP4, codebook_rows, kRank, seed + 6,
-                                                options));
-    input_projection::DevicePackedWeight succ_packed(
-        quantized_weight::make_patterned_weight(QType::NVFP4, codebook_rows, kRank, seed + 8,
-                                                options));
+    input_projection::DevicePackedWeight pred_packed(quantized_weight::make_patterned_weight(
+        QType::NVFP4, codebook_rows, kRank, seed + 6, options));
+    input_projection::DevicePackedWeight succ_packed(quantized_weight::make_patterned_weight(
+        QType::NVFP4, codebook_rows, kRank, seed + 8, options));
 
     std::vector<float> logits(static_cast<std::size_t>(vocab) * tokens * batch);
     std::vector<float> hidden(static_cast<std::size_t>(kHidden) * tokens * batch);
@@ -819,9 +836,8 @@ int run_nvfp4_codebook_greedy_case(const char* label, std::int32_t tokens, std::
     round_to_bf16(pred);
     round_to_bf16(succ);
 
-    const auto expected =
-        path_oracle(logits, hidden, device_weight.host, pred, succ, anchors, vocab, tokens, batch,
-                    codebook_rows);
+    const auto expected = path_oracle(logits, hidden, device_weight.host, pred, succ, anchors,
+                                      vocab, tokens, batch, codebook_rows);
 
     const auto logit_bits  = encode_bf16(logits);
     const auto hidden_bits = encode_bf16(hidden);
@@ -835,12 +851,12 @@ int run_nvfp4_codebook_greedy_case(const char* label, std::int32_t tokens, std::
     device_anchors.copy_from_host(anchors.data(), device_anchors.bytes());
     device_path.fill(0xcd);
 
-    Tensor logits_t =
-        batch == 1 ? Tensor(device_logits.data(), DType::BF16, {vocab, tokens})
-                   : Tensor(device_logits.data(), DType::BF16, {vocab, tokens, batch});
-    Tensor hidden_t =
-        batch == 1 ? Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens})
-                   : Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens, batch});
+    Tensor logits_t = batch == 1
+                          ? Tensor(device_logits.data(), DType::BF16, {vocab, tokens})
+                          : Tensor(device_logits.data(), DType::BF16, {vocab, tokens, batch});
+    Tensor hidden_t = batch == 1
+                          ? Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens})
+                          : Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens, batch});
     Tensor dummy_code;
     Tensor anchors_t(device_anchors.data(), DType::I32, {batch});
     Tensor path_t = batch == 1 ? Tensor(device_path.data(), DType::I32, {tokens})
@@ -848,17 +864,17 @@ int run_nvfp4_codebook_greedy_case(const char* label, std::int32_t tokens, std::
     Weight pred_w = pred_packed.view();
     Weight succ_w = succ_packed.view();
 
-    const std::size_t workspace_bytes = ops::dflash2_path_select_workspace_capacity_bytes(
-        QType::BF16_CTRL, tokens, tokens, batch);
+    const std::size_t workspace_bytes =
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     call_path_select(logits_t, hidden_t, device_weight.view(), dummy_code, dummy_code, anchors_t,
                      batch, 0.0f, 0ull, path_t, workspace, nullptr, nullptr, &pred_w, &succ_w);
     cuda_synchronize();
 
-    int failures = verify_exact(label,
-                                from_device<std::int32_t>(device_path.data(),
-                                                          static_cast<std::size_t>(tokens) * batch),
-                                expected);
+    int failures = verify_exact(
+        label,
+        from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens) * batch),
+        expected);
     failures += device_path.verify_guards("dflash2_path_select NVFP4 codebook path");
     failures += pred_packed.verify_preserved("dflash2_path_select NVFP4 pred codebook");
     failures += succ_packed.verify_preserved("dflash2_path_select NVFP4 succ codebook");
@@ -892,9 +908,8 @@ int run_mixed_temperature_batch_case() {
     round_to_bf16(succ);
     std::vector<std::int32_t> anchors{3, 5};
 
-    const auto expected =
-        path_oracle(logits, hidden, device_weight.host, pred, succ, anchors, vocab, tokens, batch,
-                    vocab);
+    const auto expected = path_oracle(logits, hidden, device_weight.host, pred, succ, anchors,
+                                      vocab, tokens, batch, vocab);
 
     const auto logit_bits  = encode_bf16(logits);
     const auto hidden_bits = encode_bf16(hidden);
@@ -931,26 +946,27 @@ int run_mixed_temperature_batch_case() {
     configs[1].seed        = 0ull;
     GuardedDeviceBuffer device_configs(configs.size() * sizeof(ops::SamplingConfig));
     device_configs.copy_from_host(configs.data(), device_configs.bytes());
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens,
-                                                               batch)));
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
+                                       QType::BF16_CTRL, tokens, tokens, batch)));
     ops::dflash2_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
-                              positions_t,
-                              reinterpret_cast<const ops::SamplingConfig*>(device_configs.data()),
+                             positions_t,
+                             reinterpret_cast<const ops::SamplingConfig*>(device_configs.data()),
                              path_t, workspace, nullptr);
     cuda_synchronize();
 
-    const auto got = from_device<std::int32_t>(device_path.data(),
-                                               static_cast<std::size_t>(tokens) * batch);
+    const auto got =
+        from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens) * batch);
     for (std::int32_t t = 0; t < tokens; ++t) {
         const std::int32_t sampled = got[static_cast<std::size_t>(t)];
-        const std::int32_t greedy  = got[static_cast<std::size_t>(tokens + t)];
+        const std::int32_t greedy  = got[static_cast<std::size_t>(tokens) + t];
         if (sampled < 0 || sampled >= kTopK) {
             std::cerr << "dflash2_path_select mixed-temp: sampled row token outside top-16\n";
             return 1;
         }
-        if (greedy != expected[static_cast<std::size_t>(tokens + t)]) {
-            std::cerr << "dflash2_path_select mixed-temp: greedy row used another row's temperature\n";
+        if (greedy != expected[static_cast<std::size_t>(tokens) + t]) {
+            std::cerr
+                << "dflash2_path_select mixed-temp: greedy row used another row's temperature\n";
             return 1;
         }
     }
@@ -963,8 +979,8 @@ int run_nvfp4_projection_oracle() {
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 1.0F;
-    input_projection::DevicePackedWeight device_weight(quantized_weight::make_patterned_weight(
-        QType::NVFP4, kRank, kHidden, 41u, options));
+    input_projection::DevicePackedWeight device_weight(
+        quantized_weight::make_patterned_weight(QType::NVFP4, kRank, kHidden, 41u, options));
 
     std::vector<float> logits(static_cast<std::size_t>(vocab) * tokens);
     std::vector<float> hidden(static_cast<std::size_t>(kHidden) * tokens);
@@ -1008,8 +1024,8 @@ int run_nvfp4_projection_oracle() {
         int best_id    = top_idx[0];
         double best_sc = 0.0;
         for (std::int32_t c = 0; c < kTopK; ++c) {
-            const int cand = top_idx[static_cast<std::size_t>(c)];
-            double acc     = static_cast<double>(top_val[static_cast<std::size_t>(c)]);
+            const int cand             = top_idx[static_cast<std::size_t>(c)];
+            double acc                 = static_cast<double>(top_val[static_cast<std::size_t>(c)]);
             const std::size_t pred_row = static_cast<std::size_t>(prev) * kRank;
             const std::size_t succ_row = static_cast<std::size_t>(cand) * kRank;
             for (std::int32_t r = 0; r < kRank; ++r) {
@@ -1048,8 +1064,8 @@ int run_nvfp4_projection_oracle() {
     Tensor succ_t(device_succ.data(), DType::BF16, {kRank, vocab});
     Tensor anchors_t(device_anchors.data(), DType::I32, {1});
     Tensor path_t(device_path.data(), DType::I32, {tokens});
-    const std::size_t workspace_bytes = ops::dflash2_path_select_workspace_capacity_bytes(
-        QType::NVFP4, tokens, tokens, 1);
+    const std::size_t workspace_bytes =
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::NVFP4, tokens, tokens, 1);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.0f,
                      0ull, path_t, workspace, nullptr);
@@ -1067,8 +1083,8 @@ std::uint8_t encode_e4m3fn_nonneg(float value) {
     std::uint8_t best = 0;
     float best_err    = value;
     for (int word = 1; word <= 0x7e; ++word) {
-        const float decoded =
-            static_cast<float>(quantized_weight::detail::decode_e4m3fn(static_cast<std::uint8_t>(word)));
+        const float decoded = static_cast<float>(
+            quantized_weight::detail::decode_e4m3fn(static_cast<std::uint8_t>(word)));
         const float err = std::fabs(decoded - value);
         if (err < best_err) {
             best     = static_cast<std::uint8_t>(word);
@@ -1106,9 +1122,9 @@ quantized_weight::PackedWeight pack_dflash2_nvfp4_codebook(const std::vector<flo
     const float divisor = amax == 0.0f ? 1.0f : (kE2M1Max * kE4M3Max) / amax;
 
     quantized_weight::PackedWeight packed;
-    packed.code_plane_bytes = static_cast<std::uint64_t>(rows) * kRank / 2;
-    packed.scale_plane_offset =
-        quantized_weight::detail::align_up_size(static_cast<std::size_t>(packed.code_plane_bytes), 256);
+    packed.code_plane_bytes   = static_cast<std::uint64_t>(rows) * kRank / 2;
+    packed.scale_plane_offset = quantized_weight::detail::align_up_size(
+        static_cast<std::size_t>(packed.code_plane_bytes), 256);
     packed.scale_plane_bytes     = static_cast<std::uint64_t>(rows) * kRank / 16;
     packed.weight_divisor_offset = packed.scale_plane_offset + packed.scale_plane_bytes;
     packed.payload.assign(static_cast<std::size_t>(packed.weight_divisor_offset) + 4U, 0);
@@ -1119,32 +1135,28 @@ quantized_weight::PackedWeight pack_dflash2_nvfp4_codebook(const std::vector<flo
         const std::int32_t row_tile  = row / 128;
         const std::int32_t row_inner = row % 128;
         for (int group = 0; group < kRank / kGroup; ++group) {
+            const std::size_t group_base =
+                static_cast<std::size_t>(row) * kRank + static_cast<std::size_t>(group) * kGroup;
             float group_amax = 0.0f;
             for (int i = 0; i < kGroup; ++i) {
-                group_amax = std::max(
-                    group_amax,
-                    std::fabs(token_major[static_cast<std::size_t>(row) * kRank + group * kGroup + i]));
+                group_amax = std::max(group_amax, std::fabs(token_major[group_base + i]));
             }
             const float scale_fp32 =
                 std::min(kE4M3Max, std::max(0.0f, group_amax * divisor / kE2M1Max));
             const std::uint8_t scale_word = encode_e4m3fn_nonneg(scale_fp32);
             const float decoded =
                 static_cast<float>(quantized_weight::detail::decode_e4m3fn(scale_word));
-            const float safe              = decoded > 0.0f ? decoded : 1.0f;
-            const int scale_tile          = group / 4;
-            const int scale_lane          = group % 4;
+            const float safe                                     = decoded > 0.0f ? decoded : 1.0f;
+            const int scale_tile                                 = group / 4;
+            const int scale_lane                                 = group % 4;
             packed.payload[packed.scale_plane_offset +
                            static_cast<std::size_t>(row_tile * k_tiles + scale_tile) * 512U +
                            static_cast<std::size_t>(row_inner % 32) * 16U +
                            static_cast<std::size_t>(row_inner / 32) * 4U +
                            static_cast<std::size_t>(scale_lane)] = scale_word;
             for (int i = 0; i < kGroup; i += 2) {
-                const float lo =
-                    token_major[static_cast<std::size_t>(row) * kRank + group * kGroup + i] *
-                    divisor / safe;
-                const float hi =
-                    token_major[static_cast<std::size_t>(row) * kRank + group * kGroup + i + 1] *
-                    divisor / safe;
+                const float lo = token_major[group_base + i] * divisor / safe;
+                const float hi = token_major[group_base + i + 1] * divisor / safe;
                 packed.payload[static_cast<std::size_t>(row) * (kRank / 2) +
                                static_cast<std::size_t>(group * (kGroup / 2) + i / 2)] =
                     static_cast<std::uint8_t>(encode_e2m1_nibble(lo) |
@@ -1185,8 +1197,8 @@ int run_nvfp4_codebook_matches_bf16_accept(const char* label, std::int32_t token
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 1.0F;
-    input_projection::DevicePackedWeight projection(quantized_weight::make_patterned_weight(
-        QType::NVFP4, kRank, kHidden, seed, options));
+    input_projection::DevicePackedWeight projection(
+        quantized_weight::make_patterned_weight(QType::NVFP4, kRank, kHidden, seed, options));
 
     std::vector<float> logits(static_cast<std::size_t>(vocab) * tokens * batch);
     std::vector<float> hidden(static_cast<std::size_t>(kHidden) * tokens * batch);
@@ -1219,7 +1231,8 @@ int run_nvfp4_codebook_matches_bf16_accept(const char* label, std::int32_t token
     GuardedDeviceBuffer device_pred(pred_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_succ(succ_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_anchors(anchors.size() * sizeof(std::int32_t));
-    GuardedDeviceBuffer device_bf16(static_cast<std::size_t>(tokens) * batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_bf16(static_cast<std::size_t>(tokens) * batch *
+                                    sizeof(std::int32_t));
     GuardedDeviceBuffer device_nvfp4(static_cast<std::size_t>(tokens) * batch *
                                      sizeof(std::int32_t));
     device_logits.copy_from_host(logit_bits.data(), device_logits.bytes());
@@ -1230,18 +1243,18 @@ int run_nvfp4_codebook_matches_bf16_accept(const char* label, std::int32_t token
     device_bf16.fill(0xcd);
     device_nvfp4.fill(0xcd);
 
-    Tensor logits_t =
-        batch == 1 ? Tensor(device_logits.data(), DType::BF16, {vocab, tokens})
-                   : Tensor(device_logits.data(), DType::BF16, {vocab, tokens, batch});
-    Tensor hidden_t =
-        batch == 1 ? Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens})
-                   : Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens, batch});
+    Tensor logits_t = batch == 1
+                          ? Tensor(device_logits.data(), DType::BF16, {vocab, tokens})
+                          : Tensor(device_logits.data(), DType::BF16, {vocab, tokens, batch});
+    Tensor hidden_t = batch == 1
+                          ? Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens})
+                          : Tensor(device_hidden.data(), DType::BF16, {kHidden, tokens, batch});
     Tensor pred_t(device_pred.data(), DType::BF16, {kRank, vocab});
     Tensor succ_t(device_succ.data(), DType::BF16, {kRank, vocab});
     Tensor dummy;
     Tensor anchors_t(device_anchors.data(), DType::I32, {batch});
-    Tensor bf16_path = batch == 1 ? Tensor(device_bf16.data(), DType::I32, {tokens})
-                                  : Tensor(device_bf16.data(), DType::I32, {tokens, batch});
+    Tensor bf16_path  = batch == 1 ? Tensor(device_bf16.data(), DType::I32, {tokens})
+                                   : Tensor(device_bf16.data(), DType::I32, {tokens, batch});
     Tensor nvfp4_path = batch == 1 ? Tensor(device_nvfp4.data(), DType::I32, {tokens})
                                    : Tensor(device_nvfp4.data(), DType::I32, {tokens, batch});
     const std::size_t workspace_bytes =
@@ -1253,7 +1266,7 @@ int run_nvfp4_codebook_matches_bf16_accept(const char* label, std::int32_t token
                      0ull, nvfp4_path, workspace, nullptr, nullptr, &pred_w, &succ_w);
     cuda_synchronize();
 
-    const std::size_t count = static_cast<std::size_t>(tokens) * batch;
+    const std::size_t count   = static_cast<std::size_t>(tokens) * batch;
     const auto bf16_path_ids  = from_device<std::int32_t>(device_bf16.data(), count);
     const auto nvfp4_path_ids = from_device<std::int32_t>(device_nvfp4.data(), count);
     std::size_t path_mismatch = 0;
@@ -1302,8 +1315,8 @@ int run_nvfp4_codebook_matches_bf16_accept(const char* label, std::int32_t token
                              frontiers_t, ids_nvfp4_t, parent_nvfp4_t, cache_t, rope_t, mask_t,
                              valid_nvfp4_t, workspace, nullptr, nullptr, &pred_w, &succ_w);
     cuda_synchronize();
-    const auto tree_bf16  = from_device<std::int32_t>(device_ids_bf16.data(), width);
-    const auto tree_nvfp4 = from_device<std::int32_t>(device_ids_nvfp4.data(), width);
+    const auto tree_bf16      = from_device<std::int32_t>(device_ids_bf16.data(), width);
+    const auto tree_nvfp4     = from_device<std::int32_t>(device_ids_nvfp4.data(), width);
     std::size_t tree_mismatch = 0;
     for (std::size_t i = 0; i < static_cast<std::size_t>(width); ++i) {
         if (tree_nvfp4[i] != tree_bf16[i]) { ++tree_mismatch; }
@@ -1323,8 +1336,11 @@ int run_nvfp4_codebook_matches_bf16_accept(const char* label, std::int32_t token
 // identically and only the *structural* invariants (prefix-closed parent, mask
 // closure, cache/rope slots, live count) are exercised. The content of the
 // node selection -- which token actually lands in which tree node, via the real
-// Markov score -- was never checked. This oracle rebuilds the same beam-2 BFS
-// in FP64 on the host and compares the full packed tree.
+// Markov score -- is checked here. This oracle rebuilds the best-first tree in FP64
+// on the host (each parent's 16 children scored by unary + Markov, log-softmax
+// normalized per parent; repeatedly pop the frontier node of greatest path
+// log-probability) and emits it in depth-first preorder with children in
+// descending path log-probability, then compares the full packed tree.
 //
 // The inputs are deliberately well-separated so the top-2 frontier choice is
 // unambiguous regardless of the kernel's FP32/BF16 accumulation order:
@@ -1346,22 +1362,16 @@ struct TreeContentOracle {
 };
 
 TreeContentOracle tree_content_oracle(const std::vector<float>& logits,
-                                       const std::vector<float>& pred,
-                                       const std::vector<float>& succ,
-                                       std::int32_t anchor, std::int32_t frontier,
-                                       std::int32_t vocab, std::int32_t tokens,
-                                       std::int32_t width) {
-    const std::int32_t kExpand = ops::kDflash2TreeExpandWidth;
-    // node_id[i] = packed column i's token id; node_parent[i] = parent packed column
-    // (-1 for the root); node_score[i] = cumulative Markov score of the path.
-    std::vector<std::int32_t> node_id;    // token id per packed column
-    std::vector<std::int32_t> node_parent;
-    std::vector<std::int32_t> node_depth;
-    std::vector<double> node_score;
-    node_id.push_back(anchor);
-    node_parent.push_back(-1);
-    node_depth.push_back(0);
-    node_score.push_back(0.0);
+                                      const std::vector<float>& pred,
+                                      const std::vector<float>& succ, std::int32_t anchor,
+                                      std::int32_t frontier, std::int32_t vocab,
+                                      std::int32_t tokens, std::int32_t width,
+                                      double hidden_scale = 1.0, double temperature = 1.0) {
+    // Nodes in pop order: token id, parent node, depth, path log-probability.
+    std::vector<std::int32_t> node_id{anchor};
+    std::vector<std::int32_t> node_parent{-1};
+    std::vector<std::int32_t> node_depth{0};
+    std::vector<double> node_logp{0.0};
 
     auto top16 = [&](std::int32_t t) {
         std::vector<float> tv(kTopK, -std::numeric_limits<float>::infinity());
@@ -1372,63 +1382,82 @@ TreeContentOracle tree_content_oracle(const std::vector<float>& logits,
         }
         return std::pair<std::vector<float>, std::vector<int>>(std::move(tv), std::move(ti));
     };
+    // The fixtures force the hidden projection h = 1 exactly; the Markov sum is evaluated
+    // generically over the kRank ranks.
+    std::vector<double> hidden_proj(kRank, hidden_scale);
 
-    // h[r] for each draft column: here the test fixtures force h = 1 exactly, but the
-    // oracle computes the Markov sum generically over the kRank ranks so it stays valid
-    // if the fixture is relaxed.
-    std::vector<std::vector<double>> hidden_proj(tokens, std::vector<double>(kRank, 1.0));
+    struct Entry {
+        double logp;
+        std::int32_t cand;
+        std::int32_t parent;
+        std::int32_t depth;
+    };
 
-    std::vector<std::int32_t> frontier_nodes{0};
-    for (std::int32_t t = 0; t < tokens; ++t) {
-        const auto tv_ti = top16(t);
-        const auto& top_val = tv_ti.first;
-        const auto& top_idx = tv_ti.second;
-        struct Pair {
-            double joint;
-            int cand;
-            int pcol;
-        };
-        std::vector<Pair> pairs;
-        pairs.reserve(frontier_nodes.size() * static_cast<std::size_t>(kTopK));
-        for (int f : frontier_nodes) {
-            const int pcol         = f;
-            const double base     = node_score[pcol];
-            const int parent_token = node_id[pcol];
-            for (int c = 0; c < kTopK; ++c) {
-                const int cand        = top_idx[static_cast<std::size_t>(c)];
-                const double unary    = static_cast<double>(top_val[static_cast<std::size_t>(c)]);
-                double markov         = 0.0;
-                for (std::int32_t r = 0; r < kRank; ++r) {
-                    markov += (static_cast<double>(
-                                    pred[static_cast<std::size_t>(parent_token) * kRank + r]) *
-                                hidden_proj[static_cast<std::size_t>(t)][static_cast<std::size_t>(r)]) *
-                               static_cast<double>(succ[static_cast<std::size_t>(cand) * kRank + r]);
-                }
-                pairs.push_back({base + unary + markov, cand, pcol});
+    std::vector<Entry> pool;
+    const auto expand = [&](std::int32_t node) {
+        const std::int32_t t = node_depth[static_cast<std::size_t>(node)];
+        if (t >= tokens) { return; }
+        const auto [top_val, top_idx] = top16(t);
+        std::vector<double> score(kTopK);
+        const int parent_token = node_id[static_cast<std::size_t>(node)];
+        for (int c = 0; c < kTopK; ++c) {
+            const int cand = top_idx[static_cast<std::size_t>(c)];
+            double markov  = 0.0;
+            for (std::int32_t r = 0; r < kRank; ++r) {
+                markov +=
+                    (static_cast<double>(pred[static_cast<std::size_t>(parent_token) * kRank + r]) *
+                     hidden_proj[static_cast<std::size_t>(r)]) *
+                    static_cast<double>(succ[static_cast<std::size_t>(cand) * kRank + r]);
+            }
+            score[static_cast<std::size_t>(c)] =
+                (static_cast<double>(top_val[static_cast<std::size_t>(c)]) + markov) / temperature;
+        }
+        const double mx = *std::max_element(score.begin(), score.end());
+        double sum      = 0.0;
+        for (double v : score) { sum += std::exp(v - mx); }
+        const double lse = mx + std::log(sum);
+        for (int c = 0; c < kTopK; ++c) {
+            pool.push_back({node_logp[static_cast<std::size_t>(node)] +
+                                score[static_cast<std::size_t>(c)] - lse,
+                            top_idx[static_cast<std::size_t>(c)], node, t + 1});
+        }
+    };
+    expand(0);
+    while (static_cast<std::int32_t>(node_id.size()) < width && !pool.empty()) {
+        std::size_t best = 0;
+        for (std::size_t i = 1; i < pool.size(); ++i) {
+            if (pool[i].logp > pool[best].logp ||
+                (pool[i].logp == pool[best].logp && pool[i].cand < pool[best].cand)) {
+                best = i;
             }
         }
-        // Top-2 by (joint desc, cand asc, pcol asc) -- matches the kernel tiebreak.
-        std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) {
-            if (a.joint != b.joint) { return a.joint > b.joint; }
-            if (a.cand != b.cand) { return a.cand < b.cand; }
-            return a.pcol < b.pcol;
-        });
-        const int take = std::min<std::size_t>(2, pairs.size());
-        std::vector<std::int32_t> next_frontier;
-        for (int s = 0; s < take; ++s) {
-            const auto& p = pairs[static_cast<std::size_t>(s)];
-            if (static_cast<std::int32_t>(node_id.size()) >= kExpand) { break; }
-            node_id.push_back(p.cand);
-            node_parent.push_back(p.pcol);
-            node_depth.push_back(t + 1);
-            node_score.push_back(p.joint);
-            next_frontier.push_back(static_cast<std::int32_t>(node_id.size() - 1));
-        }
-        if (!next_frontier.empty()) { frontier_nodes = std::move(next_frontier); }
+        const Entry e = pool[best];
+        pool.erase(pool.begin() + static_cast<std::ptrdiff_t>(best));
+        node_id.push_back(e.cand);
+        node_parent.push_back(e.parent);
+        node_depth.push_back(e.depth);
+        node_logp.push_back(e.logp);
+        expand(static_cast<std::int32_t>(node_id.size()) - 1);
     }
+    const auto out_n = static_cast<std::int32_t>(node_id.size());
 
-    const std::int32_t out_n =
-        static_cast<std::int32_t>(std::min(node_id.size(), static_cast<std::size_t>(width)));
+    // Depth-first preorder, children in descending path log-probability.
+    std::vector<std::int32_t> order;
+    std::vector<std::int32_t> column_of(node_id.size(), -1);
+    const auto visit = [&](auto&& self, std::int32_t node) -> void {
+        column_of[static_cast<std::size_t>(node)] = static_cast<std::int32_t>(order.size());
+        order.push_back(node);
+        std::vector<std::int32_t> kids;
+        for (std::int32_t c = 1; c < out_n; ++c) {
+            if (node_parent[static_cast<std::size_t>(c)] == node) { kids.push_back(c); }
+        }
+        std::stable_sort(kids.begin(), kids.end(), [&](std::int32_t x, std::int32_t y) {
+            return node_logp[static_cast<std::size_t>(x)] > node_logp[static_cast<std::size_t>(y)];
+        });
+        for (std::int32_t kid : kids) { self(self, kid); }
+    };
+    visit(visit, 0);
+
     TreeContentOracle out;
     out.ids.resize(width);
     out.parent.resize(width);
@@ -1438,19 +1467,22 @@ TreeContentOracle tree_content_oracle(const std::vector<float>& logits,
     const std::int32_t last = out_n > 0 ? out_n - 1 : 0;
     for (std::int32_t i = 0; i < width; ++i) {
         if (i < out_n) {
-            out.ids[static_cast<std::size_t>(i)]    = node_id[static_cast<std::size_t>(i)];
-            out.parent[static_cast<std::size_t>(i)] = i == 0 ? -1 : node_parent[static_cast<std::size_t>(i)];
-            out.cache[static_cast<std::size_t>(i)]  = frontier + i;
-            out.rope[static_cast<std::size_t>(i)]   = frontier + node_depth[static_cast<std::size_t>(i)];
-            int m   = 0;
-            int cur = i;
-            while (cur >= 0) {
-                m |= 1 << cur;
-                cur = node_parent[static_cast<std::size_t>(cur)];
+            const std::int32_t n                 = order[static_cast<std::size_t>(i)];
+            out.ids[static_cast<std::size_t>(i)] = node_id[static_cast<std::size_t>(n)];
+            out.parent[static_cast<std::size_t>(i)] =
+                i == 0
+                    ? -1
+                    : column_of[static_cast<std::size_t>(node_parent[static_cast<std::size_t>(n)])];
+            out.cache[static_cast<std::size_t>(i)] = frontier + i;
+            out.rope[static_cast<std::size_t>(i)] =
+                frontier + node_depth[static_cast<std::size_t>(n)];
+            int m = 0;
+            for (std::int32_t cur = n; cur >= 0; cur = node_parent[static_cast<std::size_t>(cur)]) {
+                m |= 1 << column_of[static_cast<std::size_t>(cur)];
             }
             out.mask[static_cast<std::size_t>(i)] = m;
         } else {
-            // Padding columns duplicate the last live node's id/parent/rope/mask, but keep
+            // Padding columns duplicate the last live column's id/parent/rope/mask, but keep
             // their own cache slot (e + col) -- matches the kernel's output convention.
             out.ids[static_cast<std::size_t>(i)]    = out.ids[static_cast<std::size_t>(last)];
             out.parent[static_cast<std::size_t>(i)] = out.parent[static_cast<std::size_t>(last)];
@@ -1463,12 +1495,17 @@ TreeContentOracle tree_content_oracle(const std::vector<float>& logits,
     return out;
 }
 
+// hidden_scale (a power of two) scales the projected hidden state so Markov terms are moderate
+// and the per-parent softmax temperature changes cross-parent choices. p_less_temperature > 0
+// runs the row as p-less with that tree temperature. expected_out receives the packed ids.
 int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t width,
-                          std::int32_t anchor, std::int32_t frontier) {
+                          std::int32_t anchor, std::int32_t frontier, float hidden_scale = 1.0f,
+                          float p_less_temperature           = 0.0f,
+                          std::vector<std::int32_t>* ids_out = nullptr) {
     constexpr std::int32_t vocab = 32;
     // The first 32 primes, so prime[token] is unique per token.
     const std::int32_t prime[vocab] = {
-        2,  3,  5,  7,  11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
+        2,  3,  5,  7,  11, 13, 17, 19, 23, 29,  31,  37,  41,  43,  47,  53,
         59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131,
     };
     std::vector<float> logits(static_cast<std::size_t>(vocab) * tokens, 0.0f);
@@ -1477,9 +1514,11 @@ int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t w
     std::vector<float> succ(static_cast<std::size_t>(kRank) * vocab, 0.0f);
     for (std::int32_t t = 0; t < tokens; ++t) {
         const std::size_t col = static_cast<std::size_t>(t) * static_cast<std::size_t>(vocab);
-        for (std::int32_t v = 0; v < vocab; ++v) { logits[col + static_cast<std::size_t>(v)] = static_cast<float>(v); }
-        // hidden[0] = 1 for every draft column, rest zero -> h = 1 exactly.
-        hidden[static_cast<std::size_t>(t) * kHidden + 0] = 1.0f;
+        for (std::int32_t v = 0; v < vocab; ++v) {
+            logits[col + static_cast<std::size_t>(v)] = static_cast<float>(v);
+        }
+        // hidden[0] = hidden_scale for every draft column, rest zero -> h = hidden_scale exactly.
+        hidden[static_cast<std::size_t>(t) * kHidden + 0] = hidden_scale;
     }
     for (std::int32_t token = 0; token < vocab; ++token) {
         for (std::int32_t r = 0; r < kRank; ++r) {
@@ -1505,7 +1544,14 @@ int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t w
     DeviceWeight device_weight(std::move(host_weight));
 
     const TreeContentOracle expected =
-        tree_content_oracle(logits, pred, succ, anchor, frontier, vocab, tokens, width);
+        tree_content_oracle(logits, pred, succ, anchor, frontier, vocab, tokens, width,
+                            hidden_scale, p_less_temperature > 0.0f ? p_less_temperature : 1.0);
+
+    ops::SamplingConfig config;
+    config.temperature = 2.0f;
+    config.p_less      = p_less_temperature > 0.0f ? 1 : 0;
+    GuardedDeviceBuffer device_config(sizeof(ops::SamplingConfig));
+    device_config.copy_from_host(&config, sizeof(config));
 
     const auto logit_bits  = encode_bf16(logits);
     const auto hidden_bits = encode_bf16(hidden);
@@ -1543,13 +1589,17 @@ int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t w
     Tensor mask_t(device_mask.data(), DType::I32, {width, 1});
     Tensor valid_t(device_valid.data(), DType::I32, {1});
     WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+        256,
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
     ops::dflash2_tree_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
                              frontiers_t, ids_t, parent_t, cache_t, rope_t, mask_t, valid_t,
-                             workspace, nullptr);
+                             workspace, nullptr, nullptr, nullptr, nullptr,
+                             reinterpret_cast<const ops::SamplingConfig*>(device_config.data()),
+                             p_less_temperature > 0.0f ? p_less_temperature : 1.0f);
     cuda_synchronize();
 
-    const auto ids    = from_device<std::int32_t>(device_ids.data(), width);
+    const auto ids = from_device<std::int32_t>(device_ids.data(), width);
+    if (ids_out != nullptr) { *ids_out = ids; }
     const auto parent = from_device<std::int32_t>(device_parent.data(), width);
     const auto cache  = from_device<std::int32_t>(device_cache.data(), width);
     const auto rope   = from_device<std::int32_t>(device_rope.data(), width);
@@ -1565,8 +1615,8 @@ int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t w
             (ids[static_cast<std::size_t>(i)] != expected.ids[static_cast<std::size_t>(i)] ||
              parent[static_cast<std::size_t>(i)] != expected.parent[static_cast<std::size_t>(i)])) {
             std::cerr << label << ": node " << i << " got id=" << ids[static_cast<std::size_t>(i)]
-                      << " parent=" << parent[static_cast<std::size_t>(i)] << " expected id="
-                      << expected.ids[static_cast<std::size_t>(i)]
+                      << " parent=" << parent[static_cast<std::size_t>(i)]
+                      << " expected id=" << expected.ids[static_cast<std::size_t>(i)]
                       << " parent=" << expected.parent[static_cast<std::size_t>(i)] << "\n";
             ++failures;
         }
@@ -1586,13 +1636,13 @@ int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t w
 // packed tree, so a shared/strided tree would poison one concurrent slot while greedy
 // argmax (C=3 isolation) still looks coherent.
 int run_tree_batch_row_isolation_case() {
-    constexpr const char* label    = "dflash2_tree_select B=2 row isolation T=7 W=12";
-    constexpr std::int32_t vocab   = 32;
-    constexpr std::int32_t tokens  = 7;
-    constexpr std::int32_t width   = ops::kDflash2VerifyWidth;
-    constexpr std::int32_t batch   = 2;
+    constexpr const char* label     = "dflash2_tree_select B=2 row isolation T=7 W=12";
+    constexpr std::int32_t vocab    = 32;
+    constexpr std::int32_t tokens   = 7;
+    constexpr std::int32_t width    = ops::kDflash2VerifyWidth;
+    constexpr std::int32_t batch    = 2;
     const std::int32_t prime[vocab] = {
-        2,  3,  5,  7,  11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
+        2,  3,  5,  7,  11, 13, 17, 19, 23, 29,  31,  37,  41,  43,  47,  53,
         59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131,
     };
     const std::int32_t anchors[batch]   = {9, 3};
@@ -1615,7 +1665,7 @@ int run_tree_batch_row_isolation_case() {
             for (std::int32_t v = 0; v < vocab; ++v) {
                 const float logit =
                     b == 0 ? static_cast<float>(v) : static_cast<float>(vocab - 1 - v);
-                logits[col + static_cast<std::size_t>(v)]                              = logit;
+                logits[col + static_cast<std::size_t>(v)] = logit;
                 row_logits[static_cast<std::size_t>(b)][row_col + static_cast<std::size_t>(v)] =
                     logit;
             }
@@ -1649,9 +1699,9 @@ int run_tree_batch_row_isolation_case() {
 
     std::array<TreeContentOracle, batch> expected{};
     for (std::int32_t b = 0; b < batch; ++b) {
-        expected[static_cast<std::size_t>(b)] = tree_content_oracle(
-            row_logits[static_cast<std::size_t>(b)], pred, succ, anchors[b], frontiers[b], vocab,
-            tokens, width);
+        expected[static_cast<std::size_t>(b)] =
+            tree_content_oracle(row_logits[static_cast<std::size_t>(b)], pred, succ, anchors[b],
+                                frontiers[b], vocab, tokens, width);
     }
     if (expected[0].ids == expected[1].ids) {
         std::cerr << label << ": oracles are not distinct; isolation would be vacuous\n";
@@ -1671,7 +1721,8 @@ int run_tree_batch_row_isolation_case() {
     GuardedDeviceBuffer device_ids(static_cast<std::size_t>(width) * batch * sizeof(std::int32_t));
     GuardedDeviceBuffer device_parent(static_cast<std::size_t>(width) * batch *
                                       sizeof(std::int32_t));
-    GuardedDeviceBuffer device_cache(static_cast<std::size_t>(width) * batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_cache(static_cast<std::size_t>(width) * batch *
+                                     sizeof(std::int32_t));
     GuardedDeviceBuffer device_rope(static_cast<std::size_t>(width) * batch * sizeof(std::int32_t));
     GuardedDeviceBuffer device_mask(static_cast<std::size_t>(width) * batch * sizeof(std::int32_t));
     GuardedDeviceBuffer device_valid(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
@@ -1694,28 +1745,28 @@ int run_tree_batch_row_isolation_case() {
     Tensor rope_t(device_rope.data(), DType::I32, {width, batch});
     Tensor mask_t(device_mask.data(), DType::I32, {width, batch});
     Tensor valid_t(device_valid.data(), DType::I32, {batch});
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens,
-                                                               batch)));
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
+                                       QType::BF16_CTRL, tokens, tokens, batch)));
     ops::dflash2_tree_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
                              frontiers_t, ids_t, parent_t, cache_t, rope_t, mask_t, valid_t,
                              workspace, nullptr);
     cuda_synchronize();
 
-    const auto ids    = from_device<std::int32_t>(device_ids.data(),
-                                               static_cast<std::size_t>(width) * batch);
-    const auto parent = from_device<std::int32_t>(device_parent.data(),
-                                                  static_cast<std::size_t>(width) * batch);
-    const auto cache  = from_device<std::int32_t>(device_cache.data(),
-                                               static_cast<std::size_t>(width) * batch);
-    const auto valid  = from_device<std::int32_t>(device_valid.data(), batch);
-    int failures      = 0;
+    const auto ids =
+        from_device<std::int32_t>(device_ids.data(), static_cast<std::size_t>(width) * batch);
+    const auto parent =
+        from_device<std::int32_t>(device_parent.data(), static_cast<std::size_t>(width) * batch);
+    const auto cache =
+        from_device<std::int32_t>(device_cache.data(), static_cast<std::size_t>(width) * batch);
+    const auto valid = from_device<std::int32_t>(device_valid.data(), batch);
+    int failures     = 0;
     for (std::int32_t b = 0; b < batch; ++b) {
         const TreeContentOracle& want = expected[static_cast<std::size_t>(b)];
         const std::size_t row         = static_cast<std::size_t>(b) * width;
         if (valid[static_cast<std::size_t>(b)] != want.valid) {
-            std::cerr << label << " row " << b << ": valid got " << valid[static_cast<std::size_t>(b)]
-                      << " expected " << want.valid << "\n";
+            std::cerr << label << " row " << b << ": valid got "
+                      << valid[static_cast<std::size_t>(b)] << " expected " << want.valid << "\n";
             ++failures;
         }
         for (std::int32_t i = 0; i < width; ++i) {
@@ -1748,7 +1799,7 @@ int main() {
     failures +=
         run_greedy_case("dflash2_path_select forced-greedy refinement T=2 V=256", 256, 2, 1, 11u);
     failures += run_greedy_case("dflash2_path_select p-less T=2 is greedy one-hot q V=64", 64, 4, 1,
-                               13u, false, 2.0f, 1);
+                                13u, false, 2.0f, 1);
     failures += run_greedy_case("dflash2_path_select greedy T=1 V=64", 64, 1, 1, 13u);
     failures += run_greedy_case("dflash2_path_select greedy T=4 B=2 V=64", 64, 4, 2, 17u);
     failures += run_greedy_case("dflash2_path_select greedy T=5 B=2 V=64", 64, 5, 2, 19u);
@@ -1763,13 +1814,29 @@ int main() {
     failures += run_tree_layout_case(ops::kDflash2VerifyWidth);
     failures += run_tree_layout_case(6);
     failures += run_tree_compact_case();
-    failures += run_tree_content_case(
-        "dflash2_tree_select content T=4 W=12 anchor=5 e=16", 4, ops::kDflash2VerifyWidth, 5, 16);
-    failures += run_tree_content_case(
-        "dflash2_tree_select content T=7 W=12 anchor=9 e=24", 7, ops::kDflash2VerifyWidth, 9, 24);
+    failures += run_tree_content_case("dflash2_tree_select content T=4 W=12 anchor=5 e=16", 4,
+                                      ops::kDflash2VerifyWidth, 5, 16);
+    failures += run_tree_content_case("dflash2_tree_select content T=7 W=12 anchor=9 e=24", 7,
+                                      ops::kDflash2VerifyWidth, 9, 24);
+    {
+        // h = 2^-26 leaves the Markov term a sub-0.02 tie-breaker, so each parent's children
+        // follow softmax(unary / T) with unit unary spacing: T=1.5 admits a third root child
+        // that T=1 does not.
+        constexpr float kScale = 1.0f / 67108864.0f;
+        std::vector<std::int32_t> greedy_tree;
+        std::vector<std::int32_t> p_less_tree;
+        failures += run_tree_content_case("dflash2_tree_select content T=7 W=8 moderate", 7, 8, 7,
+                                          32, kScale, 0.0f, &greedy_tree);
+        failures += run_tree_content_case("dflash2_tree_select content T=7 W=8 p-less T=1.5", 7, 8,
+                                          7, 32, kScale, 1.5f, &p_less_tree);
+        if (greedy_tree == p_less_tree) {
+            std::cerr << "dflash2_tree_select: p-less tree temperature left the tree unchanged\n";
+            ++failures;
+        }
+    }
     failures += run_tree_batch_row_isolation_case();
-    failures += run_nvfp4_codebook_greedy_case("dflash2_path_select NVFP4 codebook greedy T=2 V=128",
-                                              2, 1, 23u);
+    failures += run_nvfp4_codebook_greedy_case(
+        "dflash2_path_select NVFP4 codebook greedy T=2 V=128", 2, 1, 23u);
     failures += run_nvfp4_codebook_greedy_case(
         "dflash2_path_select NVFP4 codebook greedy T=5 B=2 V=128", 5, 2, 29u);
     failures += run_nvfp4_codebook_greedy_case(

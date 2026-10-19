@@ -2,7 +2,7 @@
 //
 // Examples:
 //   ./build/bench/ninfer_gdn_gating_proj_bench --35b --candidate auto
-//   ./build/bench/ninfer_gdn_gating_proj_bench --35b \
+//   ./build/bench/ninfer_gdn_gating_proj_bench --35b
 //     --candidate mma-split16 -p 128,512,1024
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/rmsnorm.h"
@@ -33,11 +33,8 @@ struct Options {
     bool norm_control          = false;
     bool auto_route            = true;
     bool composed_norm_control = false;
-    bool bitexact              = false;
     std::int32_t packed_width  = 0;
     ops::detail::Bf16GdnGatingScheduleId candidate =
-        ops::detail::Bf16GdnGatingScheduleId::SimtWarpRowC4;
-    ops::detail::Bf16GdnGatingScheduleId bitexact_candidate =
         ops::detail::Bf16GdnGatingScheduleId::SimtWarpRowC4;
     std::vector<std::int32_t> tokens{1, 2, 4, 6, 8, 9, 16, 32, 64, 128, 256, 512, 1024};
     int warmup              = 8;
@@ -78,14 +75,14 @@ Weight bf16_weight(const void* data, std::int32_t rows, std::int32_t hidden) {
 Weight bf16_row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
     const std::size_t row_bytes = static_cast<std::size_t>(parent.k) * sizeof(std::uint16_t);
     const auto* data            = static_cast<const std::uint8_t*>(parent.qdata) +
-                       static_cast<std::size_t>(row_begin) * row_bytes;
-    Weight view          = parent;
-    view.payload         = data;
-    view.payload_bytes   = static_cast<std::uint64_t>(rows) * row_bytes;
-    view.qdata           = data;
-    view.shape[0]        = rows;
-    view.padded_shape[0] = rows;
-    view.n               = rows;
+                                  static_cast<std::size_t>(row_begin) * row_bytes;
+    Weight view                 = parent;
+    view.payload                = data;
+    view.payload_bytes          = static_cast<std::uint64_t>(rows) * row_bytes;
+    view.qdata                  = data;
+    view.shape[0]               = rows;
+    view.padded_shape[0]        = rows;
+    view.n                      = rows;
     return view;
 }
 
@@ -114,14 +111,13 @@ ops::detail::Bf16GdnGatingScheduleId parse_candidate(std::string_view raw) {
     if (raw == "mma-split4") { return S::MmaCooperativeSplit4; }
     if (raw == "mma-split2") { return S::MmaCooperativeSplit2; }
     if (raw == "mma-unsplit") { return S::MmaUnsplit; }
-    if (raw == "small-t-split10") { return S::SmallTSplit10; }
-    if (raw == "small-t-fused") { return S::SmallTFusedCooperative; }
+    if (raw == "mma-split40") { return S::MmaCooperativeSplit40; }
     throw std::invalid_argument("unknown candidate: " + std::string(raw));
 }
 
 bool candidate_is_27b(const ops::detail::Bf16GdnGatingScheduleId candidate) {
     using S = ops::detail::Bf16GdnGatingScheduleId;
-    return candidate == S::SmallTSplit10 || candidate == S::SmallTFusedCooperative;
+    return candidate == S::MmaCooperativeSplit40;
 }
 
 Options parse_args(int argc, char** argv) {
@@ -142,18 +138,14 @@ Options parse_args(int argc, char** argv) {
             if (!opt.auto_route && !opt.composed_norm_control) {
                 opt.candidate = parse_candidate(raw);
             }
-        } else if (!std::strcmp(argv[i], "--bitexact")) {
-            const std::string_view raw = next("bitexact");
-            opt.bitexact               = true;
-            opt.bitexact_candidate     = parse_candidate(raw);
         } else if (!std::strcmp(argv[i], "--packed-width")) {
-            opt.packed_width = std::atoi(next("packed-width"));
+            opt.packed_width = parse_number<int>(next("packed-width"), "--packed-width");
         } else if (!std::strcmp(argv[i], "-p") || !std::strcmp(argv[i], "--tokens")) {
             opt.tokens = parse_tokens(next("tokens"));
         } else if (!std::strcmp(argv[i], "--warmup")) {
-            opt.warmup = std::atoi(next("warmup"));
+            opt.warmup = parse_number<int>(next("warmup"), "--warmup");
         } else if (!std::strcmp(argv[i], "--repeat")) {
-            opt.repeat = std::atoi(next("repeat"));
+            opt.repeat = parse_number<int>(next("repeat"), "--repeat");
         } else if (!std::strcmp(argv[i], "--flush-mib")) {
             const long mib = std::strtol(next("flush-mib"), nullptr, 10);
             if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
@@ -162,8 +154,7 @@ Options parse_args(int argc, char** argv) {
             std::printf("usage: %s [--35b] [--norm-control] "
                         "[--candidate auto|composed|simt-c4|simt-c8|mma-split32|"
                         "mma-split16|mma-split8|mma-split4|mma-split2|mma-unsplit|"
-                        "small-t-split10|small-t-fused] "
-                        "[--bitexact <candidate>] [--packed-width W] "
+                        "mma-split40] [--packed-width W] "
                         "[-p 1,2,...] [--warmup N] [--repeat N] [--flush-mib N]\n",
                         argv[0]);
             std::exit(0);
@@ -179,25 +170,12 @@ Options parse_args(int argc, char** argv) {
             throw std::invalid_argument("fixed candidate screening is supported only for --35b");
         }
     }
-    if (opt.bitexact) {
-        if (opt.geometry35 && candidate_is_27b(opt.bitexact_candidate)) {
-            throw std::invalid_argument("27B small-T bitexact checks require the default 27B geometry");
-        }
-        if (!opt.geometry35 && !candidate_is_27b(opt.bitexact_candidate)) {
-            throw std::invalid_argument("27B bitexact checks support only small-T candidates");
-        }
-    }
     if (opt.norm_control && !opt.auto_route && !opt.composed_norm_control) {
         throw std::invalid_argument("--norm-control supports only --candidate auto or composed");
     }
     if (opt.packed_width != 0 &&
         (!opt.norm_control || opt.geometry35 || !opt.auto_route || opt.packed_width < 1)) {
-        throw std::invalid_argument(
-            "--packed-width requires 27B --norm-control --candidate auto");
-    }
-    if (opt.packed_width != 0 && opt.bitexact) {
-        throw std::invalid_argument(
-            "--packed-width cannot be combined with private candidate bitexact screening");
+        throw std::invalid_argument("--packed-width requires 27B --norm-control --candidate auto");
     }
     if (!opt.norm_control && opt.composed_norm_control) {
         throw std::invalid_argument("--candidate composed requires --norm-control");
@@ -238,18 +216,18 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const Weight wb     = bf16_row_view(parent, heads, heads);
     if (opt.packed_width != 0 &&
         (tokens % opt.packed_width != 0 || tokens / opt.packed_width < 1 ||
-         tokens / opt.packed_width > 4)) {
-        throw std::invalid_argument("packed T must be W times B=1..4");
+         tokens / opt.packed_width > ops::detail::kBf16GdnGatingPackedMaxBatch)) {
+        throw std::invalid_argument("packed T must be W times B=1..6");
     }
 
     const ops::detail::Bf16GdnGatingProblem problem{heads, hidden, tokens};
     const auto plan = [&] {
-        if (opt.packed_width == 5 && tokens / opt.packed_width >= 2) {
-            return ops::detail::bf16_gdn_gating_resolve_packed_w5_plan(problem);
+        if (opt.packed_width != 0 && ops::detail::bf16_gdn_gating_packed_aggregates(
+                                         opt.packed_width, tokens / opt.packed_width)) {
+            return ops::detail::bf16_gdn_gating_resolve_packed_plan(problem);
         }
         if (opt.packed_width != 0) {
-            return ops::detail::bf16_gdn_gating_resolve_plan(
-                {heads, hidden, opt.packed_width});
+            return ops::detail::bf16_gdn_gating_resolve_plan({heads, hidden, opt.packed_width});
         }
         return opt.auto_route || opt.composed_norm_control
                    ? ops::detail::bf16_gdn_gating_resolve_plan(problem)
@@ -260,9 +238,9 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     WorkspaceArena ws(std::max<std::size_t>(1, workspace_bytes));
     const auto launch = [&](cudaStream_t stream) {
         if (opt.norm_control && opt.packed_width != 0) {
-            ops::gdn_norm_gating_proj_packed_sequences(
-                tx, tnorm_weight, 1.0e-6F, wa, wb, tA_log, tdt_bias, ws, th, tg, tbeta, stream,
-                opt.packed_width);
+            ops::gdn_norm_gating_proj_packed_sequences(tx, tnorm_weight, 1.0e-6F, wa, wb, tA_log,
+                                                       tdt_bias, ws, th, tg, tbeta, stream,
+                                                       opt.packed_width);
         } else if (opt.norm_control && opt.composed_norm_control) {
             ops::rmsnorm(tx, tnorm_weight, 1.0e-6F, true, th, stream);
             if (opt.geometry35) {
@@ -295,15 +273,22 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const double useful_flops =
         2.0 * 2.0 * static_cast<double>(heads) * hidden * static_cast<double>(tokens);
     const bool mma = plan.token_variant != ops::detail::Bf16GdnGatingTokenVariant::None;
-    const std::int32_t mma_tile = opt.geometry35 ? 64 : 128;
-    const double executed_cols = !mma
-                                     ? tokens
-                                     : opt.packed_width != 0
-                                           ? static_cast<double>(tokens / opt.packed_width) *
-                                                 ((opt.packed_width + mma_tile - 1) / mma_tile) *
-                                                 mma_tile
-                                           : static_cast<double>(
-                                                 ((tokens + mma_tile - 1) / mma_tile) * mma_tile);
+    const bool aggregate =
+        opt.packed_width != 0 &&
+        ops::detail::bf16_gdn_gating_packed_aggregates(opt.packed_width, tokens / opt.packed_width);
+    const int panel_cols = opt.packed_width != 0 && !aggregate ? opt.packed_width : tokens;
+    const bool narrow =
+        plan.schedule == ops::detail::Bf16GdnGatingScheduleId::MmaCooperativeSplit40;
+    const int mma_tile = narrow ? (panel_cols <= 8    ? 8
+                                   : panel_cols <= 16 ? 16
+                                   : panel_cols <= 32 ? 32
+                                                      : 48)
+                                : (opt.geometry35 ? 64 : 128);
+    // tokens is a whole number of panels; each panel executes its columns rounded up to the tile.
+    const int panels      = tokens / panel_cols;
+    const int panel_tiles = (panel_cols + mma_tile - 1) / mma_tile;
+    const double executed_cols =
+        !mma ? tokens : static_cast<double>(panels) * panel_tiles * mma_tile;
     const double executed_flops  = 2.0 * 2.0 * static_cast<double>(heads) * hidden * executed_cols;
     const double useful_tflops   = useful_flops / sec / 1e12;
     const double executed_tflops = executed_flops / sec / 1e12;
@@ -316,9 +301,8 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const double useful_gbs = useful_bytes / sec / 1e9;
 
     const char* route =
-        opt.packed_width != 0
-            ? "gdn_norm_gating_proj.bf16.packed_sequences"
-            : opt.norm_control
+        opt.packed_width != 0 ? "gdn_norm_gating_proj.bf16.packed_sequences"
+        : opt.norm_control
             ? (opt.composed_norm_control
                    ? "gdn_norm_gating_proj.bf16.composed_control"
                    : ops::detail::bf16_gdn_norm_gating_schedule_name(norm_plan.schedule))
@@ -327,46 +311,13 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
         opt.packed_width != 0
             ? interval_capacity
             : (opt.norm_control && !opt.composed_norm_control ? norm_plan.workspace_bytes
-                                                               : plan.workspace_bytes);
+                                                              : plan.workspace_bytes);
 
-    char bitexact[16] = "-";
-    bool bitexact_ok  = true;
-    if (opt.bitexact) {
-        DeviceBuffer a_g     = make_zeros(out_elems * sizeof(float));
-        DeviceBuffer a_beta  = make_zeros(out_elems * sizeof(float));
-        DeviceBuffer b_g     = make_zeros(out_elems * sizeof(float));
-        DeviceBuffer b_beta  = make_zeros(out_elems * sizeof(float));
-        Tensor ta_g(a_g.p, DType::FP32, {heads, tokens});
-        Tensor ta_beta(a_beta.p, DType::FP32, {heads, tokens});
-        Tensor tb_g(b_g.p, DType::FP32, {heads, tokens});
-        Tensor tb_beta(b_beta.p, DType::FP32, {heads, tokens});
-        // Reference = the other small-T implementation, so the check is never a candidate
-        // compared against itself (the auto route now resolves to the fused kernel).
-        const ops::detail::Bf16GdnGatingScheduleId reference =
-            opt.bitexact_candidate == ops::detail::Bf16GdnGatingScheduleId::SmallTFusedCooperative
-                ? ops::detail::Bf16GdnGatingScheduleId::SmallTSplit10
-                : ops::detail::Bf16GdnGatingScheduleId::SmallTFusedCooperative;
-        ops::detail::bf16_gdn_gating_execute_candidate(reference, tx, wa, wb, tA_log, tdt_bias, ws,
-                                                       ta_g, ta_beta, 0);
-        ops::detail::bf16_gdn_gating_execute_candidate(opt.bitexact_candidate, tx, wa, wb, tA_log,
-                                                       tdt_bias, ws, tb_g, tb_beta, 0);
-        std::vector<float> ha(out_elems), hb(out_elems);
-        const std::size_t g_bytes = out_elems * sizeof(float);
-        a_g.copy_to_host(ha.data(), g_bytes);
-        b_g.copy_to_host(hb.data(), g_bytes);
-        const bool g_match = std::memcmp(ha.data(), hb.data(), g_bytes) == 0;
-        a_beta.copy_to_host(ha.data(), g_bytes);
-        b_beta.copy_to_host(hb.data(), g_bytes);
-        const bool beta_match = std::memcmp(ha.data(), hb.data(), g_bytes) == 0;
-        bitexact_ok = g_match && beta_match;
-        std::snprintf(bitexact, sizeof(bitexact), "%s", bitexact_ok ? "OK" : "MISMATCH");
-    }
-
-    std::printf("%s,%s,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%zu,%s\n", opt.geometry35 ? "35b" : "27b",
+    std::printf("%s,%s,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%zu\n", opt.geometry35 ? "35b" : "27b",
                 opt.norm_control ? "norm_control" : "control", tokens, route, timing.median_us,
                 timing.min_us, timing.p95_us, useful_tflops, executed_tflops, useful_gbs,
-                reported_workspace, bitexact);
-    return bitexact_ok;
+                reported_workspace);
+    return true;
 }
 
 } // namespace
@@ -395,7 +346,7 @@ int main(int argc, char** argv) {
                 : ops::gdn_gating_proj_workspace_capacity_bytes(heads, hidden, min_tokens,
                                                                 max_tokens);
         std::printf("geometry,operation,T,route,median_us,min_us,p95_us,useful_tflops,"
-                    "executed_tflops,useful_gbps,workspace_bytes,bitexact\n");
+                    "executed_tflops,useful_gbps,workspace_bytes\n");
         bool all_ok = true;
         for (const std::int32_t tokens : opt.tokens) {
             all_ok = run(opt, tokens, interval_capacity, flush) && all_ok;

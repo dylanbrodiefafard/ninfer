@@ -20,8 +20,10 @@ endfunction()
 add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
+  core/device_copy.cu
   core/dtype.cpp
   core/gdn_replay_records.cpp
+  core/gdn_history.cpp
   core/cyclic_kv_cache.cpp
   core/paged_kv_cache.cpp
   core/paged_kv_scatter.cu
@@ -49,7 +51,7 @@ add_library(ninfer_artifact STATIC
 ninfer_internal_includes(ninfer_artifact)
 target_link_libraries(ninfer_artifact
   PUBLIC ninfer_core
-  PRIVATE Threads::Threads)
+  PRIVATE Threads::Threads OpenSSL::Crypto)
 
 # The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
 # producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
@@ -72,6 +74,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
   ops/launcher/nll_from_logits.cu
+  ops/launcher/token_logprobs.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
   ops/launcher/embed_gather.cu
@@ -111,13 +114,13 @@ add_library(ninfer_ops STATIC
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
   ops/linear_attention/gated_delta_net/replay.cpp
   ops/linear_attention/gated_delta_net/recurrent.cu
+  ops/linear_attention/gated_delta_net/history.cu
   ops/linear_attention/gated_delta_net/chunked/launch.cu
   ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
   ops/linear_attention/gated_delta_net/chunked/state_passing.cu
   ops/linear_attention/gated_delta_net/chunked/output.cu
   ops/attn_input_proj/bf16/bf16_attn_input_decode.cu
   ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
-  ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu
   ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp
   ops/attn_input_proj/fp8/fp8_attn_input_decode.cu
   ops/attn_input_proj/fp8/fp8_attn_input_small_t.cu
@@ -127,7 +130,7 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
-  ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
+  ops/attn_input_proj/nvfp4/nvfp4_attn_input_quantized.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
@@ -139,7 +142,7 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/w8/w8_attn_input_plan.cpp
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
+  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_quantized.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp
   ops/gdn_input_proj/fp8/fp8_gdn_input_decode.cu
   ops/gdn_input_proj/fp8/fp8_gdn_input_matrix.cu
@@ -171,6 +174,7 @@ add_library(ninfer_ops STATIC
   ops/linear/nvfp4/nvfp4_gemv.cu
   ops/linear/nvfp4/nvfp4_small_t.cu
   ops/linear/nvfp4/nvfp4_w4a4.cu
+  ops/linear/nvfp4/nvfp4_w4a8.cu
   ops/linear/nvfp4/nvfp4_dispatch.cpp
   ops/linear/q4/q4_small_t_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_mma.cu
@@ -183,7 +187,6 @@ add_library(ninfer_ops STATIC
   ops/linear/q5/q5_rowsplit_gemv.cu
   ops/linear_add/bf16/bf16_linear_add_decode.cu
   ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
-  ops/linear_add/bf16/bf16_linear_add_small_t.cu
   ops/linear_add/bf16/bf16_linear_add_plan.cpp
   ops/linear_add/fp8/fp8_linear_add_plan.cpp
   ops/linear_add/fp8/fp8_linear_add_decode.cu
@@ -191,7 +194,7 @@ add_library(ninfer_ops STATIC
   ops/linear_add/fp8/fp8_linear_add_a8.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
-  ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+  ops/linear_add/nvfp4/nvfp4_linear_add_quantized.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
@@ -206,7 +209,7 @@ add_library(ninfer_ops STATIC
   ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
+  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_quantized.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
   ops/linear_swiglu/w8/w8_linear_swiglu_decode.cu
   ops/linear_swiglu/w8/w8_linear_swiglu_gemm_mma.cu
@@ -237,6 +240,8 @@ add_library(ninfer_ops STATIC
   ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
   ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
   ops/linear/linear.cpp
+  ops/linear/linear_kv_projection.cpp
+  ops/linear/nvfp4/nvfp4_kv_projection.cu
   ops/linear/fp8/fp8_format.cpp
   ops/linear/fp8/fp8_gemv.cu
   ops/linear/fp8/fp8_small_t.cu
@@ -247,6 +252,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp
   ops/wrapper/nll_from_logits.cpp
+  ops/wrapper/token_logprobs.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
   ops/wrapper/embedding.cpp
@@ -258,6 +264,8 @@ add_library(ninfer_ops STATIC
   ops/wrapper/swa.cpp
   ops/wrapper/gqa_attention.cpp
   ops/wrapper/kv_cache_append_prefix.cpp
+  ops/wrapper/normalized_rope_kv_append.cpp
+  ops/launcher/normalized_rope_kv_append.cu
   ops/wrapper/attn_input_proj.cpp
   ops/wrapper/l2norm.cpp
   ops/wrapper/layer_norm.cpp
@@ -291,6 +299,7 @@ target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
+  text/json_input.cpp
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
@@ -313,10 +322,13 @@ if(NINFER_BUILD_PROMPT_INPUT)
   add_library(ninfer_product_prompt_input STATIC
     product/prompt_input/prompt_input.cpp)
   ninfer_internal_includes(ninfer_product_prompt_input)
-  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire)
+  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire ninfer_text)
 endif()
 
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  add_library(ninfer_product_startup STATIC product/startup_options.cpp)
+  ninfer_internal_includes(ninfer_product_startup)
+  target_link_libraries(ninfer_product_startup PRIVATE ninfer_artifact)
   add_library(ninfer_product_load_progress STATIC
     product/load_progress/load_progress.cpp)
   ninfer_internal_includes(ninfer_product_load_progress)
@@ -352,6 +364,7 @@ add_library(ninfer::engine ALIAS ninfer_engine)
 if(NINFER_BUILD_SERVE)
   # HTTP protocol/product adapter. No serving header is part of the public API.
   add_library(ninfer_serve STATIC
+    serve/json_input.cpp
     serve/openai_schema.cpp
     serve/responses_schema.cpp
     serve/anthropic_schema.cpp
@@ -360,6 +373,7 @@ if(NINFER_BUILD_SERVE)
     serve/console_log.cpp
     serve/generation_service.cpp
     serve/request_log.cpp
+    serve/metrics.cpp
     serve/http_server.cpp
     serve/responses_http.cpp
     serve/serve_options.cpp)
@@ -368,5 +382,5 @@ if(NINFER_BUILD_SERVE)
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire CUDA::cudart)
+    PRIVATE ninfer_media_acquire ninfer_text CUDA::cudart)
 endif()

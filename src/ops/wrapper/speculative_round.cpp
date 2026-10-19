@@ -26,13 +26,6 @@ void require_dtype(const Tensor& t, DType dtype, const char* op, const char* nam
     require_contiguous_nonnull(t, op, name);
 }
 
-void require_scalar(const Tensor& t, DType dtype, const char* op, const char* name) {
-    require_dtype(t, dtype, op, name);
-    if (t.ne[0] != 1 || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
-        throw std::invalid_argument(std::string(op) + ": invalid scalar shape for " + name);
-    }
-}
-
 void require_vector(const Tensor& t, DType dtype, std::int32_t n, const char* op,
                     const char* name) {
     require_dtype(t, dtype, op, name);
@@ -142,7 +135,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
                                       WorkspaceArena& workspace, cudaStream_t stream,
-                                      const Tensor* selector_ids, const Tensor* selector_q) {
+                                      const Tensor* selector_ids, const Tensor* selector_q,
+                                      Tensor* proposal_calibration) {
     constexpr const char* op = "speculative_accept_greedy_drafts";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -168,12 +162,27 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
     require_vector(accepted, DType::I32, batch, op, "accepted");
     if ((selector_ids == nullptr) != (selector_q == nullptr)) {
-        throw std::invalid_argument(
-            "speculative_accept_greedy_drafts: selector_ids and selector_q must both be null or both set");
+        throw std::invalid_argument("speculative_accept_greedy_drafts: selector_ids and selector_q "
+                                    "must both be null or both set");
     }
     if (selector_ids != nullptr) { require_selector_q(*selector_ids, *selector_q, k, batch, op); }
     if (configs == nullptr) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: configs must be non-null");
+    }
+    if (proposal_calibration != nullptr) {
+        if (selector_ids == nullptr || selector_ids->ne[0] > 32 || !selector_ids->is_contiguous() ||
+            !selector_q->is_contiguous()) {
+            throw std::invalid_argument("speculative_accept_greedy_drafts: proposal calibration "
+                                        "requires contiguous selectors with C<=32");
+        }
+        require_dtype(*proposal_calibration, DType::FP32, op, "proposal_calibration");
+        if (!proposal_calibration->is_contiguous() ||
+            proposal_calibration->ne[0] != kPLessProposalCalibrationTemperatureCount ||
+            proposal_calibration->ne[1] != k || proposal_calibration->ne[2] != batch ||
+            proposal_calibration->ne[3] != 1) {
+            throw std::invalid_argument(
+                "speculative_accept_greedy_drafts: proposal_calibration must be FP32 [G,K,B]");
+        }
     }
     auto scratch_scope = workspace.scope();
     const std::size_t bytes =
@@ -181,8 +190,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream, selector_ids,
-        selector_q);
+        licensed_counts, accepted, token_domain, configs, scratch, stream, selector_ids, selector_q,
+        proposal_calibration);
 }
 
 void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& logits,
@@ -222,10 +231,9 @@ void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& l
     if (token_domain <= 0 || token_domain > logits.ne[0]) {
         throw std::invalid_argument("speculative_accept_tree_drafts: token_domain out of range");
     }
-    auto scratch_scope = workspace.scope();
-    const std::size_t bytes =
-        speculative_accept_tree_drafts_workspace_capacity_bytes(token_domain, width, width, batch,
-                                                                batch);
+    auto scratch_scope      = workspace.scope();
+    const std::size_t bytes = speculative_accept_tree_drafts_workspace_capacity_bytes(
+        token_domain, width, width, batch, batch);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_tree_drafts_launch(
         target_tokens, logits, verify_ids, parent_index, valid_columns, current_extents, lengths,
@@ -249,8 +257,8 @@ void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& sele
     detail::speculative_select_accepted_hidden_launch(hidden, selectors, out, stream);
 }
 
-void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map, std::int32_t n,
-                              cudaStream_t stream) {
+void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map,
+                              std::int32_t count, cudaStream_t stream) {
     constexpr const char* op = "proposal_remap_token_ids";
     require_dtype(proposal_tokens, DType::I32, op, "proposal_tokens");
     if (proposal_tokens.ne[0] <= 0 || proposal_tokens.ne[1] != 1 || proposal_tokens.ne[2] != 1 ||
@@ -258,10 +266,11 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
         throw std::invalid_argument(
             "proposal_remap_token_ids: proposal_tokens must be a non-empty vector");
     }
-    if (id_map == nullptr || n <= 0) {
-        throw std::invalid_argument("proposal_remap_token_ids: id_map must be non-null and n>0");
+    if (id_map == nullptr || count <= 0) {
+        throw std::invalid_argument(
+            "proposal_remap_token_ids: id_map must be non-null and count>0");
     }
-    detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
+    detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, count, stream);
 }
 
 } // namespace ninfer::ops

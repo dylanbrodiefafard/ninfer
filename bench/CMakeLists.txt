@@ -15,7 +15,14 @@ ninfer_add_op_bench(ninfer_silu_mul_bench SOURCES ops/silu_mul_bench.cu)
 ninfer_add_op_bench(ninfer_residual_add_bench SOURCES ops/residual_add_bench.cu)
 ninfer_add_op_bench(ninfer_sigmoid_mul_bench SOURCES ops/sigmoid_mul_bench.cu)
 ninfer_add_op_bench(ninfer_rmsnorm_bench SOURCES ops/rmsnorm_bench.cu)
+ninfer_add_op_bench(ninfer_dual_rmsnorm_bench SOURCES ops/dual_rmsnorm_bench.cu)
+ninfer_add_op_bench(ninfer_linear_kv_projection_bench SOURCES ops/linear_kv_projection_bench.cu)
+ninfer_add_op_bench(ninfer_normalized_rope_kv_append_bench
+  SOURCES ops/normalized_rope_kv_append_bench.cpp)
+target_include_directories(ninfer_normalized_rope_kv_append_bench PRIVATE ${PROJECT_SOURCE_DIR}/tests)
 ninfer_add_op_bench(ninfer_residual_rmsnorm_bench SOURCES ops/residual_rmsnorm_bench.cu)
+ninfer_add_op_bench(ninfer_grouped_dynamic_conv_bench
+  SOURCES ops/grouped_dynamic_conv_bench.cu)
 ninfer_add_op_bench(ninfer_l2norm_bench SOURCES ops/l2norm_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_gating_bench SOURCES ops/gdn_gating_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_gating_proj_bench SOURCES ops/gdn_gating_proj_bench.cu)
@@ -34,6 +41,7 @@ ninfer_add_op_bench(ninfer_embedding_bench SOURCES ops/embedding_bench.cu)
 ninfer_add_op_bench(ninfer_position_bench SOURCES ops/position_bench.cu)
 ninfer_add_op_bench(ninfer_cast_bench SOURCES ops/cast_bench.cu)
 ninfer_add_op_bench(ninfer_argmax_bench SOURCES ops/argmax_bench.cu)
+ninfer_add_op_bench(ninfer_token_logprobs_bench SOURCES ops/token_logprobs_bench.cu)
 ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES ops/causal_conv1d_silu_bench.cu)
 ninfer_add_op_bench(ninfer_linear_bench SOURCES ops/linear_bench.cu)
 ninfer_add_op_bench(ninfer_output_stage_bench SOURCES ops/output_stage_bench.cu)
@@ -43,9 +51,6 @@ ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
 ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES ops/attn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_w8_linear_swiglu_bench SOURCES ops/w8_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES ops/nvfp4_linear_swiglu_bench.cu)
-# Isolated TMA W4A4 (prefill) GEMM schedule A/B (occupancy/pipeline/BlockM). Drives the kernel
-# directly; conformance-gates each variant against the production m256s3 schedule.
-ninfer_add_op_bench(ninfer_nvfp4_tma_ab_bench SOURCES ops/nvfp4_tma_ab_bench.cu)
 # Curated NVFP4 decode T=4 harnesses (ninfer/bench/PERF_LANDS.md). Superseded
 # sweeps live in ops/_archive/ and are not built.
 ninfer_add_op_bench(ninfer_nvfp4_swiglu_t4_explore_v5
@@ -104,19 +109,6 @@ target_include_directories(ninfer_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party)
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
-
-# Native target-private MTP proposal/verification microbenchmark. It enters through the target
-# Program facade and executes the production round schedule over a real .ninfer artifact.
-add_executable(ninfer_qwen3_6_27b_mtp_round_bench
-  targets/qwen3_6_27b/target_mtp_round_bench.cpp)
-target_include_directories(ninfer_qwen3_6_27b_mtp_round_bench PRIVATE
-  ${PROJECT_SOURCE_DIR}/include
-  ${PROJECT_SOURCE_DIR}/src
-  ${PROJECT_SOURCE_DIR}/third_party
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-target_link_libraries(ninfer_qwen3_6_27b_mtp_round_bench PRIVATE
-  ninfer_engine ninfer_core)
 
 # Complete production DFlash steady round: confirmed-context append, next proposal, target
 # verification/acceptance, and host publication over a real 35B artifact.

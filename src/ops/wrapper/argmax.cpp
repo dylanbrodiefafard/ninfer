@@ -64,8 +64,7 @@ void argmax_impl(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
     if (logits.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("argmax: logits/out data must be non-null");
     }
-    if (configs != nullptr &&
-        (columns_per_config <= 0 || logits.ne[1] % columns_per_config != 0)) {
+    if (configs != nullptr && (columns_per_config <= 0 || logits.ne[1] % columns_per_config != 0)) {
         throw std::invalid_argument(
             "argmax: suppressed-token config width must divide the output columns");
     }
@@ -80,8 +79,7 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
 }
 
 void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
-            const SamplingConfig* configs, std::int32_t columns_per_config,
-            cudaStream_t stream) {
+            const SamplingConfig* configs, std::int32_t columns_per_config, cudaStream_t stream) {
     if (configs == nullptr) {
         throw std::invalid_argument("argmax: suppressed-token configs must be non-null");
     }

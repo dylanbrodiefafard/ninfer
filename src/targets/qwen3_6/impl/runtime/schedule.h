@@ -13,10 +13,11 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
-#include "targets/qwen3_6/impl/runtime/tool_masks.h"
+#include "targets/qwen3_6/impl/runtime/token_masks.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
+#include "targets/qwen3_6/impl/runtime/prefill_schedule.h"
 
 #include <algorithm>
 #include <array>
@@ -31,30 +32,8 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 using qwen3_6::PreparedPromptData;
 using qwen3_6::PromptModality;
 
-// Large aligned extents use the full 8192-token workspace efficiently. A large unaligned tail
-// sends every major projection through its remainder schedule; cap that unit at 4096 so only the
-// smaller final unit pays the tail cost. Explicit smaller chunks retain their requested policy.
-inline constexpr std::uint32_t kIrregularPrefillSplit = 4096;
-
-[[nodiscard]] inline std::uint32_t select_prefill_chunk(std::uint32_t remaining,
-                                                        std::uint32_t maximum) noexcept {
-    const std::uint32_t nominal = std::min(remaining, maximum);
-    if (maximum > kIrregularPrefillSplit && nominal > kIrregularPrefillSplit &&
-        nominal % kPrefillChunkAlignment != 0) {
-        return kIrregularPrefillSplit;
-    }
-    return nominal;
-}
-
-[[nodiscard]] inline std::uint64_t prefill_chunk_count(std::uint32_t tokens,
-                                                       std::uint32_t maximum) noexcept {
-    std::uint64_t count = 0;
-    while (tokens != 0) {
-        tokens -= select_prefill_chunk(tokens, maximum);
-        ++count;
-    }
-    return count;
-}
+using qwen3_6::detail::select_prefill_chunk;
+using qwen3_6::detail::prefill_chunk_count;
 
 struct ExecutionCore {
     DeviceContext& device;
@@ -71,6 +50,7 @@ struct ExecutionCore {
     float keep_frac;
     float xattn_tau;
     std::int32_t xattn_min_len;
+    const GdnHistory* gdn_history;
 };
 
 struct PrefillContext {
@@ -84,7 +64,6 @@ struct PrefillContext {
     const ops::SamplingConfig* sampling;
     Tensor* rewrite_checkpoint_hidden;
     std::int32_t current_state_slot                         = 0;
-    std::int32_t rewrite_checkpoint_state_slot              = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
 };
@@ -106,7 +85,7 @@ struct MtpBatchContext {
     const qwen3_6::MtpDecodeIngress& host_ingress;
     qwen3_6::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    qwen3_6::TokenMaskExchange* token_masks = nullptr;
 };
 
 struct DFlashBatchContext {
@@ -117,7 +96,12 @@ struct DFlashBatchContext {
     const qwen3_6::DFlashDecodeIngress& host_ingress;
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    qwen3_6::TokenMaskExchange* token_masks = nullptr;
+    // DFlash2 chain rounds score the p-less proposal calibration grid into host_egress. A
+    // captured graph fixes whether the scoring kernel exists, so this is the Program's startup
+    // property (calibrates_p_less_drafts()) at warm-up, capture, and every round alike, never a
+    // per-round choice. Packed-tree rounds do not score, and the Program does not read them.
+    bool calibrate_p_less_drafts = false;
 };
 
 struct DFlashAppendContext {
@@ -156,29 +140,96 @@ struct TargetVerifyFrameView {
     Tensor accepted_drafts;
     Tensor selected_hidden;
     Tensor parent_index;
+    // I32 [kGdnTreeScheduleWords,B], written by target_verify_accept from parent_index.
+    Tensor gdn_tree_schedule;
     Tensor ancestor_mask;
     Tensor prefix_lengths;
     Tensor accepted_column;
     Tensor fold_path;
     Tensor draft_selector_ids;
     Tensor draft_selector_q;
-    bool tree_verify = false;
-    const GdnReplayRecords* replay_records = nullptr;
-    const ops::SamplingConfig* sampling    = nullptr;
-    DFlashFeatureSink* feature_sink        = nullptr;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    // Optional FP32 [G,k,B] chain proposal calibration output; requires the draft selectors.
+    Tensor proposal_calibration;
+    bool tree_verify                        = false;
+    const GdnReplayRecords* replay_records  = nullptr;
+    const ops::SamplingConfig* sampling     = nullptr;
+    DFlashFeatureSink* feature_sink         = nullptr;
+    qwen3_6::TokenMaskExchange* token_masks = nullptr;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
-                         std::int32_t rewrite_checkpoint_state_slot,
                          std::uint32_t mtp_proposal_extent);
+// With `owner`, the verify forward drives that prefill owner's chunk layer by layer (a mixed
+// round); the frame must then carry a DFlash feature sink.
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::GqaExecutionEnvelope envelope, bool reset_workspace = true);
+                          ops::GqaExecutionEnvelope envelope, bool reset_workspace = true,
+                          const MixedOwnerForward* owner = nullptr);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
+    std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
+
+// Startup-owned stream and barriers for concurrent forwards of disjoint request slots.
+// Each layer records both completions before either stream waits; the final join includes
+// the owner's normalization, feature positions and optional sampling tail.
+class MixedForwardStreams {
+public:
+    MixedForwardStreams();
+    ~MixedForwardStreams();
+    MixedForwardStreams(const MixedForwardStreams&)            = delete;
+    MixedForwardStreams& operator=(const MixedForwardStreams&) = delete;
+
+    [[nodiscard]] cudaStream_t owner_stream() const noexcept { return owner_stream_; }
+
+    void fork(cudaStream_t verify_stream);
+    void join_layer(cudaStream_t verify_stream);
+    void join_owner(cudaStream_t verify_stream);
+
+private:
+    cudaStream_t owner_stream_ = nullptr;
+    cudaEvent_t owner_done_    = nullptr;
+    cudaEvent_t verify_done_   = nullptr;
+};
+
+// The prefill owner of a mixed DFlash round: one text chunk (no media, no MTP) of the request
+// that `state` describes. The round runs forward() inside its verify forward, then
+// append_context() on the primary stream after accept and the final owner join. Forward scratch
+// occupies disjoint planned regions; append reclaims the primary workspace after verify.
+// Lives on the stack of the round that runs it.
+class MixedPrefillOwner {
+public:
+    MixedPrefillOwner(PrefillContext& state, std::span<const TokenId> ids,
+                      std::uint32_t nominal_length,
+                      std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
+                      bool finalize_at_end, MixedForwardStreams& streams,
+                      WorkspaceArena& owner_work);
+    MixedPrefillOwner(const MixedPrefillOwner&)            = delete;
+    MixedPrefillOwner& operator=(const MixedPrefillOwner&) = delete;
+
+    [[nodiscard]] const MixedOwnerForward& forward() const noexcept { return forward_; }
+
+    // Appends the chunk's captured DFlash context; requires forward() to have run.
+    void append_context();
+    // The chunk's progress; requires append_context().
+    [[nodiscard]] PrefillChunkResult result() const;
+
+private:
+    PrefillContext& state_;
+    MixedForwardStreams& streams_;
+    TextContext card_;
+    DFlashFeatureSink sink_;
+    std::span<const int> prompt_;
+    std::uint32_t nominal_length_;
+    bool finalize_at_end_;
+    std::optional<PrefillChunkResult> forwarded_;
+    bool appended_ = false;
+    MixedOwnerForward forward_;
+};
+
+[[nodiscard]] PrefillChunkResult prefill_mrope_text_chunk(
+    PrefillContext& state, const qwen3_6::PreparedPromptData& prompt, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
 
 [[nodiscard]] PrefillChunkResult
@@ -233,9 +284,11 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
                                  DFlashEnvelopes envelopes,
                                  ops::GqaExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition);
+// With `owner` (eager, exact envelopes only) the round is mixed: the verify forward runs the
+// owner's prefill chunk beside it, and the owner's DFlash context append follows the egress copy.
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          std::uint32_t verify_width, DFlashEnvelopes envelopes,
-                         ops::GqaExecutionEnvelope target_envelope,
-                         bool exact_sequence_envelopes, DecodeGraphExecutable* executable);
+                         ops::GqaExecutionEnvelope target_envelope, bool exact_sequence_envelopes,
+                         DecodeGraphExecutable* executable, MixedPrefillOwner* owner = nullptr);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

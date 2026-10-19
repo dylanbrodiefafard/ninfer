@@ -76,30 +76,45 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     validate_linear_policy(policy);
 }
 
-bool aggregate_w8_vocabulary_sequences(const Tensor& x, const Weight& w,
+// The W8 vocabulary SmallT route keeps one eight-K-warp reduction for every T<=48, so verify
+// requests (W=2..8) share weight passes of at most 48 columns; T=49 changes the route.
+std::int32_t w8_vocabulary_group_width(const Tensor& x, const Weight& w,
                                        std::int32_t sequence_width, LinearPolicy policy) {
-    return policy == LinearPolicy::A16Only && w.qtype == QType::W8G32_F16S &&
-           detail::is_w8_vocabulary_problem(w.n, w.k) && sequence_width == 5 && x.ne[1] >= 10 &&
-           x.ne[1] <= 20;
+    constexpr std::int32_t kSameReductionTokens = 48;
+    if (policy != LinearPolicy::A16Only || w.qtype != QType::W8G32_F16S ||
+        !detail::is_w8_vocabulary_problem(w.n, w.k) || sequence_width < 2 || sequence_width > 8 ||
+        x.ne[1] <= sequence_width) {
+        return 0;
+    }
+    return std::min(x.ne[1], kSameReductionTokens / sequence_width * sequence_width);
 }
 
 std::int32_t packed_sequence_group_width(const Tensor& x, const Weight& w,
                                          std::int32_t sequence_width, LinearPolicy policy) {
-    if (aggregate_w8_vocabulary_sequences(x, w, sequence_width, policy)) { return x.ne[1]; }
-    if (w.qtype == QType::NVFP4 && sequence_width == 5 && x.ne[1] >= 10 && x.ne[1] <= 20 &&
-        detail::is_nvfp4_dflash_w5_aggregate_problem(w.n, w.k, policy)) {
-        // Direct T=20 A16 differs by a few BF16 ulps on real recurrent activations despite
-        // passing random conformance inputs. Two T=10 groups preserve the qualified C=2 route
-        // exactly while still halving C=4 weight reads. W4A4 gate/down is exact at T=20.
-        if (x.ne[1] == 20 && detail::is_nvfp4_a16_only_problem(
-                                 detail::resolve_nvfp4_problem(w.n, w.k))) {
-            return 2 * sequence_width;
-        }
+    if (const std::int32_t group = w8_vocabulary_group_width(x, w, sequence_width, policy);
+        group > 0) {
+        return group;
+    }
+    if (w.qtype == QType::NVFP4 && sequence_width >= 2 &&
+        detail::is_nvfp4_dflash_mma_aggregate_problem(w.n, w.k, policy)) {
         return x.ne[1];
     }
-    if (w.qtype == QType::Q4G64_F16S && policy == LinearPolicy::A16Only && sequence_width == 4 &&
-        x.ne[1] >= 8 && x.ne[1] <= 16 && detail::is_q4_27b_draft_head_problem(w.n, w.k)) {
+    if (w.qtype == QType::NVFP4 &&
+        detail::is_nvfp4_dflash_w4a4_aggregate_problem(w.n, w.k, policy, sequence_width)) {
         return x.ne[1];
+    }
+    // The DFlash conv projection SmallT keeps one lane reduction for every T<=32.
+    if (w.qtype == QType::NVFP4 && sequence_width >= 2 && sequence_width <= 8 &&
+        x.ne[1] > sequence_width &&
+        detail::is_nvfp4_dflash_conv_aggregate_problem(w.n, w.k, policy)) {
+        constexpr std::int32_t kSameReductionTokens = 32;
+        return std::min(x.ne[1], kSameReductionTokens / sequence_width * sequence_width);
+    }
+    // The Q4 27B draft head reduces every column in the same order; one pass holds 48 columns.
+    if (w.qtype == QType::Q4G64_F16S && policy == LinearPolicy::A16Only && sequence_width >= 2 &&
+        x.ne[1] > sequence_width && detail::is_q4_27b_draft_head_problem(w.n, w.k)) {
+        constexpr std::int32_t kSameReductionTokens = 48;
+        return std::min(x.ne[1], kSameReductionTokens / sequence_width * sequence_width);
     }
     return sequence_width;
 }
@@ -168,14 +183,15 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         return 0;
     case QType::NVFP4:
         if (!detail::is_nvfp4_linear_problem(output_rows, input_rows) ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
+             policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("linear workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                              min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16S:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
-                                                          min_tokens, max_tokens);
+                                                           min_tokens, max_tokens);
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;

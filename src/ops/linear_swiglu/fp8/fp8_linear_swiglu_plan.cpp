@@ -30,8 +30,8 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     constexpr std::int32_t kChunk      = kFp8LinearSmallTMax<Fp8MlpGateUpGeometry>;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
-        auto* input               = static_cast<std::uint8_t*>(x.data) +
-                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
+        auto* input  = static_cast<std::uint8_t*>(x.data) +
+                       static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
         auto* output = static_cast<std::uint8_t*>(out.data) +
                        static_cast<std::int64_t>(token_begin) * kOutputRows * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});

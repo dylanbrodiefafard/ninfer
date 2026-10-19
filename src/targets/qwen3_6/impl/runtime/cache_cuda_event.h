@@ -11,9 +11,7 @@ namespace ninfer::targets::qwen3_6::detail {
 inline void check_cache_cuda_event_allocation(cudaError_t result) {
     if (result == cudaErrorMemoryAllocation) {
         const cudaError_t pending = cudaGetLastError();
-        if (pending != cudaSuccess && pending != cudaErrorMemoryAllocation) {
-            CUDA_CHECK(pending);
-        }
+        if (pending != cudaSuccess && pending != cudaErrorMemoryAllocation) { CUDA_CHECK(pending); }
         throw std::bad_alloc();
     }
     CUDA_CHECK(result);

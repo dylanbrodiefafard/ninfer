@@ -7,6 +7,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/gdn_history.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
@@ -69,8 +70,7 @@ struct ModelConfig {
 };
 
 inline constexpr ModelConfig kCfg{};
-inline constexpr float kAttnScale                     = kAttentionScale;
-inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
+inline constexpr float kAttnScale = kAttentionScale;
 
 struct MlpW {
     const MlpWeights* payload = nullptr;
@@ -127,7 +127,7 @@ struct PrefillChunkResult {
 
 struct DFlashFeatureSink {
     static constexpr bool enabled = true;
-    using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
+    using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&)>;
 
     Tensor* features                  = nullptr;
     Tensor* positions                 = nullptr;
@@ -144,21 +144,30 @@ struct DFlashFeatureSink {
     void begin(const Tensor& value);
     void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
     void capture_positions(const Tensor& source, cudaStream_t stream);
-    void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
+    void consume_prefill_chunk(std::int32_t tokens);
 };
 
 class VisionPrefillSession;
 
+// A mixed DFlash round runs a prefill owner and verify batch on separate TextContexts.
+// The owner invokes its partner after submitting each layer; the partner submits the matching
+// verify layer and joins both streams before either forward advances to the next layer.
+using LayerPartner      = std::function<void(int layer)>;
+using MixedOwnerForward = std::function<void(const LayerPartner& partner)>;
+
 class TextContext {
 public:
+    // An explicit execution stream borrows startup-owned mixed resources and is used only
+    // with a layer partner; the caller joins it before primary-stream publication or cleanup.
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
-    ~TextContext();
+                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
+                cudaStream_t execution_stream              = nullptr);
+    ~TextContext() = default;
 
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
@@ -170,9 +179,9 @@ public:
     }
 
     void set_prefill_skip(float keep_frac, float xattn_tau, std::int32_t xattn_min_len) noexcept {
-        keep_frac_       = keep_frac;
-        xattn_tau_       = xattn_tau;
-        xattn_min_len_   = xattn_min_len;
+        keep_frac_     = keep_frac;
+        xattn_tau_     = xattn_tau;
+        xattn_min_len_ = xattn_min_len;
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
@@ -181,16 +190,22 @@ public:
         prefill_rewrite_checkpoint_frontier_ = position;
     }
 
+    void set_prefill_split_frontiers(std::span<const std::uint32_t> frontiers) noexcept {
+        prefill_split_frontiers_ = frontiers;
+    }
+
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
         rewrite_checkpoint_hidden_output_ = output;
     }
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
-    void set_linear_state_slots(std::int32_t current_slot, std::int32_t rewrite_checkpoint_slot);
-    void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
-    void set_tree_verify(const Tensor* parent_index, const Tensor* ancestor_mask,
-                         const Tensor* prefix_lengths);
+    void set_linear_state_slot(std::int32_t current_slot);
+    void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records,
+                              const GdnHistory* history = nullptr);
+    void set_tree_verify(const Tensor* parent_index, const Tensor* gdn_tree_schedule,
+                         const Tensor* ancestor_mask, const Tensor* prefix_lengths);
+
     void set_sequence_row(std::int32_t row) noexcept { active_sequence_row_ = row; }
 
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
@@ -209,13 +224,31 @@ public:
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    // The text chunk as a mixed-round owner: `partner` runs after each layer. The chunk leaves the
+    // workspace unreset, does not synchronize, and does not consume the sink; the round calls
+    // sink.consume_prefill_chunk(processed_tokens) once the partner forward is resolved.
+    [[nodiscard]] PrefillChunkResult
+    prefill_chunk(std::span<const int> full_ids, std::uint32_t begin, std::uint32_t nominal_length,
+                  bool finalize_at_end, DFlashFeatureSink& sink, const LayerPartner& partner);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
-    [[nodiscard]] PrefillChunkResult
-    prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
-                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end,
-                  DFlashFeatureSink& sink);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen3_6::PreparedPromptData& input,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   VisionPrefillSession& vision,
+                                                   bool finalize_at_end, DFlashFeatureSink& sink);
+    // Text suffix of a multimodal prompt. There is no Vision session, but RoPE stays on the
+    // prompt's 3-axis positions; a 1-D continuation would not match a cold prefill.
+    [[nodiscard]] PrefillChunkResult prefill_mrope_chunk(const qwen3_6::PreparedPromptData& input,
+                                                         std::uint32_t begin,
+                                                         std::uint32_t nominal_length,
+                                                         bool finalize_at_end);
+    [[nodiscard]] PrefillChunkResult prefill_mrope_chunk(const qwen3_6::PreparedPromptData& input,
+                                                         std::uint32_t begin,
+                                                         std::uint32_t nominal_length,
+                                                         bool finalize_at_end,
+                                                         DFlashFeatureSink& sink);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_slots, ops::GqaExecutionEnvelope envelope,
@@ -224,13 +257,15 @@ public:
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
-                             Tensor& target_tokens, bool reset_workspace = true);
+                             Tensor& target_tokens, bool reset_workspace = true,
+                             cudaEvent_t sampling_ready = nullptr);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
                              Tensor& target_tokens, DFlashFeatureSink& sink,
-                             bool reset_workspace = true);
+                             bool reset_workspace = true, cudaEvent_t sampling_ready = nullptr,
+                             const MixedOwnerForward* owner = nullptr);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -252,19 +287,22 @@ private:
     }
 
     [[nodiscard]] const MtpW& mtp_weights() const;
-    void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
+    void attn_mix(const FullLayerW& weights, Tensor& x, int full_index, Phase phase);
+    void gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
+    template <class Tap>
+    void run_layer(int layer, Tensor& x, Phase phase, Tap& tap);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
-    void run_layers(Tensor& x, Phase phase, Tap& tap);
+    void run_layers(Tensor& x, Phase phase, Tap& tap, const LayerPartner* partner = nullptr);
     template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,
                                   const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                   ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap,
-                                  bool reset_workspace);
+                                  bool reset_workspace, cudaEvent_t sampling_ready,
+                                  const MixedOwnerForward* owner);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
@@ -296,8 +334,10 @@ private:
     template <class Tap>
     [[nodiscard]] PrefillChunkResult
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
-                 const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
+                 const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end,
+                 const LayerPartner* partner = nullptr);
     DeviceContext& ctx_;
+    cudaStream_t stream_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
     qwen3_6::PagedKVCacheView kv_;
@@ -315,6 +355,7 @@ private:
     const Tensor* active_linear_state_slots_              = nullptr;
     const Tensor* active_valid_columns_                   = nullptr;
     const Tensor* active_parent_index_                    = nullptr;
+    const Tensor* active_gdn_tree_schedule_               = nullptr;
     const Tensor* active_ancestor_mask_                   = nullptr;
     const Tensor* active_prefix_lengths_                  = nullptr;
     const Tensor* active_backend_kv_table_rows_           = nullptr;
@@ -324,17 +365,18 @@ private:
     std::int32_t active_sequence_row_                     = 0;
     std::int32_t rope_delta_                              = 0;
     std::int32_t linear_state_current_slot_               = 0;
-    std::int32_t linear_state_rewrite_checkpoint_slot_    = 0;
     GdnStateAction gdn_state_action_                      = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_               = nullptr;
+    const GdnHistory* gdn_history_                        = nullptr;
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
-    Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
-    std::uint32_t mtp_proposal_extent_                    = 0;
+    std::span<const std::uint32_t> prefill_split_frontiers_{};
+    Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
+    std::uint32_t mtp_proposal_extent_        = 0;
     // Prefill tile-skip: keep_frac (Sparge) and xattn_tau (XAttention). Decode/SmallT
     // ignore these (forced dense). Defaults are exact attention.
-    float keep_frac_                                       = 1.0f;
-    float xattn_tau_                                       = 1.0f;
-    std::int32_t xattn_min_len_                            = 8192;
+    float keep_frac_            = 1.0f;
+    float xattn_tau_            = 1.0f;
+    std::int32_t xattn_min_len_ = 8192;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

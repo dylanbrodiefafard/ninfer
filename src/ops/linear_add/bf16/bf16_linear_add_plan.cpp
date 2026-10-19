@@ -15,7 +15,6 @@ Bf16LinearAddScheduleId bf16_linear_add_select(std::int32_t output_rows, std::in
         throw std::invalid_argument("bf16 linear_add: unsupported exact problem");
     }
     if (tokens == 1) { return Bf16LinearAddScheduleId::Decode; }
-    if (tokens <= kBf16LinearAddSmallTDispatchEnd) { return Bf16LinearAddScheduleId::SmallT; }
     if (tokens <= kBf16LinearAddAggregateMmaEnd) { return Bf16LinearAddScheduleId::AggregateMma; }
     return Bf16LinearAddScheduleId::Mma;
 }
@@ -24,8 +23,6 @@ const char* bf16_linear_add_schedule_name(Bf16LinearAddScheduleId schedule) noex
     switch (schedule) {
     case Bf16LinearAddScheduleId::Decode:
         return "linear_add.bf16.decode.residual";
-    case Bf16LinearAddScheduleId::SmallT:
-        return "linear_add.bf16.small_t.residual";
     case Bf16LinearAddScheduleId::AggregateMma:
         return "linear_add.bf16.aggregate_mma.residual";
     case Bf16LinearAddScheduleId::Mma:
@@ -39,9 +36,6 @@ void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& res
     switch (bf16_linear_add_select(weight.n, weight.k, x.ne[1])) {
     case Bf16LinearAddScheduleId::Decode:
         bf16_linear_add_decode_launch(x, weight, residual, stream);
-        return;
-    case Bf16LinearAddScheduleId::SmallT:
-        bf16_linear_add_small_t_launch(x, weight, residual, stream);
         return;
     case Bf16LinearAddScheduleId::AggregateMma:
         bf16_linear_add_aggregate_mma_launch(x, weight, residual, stream);

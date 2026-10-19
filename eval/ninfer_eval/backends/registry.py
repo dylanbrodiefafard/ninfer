@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import functools
+
 from .base import EvaluationBackend
 
 _BACKENDS: dict[str, EvaluationBackend] = {}
-_BUILTINS_LOADED = False
 
 
 def register_backend(backend: EvaluationBackend) -> None:
@@ -25,14 +26,11 @@ def backend_names() -> list[str]:
     return sorted(_BACKENDS)
 
 
+@functools.cache
 def _ensure_builtins() -> None:
-    global _BUILTINS_LOADED
-    if _BUILTINS_LOADED:
-        return
     from .evalscope import EvalScopeBackend
     from .mock import MockBackend
 
     for backend in (MockBackend(), EvalScopeBackend()):
         if backend.name not in _BACKENDS:
             register_backend(backend)
-    _BUILTINS_LOADED = True

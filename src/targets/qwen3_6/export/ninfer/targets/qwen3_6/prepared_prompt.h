@@ -11,7 +11,7 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-struct ToolGrammarData;
+struct TokenGrammarData;
 
 enum class PromptModality : std::uint8_t {
     Image = 1,
@@ -49,6 +49,9 @@ enum class RewriteCheckpointKind : std::uint8_t {
 struct RewriteCheckpointSpec {
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::uint32_t frontier     = 0;
+    // The checkpoint is this request's own generation opener, not an earlier assistant turn's
+    // (a TurnClosure checkpoint inside a tool loop sits at the loop's first opener).
+    bool generation_opener = false;
 
     [[nodiscard]] bool operator==(const RewriteCheckpointSpec&) const = default;
 };
@@ -72,12 +75,15 @@ struct PreparedPromptData {
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;
+    // Sorted absolute token indexes of turn-closure frontiers inside this prompt. A cold prefill
+    // stops at each one so its state matches a checkpoint captured on an earlier turn.
+    std::vector<std::uint32_t> turn_closure_frontiers;
     std::vector<float> patches;
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
     bool starts_in_reasoning = false;
     bool tool_output_enabled = false;
-    std::shared_ptr<const ToolGrammarData> tool_grammar;
+    std::shared_ptr<const TokenGrammarData> token_grammar;
     std::shared_ptr<const GenerationRecoveryContext> generation_recovery;
     PrepareStats prepare;
 

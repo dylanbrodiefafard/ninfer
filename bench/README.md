@@ -37,7 +37,7 @@ is enabled and the matrix contains decode work, one ordinary public generation r
 decode graph before warmups and measured repetitions. `--concurrency N` also primes the N-lane
 decode graph.
 
-`--concurrency N` (1–4) sizes the Engine for N active lanes. Pure-prefill throughput is aggregate
+`--concurrency N` (1–6) sizes the Engine for N active lanes. Pure-prefill throughput is aggregate
 `N * P / wave_seconds`; because the Engine permits one prefill owner, it measures a serialized
 request wave rather than N simultaneous prefill kernels. Decode throughput is aggregate:
 `N * G / max(decode_seconds)` across lanes. For `pp+tg` at `N>1`, each lane first completes a
@@ -55,8 +55,8 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..4>]
-           [--spec <mtp|dflash>] [--draft-tokens <0..5>] [--dflash-verify-width <2..16>]
+          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..6>]
+           [--spec <dflash>] [--draft-tokens <1..7>] [--dflash-verify-width <2..16>]
            [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -73,16 +73,21 @@ Example:
 ```
 
 `bf16` selects BF16 KV storage, `int8` selects INT8 group-64 KV storage, and `nvfp4` selects the
-NVFP4-G16 KV layout. `--spec mtp` (default) enables MTP with `--draft-tokens 1..5`; `--spec
-dflash` requires the artifact to contain `dflash/` objects and takes `--draft-tokens 1..5`
-(verify width 0 = k-dependent default, or explicit `--dflash-verify-width`). `--lm-head-draft`
-selects the optimized proposal head. CUDA Graph decode is enabled by default. `--concurrency 2` is the
+NVFP4-G16 KV layout. Speculative decoding is off by default. `--spec dflash` requires the
+artifact to contain `dflash/` objects and takes `--draft-tokens 1..7` (verify width 0 selects
+the k-dependent default, or use explicit `--dflash-verify-width`). MTP execution is disabled.
+`--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is enabled by default. `--concurrency 2` is the
 batched-decode check: two Engine lanes, not HTTP.
 
-`--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
-and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
-`cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
-load, graph construction, and warmup do not enter topology counts.
+`--profile-measured` is a benchmark-only profiler boundary. For ordinary tests it requires
+exactly one selected test and `-r 1`, synchronizes after warmup, and brackets the measured
+repetition with `cudaProfilerStart/Stop`. With `--contention` it brackets the owner job window,
+excluding model loading and the decode-only calibration windows. Background decode remains
+live, so a decode round may straddle a capture boundary; use launch-correlated NVTX ranges to
+attribute mixed work. Use an Nsight Systems `cudaProfilerApi` capture range. On the installed
+profiler, stopping collection while background decode remains live can abort the application;
+`--capture-range-end=none` keeps collection active until process exit. In that mode, exclude the
+subsequent calibration and shutdown work when analyzing the owner window.
 
 ## Linear Op benchmark
 
@@ -159,6 +164,52 @@ bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidt
 the practical utilization measure for read-dominated points. Physical traffic and instruction
 utilization still require NCU.
 
+## Convolution finish, residual and plain RMS benchmark
+
+`ninfer_grouped_dynamic_conv_bench` measures the complete public convolution
+finish/residual/plain-RMS edge, comparing its three-Op composition with
+`grouped_dynamic_conv_finish_residual_rmsnorm`. Both use D=5120, represented BF16
+inputs, warm-L2 captured graphs and untimed residual resets. Timing includes graph
+dispatch/event overhead; it is an operator-edge comparison, not Engine throughput.
+The retained benchmark selects production dispatch and has no private route controls.
+
+```bash
+cmake --build build --parallel 4 --target ninfer_grouped_dynamic_conv_bench
+./build/bench/ninfer_grouped_dynamic_conv_bench --batch 6 --width 8 --repeat 300
+```
+
+## Selected K/V projection and normalization Op benchmarks
+
+These executables measure retained public Ops on RTX5090. They have no candidate
+forcing or comparison routes; production dispatch owns the implementation.
+
+```bash
+cmake --build build --parallel 4 --target ninfer_linear_kv_projection_bench \
+  ninfer_dual_rmsnorm_bench ninfer_normalized_rope_kv_append_bench
+./build/bench/ninfer_linear_kv_projection_bench \
+  --batch 6 --widths 3,8,128,2048 --mode graph --cold --repeat 100
+./build/bench/ninfer_dual_rmsnorm_bench --tokens 18 --repeat 200
+./build/bench/ninfer_normalized_rope_kv_append_bench \
+  --batch 6 --width 8 --count 8 --repeat 100
+```
+
+`linear_kv_projection` uses an original NVFP4 `[6144,5120]` weight and writes
+separate contiguous K/V `[1024,W*B]` outputs. `--batch` accepts 1..6;
+`--widths` accepts widths 1..2048. `--mode` selects eager or captured execution.
+`--cold` flushes L2 outside the event interval; otherwise buffers remain resident.
+`--layers 5` measures five distinct weights with the same output storage reused.
+
+`dual_offset_rmsnorm` normalizes two independent BF16 `[5120,T]` panels and reports
+eager and captured timings. Without `--tokens`, it covers the distinct extents
+from B1/2/6 and W1..6.
+
+`normalized_rope_kv_append` measures the complete plain K RMS/RoPE/accepted BF16
+cyclic-cache update, including exact V copies. Defaults cover B1/2/6, W3..8,
+and counts zero/one/mixed/full. `--count -1` selects mixed device counts; width
+2048 with count2048 measures complete ring replacement. All timings exclude
+fixture setup and cache initialization. Independent numerical and state
+qualification lives in the corresponding Op tests.
+
 ## Embedding Op benchmark
 
 `ninfer_embedding_bench` measures the three registered quantized public `embedding()` profiles:
@@ -191,7 +242,7 @@ selects the 35B contiguous-parent form. `--candidate auto` uses production dispa
 selected route and transient workspace after a 256 MiB L2 flush.
 
 For the 27B norm/control profile, `--packed-width W` measures the public packed-independent-
-sequence entry with each listed `T` interpreted as `W*B` for B=1..4. It is valid only with
+sequence entry with each listed `T` interpreted as `W*B` for B=1..6. It is valid only with
 `--norm-control --candidate auto`; private candidate bit-exact screening remains a separate mode.
 
 ```bash
@@ -218,9 +269,9 @@ Running/chunked modes use batch 1; snapshot mode accepts exact `B=1..8` and opti
 prefixes. Every measurement is a CUDA Graph replay preceded by a 256 MiB L2 flush outside the timed
 interval.
 
-`--running` measures the public running-state entry across recurrent-only, complete 64-token
-chunks, and chunked-plus-recurrent-tail routes. `--snapshot` measures the snapshot entry over the
-production `W=1..16` batch range; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
+`--running` measures the public running-state entry across its recurrent route (T < 60) and
+its chunked route, whose last 64-token chunk may be partial. `--snapshot` measures the snapshot
+entry over the production `W=1..16` batch range; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
 `--chunked-only` measures the complete pre-normalized BF16 pipeline through the public Op. Adding
 `--breakdown` reports isolated `prepare_wy_wu`, `state_passing`, and `output` stage timings. These
 three intrinsic algorithm stages are the benchmark's sole private-launcher exception; the complete
@@ -277,9 +328,9 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 
 `ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6 Q4/Q5, NVFP4, and W8
 `gdn_input_proj_conv_snapshot` forms for exact `B=1..8` and record-producing forms for the product
-domain `B=1..4`. The timed body is exactly one complete public Op call; the benchmark does not
+domain `B=1..6`. The timed body is exactly one complete public Op call; the benchmark does not
 include private launchers, candidate selection, duplicated compositions, or route labels. Its
-default `T=1..6` sweep is the production MTP verification interval. NVFP4 accepts
+default `T=1..6` sweep is the dormant private MTP verification interval. NVFP4 accepts
 the public `a16` and `a4` policies; the reported profile names the caller policy, not a private
 resolved route.
 
@@ -429,6 +480,18 @@ cmake --build build --parallel --target ninfer_prepare_masked_block_bench
 
 Useful traffic is `(2+2B)*4` bytes: two device scalar reads and two complete I32 output writes.
 
+## NVFP4 normalized LinearSwiGLU Op benchmark
+
+`ninfer_nvfp4_linear_swiglu_bench` accepts `--policy a16|a4|a8`.
+`--rmsnorm` times the composed RMSNorm→LinearSwiGLU sequence; `--rmsnorm-fused`
+times the `rmsnorm_linear_swiglu` public Op and requires `--policy a8` without panel splitting.
+Both include normalization, quantization and projection in the timed region:
+
+```bash
+./build/bench/ninfer_nvfp4_linear_swiglu_bench --policy a8 --rmsnorm --t-sweep 4,5,6,16,20,24
+./build/bench/ninfer_nvfp4_linear_swiglu_bench --policy a8 --rmsnorm-fused --t-sweep 4,5,6,16,20,24
+```
+
 ## W8 LinearSwiGLU Op benchmark
 
 `ninfer_w8_linear_swiglu_bench` measures the registered W8 `[12288,2048] -> [6144,T]`
@@ -474,8 +537,8 @@ cmake --build build --parallel --target ninfer_q5_linear_add_bench
 ## BF16 LinearAdd Op benchmark
 
 `ninfer_bf16_linear_add_bench` measures the contiguous BF16 `[5120,6144]` projection with its
-in-place BF16 residual epilogue. Production uses decode at `T=1`, exact-small-T at `T=2..4`,
-aggregate MMA through `T=48`, and the large-T MMA afterward.
+in-place BF16 residual epilogue. Production uses decode at `T=1`, aggregate MMA at `T=2..48`,
+and the large-T MMA afterward; `--route aggregate-mma` forces the aggregate MMA.
 Every sample is cold-cache. Effective bandwidth counts the weight once, the activation once, and
 the residual read plus write; its `READ_%` and `TC_%` use the benchmark's explicit RTX 5090 BF16
 references.
@@ -594,19 +657,6 @@ cmake --build build --parallel --target ninfer_mtp_pack_bench
 ./build/bench/ninfer_mtp_pack_bench --op split --tokens 1,2,3,4,5,6,48
 ```
 
-## Target MTP round benchmark
-
-`ninfer_qwen3_6_27b_mtp_round_bench` measures the registered target's native proposal and
-verification round without introducing a second generation controller. It loads the same `.ninfer`
-artifact through the target-private package facade, prepares a real prompt with that target's
-Frontend, and reports draft/accept statistics for the target-owned MTP schedule:
-
-```bash
-cmake --build build --parallel --target ninfer_qwen3_6_27b_mtp_round_bench
-./build/bench/ninfer_qwen3_6_27b_mtp_round_bench \
-  --artifact out/qwen3_6_27b.ninfer
-```
-
 ## 35B complete DFlash round benchmark
 
 `ninfer_qwen3_6_35b_a3b_dflash_round_bench` drives the production Program through consecutive
@@ -637,6 +687,14 @@ cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_sele
 ./build/bench/ninfer_argmax_bench
 ./build/bench/ninfer_argmax_bench --shape full --cols 128
 ./build/bench/ninfer_argmax_bench --shape shortlist --cols 120
+```
+
+`ninfer_token_logprobs_bench` times public `token_logprobs` at the same head geometry for the
+ordinary, chain, and widest verify frames, once with every slot active and once with every row
+disabled (the cost of a round in which no request asked for logprobs):
+
+```bash
+./build/bench/ninfer_token_logprobs_bench
 ```
 
 The G2/G3 benchmark uses physical rows 248320, valid token domain 248077, optional occurrence

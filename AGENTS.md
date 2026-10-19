@@ -73,13 +73,23 @@ or will be changed, proportionately and without performative apology or praise.
 
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance,
 compiled for `sm_120a` and tuned on an NVIDIA GeForce RTX 5090. The only supported identity is
-`qwen3.8-27b/nvfp4`; its default artifact, when available, is the MTP-NVFP4 or DFlash2 (NVFP4
-matrices, BF16 selector codebook) variant over the base Ostfralla NVFP4 shell. The workload is
-one GPU, one resident model instance, and a startup-fixed one to four active requests. The
-Engine forms one compact decode batch per round boundary with bounded FIFO ingress and no
-preemption. Large-scale or preemptive continuous batching, priority/QoS scheduling, additional
+`qwen3.8-27b/nvfp4`; its recommended artifact is the DFlash2 variant (NVFP4 matrices, BF16
+selector codebook) over the base Ostfralla NVFP4 shell. CLI/server default to automatic KV capacity
+and enable adaptive DFlash2 K7 with the optimized proposal head when that companion is present;
+base artifacts run without speculation. MTP execution is disabled; stored MTP tensors remain
+artifact-validation inputs only. NVFP4 KV is the recommended cache format. The workload is one
+GPU, one resident model instance, and a startup-fixed one to six active requests. The
+Engine forms one compact decode batch per round boundary with bounded FIFO ingress. A short
+text prefill may interrupt a large prefill at a completed chunk boundary only on a genuinely
+available spare lane with its own feasible resources; the suspended owner retains its lane
+and state and must advance another chunk before another interruption. General preemptive
+continuous batching, priority/QoS scheduling, additional
 checkpoint targets, and retargeting to another execution platform are outside the current
-product. This is a trusted local, single-owner project, and requirements from a different
+product. Per-request `cache_write: false` supports disposable turns that fork coherent cached
+state into independent allocations, preserve the original through initialization, suppress reuse
+checkpoint captures and RAM/disk writes for the branch, and prioritize disposable idle state for
+eviction. An ordinary original may migrate to full-state RAM storage to free a lane; this is not
+branch persistence. This is a trusted local, single-owner project, and requirements from a different
 workload, trust model, or deployment model are out of scope until the contract is explicitly
 changed.
 
@@ -89,7 +99,7 @@ Read only the current authorities relevant to a live decision in the task; this 
 routing map, not a mandatory reading list:
 
 - `README.md` and executable `--help`: delivered capabilities and exact commands;
-- `docs/README.md`: documentation map; `docs/cli.md`: CLI input, sampling, MTP, and runtime
+- `docs/README.md`: documentation map; `docs/cli.md`: CLI input, sampling, speculative decoding, and runtime
   options; `docs/serving.md`: OpenAI/Anthropic HTTP behavior; `docs/performance.md`:
   performance methodology and results;
 - `docs/maintainer/concurrent-inference-architecture.md`: request/slot lifecycle, scheduling,
@@ -106,6 +116,13 @@ routing map, not a mandatory reading list:
   performance-evidence rules;
 - `docs/maintainer/kernel-iteration.md`: Layer 0-3 CUDA speed procedure (`tools.kdev`
   bound/mma/Op sweep/production path);
+- `docs/maintainer/merging-to-master.md`: the gates every merge into `master` must pass, their
+  commands, and how the result is recorded;
+- `docs/maintainer/code-quality.md`: compiler-warning, clang-tidy, formatter, linter, spelling,
+  and sanitizer gates, their pinned versions, commands, and suppression policy;
+- `docs/maintainer/upstream-sync.md`: porting from upstream Neroued/ninfer `dev` (remote
+  `upstream`): the last reviewed upstream commit and per-commit verdicts, so a new review starts
+  after that watermark and updates it;
 - `include/ninfer/engine.h` and `include/ninfer/types.h`: in-tree C++ product interface.
 
 ## Product and ownership boundaries
@@ -171,6 +188,70 @@ Where relevant to the changed behavior, account for numeric-format decode, BF16 
 GDN state, BF16/INT8/NVFP4 KV, MTP accept/commit state, arena lifetime, and CUDA Graph address
 stability. This is a risk map, not a checklist for every numerical task.
 
+## Code and comment quality
+
+The quality bar is code a demanding senior reviewer would merge without comment, on the first
+submission. Every change is correct at its boundaries, explicit about ownership and invariants,
+consistent with the code around it, and free of anything it does not need. A change that works
+but is unclear, loosely typed, under-checked, or inaccurately commented is not finished; shipping
+sooner is never a reason to lower this bar.
+
+Code:
+
+- Encode invariants in types where C++ allows it: distinct enums or strong types rather than
+  interchangeable `bool`/`int` parameters, `[[nodiscard]]` on results that must be consumed,
+  `const`/`constexpr` by default, and RAII ownership for every resource (device memory, streams,
+  events, graphs, files, threads, sockets).
+- Check every fallible operation (CUDA runtime/driver calls, kernel launches, I/O, parsing,
+  allocation) where it fails, and propagate a typed error with context; never discard a status,
+  swallow an exception, or log-and-continue past a broken invariant.
+- Size, offset, and index arithmetic cannot overflow at real model shapes. Host code uses 64-bit
+  element and byte offsets for tensors, arenas, and workspaces, with explicit and justified
+  narrowing and no product of two 32-bit values widened after the fact. Device code may index in
+  32 bits, which saves registers and instructions, only when the kernel's documented shape
+  contract bounds every product below 2^31 and its host launcher validates that bound.
+- No undefined behavior, data races, or unstated synchronization assumptions. A kernel's
+  correctness under concurrency is demonstrated with compute-sanitizer, not inferred.
+- No dead code, commented-out code, unused parameters or variables, debug output, duplicated
+  logic, or hooks for hypothetical callers. Names state meaning and unit (`bytes`, `elems`,
+  `tokens`, `rows`) where a bare number would be ambiguous.
+
+Comments:
+
+- Comments state what the code cannot: why this approach, the invariants and preconditions it
+  relies on, units, layouts, alignment, numerical reasoning, hardware limits, and
+  synchronization. A comment that restates the code is removed.
+- Every kernel documents its grid/block/warp-to-data mapping, shared-memory layout,
+  synchronization points, and the shapes and alignment it requires. Every Op and every
+  non-obvious interface documents preconditions, ownership and lifetime, and error behavior.
+- Comments are part of the change: code that changes without its comments is a defect, and a
+  stale or inaccurate comment is fixed or deleted when found.
+- Comments describe the current code, never its history or the process that produced it ("now",
+  "new", "fixed", "previously", "as requested", task or agent references); history belongs in
+  commit messages and the active references. No `TODO` without the concrete condition that
+  resolves it.
+- Comments and documentation are precise English in complete sentences, with correct spelling
+  and consistent terminology.
+
+The gates are enforced in two tiers; no hosted CI runs them.
+
+- **Every commit, on any branch.** The commit hook (`.githooks/pre-commit`, enabled by
+  `./scripts/dev-setup.sh` or `git config core.hooksPath .githooks`) formats and lints the staged
+  files, folds the automatic fixes into the commit, and fails only when a check still fails.
+  Every build is `-Werror`. While working, run the fast unit tests often
+  (`./scripts/run-unit-tests.sh --fast`) and `./scripts/run-clang-tidy.py --changed` on C++ or
+  CUDA changes.
+- **Every merge into `master`.** Every formatter, linter, compiler warning, clang-tidy check,
+  unit test, Engine test, compute-sanitizer tool, and AddressSanitizer run passes on the commit
+  being merged, as [`docs/maintainer/merging-to-master.md`](docs/maintainer/merging-to-master.md)
+  specifies.
+
+[`docs/maintainer/code-quality.md`](docs/maintainer/code-quality.md) describes each gate. The
+tree is clean under every gate, so any finding belongs to the change that produced it and is
+fixed; a suppression is reserved for correct code, is scoped to one line, and states its reason.
+Never weaken, disable, or bypass a gate (`--no-verify`, removing a check or flag) to land a
+change.
+
 ## Performance work
 
 CLI, serve, Engine A/Bs, and decode-speed work use the Engine default `--kv-dtype nvfp4` unless
@@ -202,16 +283,24 @@ active-link/stale-reference review and `git diff --check`; C++ runtime/API chang
 affected explicit targets and meaningful tests; Python tooling gets `py_compile` and affected
 Python tests; `.ninfer` reader/converter/binder changes get affected contract tests and a real
 artifact when semantics require it; CUDA math gets an independent numerical oracle at relevant
-shapes; memory/lifetime changes get the affected execution, with a sanitizer only for a
-concrete lifetime risk; performance changes get measurement at the claimed scope, with
+shapes; new or changed kernels with shared-memory staging, asynchronous copies, or warp-level
+synchronization get compute-sanitizer memcheck and racecheck on their tests, and a case in the
+`sanitizer` test set when the qwen3.8-27b DFlash2 flow dispatches them; memory/lifetime
+changes get the affected execution, with initcheck or AddressSanitizer for a concrete lifetime
+risk; performance changes get measurement at the claimed scope, with
 attribution tools only when needed; serving changes get affected OpenAI/Anthropic schema tests
 and observable request/stream behavior.
 
-After substantial work, and before a commit or push, run the full C++ unit-test suite with
-`./scripts/run-unit-tests.sh`. That command builds the test targets in the `ninfer-builder`
-GPU container and runs every CTest except the opt-in real-artifact Engine tests.
-`--real` includes those Engine tests and binds `.ninfer` files from `models/`, `/models`, or `models/weights.env`. Focused checks remain the right evidence during the work;
-the full suite is the gate that unrelated tests still pass.
+The quality gates in `docs/maintainer/code-quality.md` apply to every change in addition to this
+evidence. Run the fast unit tests often while working: `./scripts/run-unit-tests.sh --fast`
+builds the test targets in the `ninfer-builder` GPU container and runs every CTest except the
+few labelled `slow` and the real-artifact Engine tests; without `--fast` it also runs the slow
+ones, which is the right check after substantial work. Run the Engine tests
+(`./scripts/run-unit-tests.sh --real`, binding `.ninfer` files from `models/`, `/models`, or
+`models/weights.env`) only when the change requires them: Engine, runtime, target Program,
+KV-cache tiers, speculative decoding, or serving behavior. Focused checks remain the right
+evidence during the work. A merge into `master` runs everything, as
+`docs/maintainer/merging-to-master.md` specifies.
 
 ## Local environment
 
@@ -223,7 +312,8 @@ are checkout-specific, not a convention; normal build in `build/`; profiler outp
 CUDA 13.1; speed and Engine A/B work uses `--kv-dtype nvfp4`. GPU tests and kernel iteration
 run in the `ninfer-builder` container, started with `./scripts/dev-setup.sh`. That image is
 the Dockerfile `build` stage (`docker build --target build --tag local/ninfer-builder:5090 .`),
-not the runtime serve image. Use the selected Python 3.11 interpreter explicitly; do not
+not the runtime serve image, and it carries the pinned clang-tidy; the other quality tools are
+pinned in `.pre-commit-config.yaml` and installed by `pre-commit`. Use the selected Python 3.11 interpreter explicitly; do not
 install or upgrade dependencies unless the task requires it. Never select an artifact by glob,
 modification time, or an unqualified "latest" name; large artifacts, source checkpoints, and
 profiler outputs are local prerequisites, not things to download or regenerate unless in scope.

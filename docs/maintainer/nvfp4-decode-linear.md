@@ -16,6 +16,30 @@ Do not revive fused-into-MMA activation quantize, TMEM/`tcgen05`/2-SM, or a hand
 - Verify Linear `T = width × B` (MLP / attn-in / lm_head pack the compact batch). Primary points: `T = 4,5,6,8,12` (and 18,24,36 secondary).
 - Ordinary decode / MTP proposal AR: `T = B` (`1,2,3`). Cover them; they are not the tok/s point.
 
+## A8 verification route
+
+`AllowA8` selects A8 from T=2 at the supported text geometries; T=1 retains A16.
+For LinearAdd N=5120, K=17408, T=2..8, the A8 route uses M16 N32 K512, three
+stages, and 160 CTAs of 128 threads. It stages eight activation rows and supplies zeros
+for the unused upper half of each M16 MMA. This halves the number of activation-tile
+replays relative to N16 while retaining one weight pass, ascending K16 accumulation,
+and the residual BF16 cast. T>=9 retains the ordinary full-row staging schedules.
+
+NVFP4-to-FP8 expansion assembles signed code bytes with byte permutations. This is an
+exact format transformation, including negative zero; block scales remain applied to
+K16 partials in FP32. The exhaustive device test checks all 65,536 packed four-code words
+against an independent table of represented values.
+
+Measure the complete LinearAdd Op, including activation quantization:
+
+```bash
+./build/bench/ninfer_nvfp4_linear_add_bench --n 5120 --k 17408 --policy a8 --t-sweep 2,8,9
+```
+
+The full Up/SwiGLU/quantize/Down cooperative fusion was also numerically qualified, but
+lost to this native schedule with exact code expansion. It is not dispatched. Engine
+results and the scope of that comparison belong in [performance.md](../performance.md).
+
 ## Roofline
 
 \[
@@ -25,8 +49,11 @@ B_W=\tfrac{9}{16}NK,\quad
 \]
 
 Ridge at 1676 TFLOP/s and 1674.5 GB/s is \(\approx 1000\) FLOP/byte \(\Rightarrow T_{\mathrm{ridge}}\approx 280\).
-Serving \(T\le 36\) is 10–100× below ridge. Reusing \(W\) across T, tensor-core issue rate, and
-MMA instruction count do not move wall time. The only Linear floor is one pass over \(W\):
+These dense-FP4 estimates describe W4A4; A8 uses the separately calibrated FP8 K16 issue
+roof from `tools.kdev mma`. Serving \(T\le 36\) lies far below the dense-FP4 ridge, so one
+weight pass is a useful byte floor. It does not prove achieved bandwidth: format expansion,
+address generation, staging, and synchronization can still increase measured wall time.
+The weight-bandwidth lower bound is:
 
 \[
 t\ge t_{\mathrm{mem}}=B/1674.5\,\mathrm{GB/s}.
@@ -38,7 +65,7 @@ is slower because of the **access pattern and grid**, not missing FLOPs.
 
 Whole-decoder NVFP4 weights \(\approx 13.7\) GB \(\Rightarrow \approx 119\) tok/s with no speculation
 (one token per full weight pass). 290 tok/s without spec is not a Linear-issue ceiling on this
-HBM; it matches speculative Linear-only arithmetic (MTP3 × 119) if the rest of the round were free.
+memory bandwidth; it matches speculative Linear-only arithmetic (MTP3 × 119) if the rest of the round were free.
 
 ## What the current W4A4 decode kernel does wrong
 

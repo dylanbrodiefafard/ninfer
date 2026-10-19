@@ -18,16 +18,15 @@ import statistics
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
-
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.bench import run_serve_corpus as corpus  # noqa: E402
-
 
 SUITES = ("decode-saturation", "corpus-makespan")
 DEFAULT_STATS_INTERVAL_MS = 1000
@@ -122,7 +121,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--mode",
         action="append",
         choices=tuple(corpus.SPECULATIVE_MODES),
-        help="speculative mode; repeat to select multiple (default: mtp0 and mtp3)",
+        help="speculative mode; repeat to select multiple (default: ordinary and dflash7)",
     )
     parser.add_argument(
         "--sampling",
@@ -135,6 +134,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.6,
         help="stochastic temperature override (default: 0.6, published method)",
+    )
+    parser.add_argument(
+        "--p-less-draft-temperature",
+        type=float,
+        default=None,
+        help="pinned DFlash2 p-less draft temperature passed to ninfer-serve "
+        "(default: the server's online calibration)",
+    )
+    parser.add_argument(
+        "--p-less-temperature",
+        type=float,
+        default=None,
+        help="p-less sampling temperature passed to ninfer-serve (default: the server's own)",
     )
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
@@ -208,7 +220,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--adaptive-draft",
         action="store_true",
-        help="pass --adaptive-draft (live K); requires MTP or DFlash --mode",
+        help="pass --adaptive-draft (live K); requires a DFlash --mode",
     )
     parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
@@ -217,7 +229,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--proposal-head",
         choices=("optimized", "full"),
         default="optimized",
-        help="DFlash/MTP proposal head: optimized (--lm-head-draft) or full vocab (default: optimized)",
+        help="DFlash proposal head: optimized (--lm-head-draft) or full vocab (default: optimized)",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="print point commands and request counts only"
@@ -246,15 +258,13 @@ def validate_args(args: argparse.Namespace) -> None:
     if len(args.concurrency) != len(set(args.concurrency)):
         raise corpus.CampaignError("duplicate --concurrency value")
     for concurrency in args.concurrency:
-        if concurrency < 1 or concurrency > 4:
-            raise corpus.CampaignError("--concurrency must be in [1, 4]")
+        if concurrency < 1 or concurrency > 6:
+            raise corpus.CampaignError("--concurrency must be in [1, 6]")
     if len(args.suite) != len(set(args.suite)):
         raise corpus.CampaignError("duplicate --suite value")
 
 
-def build_points(
-    artifacts: Sequence[tuple[str, Path]], args: argparse.Namespace
-) -> list[Point]:
+def build_points(artifacts: Sequence[tuple[str, Path]], args: argparse.Namespace) -> list[Point]:
     mode_names = args.mode or list(corpus.DEFAULT_MODES)
     if len(mode_names) != len(set(mode_names)):
         raise corpus.CampaignError("duplicate --mode value")
@@ -297,11 +307,19 @@ def saturation_job_fixtures(
     if args.saturation_messages is not None:
         path = args.saturation_messages.expanduser().resolve()
         try:
-            messages = json.loads(path.read_text(encoding="utf-8"))
+            loaded = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise corpus.CampaignError(f"failed to read --saturation-messages: {exc}") from exc
+        # A plain message list, or a captured request object {"messages": [...], "tools": [...]}.
+        tools = None
+        messages = loaded
+        if isinstance(loaded, dict):
+            messages = loaded.get("messages")
+            tools = loaded.get("tools") or None
         if not isinstance(messages, list) or not messages:
-            raise corpus.CampaignError("--saturation-messages must be a non-empty JSON list")
+            raise corpus.CampaignError(
+                "--saturation-messages must be a non-empty message list or {messages, tools}"
+            )
         one = corpus.Fixture(
             name=path.stem,
             messages=messages,
@@ -309,6 +327,7 @@ def saturation_job_fixtures(
             max_new=args.decode_tokens,
             suite="long_niah",
             category=None,
+            tools=tools,
         )
         return [one] * concurrency
     resolved: list[corpus.Fixture] = []
@@ -442,6 +461,10 @@ def server_command(
             command.append("--lm-head-draft")
         if getattr(args, "adaptive_draft", False):
             command.append("--adaptive-draft")
+    if point.sampling_mode == "p-less" and getattr(args, "p_less_temperature", None) is not None:
+        command.extend(["--temperature", str(args.p_less_temperature)])
+    if getattr(args, "p_less_draft_temperature", None) is not None:
+        command.extend(["--dflash-p-less-draft-temperature", str(args.p_less_draft_temperature)])
     if point.sampling_mode == "greedy":
         command.extend(["--greedy", "--no-p-less-sampling"])
     elif point.sampling_mode == "stochastic":
@@ -479,22 +502,20 @@ def validate_server_start(
         "max_pending_requests": 1,
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
         "prefill_chunk": args.prefill_chunk,
-        "log_stats_interval_ms": getattr(
-            args, "log_stats_interval_ms", DEFAULT_STATS_INTERVAL_MS
-        ),
+        "log_stats_interval_ms": getattr(args, "log_stats_interval_ms", DEFAULT_STATS_INTERVAL_MS),
         "kv_cache": corpus.KV_CACHE_LOG_NAMES[args.kv_dtype],
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
         "speculative_draft_window": point.draft_tokens,
-        "proposal_head": getattr(args, "proposal_head", "optimized") if point.draft_tokens else "full",
+        "proposal_head": getattr(args, "proposal_head", "optimized")
+        if point.draft_tokens
+        else "full",
     }
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:
         raise corpus.CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
-    if event.get("sampling_defaults", {}).get("greedy") != (
-        point.sampling_mode == "greedy"
-    ):
+    if event.get("sampling_defaults", {}).get("greedy") != (point.sampling_mode == "greedy"):
         raise corpus.CampaignError("server_start sampling mode does not match the point")
     p_less = event.get("sampling_defaults", {}).get("server_overrides", {}).get("p_less")
     if p_less != (point.sampling_mode == "p-less"):
@@ -597,8 +618,7 @@ def receive_stream(
                 if not isinstance(delta, dict):
                     raise corpus.CampaignError("SSE delta is not a JSON object")
                 if any(
-                    delta.get(name) not in (None, "")
-                    for name in ("content", "reasoning_content")
+                    delta.get(name) not in (None, "") for name in ("content", "reasoning_content")
                 ):
                     now = time.monotonic()
                     if first_output_at is None:
@@ -618,7 +638,14 @@ def receive_stream(
                     if not isinstance(reasoning, str):
                         raise TypeError("streamed reasoning is not text")
                     reasoning_parts.append(reasoning)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise corpus.CampaignError(f"invalid Chat Completions SSE response: {exc}") from exc
 
     finished_at = time.monotonic()
@@ -671,6 +698,10 @@ def run_clients(
         with dispatch_condition:
             dispatch_condition.notify_all()
 
+    def dispatch_turn_reached(job_index: int) -> bool:
+        # Reads the live shared counter; call only while holding dispatch_condition.
+        return failed.is_set() or job_index == next_dispatch_index
+
     def worker() -> None:
         nonlocal next_dispatch_index
         connection = http.client.HTTPConnection(
@@ -695,7 +726,7 @@ def run_clients(
                     if ordered_dispatch:
                         with dispatch_condition:
                             dispatch_condition.wait_for(
-                                lambda: failed.is_set() or job.index == next_dispatch_index
+                                lambda job_index=job.index: dispatch_turn_reached(job_index)
                             )
                             if failed.is_set():
                                 return
@@ -835,9 +866,7 @@ def sum_throughput(events: Sequence[dict[str, Any]]) -> dict[str, int | float | 
         "committed_decode_tokens": committed_decode_tokens,
         "decode_rounds": decode_rounds,
         "decode_row_rounds": decode_row_rounds,
-        "average_decode_batch": (
-            decode_row_rounds / decode_rounds if decode_rounds > 0 else None
-        ),
+        "average_decode_batch": (decode_row_rounds / decode_rounds if decode_rounds > 0 else None),
     }
 
 
@@ -915,9 +944,7 @@ def steady_or_request_done_metrics(
         return fallback
 
 
-def steady_metrics(
-    events: Sequence[dict[str, Any]], concurrency: int
-) -> dict[str, int | float]:
+def steady_metrics(events: Sequence[dict[str, Any]], concurrency: int) -> dict[str, int | float]:
     selected = [event for event in events if is_steady_interval(event, concurrency)]
     if not selected:
         raise corpus.CampaignError(
@@ -941,9 +968,7 @@ def steady_metrics(
     }
 
 
-def client_records(
-    results: Sequence[ClientResult], campaign_start: float
-) -> list[dict[str, Any]]:
+def client_records(results: Sequence[ClientResult], campaign_start: float) -> list[dict[str, Any]]:
     return [
         {
             "index": result.job.index,
@@ -999,9 +1024,10 @@ def analyze_point(
     runtime_totals = sum_throughput(throughput)
     client_prompt = sum(result.prompt_tokens for result in results)
     client_completion = sum(result.completion_tokens for result in results)
-    if client_prompt != done_totals["prompt_tokens"] or client_completion != done_totals[
-        "completion_tokens"
-    ]:
+    if (
+        client_prompt != done_totals["prompt_tokens"]
+        or client_completion != done_totals["completion_tokens"]
+    ):
         raise corpus.CampaignError("client usage and request_done token totals differ")
     if runtime_totals["computed_prefill_tokens"] != done_totals["computed_prefill_tokens"]:
         raise corpus.CampaignError("throughput and request_done prefill token totals differ")
@@ -1014,12 +1040,9 @@ def analyze_point(
     metrics: dict[str, Any]
     if point.suite == "decode-saturation":
         if any(
-            event.get("result", {}).get("finish_reason") != "output_limit"
-            for event in request_done
+            event.get("result", {}).get("finish_reason") != "output_limit" for event in request_done
         ):
-            raise corpus.CampaignError(
-                "decode-saturation request stopped before its output limit"
-            )
+            raise corpus.CampaignError("decode-saturation request stopped before its output limit")
         metrics = {
             "wave_makespan_seconds": makespan,
             "steady": steady_or_request_done_metrics(
@@ -1225,9 +1248,7 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
         row["workload_prefill_tokens_per_second"] = report["metrics"][
             "computed_prefill_tokens_per_second"
         ]
-        row["workload_decode_tokens_per_second"] = report["metrics"][
-            "decode_tokens_per_second"
-        ]
+        row["workload_decode_tokens_per_second"] = report["metrics"]["decode_tokens_per_second"]
     return row
 
 
@@ -1336,9 +1357,7 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
         "# Concurrent serving benchmark\n\n"
         "Saturated decode rates use only complete intervals whose decode batch equals the "
         "configured concurrency. Corpus makespan spans simultaneous client release through the "
-        f"last complete HTTP response.{corpus_order_note}\n\n"
-        + "\n\n".join(sections)
-        + "\n"
+        f"last complete HTTP response.{corpus_order_note}\n\n" + "\n\n".join(sections) + "\n"
     )
     (output_dir / "summary.md").write_text(markdown, encoding="utf-8")
 
@@ -1364,10 +1383,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for point in points:
             log_path = output_dir / "server" / f"{point.key}.jsonl"
             jobs = build_jobs(point, fixtures, args)
-            print(
-                f"# {point.key}: {len(jobs)} request(s), "
-                f"order={workload_order_label(point)}"
-            )
+            print(f"# {point.key}: {len(jobs)} request(s), order={workload_order_label(point)}")
             print(shlex.join(server_command(serve, point, log_path, args)))
         return 0
 

@@ -18,9 +18,9 @@ import argparse
 import json
 import os
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
 
 import torch
 

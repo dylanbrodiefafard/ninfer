@@ -4,6 +4,7 @@
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -25,6 +26,19 @@ void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tens
 void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,
                                   cudaStream_t stream);
+
+// The W4A4 projection of an already quantized [5120, tokens] activation (codes and tiled scales).
+void nvfp4_attn_input_w4a4_project(const Weight& weight, std::int32_t tokens,
+                                   Nvfp4W4a4Workspace activation, Tensor& q, Tensor& gate,
+                                   Tensor& k, Tensor& v, cudaStream_t stream);
+
+void nvfp4_attn_input_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                  Tensor& k, Tensor& v, Fp8A8Workspace workspace,
+                                  cudaStream_t stream);
+// The W4A8 projection of an already quantized [5120, tokens] activation.
+void nvfp4_attn_input_w4a8_project(const Weight& weight, std::int32_t tokens,
+                                   Fp8A8Workspace activation, Tensor& q, Tensor& gate, Tensor& k,
+                                   Tensor& v, cudaStream_t stream);
 
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,

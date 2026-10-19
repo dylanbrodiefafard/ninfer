@@ -15,11 +15,13 @@ struct DeviceContext {
     cudaStream_t stream      = nullptr;
     cudaStream_t load_stream = nullptr;
     cudaStream_t copy_stream = nullptr;
+    // Host callback exchanges run independently of compute and KV copies.
+    cudaStream_t host_stream     = nullptr;
     cudaEvent_t copy_order_event = nullptr;
     // Interrupt wait for host-side stream completion. CUDA's default schedule
     // spins a CPU core; this event is created with cudaEventBlockingSync so
     // synchronize() sleeps instead of busy-waiting on GPU work.
-    cudaEvent_t host_wait        = nullptr;
+    cudaEvent_t host_wait = nullptr;
     cudaDeviceProp props{};
 
     explicit DeviceContext(int device_id = 0);
@@ -30,6 +32,8 @@ struct DeviceContext {
     DeviceContext(DeviceContext&& other) noexcept;
     DeviceContext& operator=(DeviceContext&& other) noexcept;
 
+    void bind_to_current_thread() const;
+    void bind_to_current_thread_noexcept() const noexcept;
     int sm() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;

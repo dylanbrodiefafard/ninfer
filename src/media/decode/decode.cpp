@@ -118,6 +118,32 @@ int read_packet(void* opaque, std::uint8_t* output, int size) {
     return static_cast<int>(amount);
 }
 
+class AvImageBuffer {
+public:
+    AvImageBuffer(int width, int height, AVPixelFormat format) {
+        constexpr int alignment = 64;
+        const int rc =
+            av_image_alloc(data_.data(), linesize_.data(), width, height, format, alignment);
+        if (rc == AVERROR(ENOMEM)) { throw std::bad_alloc(); }
+        if (rc < 0) {
+            throw std::runtime_error("failed to allocate media conversion buffer: " + av_error(rc));
+        }
+    }
+
+    ~AvImageBuffer() { av_freep(static_cast<void*>(data_.data())); }
+
+    AvImageBuffer(const AvImageBuffer&)            = delete;
+    AvImageBuffer& operator=(const AvImageBuffer&) = delete;
+
+    [[nodiscard]] std::uint8_t* const* data() const noexcept { return data_.data(); }
+
+    [[nodiscard]] const int* linesize() const noexcept { return linesize_.data(); }
+
+private:
+    std::array<std::uint8_t*, 4> data_{};
+    std::array<int, 4> linesize_{};
+};
+
 std::int64_t seek_packet(void* opaque, std::int64_t offset, int whence) {
     auto& cursor = *static_cast<BufferCursor*>(opaque);
     if (whence == AVSEEK_SIZE) { return static_cast<std::int64_t>(cursor.size); }
@@ -160,9 +186,8 @@ public:
             int rc               = avformat_open_input(&raw, nullptr, nullptr, nullptr);
             format_              = raw;
             if (rc < 0) { throw std::invalid_argument("failed to open media: " + av_error(rc)); }
-            if ((rc = avformat_find_stream_info(format_, nullptr)) < 0) {
-                throw std::invalid_argument("failed to inspect media: " + av_error(rc));
-            }
+            rc = avformat_find_stream_info(format_, nullptr);
+            if (rc < 0) { throw std::invalid_argument("failed to inspect media: " + av_error(rc)); }
             stream_index_ = av_find_best_stream(format_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
             if (stream_index_ < 0) {
                 throw std::invalid_argument("media has no decodable video stream");
@@ -172,8 +197,9 @@ public:
             if (codec == nullptr) { throw std::invalid_argument("media codec is not supported"); }
             codec_ = avcodec_alloc_context3(codec);
             if (codec_ == nullptr) { throw std::bad_alloc(); }
-            if ((rc = avcodec_parameters_to_context(codec_, stream_->codecpar)) < 0 ||
-                (rc = avcodec_open2(codec_, codec, nullptr)) < 0) {
+            rc = avcodec_parameters_to_context(codec_, stream_->codecpar);
+            if (rc >= 0) { rc = avcodec_open2(codec_, codec, nullptr); }
+            if (rc < 0) {
                 throw std::invalid_argument("failed to open media codec: " + av_error(rc));
             }
             packet_ = av_packet_alloc();
@@ -257,27 +283,39 @@ public:
         out.height = height;
         const AVPixFmtDescriptor* descriptor =
             av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
-        const bool alpha = composite_alpha && descriptor != nullptr &&
-                           (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
-        const int channels = alpha ? 4 : 3;
-        std::vector<std::uint8_t> converted(static_cast<std::size_t>(width) * height * channels);
+        const bool alpha                       = composite_alpha && descriptor != nullptr &&
+                                                 (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        const AVPixelFormat destination_format = alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+        AvImageBuffer converted(width, height, destination_format);
         sws_ = sws_getCachedContext(sws_, width, height, static_cast<AVPixelFormat>(frame->format),
-                                    width, height, alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24,
-                                    SWS_POINT, nullptr, nullptr, nullptr);
+                                    width, height, destination_format, SWS_POINT, nullptr, nullptr,
+                                    nullptr);
         if (sws_ == nullptr) { throw std::runtime_error("failed to create media color converter"); }
-        std::uint8_t* dst[] = {converted.data(), nullptr, nullptr, nullptr};
-        int stride[]        = {width * channels, 0, 0, 0};
-        const int rows      = sws_scale(sws_, frame->data, frame->linesize, 0, height, dst, stride);
+        const int rows = sws_scale(sws_, frame->data, frame->linesize, 0, height, converted.data(),
+                                   converted.linesize());
         if (rows != height) { throw std::runtime_error("failed to convert media frame to RGB"); }
-        out.rgb.resize(static_cast<std::size_t>(width) * height * 3);
+        const std::size_t pixels = static_cast<std::size_t>(width) * height;
+        out.rgb.resize(pixels * 3);
         if (!alpha) {
-            out.rgb = std::move(converted);
+            const std::size_t row_bytes = static_cast<std::size_t>(width) * 3;
+            for (int y = 0; y < height; ++y) {
+                std::memcpy(out.rgb.data() + static_cast<std::size_t>(y) * row_bytes,
+                            converted.data()[0] +
+                                static_cast<std::size_t>(y) * converted.linesize()[0],
+                            row_bytes);
+            }
         } else {
-            for (std::size_t i = 0; i < static_cast<std::size_t>(width) * height; ++i) {
-                const int a = converted[4 * i + 3];
-                for (int c = 0; c < 3; ++c) {
-                    out.rgb[3 * i + c] = static_cast<std::uint8_t>(
-                        ((255 - a) * 255 + a * converted[4 * i + c] + 127) / 255);
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* source =
+                    converted.data()[0] + static_cast<std::size_t>(y) * converted.linesize()[0];
+                std::uint8_t* destination =
+                    out.rgb.data() + static_cast<std::size_t>(y) * width * 3;
+                for (int x = 0; x < width; ++x) {
+                    const int a = source[4 * x + 3];
+                    for (int c = 0; c < 3; ++c) {
+                        destination[3 * x + c] = static_cast<std::uint8_t>(
+                            ((255 - a) * 255 + a * source[4 * x + c] + 127) / 255);
+                    }
                 }
             }
         }
@@ -330,7 +368,11 @@ private:
         av_packet_free(&packet_);
         avcodec_free_context(&codec_);
         if (format_ != nullptr) { avformat_close_input(&format_); }
-        if (io_ != nullptr) { avio_context_free(&io_); }
+        if (io_ != nullptr) {
+            // FFmpeg may replace the buffer while probing; free the current allocation.
+            av_freep(static_cast<void*>(&io_->buffer));
+            avio_context_free(&io_);
+        }
     }
 
     AVFormatContext* format_ = nullptr;
@@ -435,7 +477,7 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, do
     Decoder probe(bytes, policy.max_decoded_pixels);
     const double fps      = fps_of(probe.stream());
     int total             = probe.stream()->nb_frames > 0 &&
-                        probe.stream()->nb_frames <= std::numeric_limits<int>::max()
+                                    probe.stream()->nb_frames <= std::numeric_limits<int>::max()
                                 ? static_cast<int>(probe.stream()->nb_frames)
                                 : 0;
     const double duration = probe.duration_seconds();

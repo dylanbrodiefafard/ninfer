@@ -16,11 +16,7 @@ def _e4m3fn_oracle(word: int) -> float:
     exponent = (word >> 3) & 0xF
     fraction = word & 0x7
     if exponent == 0:
-        return (
-            math.copysign(0.0, sign)
-            if fraction == 0
-            else sign * fraction / 512.0
-        )
+        return math.copysign(0.0, sign) if fraction == 0 else sign * fraction / 512.0
     if exponent == 15 and fraction == 7:
         return math.copysign(math.nan, sign)
     return sign * (8 + fraction) * (2.0 ** (exponent - 10))
@@ -30,9 +26,7 @@ def test_all_e2m1_words_decode_exactly_and_preserve_signed_zero():
     magnitudes = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
     for word in range(16):
         actual = decode_e2m1_word(word)
-        expected = math.copysign(
-            magnitudes[word & 7], -1.0 if word & 8 else 1.0
-        )
+        expected = math.copysign(magnitudes[word & 7], -1.0 if word & 8 else 1.0)
         assert actual == expected
         assert math.copysign(1.0, actual) == math.copysign(1.0, expected)
 
@@ -47,9 +41,7 @@ def test_all_e4m3fn_words_match_independent_scalar_oracle():
         else:
             assert actual == expected
             if expected == 0.0:
-                assert math.copysign(1.0, actual) == math.copysign(
-                    1.0, expected
-                )
+                assert math.copysign(1.0, actual) == math.copysign(1.0, expected)
 
 
 def test_nvfp4_stored_scale_and_divisor_word_validity():

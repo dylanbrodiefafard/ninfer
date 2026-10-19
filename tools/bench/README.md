@@ -3,6 +3,72 @@
 Offline helper for the `ninfer_bench` throughput tool. Correctness/parity tooling lives separately
 under [`tools/parity`](../parity).
 
+## README workload measurements
+
+`run_readme_workloads.py` measures the same five generation workloads as the AMD fork's
+README: English story, Python package, math reasoning, and document summaries near 8K and
+32K prompt tokens. `fixtures/readme_workloads.json` freezes the messages and thinking flags
+from its 2026-10-17 stock archive (revision `0b78d7b1`). The two document strings are stored
+as complete CLI message arrays under `examples/cli/messages/readme_document_*.json`. Freezing
+the messages keeps the benchmark inputs stable as either repository's documentation changes. No tokenizer or Python packages beyond the standard
+library are needed to replay them.
+
+Run in the `ninfer-builder` GPU environment with Python 3.11, holding the host NVIDIA GPU lock
+throughout the runner and server lifetimes:
+
+```bash
+flock --exclusive /tmp/ninfer-gpu-queue.lock \
+  python3.11 tools/bench/run_readme_workloads.py \
+    --artifact /path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+    --concurrency 1 6 --tokens 512 --warmup 1 --repetitions 3 \
+    --output profiles/bench/readme-workloads
+```
+
+The runner selects NVFP4 KV, CUDA Graphs, adaptive DFlash up to seven drafts, the optimized
+proposal head, chunk 2048, automatic KV capacity and p-less temperature 1.5. Vision and RAM/SSD
+prefix tiers stay off. Each synchronized wave follows untimed per-lane prompt-cache seeding.
+Only complete 100-ms periodic intervals with no prefill and all C lanes decoding count;
+the rate is committed decode tokens divided by those intervals' wall time, including host
+scheduling. There is no fallback to per-request rates or prefill-inclusive makespan. C6 is
+aggregate throughput. Natural stops remain enabled; actual completion lengths are recorded.
+
+Reports preserve inputs, responses, per-request counters, startup settings and timing intervals.
+Each cell reports the mean and sample standard deviation of three measured waves after one
+warmup. The output directory must not exist. `--workload "Python package"` selects one workload;
+`--serve`, `--port` and `--concurrency` select the server and batch settings.
+
+For the C1 prefill ladder, use the CLI/server default 4,096-token chunk while retaining the
+same prompt lengths and corpus. Repeat the committed 65,536-token corpus four times without
+re-tokenizing it, then run:
+
+```bash
+python3.11 - <<'PYCODE'
+from pathlib import Path
+ids = Path("bench/fixtures/bench_corpus.ids").read_text().split()
+assert len(ids) == 65536
+output = Path("profiles/bench/readme-prefill.ids")
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(" ".join(ids * 4) + "\n")
+PYCODE
+
+flock --exclusive /tmp/ninfer-gpu-queue.lock \
+  build/bench/ninfer_bench \
+    --weights /path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+    --corpus profiles/bench/readme-prefill.ids \
+    -p 8192,32768,65536,131072,245760 \
+    --max-ctx 262144 --prefill-chunk 4096 --kv-dtype nvfp4 \
+    --spec dflash --draft-tokens 7 --adaptive-draft --lm-head-draft \
+    --warmup 1 -r 3 -o json --output-file profiles/bench/readme-prefill.json
+```
+
+The native benchmark fixes the C1 KV pool to 262,144 tokens through `--max-ctx`; it has no
+`--kv-capacity` option. This matches the AMD ladder's resolved C1 pool size.
+
+Report each repetition's prompt tokens divided by its `timings.prefill_seconds`, then compute
+the mean and sample standard deviation. This is prefill service throughput, excluding model
+load, request preparation and HTTP transport. Whole-request wall time and trailing-window
+prefill estimates are different metrics.
+
 ## Corpus baker
 
 `ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
@@ -72,7 +138,7 @@ binary:   build/bench/ninfer_bench
 corpus:   bench/fixtures/bench_corpus.ids
 ```
 
-The matrix treats MTP `k=3` with the optimized proposal head as the primary path, keeps `k=0` and
+The matrix treats DFlash `k=3` with the optimized proposal head as the primary path, keeps `k=0` and
 `k=5` as controls, and sweeps `k=0..5` on representative context-decode cases. Decode-bearing cases
 cover CUDA Graph and eager execution; prefill-only cases vary prompt length and prefill chunk.
 
@@ -89,8 +155,8 @@ python3 tools/bench/run_ninfer_bench_matrix.py --preset core
 # Longer run that adds 32k/64k prompt and context-decode points.
 python3 tools/bench/run_ninfer_bench_matrix.py --preset full
 
-# Run only the MTP draft-window sweep.
-python3 tools/bench/run_ninfer_bench_matrix.py --preset full --suite mtp_sweep
+# Run only the DFlash draft-window sweep.
+python3 tools/bench/run_ninfer_bench_matrix.py --preset full --suite draft_sweep
 ```
 
 Default outputs:
@@ -119,9 +185,9 @@ tokens over complete-wave wall time; `prefill_active_tok_s` separately reports t
 active prefill rate. The matrix manifest is descriptive and records the commands and selected local
 inputs; it does not make repository state part of report validity.
 
-`run_serve_corpus.py` runs both registered targets and both published MTP0/MTP3 suites when both
-artifacts are supplied. Pass one `--artifact` to select a single target and `--mode mtp0` or
-`--mode mtp3` to run only that suite. `--mode dflash7` runs the same decode corpus with DFlash
+`run_serve_corpus.py` runs both registered targets and both ordinary/DFlash suites when both
+artifacts are supplied. Pass one `--artifact` to select a single target and `--mode ordinary` or
+`--mode dflash3` to run only that suite. `--mode dflash7` runs the same decode corpus with DFlash
 block=8 (`k=7`) and the optimized proposal head on 35B-A3B DFlash v1 or Qwen3.8-27B DFlash2.
 It is rejected for `qwen3_6_27b`. Add
 `--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
@@ -154,15 +220,15 @@ position for every request.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
-  --mode mtp3 --suite decode-saturation \
+  --artifact qwen3_8_27b=models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --mode dflash3 --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 \
   --decode-tokens 8192 \
   --output profiles/bench/concurrent-decode
 
 python3 tools/bench/run_serve_concurrency.py \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
-  --mode mtp3 --suite corpus-makespan \
+  --artifact qwen3_8_27b=models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --mode dflash3 --suite corpus-makespan \
   --concurrency 1 --concurrency 2 \
   --output profiles/bench/concurrent-corpus
 ```
@@ -173,7 +239,7 @@ would not preserve either a steady interval or one continuous makespan.
 
 ## NVFP4 KV context sweep
 
-`run_nvfp4_kv_context.py` drives `ninfer_bench` against `qwen3.8-27b/nvfp4` with MTP3 and the
+`run_nvfp4_kv_context.py` drives `ninfer_bench` against `qwen3.8-27b/nvfp4` with DFlash3 and the
 optimized proposal head. It compares INT8-G64 and NVFP4 KV:
 
 - C=1: combined `pp+tg` at 5k/20k/50k/100k/150k (prefill tok/s and decode tok/s)
@@ -181,7 +247,7 @@ optimized proposal head. It compares INT8-G64 and NVFP4 KV:
 
 ```bash
 python3 tools/bench/run_nvfp4_kv_context.py \
-  --weights out/qwen3_8_27b.ninfer \
+  --weights models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   --bench build/bench/ninfer_bench
 ```
 
@@ -189,7 +255,7 @@ python3 tools/bench/run_nvfp4_kv_context.py \
 
 `run_speed_suite.py` is the **fast-iteration** tool: it hits the *already-running* serve
 (default `http://127.0.0.1:8081`) — no engine spawn, restart, or reconfiguration — and reports,
-per scenario, prefill tok/s, decode tok/s, time-to-first-token, end-to-end wall, MTP draft
+per scenario, prefill tok/s, decode tok/s, time-to-first-token, end-to-end wall, DFlash draft
 accept, and an output hash. Unlike the offline `ninfer_bench` matrix above, it measures the
 production serve path and is the right instrument for watching a branch while you edit kernels.
 

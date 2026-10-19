@@ -10,6 +10,11 @@
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 
+// Packed verify extent (W*B tokens) whose projections keep each request's panel arithmetic in
+// one aggregated launch: the NVFP4 A8 MMA's single M48 tile. Verify aggregation and the adaptive
+// tree arm both derive from it, so they stay consistent with that kernel limit.
+inline constexpr std::int32_t kVerifyAggregateMaxTokens = 48;
+
 struct TextConfig {
     static constexpr int hidden       = 5120;
     static constexpr int layers       = 64;
@@ -73,39 +78,42 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 };
 
 struct DFlashConfig {
-    static constexpr bool supported        = true;
+    static constexpr bool supported           = true;
     static constexpr qwen3_6::DFlashKind kind = qwen3_6::DFlashKind::DFlash2;
-    static constexpr int layers            = 5;
-    static constexpr int local_layers      = 5;
-    static constexpr int full_layers       = 0;
-    static constexpr int feature_layers    = 5;
-    static constexpr int feature_rows      = feature_layers * TextConfig::hidden;
-    static constexpr int hidden            = TextConfig::hidden;
-    static constexpr int intermediate      = 17408;
-    static constexpr int query_heads       = 32;
-    static constexpr int kv_heads          = 8;
-    static constexpr int head_dim          = 128;
-    static constexpr int query_size        = query_heads * head_dim;
-    static constexpr int kv_size           = kv_heads * head_dim;
-    static constexpr int local_capacity    = 2048;
-    static constexpr int mask_token        = 248070;
-    static constexpr float rms_epsilon     = 1.0e-6F;
-    static constexpr float rope_theta      = 1.0e7F;
-    static constexpr float attention_scale = 0.08838834764831845F;
+    static constexpr int layers               = 5;
+    static constexpr int local_layers         = 5;
+    static constexpr int full_layers          = 0;
+    static constexpr int feature_layers       = 5;
+    static constexpr int feature_rows         = feature_layers * TextConfig::hidden;
+    static constexpr int hidden               = TextConfig::hidden;
+    static constexpr int intermediate         = 17408;
+    static constexpr int query_heads          = 32;
+    static constexpr int kv_heads             = 8;
+    static constexpr int head_dim             = 128;
+    static constexpr int query_size           = query_heads * head_dim;
+    static constexpr int kv_size              = kv_heads * head_dim;
+    static constexpr int local_capacity       = 2048;
+    static constexpr int mask_token           = 248070;
+    static constexpr float rms_epsilon        = 1.0e-6F;
+    static constexpr float rope_theta         = 1.0e7F;
+    static constexpr float attention_scale    = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
-    // Chain verify only: W=k+1. Packed-tree and Spark two-block are off; live k is {3,4,5}.
-    static constexpr bool tree_verify      = false;
-    static constexpr int verify_width      = 0;
+    // Adaptive draft also captures a packed best-first draft tree of this many columns (anchor
+    // included) as an arm; the picker learns per batch size when it beats the chain (W=k+1).
+    // The tree arm is captured for batches whose packed verify extent W*B stays within the
+    // aggregated verify limit; beyond it every projection splits into per-request weight passes.
+    static constexpr int tree_verify_width      = 12;
+    static constexpr int tree_verify_max_tokens = kVerifyAggregateMaxTokens;
     // 1 was A/B'd: greedy 128-tok 4.10 tok/round / 211 tok/s vs keep 4.23 / 239. Leave off.
-    static constexpr int unmask_refine     = 0;
-    static constexpr int two_block_first   = 0;
+    static constexpr int unmask_refine   = 0;
+    static constexpr int two_block_first = 0;
 };
 
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
-inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 5;
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 7;
 inline constexpr std::uint32_t kNativeContext            = 262144;
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

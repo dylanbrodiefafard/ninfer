@@ -20,7 +20,11 @@ inline constexpr std::int32_t kEmbedGatherQ6GroupsPerBlock = 2;
 inline constexpr std::int32_t kEmbedGatherW8Group          = 32;
 inline constexpr std::int32_t kEmbedGatherW8D              = 2048;
 inline constexpr std::int32_t kEmbedGatherW8Groups         = kEmbedGatherW8D / kEmbedGatherW8Group;
-inline constexpr std::int32_t kEmbedGatherFp8D             = 5120;
+inline constexpr std::int32_t kEmbedGatherW8TextD          = 5120;
+inline constexpr std::int32_t kEmbedGatherW8RowVector      = 16;
+inline constexpr std::int32_t kEmbedGatherW8TextThreads =
+    kEmbedGatherW8TextD / kEmbedGatherW8RowVector;
+inline constexpr std::int32_t kEmbedGatherFp8D = 5120;
 
 template <int BlocksPerToken, int Threads>
 __launch_bounds__(Threads) __global__
@@ -111,7 +115,7 @@ __global__ void embed_gather_q6_kernel(const std::int32_t* ids, const std::uint8
 __launch_bounds__(kEmbedGatherQ6Group* kEmbedGatherQ6GroupsPerBlock) __global__
     void embed_gather_q6_grouped_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                         const std::uint8_t* high, const std::uint8_t* scales,
-                                        __nv_bfloat16* out, std::int32_t d, std::int32_t T) {
+                                        __nv_bfloat16* out, std::int32_t d) {
     const std::int32_t kg           = d / kEmbedGatherQ6Group;
     const std::int32_t group_blocks = div_up(kg, kEmbedGatherQ6GroupsPerBlock);
     const std::int32_t t            = static_cast<std::int32_t>(blockIdx.x) / group_blocks;
@@ -135,7 +139,7 @@ __launch_bounds__(kEmbedGatherQ6Group* kEmbedGatherQ6GroupsPerBlock) __global__
                                        high + group_index * kEmbedGatherQ6HighBpr, lane);
     const std::int64_t out_idx = static_cast<std::int64_t>(t) * d +
                                  static_cast<std::int64_t>(g) * kEmbedGatherQ6Group + lane;
-    out[out_idx] = __float2bfloat16(static_cast<float>(code) * scale);
+    out[out_idx]               = __float2bfloat16(static_cast<float>(code) * scale);
 }
 
 __global__ void embed_gather_w8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
@@ -181,7 +185,7 @@ __launch_bounds__(32) __global__
         codes[group_index * kEmbedGatherW8Group + static_cast<std::int32_t>(threadIdx.x)]);
     const std::int64_t out_idx = static_cast<std::int64_t>(t) * kEmbedGatherW8D +
                                  static_cast<std::int64_t>(g) * kEmbedGatherW8Group + threadIdx.x;
-    out[out_idx] = __float2bfloat16(static_cast<float>(code) * scale);
+    out[out_idx]               = __float2bfloat16(static_cast<float>(code) * scale);
 }
 
 __launch_bounds__(256) __global__
@@ -216,6 +220,43 @@ __launch_bounds__(256) __global__
                 static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
         }
     }
+}
+
+// One block per token; each thread decodes 16 consecutive codes of one group with one 16-byte
+// code load and one scale load. A warp reads 512 contiguous code bytes, which keeps request
+// counts low when the table is pinned host memory read over PCIe.
+__launch_bounds__(kEmbedGatherW8TextThreads) __global__
+    void embed_gather_w8_row_5120_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+                                         const std::uint8_t* scales, __nv_bfloat16* out) {
+    static_assert(kEmbedGatherW8Group % kEmbedGatherW8RowVector == 0);
+    constexpr int kGroups  = kEmbedGatherW8TextD / kEmbedGatherW8Group;
+    const int tid          = static_cast<int>(threadIdx.x);
+    const int t            = static_cast<int>(blockIdx.x);
+    const std::int64_t row = ids[t];
+    const int k            = tid * kEmbedGatherW8RowVector;
+
+    const uint4 packed = *reinterpret_cast<const uint4*>(codes + row * kEmbedGatherW8TextD + k);
+    const std::uint16_t scale_bits = *reinterpret_cast<const std::uint16_t*>(
+        scales + (row * kGroups + k / kEmbedGatherW8Group) * 2);
+    const float scale = __half2float(__ushort_as_half(scale_bits));
+
+    const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+    __nv_bfloat162 pairs[8];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            const int shift     = pair * 16;
+            const auto q0       = static_cast<std::int8_t>((words[w] >> shift) & 0xffu);
+            const auto q1       = static_cast<std::int8_t>((words[w] >> (shift + 8)) & 0xffu);
+            pairs[w * 2 + pair] = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
+                                                        static_cast<float>(q1) * scale);
+        }
+    }
+    auto* dst =
+        reinterpret_cast<uint4*>(out + static_cast<std::int64_t>(t) * kEmbedGatherW8TextD + k);
+    dst[0] = *reinterpret_cast<const uint4*>(&pairs[0]);
+    dst[1] = *reinterpret_cast<const uint4*>(&pairs[4]);
 }
 
 } // namespace ninfer::ops

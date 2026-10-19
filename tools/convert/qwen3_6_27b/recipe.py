@@ -5,14 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from tools.convert.qwen3_6.common.recipe import (
-    SOURCE_DTYPE,
     Cast,
     Concat,
     DraftHeadTokenIds,
     Expression,
     GatherRows,
     Reshape,
-    ShardReader,
     Slice,
     SourcePreflight,
     SourceTensor,
@@ -20,18 +18,20 @@ from tools.convert.qwen3_6.common.recipe import (
     Transpose,
     attention_qproj_part,
     build_vision_recipes,
-    expression_shape,
     expression_sources,
-    materialize_expression,
-    materialize_recipe,
-    preflight_sources as _preflight_recipe_sources,
     source,
+)
+from tools.convert.qwen3_6.common.recipe import (
+    preflight_sources as _preflight_recipe_sources,
+)
+from tools.convert.qwen3_6.common.recipe import (
     source_requirements as _recipe_source_requirements,
+)
+from tools.convert.qwen3_6.common.recipe import (
     validate_recipe_coverage as _validate_recipe_coverage,
 )
 
 from . import inventory
-
 
 DRAFT_ROWS = 131072
 

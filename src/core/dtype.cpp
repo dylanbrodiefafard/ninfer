@@ -9,7 +9,6 @@ std::size_t dtype_size(DType dtype) {
     case DType::BF16:
         return 2;
     case DType::FP32:
-        return 4;
     case DType::I32:
         return 4;
     case DType::U8:

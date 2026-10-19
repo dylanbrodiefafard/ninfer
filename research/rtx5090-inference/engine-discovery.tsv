@@ -1,0 +1,127 @@
+canonical_repository	aliases	category	evidence_level	disposition	report_reference
+2dameneko/ninfer-xx90-win		engine fork	primary README screening; no full fork diff	Windows/rotated-codec fork, README screening only; no independently established current win.	final-engine-discovery.md
+aaditagrawal/laya-inference-engine		runtime	primary README screening	5070-Ti typed-decision single-forward workload, not autoregressive 27B generation.	final-engine-discovery.md
+adrienbrault/qwen3.8-27b-rtx5090		recipe or benchmark collection	report-level source screening; see reference for code depth	Deployment or measurement evidence; not an independently implemented engine	vllm-engines.md
+AIdevsmartdata/chimere		serving wrapper or integration	primary README screening	Rust serving over customized ik_llama.cpp, 5060 Ti evidence; backend family already covered.	final-engine-discovery.md
+alphastorm/ninfer		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+alphastorm/omp-ninfer		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+ambud/q36		native CUDA runtime inaccessible original	mirror code only; provenance limited	35B MoE; recovered attributed mirror does not authenticate original	final-engine-discovery.md
+Anbeeld/beellama.cpp		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+Apolog1ze-Dev/QwFNfer		streaming or distributed runtime	primary README screening	Flash-Next ordinary-expert streaming, outside resident dense target.	final-engine-discovery.md
+Ark0N/Qwen5090		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	completeness-audit.md
+Astrangemaninhere/ninfer-fusion		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+Avarok-Cybersecurity/atlas		runtime	primary README screening	Native Rust/CUDA, GB10 evidence, AGPL/commercial; hub GDN integration and negative draft research independently checked in final-technique-research.md.	final-engine-discovery.md
+avifenesh/memra		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	source-channel-audit.md
+azharul175706-ctrl/bw24		engine fork or hardware port	primary README screening	Older Memra lineage: inspected commit `4f9ecba` credits Avi Fenesh and retains MIT copyright; targets 82-SM **5090 Laptop**, not desktop. Older licensing does not authorize later Memra code.	final-engine-discovery.md
+BAIS1C/ninferust		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+Bjynt/vllm-radiance		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	competitive-depth-audit.md
+brontoguana/krasis		runtime	report-level source screening; see reference for code depth	Offload, distributed or different-model system; does not establish resident dense C1–4 speedup	completeness-audit.md
+cloudrift-ai/emmy		kernel library or compiler	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	landscape-coverage.md
+co-l/ninfer		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+cometkim/ninfer		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+Danmoreng/gem16		runtime	primary README screening	Native CUDA but Gemma checkpoint/16-GB specialization, no matched Qwen gain.	final-engine-discovery.md
+deepindeepsea/rtx5090-q36-bench		recipe or benchmark collection	report-level source screening; see reference for code depth	Deployment or measurement evidence; not an independently implemented engine	fork-depth-audit.md
+Doelfke/ninfer-yarn		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+dphnAI/sonar	PygmalionAI/aphrodite-engine; aphrodite-engine/aphrodite-engine	engine fork or hardware port	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	landscape-coverage.md
+drwolfen/radiance-vllm-qwen4exp		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	competitive-depth-audit.md
+drwolfen/radiance-vllm-r9700		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	competitive-depth-audit.md
+Dyluhn/R9V		engine fork or hardware port	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	competitive-depth-audit.md
+Eden-Polaris/eden.cpp	Project-Glacie/eden.cpp	engine fork	primary README screening	Frozen llama.cpp fork, also Project-Glacie/eden.cpp lineage; multi-5060 recipe.	final-engine-discovery.md
+Eliovp-BV/paiton-vllm-plugin		vLLM native-kernel plugin	primary README and benchmark screening	AMD R9700; separate from Radiance identity	final-engine-discovery.md
+EricLBuehler/mistral.rs		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+faisalmumtaz89/Lumen		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	completeness-audit.md
+fikrikarim/autoninfer		serving wrapper or integration	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+FILWYZ/nano-vllm-sm120-optimized		engine fork	primary README screening	Chinese educational 5060-Laptop/Qwen3-0.6B fork; 8.23x is against its own SDPA compatibility baseline, not upstream vLLM.	final-engine-discovery.md
+flashinfer-ai/flashinfer		kernel or research library	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	vllm-engines.md
+FlashML-org/FreeToken		streaming or distributed runtime	report-level source screening; see reference for code depth	Offload, distributed or different-model system; does not establish resident dense C1–4 speedup	landscape-coverage.md
+flashrt-project/FlashRT		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+flashrt-project/FlashRT-HF-kernels		kernel or research library	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+FMInference/FlexGen		streaming or distributed runtime	report-level source screening; see reference for code depth	Offload, distributed or different-model system; does not establish resident dense C1–4 speedup	landscape-coverage.md
+GeeeekExplorer/nano-vllm		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	landscape-coverage.md
+ggml-org/llama.cpp		base runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+GGZ14/vllm-mxfp4		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	vllm-engines.md
+Gigaxel/qwen3.8-27b-5090-bench		recipe or benchmark collection	report-level source screening; see reference for code depth	Deployment or measurement evidence; not an independently implemented engine	ecosystem-omission-audit.md
+gittensor-ai-lab/sparkinfer		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	competitive-depth-audit.md
+guoqingbao/candle-vllm		runtime	primary README screening	Related Candle serving family; do not assume an exact alias of xinfer without ancestry proof. No new matched 5090 speed evidence.	final-engine-discovery.md
+guoqingbao/xinfer		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	source-channel-audit.md
+gzenz/ninfer		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+HaberstrohSystems/antelope		native Rust/CUDA runtime	selective code audit	PRO4000 INT4 evidence; bounded target shortlist not proven exact	final-engine-discovery.md
+harrrshall/qwenfast		runtime	primary README screening	PyTorch/Triton/FlashInfer Qwen3.8 FP8 on H200, not 5090 NVFP4.	final-engine-discovery.md
+huggingface/text-generation-inference		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+hughmadden/mimo26f-afd		streaming or distributed runtime	primary README screening	5090 plus four DGX Sparks; comparison adds hardware, not equivalent single GPU.	final-engine-discovery.md
+iamwavecut/ninfer-all		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+igorls/ninfer		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+ikawrakow/ik_llama.cpp		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+infernet-org/foundry		serving wrapper or integration	primary README screening	vLLM deployment/profile system, not another native runtime.	final-engine-discovery.md
+Intelligent-Internet/Qwen3.8-Inference-MetaZenith		serving wrapper or integration	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	source-channel-audit.md
+InternLM/lmdeploy		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+ivanopcode/local-inference-e2e-guide		recipe or benchmark collection	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	source-channel-audit.md
+jieen1/BlackweLLM		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	final-independent-research.md
+JohnTDI-cpu/trtllm-nvfp4-blackwell-fix		engine fork or hardware port	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	ecosystem-omission-audit.md
+jpezzulli/sglang-rtxpro6000		recipe or benchmark collection	report-level source screening; see reference for code depth	Deployment or measurement evidence; not an independently implemented engine	ecosystem-omission-audit.md
+JustVugg/colibri		streaming or distributed runtime	report-level source screening; see reference for code depth	Offload, distributed or different-model system; does not establish resident dense C1–4 speedup	source-channel-audit.md
+kekzl/imp		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+knoopx/ninfer		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+kvcache-ai/ktransformers		streaming or distributed runtime	report-level source screening; see reference for code depth	Offload, distributed or different-model system; does not establish resident dense C1–4 speedup	landscape-coverage.md
+kvmem/kvmem-qw3		streaming or distributed runtime	report-level source screening; see reference for code depth	Offload, distributed or different-model system; does not establish resident dense C1–4 speedup	completeness-audit.md
+L1aoXingyu/qw38		early or undelivered project	primary README screening	Source checkout explicitly bootstrap-only, no inference path.	final-engine-discovery.md
+lifeidle/qwen3.8-27b-5090-laptop-nvfp4-256k		recipe or benchmark collection	primary README screening	llama.cpp laptop deployment recipe, not a new engine.	final-engine-discovery.md
+local-inference-lab/b12x	local-inference-lab/sparkinfer	kernel library	kernel agent source audit	Distinct from gittensor-ai-lab/sparkinfer engine	final-technique-research.md
+LostRuins/koboldcpp		serving wrapper or integration	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+Luce-Org/lucebox	Luce-Org/lucebox-hub; signalnine/lucebox-hub	ggml-based native speculative runtime	primary server documentation; DDTree paper and local applicability audit	DDTree and compression mode; different Q4_K_M artifact	final-engine-discovery.md
+LukasParke/qwen38-27b-5090		recipe or benchmark collection	report-level source screening; see reference for code depth	Deployment or measurement evidence; not an independently implemented engine	competitive-depth-audit.md
+magiccodingman/vllm-radiance		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	competitive-depth-audit.md
+MerkyorLynn/lynn-engine		discontinued runtime	primary README screening	Chinese first-party June 7 sunset retrospective: discontinued engine direction in favor of orchestration/weights; no current native win.	final-engine-discovery.md
+mirage-project/mirage		kernel library or compiler	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	landscape-coverage.md
+ModelTC/lightllm		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	landscape-coverage.md
+modular/modular		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	ecosystem-omission-audit.md
+mr-september/ninfer-sharp		NInfer prompt-policy fork	primary README screening	Token count reduction changes prompt; no raw TPS improvement	final-engine-discovery.md
+mudler/vllm.cpp		serving wrapper or integration	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	completeness-audit.md
+Murai-Labs/qwen3.8-27b-rtx5090		recipe or benchmark collection	report-level source screening; see reference for code depth	Deployment or measurement evidence; not an independently implemented engine	competitive-depth-audit.md
+Neroued/ninfer		base runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+nibor1896/crow-nest		native streaming runtime	primary architecture and measurement audit	Flash-Next ordinary expert streaming outside resident dense target	final-engine-discovery.md
+nickw409/Fracture		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	source-channel-audit.md
+Niko1221/Strata		streaming or distributed runtime	primary README screening	Flash-Next ordinary-expert streaming, outside resident dense target.	final-engine-discovery.md
+Ninnix/q36		Vulkan/Metal runtime	primary README screening	QuarkStar name collision; not Ambud CUDA q36	final-engine-discovery.md
+notwitcheer/sm120-field-guide		recipe or benchmark collection	report-level source screening; see reference for code depth	Deployment or measurement evidence; not an independently implemented engine	completeness-audit.md
+NVIDIA/TensorRT-LLM		base runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	vllm-engines.md
+ollama/ollama		serving wrapper or integration	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+Onwcan/crucible		runtime	primary README screening	Native Rust/CUDA for own 120M model; throughput cannot extrapolate to 27B.	final-engine-discovery.md
+p4u/rtx5090-vllm		recipe or benchmark collection	report-level source screening; see reference for code depth	Deployment or measurement evidence; not an independently implemented engine	vllm-engines.md
+PaddlePaddle/FastDeploy		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+pegainfer-project/pegainfer		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+Praecise/praecise-engine		serving wrapper or integration	primary README screening	Acceleration layer whose initial backend is llama.cpp.	final-engine-discovery.md
+QwarzEngine/qwarz		ExLlamaV3 integration with custom kernels	selective code audit	Different hybrid EXL3/NVFP4 artifact; draft-only head trimming candidate	final-engine-discovery.md
+rdumasia303/tensorrt-llm_with_open-webui		recipe or benchmark collection	report-level source screening; see reference for code depth	Deployment or measurement evidence; not an independently implemented engine	ecosystem-omission-audit.md
+remesis/ninfer		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+Resonance-Lab-AI/memrahh		source mirror	primary README screening	Memra-named mirror, current README retains Avi/FSL identity; no independent engine claim.	final-engine-discovery.md
+RightNow-AI/AutoMegaKernel		kernel library or compiler	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	source-channel-audit.md
+rochelleveritable865/q36		unverified attributed source mirror	selective historical code audit	Ambud-attributed CUDA source recovered; original inaccessible; no binary executed	final-engine-discovery.md
+samihan342/Blackwell-MOE-Engine		early or undelivered project	metadata only; remote has no advertised refs	Metadata lead; README absent and git remote advertises no refs; no delivered source recovered.	final-engine-discovery.md
+seanyourhighness/vllm-sm12x-nvfp4-dflash2		engine fork or hardware port	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	vllm-engines.md
+sergiuszm/ninfer-5090		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+sgl-project/sglang		base runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	vllm-engines.md
+signalnine/q27		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+SirDebugALot/ninfer-3090		engine fork	primary README screening; no full fork diff	Controlled ABBA 32K-prefill gain 785→1037 tok/s applies SM86/INT8 KV and different weights, not 5090 NVFP4.	final-engine-discovery.md
+SlyBase/vllm-sly-radiance		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	competitive-depth-audit.md
+snu-comparch/InfiniGen		streaming or distributed runtime	report-level source screening; see reference for code depth	Offload, distributed or different-model system; does not establish resident dense C1–4 speedup	landscape-coverage.md
+SRSWTI/cradle-codec		kernel library or compiler	primary README screening	KV transmission using HEVC/NVENC/10GbE. Prior tensor quantization remains lossy even with lossless video encoding; not resident decode acceleration.	final-engine-discovery.md
+SRSWTI/knivesysl		native CUDA derivative	selective code audit	Copy proposals help repetitive code but regress other depths; no drop-in gain	final-engine-discovery.md
+SRSWTI/knivesysl-xe		engine fork or hardware port	metadata only; different hardware	Metadata identifies Intel SYCL port; main/master README unavailable. Closed as different hardware, not code-audited.	final-engine-discovery.md
+SRSWTI/shooting-brake		streaming or distributed runtime	primary README screening	118B across 5090 and two Intel B70 cards, outside single-GPU target.	final-engine-discovery.md
+Taf0711/trail		early or undelivered project	primary README screening	CUDA vector-add learning milestone; not a delivered inference engine.	final-engine-discovery.md
+Terrydaktal/vllm-coherence		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	competitive-depth-audit.md
+The8Darkness/voidinfer		NInfer-descended EXL3 runtime	selective code audit	Current EXL3 qualified slice; negative segmented-prefix experiment	final-engine-discovery.md
+theroyallab/tabbyAPI		serving wrapper or integration	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+Tiiny-AI/PowerInfer		streaming or distributed runtime	report-level source screening; see reference for code depth	Offload, distributed or different-model system; does not establish resident dense C1–4 speedup	landscape-coverage.md
+troycheng/vllm-mach		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	ecosystem-omission-audit.md
+truespar/paddock		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	fork-depth-audit.md
+turboderp-org/exllamav2		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+turboderp-org/exllamav3		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+vllm-project/vllm		base runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	vllm-engines.md
+Wallawalla47/ninfer-custom		engine fork	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	local-engines.md
+xLLM-AI/xllm		runtime	primary README screening	Primary hardware table lists Ascend, Cambricon, Moore Threads, Hygon, MetaX and Iluvatar; not a demonstrated 5090 route.	final-engine-discovery.md
+zhaochengbiao005/qwen38-in-c		runtime	primary README screening	CPU C99/OpenMP, approximately 1 tok/s on Ryzen; not GPU engine.	final-engine-discovery.md
+zhongkaifu/TensorSharp	SciSharp/TensorSharp2	runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	final-independent-research.md
+zml/zml		kernel library or compiler	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	completeness-audit.md
+ztxz16/fastllm		runtime	report-level source screening; see reference for code depth	Prior landscape; source-specific hardware and qualification limits apply	ecosystem-omission-audit.md

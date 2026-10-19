@@ -1,5 +1,8 @@
 # Qwen3.8-27B artifact contract
 
+MTP tensors and conversion recipes remain artifact contracts. MTP execution is disabled;
+ordinary decoding and DFlash2 are the available Engine routes.
+
 This document defines the registered `qwen3.8-27b/groupwise-int` and `qwen3.8-27b/nvfp4`
 artifacts: identity, persistent inventory, conversion entry point, and Engine binding. Model
 mathematics, dimensions, frontend semantics, and state behavior are defined by
@@ -25,8 +28,8 @@ target_key = qwen3_8_27b
 Each artifact contains Text, the optimized MTP draft head, MTP, Vision, and six frontend
 resources. A Qwen3.8-27B NVFP4 file may additionally append 66 DFlash2 objects under `dflash/`.
 Those objects are inventory-conditional: current MTP-only 3.8 files and all 3.6-27B files remain
-valid. `--spec dflash` requires the appended companion; `--spec mtp` on a reconverted file still
-works (DFlash tensors stay host-placed). The identity is read from the version-2 artifact
+valid for ordinary decoding and artifact validation. `--spec dflash` requires the appended
+companion. MTP execution is disabled. The identity is read from the version-2 artifact
 directory; filenames and object counts do not select the target or weight profile.
 
 ## 2. Persistent inventory
@@ -124,9 +127,11 @@ perplexity optimality or elimination of reasoning loops.
 
 ### Mixed FP8/NVFP4 storage profile
 
-Different files under the same artifact identity must not exchange retained numerical state.
-KV disk format v6 binds the opened artifact's local file generation; use a fresh cache directory
-when switching to a composed mixed or selective variant. Old cache directories are not deleted.
+Different numerical tensor inventories under the same artifact identity must not exchange retained
+state. KV disk format v8 binds retained-state tensor descriptors and selected encoded contents with
+SHA-256; use a fresh
+cache directory when switching to a composed mixed or selective variant. Copies of identical
+tensors remain compatible. Old cache directories are not deleted.
 
 The characterized neroued/Unsloth base uses the same `qwen3.8-27b/nvfp4`
 identity with a distinct, validated Text inventory. Its vocabulary endpoints,
@@ -267,6 +272,11 @@ are not dispatch inputs. MTP matrices on that identity bind as W8 or NVFP4. The 
 `Program`, and reports `qwen3_8_27b/qwen3.8-27b/groupwise-int` or
 `qwen3_8_27b/qwen3.8-27b/nvfp4` in the load summary.
 
+Every 27B profile materializes `text/token_embedding` (1.26 GiB as W8) in pinned host memory
+(`TensorPlacement::MappedHost`) rather than VRAM: the embedding is only row-gathered, and the gather
+kernels read it through its unified device address. The load summary reports it as
+`mapped_host_bytes`; the freed VRAM goes to the automatic KV pool. `text/output_head` stays in VRAM.
+
 The opt-in 27B live Engine tests (`ninfer_qwen3_6_27b_prefix_real_test`,
 `ninfer_qwen3_6_27b_ram_real_test`) load these identities when
 `NINFER_QWEN3_6_27B_WEIGHTS` or `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` points at the Qwen3.8
@@ -276,19 +286,26 @@ The opt-in 27B live Engine tests (`ninfer_qwen3_6_27b_prefix_real_test`,
 `ninfer_qwen3_8_27b_dflash_real_test` loads a reconverted NVFP4+DFlash2 file from
 `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`. Sequential C=1 DFlash tokens are saved and used
 as the C>1 oracle: overlapping C=4 Graph DFlash2 greedy on four distinct prompts must
-match C=1 DFlash of the same k. The same C=1 and C>1 strings are also compared against
-target-only T=1 decode. A later packed/T=1 greedy flip is not treated as row mixing;
-`NINFER_DFLASH_TEST_RELAX_ORACLE=1` continues past that T=1 mismatch. Product k=4 and k=5
+match C=1 DFlash of the same k and output budget. Comparisons against target-only T=1
+decode are diagnostic: packed/T1 greedy flips do not by themselves establish row mixing.
+Actual-verifier logit licensing checks candidate choices separately. Product k=4 and k=5
 chain widths are T=5/T=6 SmallT, so they are not required to match MTP k=3 token-for-token.
-NVFP4 GDN conv-record keeps the ordinary-decode reduction and BF16 3-tap history. B=1 W=4 uses
-one fused SmallT weight pass; B=1 W=5/6 uses one grouped SmallT weight pass and a separate
-sequential FP32 convolution. Other B=1 widths use the fused T=1 GEMV+FP32 conv route. Qualified
-B=2..4 W=2/5 shapes group requests per SmallT weight pass; other B>1 widths use request-indexed
-CTAs. Every route retains explicit BF16 history roundtrips.
-Flattening that site to `T=W×B` W4A4 compose flipped
-greedy column 0 versus C=1; `run_nvfp4_batched_matches_serial_fused` guards exact q/k/v/z and
-valid-record identity for dense, ragged, and tree-parent W=4/5 C=1..4 and W=6 C=1 shapes.
-Packed GDN recurrent then overlays T=1 snapshot `out` on scratch SSM. DFlash C>1
+NVFP4 GDN conv-record under A4 (W=5..16) or A8 (W=4..16) aggregates projection across B requests
+without introducing a BF16 current-projection intermediate. Convolution consumes FP32 current
+projection and BF16 three-tap history; saved records/history remain BF16. A8 uses row-scaled
+E4M3 activations, exact expansion of the stored E2M1 codes and separately scaled K16 partials.
+It neither changes the artifact nor requantizes its weights.
+A8 W2–6 fuses projection with convolution and record publication through a CTA-local FP32
+tile; it needs only activation-quantization workspace. Wider A8 and A4 record widths retain
+the global FP32 intermediate.
+Under A16, B=1 W=4 uses one fused SmallT pass; B=1 W=5/6 uses a grouped pass and separate
+FP32 convolution. B=2..4 W=2/5 groups requests, including one W5/C3 group. W6/C2 and C4 use
+pairs; W6/C3 stays request-indexed. Other B=1 widths use fused T1 GEMV+FP32 conv, and other
+B>1 widths use request-indexed CTAs. Independent record tests cover dense/ragged/tree inputs,
+carried history and every valid prefix; the A16 pairing change additionally matches legacy
+T1 outputs exactly. Quantized projection checks use their own mathematical oracle, not A16
+bit parity or the superseded BF16-compose record route.
+Packed GDN recurrent then carries register-resident state through the width-one transition for `out`. DFlash C>1
 propose isolates each compact row as a C=1-shaped forward (`T=width`, `B=1`) so draft
 Linears, SWA, and the draft head use sequential kernels. Eager propose resolves SWA's
 direct/split route from the row frontier rather than the batch maximum; graph replay keeps
@@ -296,14 +313,21 @@ its fixed profile envelope. Target verify stays packed `B=batch` so graphs captu
 forward; ReplaySSM records are `layer(g, 0, B)` and the feature sink covers the compact
 lanes. Packed Linear/GDN-control sites normally launch at the C=1 width via
 `linear_packed_sequences` / `packed_route_tokens` so C>1 does not select a different
-T-specialized kernel (NVFP4 SmallT warp count, Q4 draft-head SmallT vs MMA, or A16↔W4A4).
-The qualified W=5 C=2..4 residual Linear, fused NVFP4/BF16-control attention-input, and NVFP4
-SwiGLU routes are explicit exceptions: their A16 T=10/15/20 schedules are bit-identical to C
-separate T=5 panels. In particular, residual T=20 retains the T=5 panel reduction profile rather
-than using the generic T=20 reduction.
+T-specialized kernel (NVFP4 SmallT warp count or A16↔W4A4). The DFlash qkv, attention-output
+and feature projections (BF16 activations on tensor cores) and the Q4 draft head reduce every
+column in one T-independent order, so they aggregate packed drafts of any width in one pass.
+Qualified NVFP4 and BF16-control attention-input, residual and MLP routes aggregate through
+W8. The selected default uses A8
+for both ordinary and GDN verification projections at every verification width (W2–W6), so a
+request's arithmetic depends on neither its draft width nor the batch. Prefill and ordinary
+decode retain their text policy.
+The eligible verification post-mixer fuses RMSNorm and A8 quantization before gate/up/SwiGLU,
+preserving the BF16 normalized-input rounding boundary. The down projection stays separate.
+The quality/default decision is recorded in the performance reference. A16 residual T20
+retains the T5 panel reduction profile.
 Target GQA stays `[D, heads, W, B]`. SmallT uses one batched launch with request-indexed partial
 CTAs and a batched reduction, preserving each request's arithmetic without taking the generic
-`MultiBatch=true` route; p-less T=2 samples that reduction. Packed GDN conv-record similarly keeps
-the W-local reduction: qualified W=2/5 B=2..4 shapes group weight replay through a private FP32
-projection and other widths remain request-indexed. NVFP4 target verify at `T>=4` uses W4A4
-attention, so no DFlash path is required to match ordinary `T=1` A16 decode.
+`MultiBatch=true` route; p-less temperature2 samples that reduction. These projection profiles
+share the existing NVFP4 attention Q codec. No DFlash arithmetic profile is required to match
+ordinary T1 decode token-for-token; same-profile isolation and state/publication correctness
+remain required.

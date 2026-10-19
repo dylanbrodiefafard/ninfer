@@ -249,6 +249,14 @@ std::int32_t schedule_cols(W8PairScheduleId schedule) {
         return 256;
     case W8PairScheduleId::DualSplitKMmaExactT:
         throw std::logic_error("w8 pair exact-T schedule has runtime column tile");
+    case W8PairScheduleId::ExactConcatMmaR32C96:
+    case W8PairScheduleId::ExactConcatMmaR32C128:
+    case W8PairScheduleId::ExactConcatMmaR64C96:
+    case W8PairScheduleId::ExactConcatMmaR64C128:
+    case W8PairScheduleId::ExactConcatMmaR96C96:
+    case W8PairScheduleId::ExactConcatMmaR128C64:
+    case W8PairScheduleId::ExactConcatMmaR128C80:
+        throw std::logic_error("w8 pair: homogeneous_schedule returned an exact-tail schedule");
     }
     throw std::logic_error("w8 pair: unknown schedule");
 }
@@ -278,7 +286,7 @@ void require_dflash_row_views(const Weight& first_weight, const Weight& second_w
     constexpr std::int32_t kFirstRow       = 4096;
     constexpr std::int32_t kSecondRow      = 5120;
     constexpr std::uint64_t kCodeBytes     = static_cast<std::uint64_t>(kParentRows) * kHidden;
-    constexpr std::uint64_t kScaleRowBytes = (kHidden / 32) * 2;
+    constexpr std::uint64_t kScaleRowBytes = static_cast<std::uint64_t>(kHidden / 32) * 2;
     constexpr std::uint64_t kPayloadBytes =
         kCodeBytes + static_cast<std::uint64_t>(kParentRows) * kScaleRowBytes;
 

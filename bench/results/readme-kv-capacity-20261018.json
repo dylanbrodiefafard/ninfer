@@ -1,0 +1,88 @@
+{
+  "measured_on": "2026-10-18",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "driver": "580.178.04",
+    "vram_mib": 32607,
+    "cuda_runtime": "13.1"
+  },
+  "artifact": {
+    "filename": "qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer",
+    "size_bytes": 19589713920,
+    "variant": "Ostfralla NVFP4 main weights, DFlash2 NVFP4 matrices and BF16 selector codebooks"
+  },
+  "settings": {
+    "max_context": 262144,
+    "prefill_chunk": 4096,
+    "kv_capacity": "auto",
+    "headroom_mib": 64,
+    "kv_dtype": "nvfp4",
+    "cuda_graphs": true,
+    "speculative_backend": "dflash",
+    "draft_tokens": 7,
+    "adaptive_draft": true,
+    "optimized_proposal_head": true,
+    "vision": false,
+    "ram_prefix_cache": false,
+    "disk_prefix_cache": false
+  },
+  "measurement": "Resolved shared token capacity after each server startup and warmup; no generation requests.",
+  "results": [
+    {
+      "concurrency": 1,
+      "shared_kv_tokens": 262144,
+      "available_after_weights_bytes": 15653994496,
+      "runtime_reservation_bytes": 6271289088,
+      "cuda_graph_allowance_bytes": 100663296,
+      "cuda_graph_observed_bytes": 44040192
+    },
+    {
+      "concurrency": 2,
+      "shared_kv_tokens": 524288,
+      "available_after_weights_bytes": 15653994496,
+      "runtime_reservation_bytes": 11429390592,
+      "cuda_graph_allowance_bytes": 176160768,
+      "cuda_graph_observed_bytes": 100663296
+    },
+    {
+      "concurrency": 3,
+      "shared_kv_tokens": 732096,
+      "available_after_weights_bytes": 15653994496,
+      "runtime_reservation_bytes": 15585971712,
+      "cuda_graph_allowance_bytes": 251658240,
+      "cuda_graph_observed_bytes": 157286400
+    },
+    {
+      "concurrency": 4,
+      "shared_kv_tokens": 714432,
+      "available_after_weights_bytes": 15653994496,
+      "runtime_reservation_bytes": 15586651392,
+      "cuda_graph_allowance_bytes": 327155712,
+      "cuda_graph_observed_bytes": 211812352
+    },
+    {
+      "concurrency": 5,
+      "shared_kv_tokens": 697408,
+      "available_after_weights_bytes": 15653994496,
+      "runtime_reservation_bytes": 15586545664,
+      "cuda_graph_allowance_bytes": 390070272,
+      "cuda_graph_observed_bytes": 260046848
+    },
+    {
+      "concurrency": 6,
+      "shared_kv_tokens": 680384,
+      "available_after_weights_bytes": 15653994496,
+      "runtime_reservation_bytes": 15586443008,
+      "cuda_graph_allowance_bytes": 452984832,
+      "cuda_graph_observed_bytes": 306184192
+    }
+  ],
+  "gpu_lock": "/tmp/ninfer-gpu-queue.lock",
+  "validation": {
+    "startup_configurations": 6,
+    "gpu_samples": 28,
+    "foreign_gpu_process_samples": 0,
+    "all_servers_healthy": true
+  },
+  "raw_reports": "profiles/bench/readme-capacity-20261018/"
+}

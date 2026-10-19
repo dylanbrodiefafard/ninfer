@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -116,16 +117,19 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--kv-ram-capacity off|N] [--kv-disk-capacity off|N]\n"
-           "       [--kv-disk-location PATH] [--kv-disk-compress off|zstd] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--kv-capacity-headroom MiB]\n"
+           "       [--kv-ram-capacity off|N] [--kv-disk-capacity off|N] [--kv-disk-location PATH]\n"
+           "       [--kv-disk-compress off|zstd] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|nvfp4] [--sage] [--keep-frac F] [--xattn-tau F]\n"
-           "       [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--spec none|dflash --draft-tokens N]\n"
            "       [--adaptive-draft] [--dflash-verify-width N] [--lm-head-draft]\n"
+           "       [--dflash-p-less-draft-temperature T]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--no-p-less-sampling]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
+           "       [--json-object|--json-schema FILE|--grammar FILE]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
            "       [--reasoning-effort low|medium|xhigh]\n"
            "       [--vision] [--no-cuda-graph] [--capture-context-checkpoint]\n"
@@ -135,18 +139,23 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
-           "--kv-capacity auto leaves " +
+           "Omitting --spec enables adaptive DFlash K7 with the optimized head when the artifact\n"
+           "contains the Qwen3.8 NVFP4 DFlash2 companion; otherwise speculation stays off.\n"
+           "--spec none disables speculation. MTP execution is disabled.\n"
+           "--kv-capacity defaults to auto and sizes the KV pool from all free GPU memory except\n"
+           "--kv-capacity-headroom MiB (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom.\n"
+           "); raise it when other processes, such as a desktop, share the GPU.\n"
            "--kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default off).\n"
-           "--kv-disk-capacity sets SSD KV prefix-cache unique-object capacity in MiB (default off).\n"
+           "--kv-disk-capacity sets SSD KV prefix-cache pack-file capacity in MiB (default "
+           "off).\n"
            "--kv-disk-location is required iff --kv-disk-capacity is enabled.\n"
            "--kv-disk-compress applies zstd-1 to new GDN/hidden/cyclic writes (default off).\n"
            "--context-checkpoints off disables the automatic prefill ladder; a comma list "
-           "replaces the default marks and requires --spec mtp or dflash.\n"
+           "replaces the default marks and requires --spec dflash.\n"
            "--capture-context-checkpoint pins the current resume frontier on an exact-hit "
            "(no-op on a fresh one-shot run).\n"
-           "P-less sampling is enabled by default and uses temperature (default 2.0) and seed "
+           "P-less sampling is enabled by default and uses temperature (default 1.5) and seed "
            "only; top-p, top-k, min-p, and penalties are ignored.\n"
            "--no-p-less-sampling opts into the registered production sampler.\n";
 }
@@ -158,8 +167,8 @@ Options parse_options(int argc, char** argv) {
         return options;
     }
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
-    options.artifact_path     = argv[1];
-    bool kv_capacity_explicit = false;
+    options.artifact_path = argv[1];
+    std::optional<std::uint64_t> kv_capacity_headroom_mib;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -172,13 +181,20 @@ Options parse_options(int argc, char** argv) {
             options.prompt = value(arg);
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
+        } else if (arg == "--json-object") {
+            options.json_object = true;
+        } else if (arg == "--json-schema") {
+            options.json_schema_path = value(arg);
+        } else if (arg == "--grammar") {
+            options.grammar_path = value(arg);
         } else if (arg == "--max-new") {
             options.max_new = parse_u32(value(arg), "max-new");
         } else if (arg == "--max-context") {
             options.max_context = parse_u32(value(arg), "max-context");
         } else if (arg == "--kv-capacity") {
-            options.kv_capacity  = parse_kv_capacity(value(arg));
-            kv_capacity_explicit = true;
+            options.kv_capacity = parse_kv_capacity(value(arg));
+        } else if (arg == "--kv-capacity-headroom") {
+            kv_capacity_headroom_mib = parse_u64(value(arg), "kv-capacity-headroom");
         } else if (arg == "--kv-ram-capacity") {
             options.kv_ram_capacity_bytes = parse_kv_ram_capacity_bytes(value(arg));
         } else if (arg == "--kv-disk-capacity") {
@@ -200,14 +216,17 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--xattn-tau") {
             options.xattn_tau = parse_unit_interval_flag(value(arg), "--xattn-tau");
         } else if (arg == "--spec") {
-            options.speculative.backend = product::parse_speculative_backend(value(arg));
+            options.speculative_selection = product::SpeculativeSelection::Explicit;
+            options.speculative.backend   = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--adaptive-draft") {
             options.speculative.adaptive_draft = true;
         } else if (arg == "--dflash-verify-width") {
-            options.speculative.dflash_verify_width =
-                parse_u32(value(arg), "dflash-verify-width");
+            options.speculative.dflash_verify_width = parse_u32(value(arg), "dflash-verify-width");
+        } else if (arg == "--dflash-p-less-draft-temperature") {
+            options.speculative.dflash_p_less_draft_temperature =
+                parse_float(value(arg), "dflash-p-less-draft-temperature", 0.0F, 2.0F);
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {
@@ -270,10 +289,24 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
-    if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    if (kv_capacity_headroom_mib) {
+        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
+            throw std::invalid_argument("--kv-capacity-headroom requires --kv-capacity auto");
+        }
+        constexpr std::uint64_t mib = 1024ULL * 1024ULL;
+        if (*kv_capacity_headroom_mib > std::numeric_limits<std::size_t>::max() / mib) {
+            throw std::invalid_argument("--kv-capacity-headroom is too large");
+        }
+        options.kv_capacity.automatic_headroom_bytes =
+            static_cast<std::size_t>(*kv_capacity_headroom_mib * mib);
     }
 
+    if (static_cast<int>(options.json_object) +
+            static_cast<int>(!options.json_schema_path.empty()) +
+            static_cast<int>(!options.grammar_path.empty()) >
+        1) {
+        throw std::invalid_argument("select only one of --json-object, --json-schema or --grammar");
+    }
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();
     if (has_prompt == has_messages) {

@@ -5,9 +5,20 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 
 namespace ninfer::ops {
+
+// Candidate DFlash p-less draft temperatures scored by the accept op's proposal calibration.
+inline constexpr std::int32_t kPLessProposalCalibrationTemperatureCount = 8;
+inline constexpr std::array<float, kPLessProposalCalibrationTemperatureCount>
+    kPLessProposalCalibrationTemperatures = {0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.8f, 1.0f, 1.25f};
+
+// The grid passed by value to the calibration kernel.
+struct PLessProposalCalibrationGrid {
+    float temperature[kPLessProposalCalibrationTemperatureCount];
+};
 
 // Caller-owned transient capacity for every draft-count and batch-size pair in the inclusive
 // domains. token_domain is the fixed sampling profile; invalid domains throw.
@@ -67,9 +78,15 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   and samples a bonus from column Pcur[b] when every available draft is accepted. Null
  *   selector_ids/selector_q is the one-hot draft convention: accept iff u < p_i(d) and the
  *   residual excludes d. Greedy mode ignores q. When configs[b].p_less is set, p is the p-less
- *   distribution from sampling.h rather than the top-k/top-p/min-p truncation, and selector q is
- *   ignored (one-hot at the realized drafted token, same as MTP). Every hop applies that
- *   Leviathan test to its own target p-less distribution, and the bonus samples its own column.
+ *   distribution from sampling.h rather than the top-k/top-p/min-p truncation; selector q is
+ *   still the recorded proposal law (one-hot for greedy drafts). The p-less chain uses block
+ *   verification (Sun et al. 2024, Algorithm 2) instead of the per-hop test: with p'_i the
+ *   p-less law of column i, p_0 = 1, p_i = min(p_{i-1} p'_{i-1}(d)/q_{i-1}(d), 1),
+ *   h_i = Z_i/(Z_i + 1 - p_i) with Z_i = sum_x max(p_i p'_i(x) - q_i(x), 0) and h_extent =
+ *   p_extent, it accepts tau = max{i : eta_i <= h_i} drafts and samples the correction from
+ *   max(p_tau p'_tau - q_tau, 0), or the bonus from p'_extent when tau = extent. eta_i uses
+ *   purpose kSamplePurposeSpeculativeBlockAccept at the round's first position with sub-key i.
+ *   A one-hot q gives token verification's acceptance length.
  *   Only hop 0 applies the cycle-exit restriction p' of sampling.h (V without a typical exclude,
  *   or Dirac on the runner-up when V is that singleton); typical_exclude is cleared for later
  *   hops because it describes one next-token decision, not a sequence-wide token ban. A
@@ -107,6 +124,19 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   token_counts. current_extents and all other inputs remain unchanged. Request statistics are
  *   deliberately outside this Op.
  *
+ * Proposal calibration (optional): proposal_calibration is FP32 [G,K,B] with
+ *   G = kPLessProposalCalibrationTemperatureCount and requires contiguous selector_ids/selector_q
+ *   with C<=32 and a token_domain large enough for the multi-block sampler (the product
+ *   vocabulary); otherwise std::invalid_argument. For each row b
+ *   that is p-less with draft_temperature T_d > 0 and each drafted hop j < current_extents[b],
+ *   proposal_calibration[g,j,b] = sum_c min(p'_j(c), q'_g(c)) over the C selector candidates of hop
+ *   j, where p'_j is the p-less target law of column j (typical exclusion at hop 0 only; a Dirac on
+ *   the correction fallback when the column has no admitted mass) and q'_g
+ *   is the recorded q_j raised to T_d / kPLessProposalCalibrationTemperatures[g] and renormalized
+ *   over the candidates: the per-hop acceptance probability the proposal would have had at that
+ *   temperature (token verification of the same prefix). Other (g,j,b) entries are -1. It reads
+ *   only accept-time statistics and does not change any accept output.
+ *
  * Workspace:
  *   Caller-owned transient storage reported by
  *   speculative_accept_greedy_drafts_workspace_capacity_bytes().
@@ -117,8 +147,9 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
                                       WorkspaceArena& workspace, cudaStream_t stream,
-                                      const Tensor* selector_ids = nullptr,
-                                      const Tensor* selector_q = nullptr);
+                                      const Tensor* selector_ids   = nullptr,
+                                      const Tensor* selector_q     = nullptr,
+                                      Tensor* proposal_calibration = nullptr);
 
 /**
  * Op: speculative_accept_tree_drafts
@@ -128,9 +159,9 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  * the truncated target distribution; if x is a child of u, accept and continue, else emit x as
  * correction (SpecInfer membership). When configs[b].p_less is set, every visited node draws
  * from its own target p-less distribution using that membership rule. Only hop 0 applies the
- * cycle-exit restriction; later hops clear typical_exclude. Walks at most current_extents[b] accepted hops
- * (same budget as chain verify). fold_path lists packed columns of the processed path including
- * the root; accepted_column is the last processed packed index (hidden selector).
+ * cycle-exit restriction; later hops clear typical_exclude. Walks at most current_extents[b]
+ * accepted hops (same budget as chain verify). fold_path lists packed columns of the processed path
+ * including the root; accepted_column is the last processed packed index (hidden selector).
  * licensed_tokens are time-ordered accepted child ids plus the correction. accepted is the
  * accepted draft count. Sampling increments configs[b].token_counts for each produced token when
  * that pointer is non-null; greedy does not. Large-vocabulary sampling uses the same
@@ -139,8 +170,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *
  * verify_ids/parent_index/fold_path/licensed_tokens are I32 [W,B]. target_tokens is I32 [W,B].
  * logits is BF16 [physical_rows,W,B]. current_extents/valid_columns and the other vectors are
- * I32 [B]. W is the packed verify width in [2,16] (tree-select W=12 is historical). lengths[b] is the
- * pre-round sequence length and is incremented by the produced count; it must not alias the
+ * I32 [B]. W is the packed verify width in [2,16] (tree-select W=12 is historical). lengths[b] is
+ * the pre-round sequence length and is incremented by the produced count; it must not alias the
  * packed-window base used by gqa_kv_compact_path (E+path[i] → E+i).
  *
  * Workspace:

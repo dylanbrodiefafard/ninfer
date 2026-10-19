@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -16,6 +17,10 @@ namespace {
 
 constexpr int kWarmup = 2;
 constexpr int kIters  = 8;
+constexpr int kRounds = 3;
+// Pack/unpack is compared with a same-run pinned memcpy baseline; each side takes its best of
+// interleaved rounds, so GPU time-slicing with another process during one round does not fail
+// the comparison while a structurally slower pack path still does.
 constexpr double kMinFractionOfPinnedMemcpy = 0.50;
 
 int fail(const char* message) {
@@ -59,6 +64,7 @@ void fill_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
             }
         }
         CUDA_CHECK(cudaMemcpy(tensor.data, host.data(), host.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 }
 
@@ -109,17 +115,18 @@ int capture_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::P
     source.tail_hidden_valid  = hidden != nullptr;
     source.ledger             = retained.token_ids;
     source.identity           = &identity;
-    source.hash_f             = ninfer::targets::qwen3_6::detail::prefix_hash_at(
-        retained.token_ids, identity, source.execution_frontier);
-    source.text        = &alloc;
-    source.text_pool   = &pool;
-    source.gdn         = gdn;
+    source.hash_f = ninfer::targets::qwen3_6::detail::prefix_hash_at(retained.token_ids, identity,
+                                                                     source.execution_frontier);
+    source.text   = &alloc;
+    source.text_pool        = &pool;
+    source.gdn              = gdn;
     source.gdn_current_slot = gdn != nullptr ? 0 : -1;
-    source.tail_hidden = hidden;
-    source.stream      = stream;
+    source.tail_hidden      = hidden;
+    source.stream           = stream;
     return cache.capture(source).status ==
                    ninfer::targets::qwen3_6::detail::RamCaptureStatus::Captured
-               ? 0 : 1;
+               ? 0
+               : 1;
 }
 
 float elapsed_ms(cudaEvent_t start, cudaEvent_t stop) {
@@ -145,14 +152,15 @@ int main() {
     ninfer::DeviceContext ctx(0);
     constexpr std::uint32_t kPages = 128;
     ninfer::LayoutBuilder builder;
-    auto layout = ninfer::plan_paged_kv_pool(builder, {.page_group_count      = kPages * 2,
-                                                       .logical_page_capacity = kPages,
-                                                       .table_rows            = 2,
-                                                       .plane_order           = ninfer::PagedKVPlaneOrder::PageMajor,
-                                                       .planes                = {{ninfer::DType::I8, 64, 2},
-                                                                                  {ninfer::DType::I8, 64, 2},
-                                                                                  {ninfer::DType::FP16, 1, 2},
-                                                                                  {ninfer::DType::FP16, 1, 2}}});
+    auto layout =
+        ninfer::plan_paged_kv_pool(builder, {.page_group_count      = kPages * 2,
+                                             .logical_page_capacity = kPages,
+                                             .table_rows            = 2,
+                                             .plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                                             .planes      = {{ninfer::DType::I8, 64, 2},
+                                                             {ninfer::DType::I8, 64, 2},
+                                                             {ninfer::DType::FP16, 1, 2},
+                                                             {ninfer::DType::FP16, 1, 2}}});
     const std::size_t pool_bytes = builder.finish(256);
     ninfer::DeviceArena arena(pool_bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, layout);
@@ -174,47 +182,53 @@ int main() {
 
     ninfer::DeviceBuffer bulk(image_bytes);
     for (int i = 0; i < kWarmup; ++i) {
-        CUDA_CHECK(cudaMemcpyAsync(pinned_block, bulk.p, image_bytes, cudaMemcpyDeviceToHost,
-                                   ctx.stream));
-        CUDA_CHECK(cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice,
-                                   ctx.stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(pinned_block, bulk.p, image_bytes, cudaMemcpyDeviceToHost, ctx.stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice, ctx.stream));
     }
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
-    CUDA_CHECK(cudaEventRecord(start, ctx.stream));
-    for (int i = 0; i < kIters; ++i) {
-        ninfer::pack_paged_kv_allocation_to_host(source, pool, pinned_block, ctx.stream);
-        ninfer::unpack_paged_kv_allocation_from_host(source, pool, pinned_block, kPages, kPages,
-                                                     ctx.stream);
-    }
-    CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    const double pack_ms = elapsed_ms(start, stop) / kIters;
-    const double pack_gbs =
-        (2.0 * static_cast<double>(image_bytes) / 1.0e9) / (pack_ms / 1000.0);
+    double pack_ms   = 0.0;
+    double memcpy_ms = 0.0;
+    for (int round = 0; round < kRounds; ++round) {
+        CUDA_CHECK(cudaEventRecord(start, ctx.stream));
+        for (int i = 0; i < kIters; ++i) {
+            ninfer::pack_paged_kv_allocation_to_host(source, pool, pinned_block, ctx.stream);
+            ninfer::unpack_paged_kv_allocation_from_host(source, pool, pinned_block, kPages, kPages,
+                                                         ctx.stream);
+        }
+        CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        const double round_pack_ms = elapsed_ms(start, stop) / kIters;
+        pack_ms                    = round == 0 ? round_pack_ms : std::min(pack_ms, round_pack_ms);
 
-    CUDA_CHECK(cudaEventRecord(start, ctx.stream));
-    for (int i = 0; i < kIters; ++i) {
-        CUDA_CHECK(cudaMemcpyAsync(pinned_block, bulk.p, image_bytes, cudaMemcpyDeviceToHost,
-                                   ctx.stream));
-        CUDA_CHECK(cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice,
-                                   ctx.stream));
+        CUDA_CHECK(cudaEventRecord(start, ctx.stream));
+        for (int i = 0; i < kIters; ++i) {
+            CUDA_CHECK(cudaMemcpyAsync(pinned_block, bulk.p, image_bytes, cudaMemcpyDeviceToHost,
+                                       ctx.stream));
+            CUDA_CHECK(cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice,
+                                       ctx.stream));
+        }
+        CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        const double round_memcpy_ms = elapsed_ms(start, stop) / kIters;
+        memcpy_ms = round == 0 ? round_memcpy_ms : std::min(memcpy_ms, round_memcpy_ms);
     }
-    CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    const double memcpy_ms = elapsed_ms(start, stop) / kIters;
+    const double pack_gbs = (2.0 * static_cast<double>(image_bytes) / 1.0e9) / (pack_ms / 1000.0);
     const double memcpy_gbs =
         (2.0 * static_cast<double>(image_bytes) / 1.0e9) / (memcpy_ms / 1000.0);
 
     std::cerr << "kv_ram_perf pages=" << kPages << " image_bytes=" << image_bytes
               << " pack_unpack=" << pack_gbs << " GB/s memcpy=" << memcpy_gbs << " GB/s\n";
     if (pack_gbs < kMinFractionOfPinnedMemcpy * memcpy_gbs) {
-        std::cerr << "paged KV host pack/unpack is far below pinned memcpy (" << pack_gbs
-                  << " vs " << memcpy_gbs << " GB/s)\n";
+        std::cerr << "paged KV host pack/unpack is far below pinned memcpy (" << pack_gbs << " vs "
+                  << memcpy_gbs << " GB/s)\n";
         return 1;
     }
 
     const auto prompt = text_prompt({1, 2, 3, 4});
-    ninfer::targets::qwen3_6::detail::KVRamCache cache(std::max(image_bytes * 4, std::size_t{1} << 20));
+    ninfer::targets::qwen3_6::detail::KVRamCache cache(
+        std::max(image_bytes * 4, std::size_t{1} << 20));
     if (capture_entry(cache, pool, source, prompt, ctx.copy_stream, nullptr, nullptr) != 0) {
         return fail("perf capture failed");
     }
@@ -222,7 +236,8 @@ int main() {
     dest.materialize_pages(kPages, ctx.stream);
     // KV-only fixture has no sampled tail hidden; a suffix regenerates it.
     const auto continuation = text_prompt({1, 2, 3, 4, 5});
-    const auto match = cache.plan_match(continuation, ninfer::targets::qwen3_6::detail::prefix_hash_chain(continuation));
+    const auto match        = cache.plan_match(
+        continuation, ninfer::targets::qwen3_6::detail::prefix_hash_chain(continuation));
     if (!match) { return fail("perf capture did not index before copy completion"); }
     ninfer::targets::qwen3_6::detail::RamRestoreTarget target;
     target.text           = &dest;
@@ -235,9 +250,8 @@ int main() {
     cache.consume(match->entry_id);
     CUDA_CHECK(cudaEventRecord(stop, ctx.copy_stream));
     CUDA_CHECK(cudaEventSynchronize(stop));
-    const double restore_ms = elapsed_ms(start, stop);
-    const double restore_gbs =
-        (static_cast<double>(image_bytes) / 1.0e9) / (restore_ms / 1000.0);
+    const double restore_ms  = elapsed_ms(start, stop);
+    const double restore_gbs = (static_cast<double>(image_bytes) / 1.0e9) / (restore_ms / 1000.0);
     std::cerr << "kv_ram_perf restore=" << restore_gbs << " GB/s (" << restore_ms << " ms)\n";
     if (expect_logical_pages(pool, dest, 21) != 0) {
         return fail("event-overlapped restore corrupted logical pages");
@@ -245,15 +259,15 @@ int main() {
     dest.release();
 
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 2,
-                      .conv_channels  = 8,
-                      .conv_width     = 4,
-                      .value_heads    = 2,
-                      .value_head_dim = 4,
-                      .key_head_dim   = 3,
-                      .slot_count     = 2,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 2,
+                                                               .conv_channels  = 8,
+                                                               .conv_width     = 4,
+                                                               .value_heads    = 2,
+                                                               .value_head_dim = 4,
+                                                               .key_head_dim   = 3,
+                                                               .slot_count     = 2,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     ninfer::DeviceBuffer hidden_buf(256);
@@ -264,7 +278,8 @@ int main() {
         conv_pattern[i] = static_cast<unsigned char>(i + 3);
     }
     CUDA_CHECK(cudaMemcpy(gdn.conv_slot(0, 0).data, conv_pattern.data(), conv_pattern.size(),
-                           cudaMemcpyHostToDevice));
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     fill_logical_pages(pool, source, 22);
     ninfer::targets::qwen3_6::detail::KVRamCache gdn_cache(8ULL << 20);
     if (capture_entry(gdn_cache, pool, source, prompt, ctx.copy_stream, &gdn, &hidden) != 0) {
@@ -279,24 +294,26 @@ int main() {
     hidden_out_buf.fill(0);
     ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {256});
     ninfer::targets::qwen3_6::detail::RamRestoreTarget gdn_target;
-    gdn_target.text           = &gdn_dest;
-    gdn_target.text_pool      = &pool;
-    gdn_target.text_dst_pages = kPages;
-    gdn_target.gdn            = &gdn;
+    gdn_target.text             = &gdn_dest;
+    gdn_target.text_pool        = &pool;
+    gdn_target.text_dst_pages   = kPages;
+    gdn_target.gdn              = &gdn;
     gdn_target.gdn_current_slot = 1;
-    gdn_target.tail_hidden    = &hidden_out;
-    gdn_target.stream         = ctx.copy_stream;
+    gdn_target.tail_hidden      = &hidden_out;
+    gdn_target.stream           = ctx.copy_stream;
     gdn_cache.claim(gdn_match->entry_id);
     (void)gdn_cache.unpack_device(gdn_match->entry_id, gdn_target);
     gdn_cache.consume(gdn_match->entry_id);
+    // consume() does not fence the restore; the reader waits for its H2D.
+    ctx.synchronize_all();
     if (expect_logical_pages(pool, gdn_dest, 22) != 0) { return fail("GDN restore KV mismatch"); }
     std::vector<unsigned char> conv_out(conv_pattern.size());
     CUDA_CHECK(cudaMemcpy(conv_out.data(), gdn.conv_slot(0, 1).data, conv_out.size(),
-                           cudaMemcpyDeviceToHost));
+                          cudaMemcpyDeviceToHost));
     if (conv_out != conv_pattern) { return fail("GDN conv did not round-trip through RAM"); }
     std::vector<unsigned char> hidden_host(256);
     CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
-                           cudaMemcpyDeviceToHost));
+                          cudaMemcpyDeviceToHost));
     if (hidden_host != std::vector<unsigned char>(256, 0x5a)) {
         return fail("tail hidden did not round-trip through RAM");
     }

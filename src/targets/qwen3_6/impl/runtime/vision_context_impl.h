@@ -23,7 +23,6 @@
 #include <string>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
-namespace {
 
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
     if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
@@ -136,13 +135,11 @@ void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
     CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
 }
 
-} // namespace
-
-VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights) : ctx_(ctx) {
-    if (!weights.vision) {
+VisionContext::VisionContext(DeviceContext& device, const LoadedModelData& model) : ctx_(device) {
+    if (!model.vision) {
         throw std::invalid_argument("Vision execution was requested without materialized weights");
     }
-    const auto& vision = *weights.vision;
+    const auto& vision = *model.vision;
     patch_embed_       = &vision.common.patch_embedding;
     patch_embed_bias_  = &vision.common.patch_embedding_bias;
     position_embed_    = &vision.common.position_embedding;
@@ -263,10 +260,13 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, Workspace
     for (std::size_t layer = 0; layer < blocks_.size(); ++layer) {
         const BlockW& block = blocks_[layer];
         const std::string layer_prefix =
-            trace == nullptr ? std::string{} : "block_" + (layer < 10 ? std::string("0") : "") +
-                                                   std::to_string(layer) + "/";
+            trace == nullptr
+                ? std::string{}
+                : "block_" + (layer < 10 ? std::string("0") : "") + std::to_string(layer) + "/";
         const auto capture_layer = [&](std::string_view stage, const Tensor& value) {
-            if (trace != nullptr) { trace->capture(layer_prefix + std::string(stage), value, stream); }
+            if (trace != nullptr) {
+                trace->capture(layer_prefix + std::string(stage), value, stream);
+            }
         };
         {
             Tensor attended = layout.attended.bind(backing);
@@ -429,8 +429,8 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
     for (int axis = 0; axis < 2; ++axis) {
         for (const VisionUseSpan& use : plan_.uses) {
             const auto& control = plan_.control->items[use.item_index];
-            const auto begin = control.position_ids.begin() +
-                               static_cast<std::ptrdiff_t>(axis * control.patch_count);
+            const auto begin    = control.position_ids.begin() +
+                                  static_cast<std::ptrdiff_t>(axis * control.patch_count);
             batch_control_.position_ids.insert(
                 batch_control_.position_ids.end(), begin,
                 begin + static_cast<std::ptrdiff_t>(control.patch_count));
@@ -490,24 +490,17 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     }
     const std::uint64_t nominal_end64 =
         static_cast<std::uint64_t>(begin) + static_cast<std::uint64_t>(nominal_length);
-    std::uint32_t end = static_cast<std::uint32_t>(
+    const std::uint32_t end = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(nominal_end64, prompt_.token_ids.size()));
-
-    const VisionUseSpan* active = nullptr;
-    for (const VisionUseSpan& use : plan_.uses) {
-        if (use.end <= begin) { continue; }
-        if (use.begin >= end) { break; }
-        if (active == nullptr) {
-            active = &use;
-        } else {
-            end = std::min(end, use.begin);
-            break;
-        }
+    const VisionChunkSelection selected =
+        select_vision_prefill_chunk(plan_.uses, begin, end - begin);
+    if (selected.length == 0) {
+        throw std::logic_error("Vision chunk cap made no forward progress");
     }
-    if (end <= begin) { throw std::logic_error("Vision chunk cap made no forward progress"); }
-    if (active == nullptr) {
-        return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
+    if (!selected.use_index) {
+        return VisionChunk{static_cast<std::int32_t>(selected.length), nullptr, {}};
     }
+    const VisionUseSpan* active = &plan_.uses[*selected.use_index];
     if (active->item_index >= plan_.control->items.size() ||
         active->item_index >= prompt_.vision_items.size()) {
         throw std::logic_error("Vision prefill item index is out of range");
@@ -522,14 +515,14 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     if (control.merged_count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("Vision item output columns exceed int32");
     }
-    const std::size_t output_offset = checked_mul(
-        checked_mul(active->output_begin,
-                    static_cast<std::size_t>(VisionScheduleConfig::out_hidden),
-                    "item output offset elements"),
-        dtype_size(DType::BF16), "item output offset bytes");
-    Tensor output(transient_.data + output_offset, DType::BF16,
-                  {VisionScheduleConfig::out_hidden,
-                   static_cast<std::int32_t>(control.merged_count)});
+    const std::size_t output_offset =
+        checked_mul(checked_mul(active->output_begin,
+                                static_cast<std::size_t>(VisionScheduleConfig::out_hidden),
+                                "item output offset elements"),
+                    dtype_size(DType::BF16), "item output offset bytes");
+    Tensor output(
+        transient_.data + output_offset, DType::BF16,
+        {VisionScheduleConfig::out_hidden, static_cast<std::int32_t>(control.merged_count)});
 
     if (!active_item_ || *active_item_ != active->item_index) {
         if (active_item_ && active->item_index <= *active_item_) {
@@ -561,7 +554,7 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         }
         active_item_ = active->item_index;
     }
-    return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output};
+    return VisionChunk{static_cast<std::int32_t>(selected.length), &control, output};
 }
 
 bool VisionPrefillSession::release_consumed_media_payload() noexcept {

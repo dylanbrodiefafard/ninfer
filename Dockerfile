@@ -16,12 +16,14 @@ RUN apt-get update \
         libavformat-dev \
         libavutil-dev \
         libcurl4-openssl-dev \
+        libssl-dev \
         libswscale-dev \
         libzstd-dev \
         ninja-build \
         patch \
         pkg-config \
         python3 \
+        python3-venv \
     && rm -rf /var/lib/apt/lists/* \
     # Host driver supplies libcuda (e.g. 580.x). The image cuda-compat tree (590.x)
     # wins ldconfig on this base and triggers cudaErrorCompatNotSupportedOnDevice
@@ -30,15 +32,23 @@ RUN apt-get update \
     && rm -f /etc/ld.so.conf.d/*compat*.conf \
     && ldconfig
 
+# Pinned static analyzer; must equal CLANG_TIDY_VERSION in scripts/run-clang-tidy.py, which
+# refuses any other version.
+ARG NINFER_CLANG_TIDY_VERSION=22.1.8
+RUN python3 -m venv /opt/ninfer-lint \
+    && /opt/ninfer-lint/bin/pip install --no-cache-dir "clang-tidy==${NINFER_CLANG_TIDY_VERSION}"
+
 WORKDIR /src
 COPY . .
 
+# Compile jobs; the default leaves room for other work on a shared host.
+ARG NINFER_BUILD_JOBS=8
 RUN cmake -S . -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \
-    && cmake --build /build --parallel --target ninfer ninfer-serve
+    && cmake --build /build --parallel "${NINFER_BUILD_JOBS}" --target ninfer ninfer-serve
 
 FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
 
@@ -51,6 +61,7 @@ RUN apt-get update \
         libavformat60 \
         libavutil58 \
         libcurl4t64 \
+        libssl3t64 \
         libswscale7 \
         libzstd1 \
     && rm -rf /var/lib/apt/lists/* \

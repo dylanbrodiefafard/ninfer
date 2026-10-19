@@ -12,6 +12,7 @@ namespace {
 enum class Nvfp4LinearAddRoute : std::uint8_t {
     A16,
     W4A4,
+    W4A8,
 };
 
 Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
@@ -20,6 +21,9 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) { return Nvfp4LinearAddRoute::A16; }
+    if (policy == LinearPolicy::AllowA8) {
+        return tokens >= kNvfp4FirstA8 ? Nvfp4LinearAddRoute::W4A8 : Nvfp4LinearAddRoute::A16;
+    }
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported policy");
     }
@@ -35,8 +39,8 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStr
     constexpr std::int32_t kChunk = kNvfp4LastSmallT;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
-        auto* input               = static_cast<std::uint8_t*>(x.data) +
-                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
+        auto* input  = static_cast<std::uint8_t*>(x.data) +
+                       static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
         auto* output = static_cast<std::uint8_t*>(residual.data) +
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
@@ -59,6 +63,9 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
         throw std::invalid_argument("nvfp4 linear_add workspace: invalid token interval");
     }
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
+    if (resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearAddRoute::W4A8) {
+        return fp8_a8_workspace_capacity_bytes(max_tokens, input_rows);
+    }
     return resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearAddRoute::W4A4
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows)
                : 0;
@@ -71,7 +78,12 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
         launch_a16(x, weight, residual, stream);
         return;
     }
-    auto scope                       = workspace.scope();
+    auto scope = workspace.scope();
+    if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearAddRoute::W4A8) {
+        const auto scratch = allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k);
+        nvfp4_linear_add_w4a8_launch(x, weight, residual, scratch, stream);
+        return;
+    }
     const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(workspace, x.ne[1], weight.k);
     nvfp4_linear_add_w4a4_launch(x, weight, residual, scratch, stream);
 }

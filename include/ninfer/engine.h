@@ -74,6 +74,9 @@ public:
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;
+    // The exact bytes a vocabulary token decodes to, special tokens included. One token may hold a
+    // partial UTF-8 sequence. Throws std::out_of_range for an id outside the vocabulary.
+    [[nodiscard]] std::string token_bytes(TokenId token) const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
     // Establishes queue membership synchronously. Delivery intent is fixed before queue
@@ -83,7 +86,7 @@ public:
     // independently from GPU execution.
     [[nodiscard]] GenerationHandle
     submit(PreparedPrompt prompt, RequestOptions options,
-           OutputDelivery delivery = OutputDelivery::TerminalOnly,
+           OutputDelivery delivery                                = OutputDelivery::TerminalOnly,
            std::chrono::steady_clock::time_point pending_deadline = {},
            HostInputLease host_input                              = {});
 
@@ -92,7 +95,8 @@ public:
                               const CancellationView& cancellation = {});
 
     // Teacher-forced next-token NLL over a prepared token sequence. Does not sample, decode,
-    // or change generate/serve graphs. Used only by the perplexity tool.
+    // or change generate/serve graphs. Used by the perplexity tool and by real tests that
+    // measure the logit gap between two candidate tokens.
     [[nodiscard]] ScoreResult score(PreparedPrompt prompt, ScoreOptions options = {});
 
     [[nodiscard]] const EngineOptions& options() const;

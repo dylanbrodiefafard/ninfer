@@ -79,10 +79,12 @@ Options parse_options(int argc, char** argv) {
             const std::string_view value = next("--policy");
             if (value == "a16") {
                 options.policy = ops::LinearPolicy::A16Only;
+            } else if (value == "a8") {
+                options.policy = ops::LinearPolicy::AllowA8;
             } else if (value == "a4") {
                 options.policy = ops::LinearPolicy::AllowA4;
             } else {
-                throw std::invalid_argument("--policy must be a16 or a4");
+                throw std::invalid_argument("--policy must be a16, a8, or a4");
             }
         } else if (argument == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep"));
@@ -96,7 +98,7 @@ Options parse_options(int argc, char** argv) {
             options.csv_out = next("--csv-out");
         } else if (argument == "--help" || argument == "-h") {
             std::printf(
-                "Usage: %s --n 5120 --k 6144|17408 [--policy a16|a4] "
+                "Usage: %s --n 5120 --k 6144|17408 [--policy a16|a8|a4] "
                 "[--t-sweep 1,4,...] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                 argv[0]);
             std::exit(0);
@@ -117,7 +119,9 @@ Options parse_options(int argc, char** argv) {
 }
 
 const char* policy_name(ops::LinearPolicy policy) {
-    return policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16";
+    return policy == ops::LinearPolicy::AllowA8   ? "A8"
+           : policy == ops::LinearPolicy::AllowA4 ? "A4"
+                                                  : "A16";
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results,
@@ -194,11 +198,11 @@ int main(int argc, char** argv) {
             const auto launch = make_launch(tokens);
             const bench::ColdTiming timing =
                 bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
-            const double seconds      = timing.median_us * 1.0e-6;
-            const double useful_flops = 2.0 * static_cast<double>(options.n) * options.k * tokens;
-            const double model_bytes  = static_cast<double>(packed.model_weight_bytes()) +
-                                       2.0 * static_cast<double>(options.k) * tokens +
-                                       4.0 * static_cast<double>(options.n) * tokens;
+            const double seconds       = timing.median_us * 1.0e-6;
+            const double useful_flops  = 2.0 * static_cast<double>(options.n) * options.k * tokens;
+            const double model_bytes   = static_cast<double>(packed.model_weight_bytes()) +
+                                         2.0 * static_cast<double>(options.k) * tokens +
+                                         4.0 * static_cast<double>(options.n) * tokens;
             const double useful_tflops = useful_flops / seconds / 1.0e12;
             const double effective_gbs = model_bytes / seconds / 1.0e9;
             std::printf("%-11s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f\n", "linear_add",

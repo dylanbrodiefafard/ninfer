@@ -1,5 +1,7 @@
 #pragma once
 
+#include "targets/qwen3_6/impl/frontend/tokenizer.h"
+
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/types.h>
 
@@ -56,6 +58,13 @@ struct ChatPart {
     }
 };
 
+// Rendered text plus the byte spans that came from the client (message text, tool calls, tool
+// definitions). Template markup outside those spans is structural and encodes with added tokens.
+struct RenderedFragment {
+    std::string text;
+    std::vector<ByteSpan> literal_spans;
+};
+
 struct ChatMessage {
     ChatRole role = ChatRole::User;
     std::vector<ChatPart> parts;
@@ -64,9 +73,9 @@ struct ChatMessage {
     std::string tool_call_id;
 
     [[nodiscard]] bool has_media() const noexcept;
-    [[nodiscard]] std::string rendered_content(bool add_vision_id = false,
-                                               int* image_count   = nullptr,
-                                               int* video_count   = nullptr) const;
+    [[nodiscard]] RenderedFragment rendered_content(bool add_vision_id = false,
+                                                    int* image_count   = nullptr,
+                                                    int* video_count   = nullptr) const;
 };
 
 struct ChatRenderOptions {
@@ -81,11 +90,18 @@ struct ChatRenderOptions {
 struct RewriteCheckpointByteSpec {
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::size_t offset         = 0;
+    // The checkpoint is this request's own generation opener (not an earlier turn's).
+    bool generation_opener = false;
 };
 
 struct RenderedChat {
     std::string text;
+    std::vector<ByteSpan> literal_spans;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    // Byte offsets immediately after each `<|im_start|>assistant\n` when thinking is not
+    // preserved. Each one is a turn-closure frontier: history omits the empty think wrapper,
+    // so a later cold prefill has to stop there to match the checkpoint that turn captured.
+    std::vector<std::size_t> turn_closure_offsets;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {
@@ -99,7 +115,12 @@ public:
 
     [[nodiscard]] PromptCapabilities capabilities() const noexcept;
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
-                                      ChatRenderOptions options = {}) const;
+                                      const ChatRenderOptions& options = {}) const;
+    // Per-message turns only: no tools preamble, no reasoning-instruction block,
+    // and no generation prompt. Assistants are rendered as a suffix after the
+    // conversation's last user query.
+    [[nodiscard]] RenderedFragment render_fragment(const std::vector<ChatMessage>& messages,
+                                                   const ChatRenderOptions& options = {}) const;
 
 private:
     explicit CompiledChatTemplate(ChatTemplateSemantics semantics) noexcept

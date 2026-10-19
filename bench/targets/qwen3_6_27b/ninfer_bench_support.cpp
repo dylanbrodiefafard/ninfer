@@ -4,6 +4,7 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -46,6 +47,16 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
         throw std::invalid_argument(std::string("invalid ") + label + ": " + std::string(text));
     }
     return static_cast<std::uint32_t>(value);
+}
+
+double parse_positive_double(const std::string& text, const char* label) {
+    char* end           = nullptr;
+    const double parsed = std::strtod(text.c_str(), &end);
+    if (text.empty() || end != text.c_str() + text.size() || !(parsed > 0.0) ||
+        !std::isfinite(parsed)) {
+        throw std::invalid_argument(std::string(label) + " must be a positive number");
+    }
+    return parsed;
 }
 
 KvCacheStorage parse_kv_cache(std::string_view text) {
@@ -262,15 +273,12 @@ std::uint32_t BenchTest::required_context(const SpeculativeOptions& spec) const 
     const std::uint64_t prompt =
         static_cast<std::uint64_t>(kind == TestKind::Decode ? kDecodeSeedTokens : n_prompt);
     const std::uint64_t decode = static_cast<std::uint64_t>(has_decode() ? n_gen : 0);
-    std::uint64_t margin = 0;
-    if (spec.draft_tokens != 0 && spec.backend == SpeculativeBackend::Mtp) {
-        margin = 2ULL * spec.draft_tokens;
-    } else if (spec.draft_tokens != 0 && spec.backend == SpeculativeBackend::DFlash) {
+    std::uint64_t margin       = 0;
+    if (spec.draft_tokens != 0 && spec.backend == SpeculativeBackend::DFlash) {
         // 27B DFlash2 is chain W=k+1. An explicit dflash_verify_width wins. Two
         // verify-widths of headroom cover the transient uncommitted round state.
-        const std::uint32_t width = spec.dflash_verify_width != 0
-                                       ? spec.dflash_verify_width
-                                       : spec.draft_tokens + 1U;
+        const std::uint32_t width =
+            spec.dflash_verify_width != 0 ? spec.dflash_verify_width : spec.draft_tokens + 1U;
         margin = 2ULL * width;
     }
     return checked_context(prompt + decode + margin, "benchmark context requirement");
@@ -296,25 +304,44 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-         << "  --kv-dtype <bf16|int8|nvfp4> KV cache storage (default: nvfp4)\n"
-         << "  --sage                    Sage3-style FP4-PV attention; requires --kv-dtype nvfp4\n"
-         << "  --keep-frac <f>           Sparge keep fraction (0,1] on exact NVFP4; forbids --sage\n"
-         << "  --xattn-tau <f>           XAttention mass threshold (0,1] on exact NVFP4\n"
-        << "  --concurrency <1..4>        concurrent Engine lanes (default: 1);\n"
+        << "  --mixed-forward <tokens>    prefill step width while other requests decode; a\n"
+        << "                              multiple of " << kMixedForwardAlignment
+        << ", at most min(--prefill-chunk, 4096) (default: 0 = prefill first)\n"
+        << "  --mixed-forward-rounds <n>  decode rounds between shared prefill steps (default: "
+           "12)\n"
+        << "  --mixed-forward-min-tokens <n>  shared-pace suffix threshold (default: 4096); 0 "
+           "fixes cadence\n"
+        << "  --contention <P,R>          R prompts of P tokens prefill back to back while\n"
+        << "                              --contention-lanes requests decode; reports decode-only\n"
+        << "                              windows before and after, the contended prefill tok/s,\n"
+        << "                              and the decode share it leaves (requires C >= 2)\n"
+        << "  --contention-context <n>    decode lanes' prompt tokens (default: "
+        << kDefaultContentionContext << ")\n"
+        << "  --contention-lanes <n>      decode lanes, 1..C-1 (default: C-1)\n"
+        << "  --contention-baseline <tok/s>  contended prefill tok/s of the same build at\n"
+        << "                              --mixed-forward 0; prints the score\n"
+        << "  --kv-dtype <bf16|int8|nvfp4> KV cache storage (default: nvfp4)\n"
+        << "  --sage                    Sage3-style FP4-PV attention; requires --kv-dtype nvfp4\n"
+        << "  --keep-frac <f>           Sparge keep fraction (0,1] on exact NVFP4; forbids --sage\n"
+        << "  --xattn-tau <f>           XAttention mass threshold (0,1] on exact NVFP4\n"
+        << "  --concurrency <1..6>        concurrent Engine lanes (default: 1);\n"
         << "                              pp+tg at C>1 reports batched decode after a sequential\n"
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
-         << "  --spec <mtp|dflash>       speculative backend (default: mtp); dflash requires\n"
-         << "                              the artifact to contain dflash/ objects\n"
-         << "  --draft-tokens <0..5>     speculative draft window: mtp [0,5] (0 = none),\n"
-         << "                              dflash [1,5] (default: 0)\n"
-         << "  --adaptive-draft            pick live K in {3,4,5} by locking E[Y]/T(k,C,L); requires --spec mtp|dflash\n"
-         << "  --dflash-verify-width <2..16> DFlash packed verify width; 0 = k-dependent\n"
-         << "                              default (dflash only)\n"
-         << "  --lm-head-draft             use the optimized proposal head; requires --draft-tokens\n"
-         << "                              greater than zero\n"
+        << "  --spec <dflash>           speculative backend (default: off); dflash requires\n"
+        << "                              the artifact to contain dflash/ objects\n"
+        << "  --draft-tokens <0..7>     speculative draft window:\n"
+        << "                              dflash [1,7] (default: 0)\n"
+        << "  --adaptive-draft            pick live K by E[Y]/T(k,C,L): DFlash {3..N} for N>=5, "
+           "within the captured set\n"
+        << "  --dflash-verify-width <2..16> DFlash packed verify width; 0 = k-dependent\n"
+        << "                              default (dflash only)\n"
+        << "  --lm-head-draft             use the optimized proposal head; requires "
+           "--draft-tokens\n"
+        << "                              greater than zero\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
-        << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
+        << "  --profile-measured          bracket measured repetition or contention with CUDA "
+           "profiler API\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
         << "  --output-file <path>        write report to a file\n"
         << "  -h, --help                  show this help\n\n"
@@ -360,32 +387,54 @@ BenchOptions parse_args(int argc, char** argv) {
             options.max_context = parse_u32(value("--max-ctx"), "max-ctx");
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
+        } else if (arg == "--mixed-forward") {
+            options.mixed_forward = parse_u32(value("--mixed-forward"), "mixed-forward", true);
+        } else if (arg == "--mixed-forward-min-tokens") {
+            options.mixed_forward_min_tokens =
+                parse_u32(value("--mixed-forward-min-tokens"), "mixed-forward-min-tokens", true);
+        } else if (arg == "--mixed-forward-rounds") {
+            options.mixed_forward_rounds =
+                parse_u32(value("--mixed-forward-rounds"), "mixed-forward-rounds");
+        } else if (arg == "--contention") {
+            const auto parsed = parse_pair_list(value("--contention"), "contention");
+            if (parsed.size() != 1) {
+                throw std::invalid_argument("--contention expects one P,R pair");
+            }
+            options.contention = parsed.front();
+        } else if (arg == "--contention-context") {
+            options.contention_context =
+                parse_positive(value("--contention-context"), "contention-context");
+        } else if (arg == "--contention-lanes") {
+            options.contention_lanes = parse_u32(value("--contention-lanes"), "contention-lanes");
+        } else if (arg == "--contention-baseline") {
+            options.contention_baseline_prefill_tok_s =
+                parse_positive_double(value("--contention-baseline"), "contention-baseline");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
         } else if (arg == "--sage") {
             options.sage_attn = true;
         } else if (arg == "--keep-frac") {
-            options.keep_frac = parse_unit_interval_flag(value("--keep-frac").c_str(), "--keep-frac");
+            options.keep_frac =
+                parse_unit_interval_flag(value("--keep-frac").c_str(), "--keep-frac");
         } else if (arg == "--xattn-tau") {
-            options.xattn_tau = parse_unit_interval_flag(value("--xattn-tau").c_str(), "--xattn-tau");
+            options.xattn_tau =
+                parse_unit_interval_flag(value("--xattn-tau").c_str(), "--xattn-tau");
         } else if (arg == "--concurrency") {
             options.concurrency = parse_u32(value("--concurrency"), "concurrency");
             if (options.concurrency > kMaximumConcurrency) {
-                throw std::invalid_argument("--concurrency must be in [1,4]");
+                throw std::invalid_argument("--concurrency must be in [1,6]");
             }
         } else if (arg == "--spec") {
             const std::string selected = value("--spec");
-            if (selected == "mtp") {
-                options.spec_backend = SpeculativeBackend::Mtp;
-            } else if (selected == "dflash") {
+            if (selected == "dflash") {
                 options.spec_backend = SpeculativeBackend::DFlash;
             } else {
-                throw std::invalid_argument("--spec must be mtp or dflash");
+                throw std::invalid_argument("--spec must be dflash");
             }
         } else if (arg == "--draft-tokens") {
             options.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens", true);
             if (options.draft_tokens > kMaxDFlashDraftTokens) {
-                throw std::invalid_argument("--draft-tokens must be in [0,5]");
+                throw std::invalid_argument("--draft-tokens must be in [0,7]");
             }
         } else if (arg == "--adaptive-draft") {
             options.adaptive_draft = true;
@@ -424,18 +473,41 @@ BenchOptions parse_args(int argc, char** argv) {
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
+    if (options.mixed_forward % kMixedForwardAlignment != 0 ||
+        options.mixed_forward > options.prefill_chunk || options.mixed_forward > 4096) {
+        throw std::invalid_argument(
+            "--mixed-forward must be a multiple of 256 and at most min(--prefill-chunk, 4096)");
+    }
+    if (options.contention) {
+        if (!options.n_prompt.empty() || !options.n_gen.empty() || !options.prompt_gen.empty()) {
+            throw std::invalid_argument("--contention excludes -p, -n, and -pg");
+        }
+        if (options.concurrency < 2) {
+            throw std::invalid_argument("--contention requires --concurrency 2 or more");
+        }
+        const std::uint32_t lanes = options.contention_lanes.value_or(options.concurrency - 1);
+        if (lanes == 0 || lanes >= options.concurrency) {
+            throw std::invalid_argument("--contention-lanes must be in [1, concurrency-1]");
+        }
+        if (options.output == OutputFormat::Csv) {
+            throw std::invalid_argument("--contention reports table or json");
+        }
+    } else if (options.contention_lanes || options.contention_baseline_prefill_tok_s) {
+        throw std::invalid_argument(
+            "--contention-lanes and --contention-baseline require --contention");
+    }
     if (options.sage_attn && options.kv_cache != KvCacheStorage::Nvfp4) {
         throw std::invalid_argument("--sage requires --kv-dtype nvfp4");
     }
     validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
                                options.xattn_tau);
-    if (options.spec_backend == SpeculativeBackend::Mtp &&
-        options.draft_tokens > kMaxMtpDraftTokens) {
-        throw std::invalid_argument("--spec mtp requires --draft-tokens in [0,5]");
+    validate_speculative_backend(options.spec_backend);
+    if (options.spec_backend == SpeculativeBackend::None && options.draft_tokens != 0) {
+        throw std::invalid_argument("--draft-tokens requires --spec dflash");
     }
     if (options.spec_backend == SpeculativeBackend::DFlash &&
         (options.draft_tokens == 0 || options.draft_tokens > kMaxDFlashDraftTokens)) {
-        throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,5]");
+        throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,7]");
     }
     if (options.dflash_verify_width != 0 && options.spec_backend != SpeculativeBackend::DFlash) {
         throw std::invalid_argument("--dflash-verify-width requires --spec dflash");
@@ -444,11 +516,10 @@ BenchOptions parse_args(int argc, char** argv) {
         throw std::invalid_argument("--dflash-verify-width must be in [2,16]");
     }
     if (options.proposal_head == ProposalHead::Optimized && options.draft_tokens == 0) {
-        throw std::invalid_argument(
-            "--lm-head-draft requires --draft-tokens greater than zero");
+        throw std::invalid_argument("--lm-head-draft requires --draft-tokens greater than zero");
     }
     if (options.adaptive_draft && options.draft_tokens == 0) {
-        throw std::invalid_argument("--adaptive-draft requires --spec mtp|dflash and --draft-tokens");
+        throw std::invalid_argument("--adaptive-draft requires --spec dflash and --draft-tokens");
     }
     return options;
 }
@@ -463,6 +534,7 @@ std::vector<BenchTest> expand_tests(const BenchOptions& options) {
     }
 
     std::vector<BenchTest> tests;
+    tests.reserve(prompts.size() + gens.size() + combined.size());
     for (const int p : prompts) {
         tests.push_back({TestKind::Prefill, p, 0, "pp" + std::to_string(p)});
     }
@@ -553,11 +625,9 @@ std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prom
 }
 
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& spec) {
-    const std::string suffix = use_cuda_graph ? "cuda_graph" : "eager";
+    std::string suffix = use_cuda_graph ? "cuda_graph" : "eager";
     if (spec.draft_tokens == 0) { return suffix; }
-    const std::string kind =
-        spec.backend == SpeculativeBackend::DFlash ? "dflash" : "mtp";
-    return kind + "_" + suffix;
+    return "dflash_" + suffix;
 }
 
 std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& spec) {
@@ -572,9 +642,12 @@ std::uint32_t decode_graph_prime_required_context(const SpeculativeOptions& spec
 
 std::string speculative_backend_name(SpeculativeBackend backend) {
     switch (backend) {
-        case SpeculativeBackend::None: return "none";
-        case SpeculativeBackend::Mtp: return "mtp";
-        case SpeculativeBackend::DFlash: return "dflash";
+    case SpeculativeBackend::None:
+        return "none";
+    case SpeculativeBackend::Mtp:
+        return "mtp";
+    case SpeculativeBackend::DFlash:
+        return "dflash";
     }
     return "none";
 }
@@ -596,12 +669,10 @@ std::vector<double> prefill_tok_s_series(const TestResult& result) {
     std::vector<double> out;
     if (!result.test.has_prefill()) { return out; }
     for (const RepTiming& rep : result.reps) {
-        const double seconds = result.test.kind == TestKind::Prefill
-                                   ? rep.wave_seconds
-                                   : rep.timings.prefill_seconds;
+        const double seconds =
+            result.test.kind == TestKind::Prefill ? rep.wave_seconds : rep.timings.prefill_seconds;
         if (seconds > 0.0) {
-            out.push_back(static_cast<double>(result.test.n_prompt) * result.concurrency /
-                          seconds);
+            out.push_back(static_cast<double>(result.test.n_prompt) * result.concurrency / seconds);
         }
     }
     return out;
@@ -612,8 +683,7 @@ std::vector<double> prefill_active_tok_s_series(const TestResult& result) {
     if (!result.test.has_prefill()) { return out; }
     for (const RepTiming& rep : result.reps) {
         if (rep.timings.prefill_seconds > 0.0) {
-            out.push_back(static_cast<double>(result.test.n_prompt) /
-                          rep.timings.prefill_seconds);
+            out.push_back(static_cast<double>(result.test.n_prompt) / rep.timings.prefill_seconds);
         }
     }
     return out;
@@ -643,7 +713,7 @@ std::vector<double> decode_engine_tok_s_series(const TestResult& result) {
     return out;
 }
 
-template <double GenerationTimings::*Field>
+template <double GenerationTimings::* Field>
 std::vector<double> timing_series(const TestResult& result) {
     std::vector<double> out;
     out.reserve(result.reps.size());
@@ -698,13 +768,15 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.memory.kv_payload_bytes) << '\n'
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
+        << " mixed_forward=" << env.mixed_forward << "x" << env.mixed_forward_rounds
+        << " mixed_forward_min_tokens=" << env.mixed_forward_min_tokens
         << " kv_cache=" << kv_cache_name(env.kv_cache) << " concurrency=" << env.concurrency
         << " spec=" << speculative_backend_name(env.speculative_backend)
-        << " k=" << env.draft_tokens
-        << " proposal_head=" << proposal_head_name(env.proposal_head)
-        << " decode_path=" << decode_path_name(
-            env.use_cuda_graph, SpeculativeOptions{env.speculative_backend, env.draft_tokens,
-                                                   env.proposal_head, env.dflash_verify_width})
+        << " k=" << env.draft_tokens << " proposal_head=" << proposal_head_name(env.proposal_head)
+        << " decode_path="
+        << decode_path_name(env.use_cuda_graph,
+                            SpeculativeOptions{env.speculative_backend, env.draft_tokens,
+                                               env.proposal_head, env.dflash_verify_width})
         << " graph_prime="
         << (env.decode_graph_primed
                 ? std::to_string(env.decode_graph_prime_output_tokens) + " outputs"
@@ -713,7 +785,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
 
     constexpr std::size_t cols                   = 10;
     const std::array<std::string, cols> headings = {
-        "test",           "n_prompt", "n_gen",         "prefill t/s", "active pp t/s",
+        "test",           "n_prompt",       "n_gen",    "prefill t/s",   "active pp t/s",
         "decode out t/s", "decode eng t/s", "spec acc", "spec round/fb", "work peak"};
     std::vector<std::array<std::string, cols>> rows;
     for (const TestResult& result : results) {
@@ -809,21 +881,24 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
-         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
-         << "    \"sage_attn\": " << (env.sage_attn ? "true" : "false") << ",\n"
-         << "    \"keep_frac\": " << env.keep_frac << ",\n"
-         << "    \"xattn_tau\": " << env.xattn_tau << ",\n"
-         << "    \"concurrency\": " << env.concurrency << ",\n"
-         << "    \"spec\": \"" << speculative_backend_name(env.speculative_backend) << "\",\n"
-         << "    \"draft_tokens\": " << env.draft_tokens << ",\n"
-         << "    \"dflash_verify_width\": " << env.dflash_verify_width << ",\n"
-         << "    \"proposal_head\": \"" << proposal_head_name(env.proposal_head) << "\",\n"
-         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
-         << "    \"decode_path\": \"" << decode_path_name(
-                   env.use_cuda_graph, SpeculativeOptions{env.speculative_backend, env.draft_tokens,
-                                                          env.proposal_head,
-                                                          env.dflash_verify_width})
-         << "\",\n"
+        << "    \"mixed_forward\": " << env.mixed_forward << ",\n"
+        << "    \"mixed_forward_rounds\": " << env.mixed_forward_rounds << ",\n"
+        << "    \"mixed_forward_min_tokens\": " << env.mixed_forward_min_tokens << ",\n"
+        << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
+        << "    \"sage_attn\": " << (env.sage_attn ? "true" : "false") << ",\n"
+        << "    \"keep_frac\": " << env.keep_frac << ",\n"
+        << "    \"xattn_tau\": " << env.xattn_tau << ",\n"
+        << "    \"concurrency\": " << env.concurrency << ",\n"
+        << "    \"spec\": \"" << speculative_backend_name(env.speculative_backend) << "\",\n"
+        << "    \"draft_tokens\": " << env.draft_tokens << ",\n"
+        << "    \"dflash_verify_width\": " << env.dflash_verify_width << ",\n"
+        << "    \"proposal_head\": \"" << proposal_head_name(env.proposal_head) << "\",\n"
+        << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
+        << "    \"decode_path\": \""
+        << decode_path_name(env.use_cuda_graph,
+                            SpeculativeOptions{env.speculative_backend, env.draft_tokens,
+                                               env.proposal_head, env.dflash_verify_width})
+        << "\",\n"
         << "    \"decode_graph_prime\": {\"primed\": "
         << (env.decode_graph_primed ? "true" : "false")
         << ", \"output_tokens\": " << env.decode_graph_prime_output_tokens << "},\n"
@@ -919,10 +994,9 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << speculative_backend_name(env.speculative_backend) << ',' << env.draft_tokens << ','
             << env.dflash_verify_width << ',' << proposal_head_name(env.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph,
-                               SpeculativeOptions{env.speculative_backend, env.draft_tokens,
-                                                  env.proposal_head, env.dflash_verify_width})
-            << ','
-            << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
+                                SpeculativeOptions{env.speculative_backend, env.draft_tokens,
+                                                   env.proposal_head, env.dflash_verify_width})
+            << ',' << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
             << ',' << env.memory.request_transient.capacity_bytes << ','
@@ -931,8 +1005,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << spec.fallback_steps << ',' << acceptance << ',' << result.reps.size() << ','
             << mean(prefill_tok_s_series(result)) << ',' << stddev(prefill_tok_s_series(result))
             << ',' << mean(prefill_active_tok_s_series(result)) << ','
-            << stddev(prefill_active_tok_s_series(result))
-            << ',' << mean(decode_output_tok_s_series(result)) << ','
+            << stddev(prefill_active_tok_s_series(result)) << ','
+            << mean(decode_output_tok_s_series(result)) << ','
             << stddev(decode_output_tok_s_series(result)) << ','
             << mean(decode_engine_tok_s_series(result)) << ','
             << stddev(decode_engine_tok_s_series(result)) << ','
@@ -1002,6 +1076,125 @@ std::uint64_t file_size_or_zero(const std::string& path) {
     std::error_code error;
     const auto size = std::filesystem::file_size(path, error);
     return error ? 0 : static_cast<std::uint64_t>(size);
+}
+
+double ContentionWindow::decode_tok_s() const noexcept {
+    return seconds > 0.0 ? static_cast<double>(committed_decode_tokens) / seconds : 0.0;
+}
+
+double ContentionWindow::decode_rounds_s() const noexcept {
+    return seconds > 0.0 ? static_cast<double>(decode_rounds) / seconds : 0.0;
+}
+
+double ContentionWindow::prefill_tok_s() const noexcept {
+    return seconds > 0.0 ? static_cast<double>(computed_prefill_tokens) / seconds : 0.0;
+}
+
+double ContentionResult::decode_share() const noexcept {
+    const double decode_only =
+        0.5 * (decode_only_before.decode_rounds_s() + decode_only_after.decode_rounds_s());
+    return decode_only > 0.0 ? contention.decode_rounds_s() / decode_only : 0.0;
+}
+
+namespace {
+
+std::optional<double> contention_score(const ContentionResult& result,
+                                       std::optional<double> baseline_prefill_tok_s) {
+    if (!baseline_prefill_tok_s) { return std::nullopt; }
+    return result.contention.prefill_tok_s() / *baseline_prefill_tok_s + result.decode_share();
+}
+
+void append_window_json(std::ostringstream& out, const char* name, const ContentionWindow& window,
+                        bool trailing_comma) {
+    out << "    \"" << name << "\": {\"seconds\": " << window.seconds
+        << ", \"committed_decode_tokens\": " << window.committed_decode_tokens
+        << ", \"decode_rounds\": " << window.decode_rounds
+        << ", \"decode_row_rounds\": " << window.decode_row_rounds
+        << ", \"computed_prefill_tokens\": " << window.computed_prefill_tokens
+        << ", \"decode_tok_s\": " << window.decode_tok_s()
+        << ", \"decode_rounds_s\": " << window.decode_rounds_s()
+        << ", \"prefill_tok_s\": " << window.prefill_tok_s() << "}"
+        << (trailing_comma ? ",\n" : "\n");
+}
+
+} // namespace
+
+std::string format_contention_table(const BenchEnvironment& env, const ContentionResult& result,
+                                    std::optional<double> baseline_prefill_tok_s) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3);
+    out << "ninfer_bench contention: " << env.gpu_name << ", C" << env.concurrency << ", "
+        << speculative_backend_name(env.speculative_backend) << " k=" << env.draft_tokens
+        << (env.adaptive_draft ? " adaptive" : "") << ", prefill_chunk=" << env.prefill_chunk
+        << ", mixed_forward=" << env.mixed_forward << "x" << env.mixed_forward_rounds
+        << " mixed_forward_min_tokens=" << env.mixed_forward_min_tokens << '\n'
+        << "  " << result.prompts << " prompts of " << result.prompt_tokens << " tokens against "
+        << result.lanes << " decode lanes of " << result.context_tokens << " context tokens\n";
+    const auto line = [&](const char* name, const ContentionWindow& window) {
+        out << "  " << std::left << std::setw(20) << name << std::right << std::setw(8)
+            << window.seconds << " s  decode " << std::setw(9) << window.decode_tok_s()
+            << " tok/s  " << std::setw(8) << window.decode_rounds_s() << " rounds/s  prefill "
+            << std::setw(10) << window.prefill_tok_s() << " tok/s\n";
+    };
+    line("decode-only before", result.decode_only_before);
+    line("contention", result.contention);
+    line("decode-only after", result.decode_only_after);
+    double ttft_sum = 0.0;
+    double ttft_max = 0.0;
+    for (const double ttft : result.ttft_seconds) {
+        ttft_sum += ttft;
+        ttft_max = std::max(ttft_max, ttft);
+    }
+    out << "  ttft mean " << ttft_sum / static_cast<double>(result.ttft_seconds.size())
+        << " s, max " << ttft_max << " s\n"
+        << "  decode share " << result.decode_share() << '\n';
+    if (const auto score = contention_score(result, baseline_prefill_tok_s)) {
+        out << "  score " << *score << " (baseline prefill " << baseline_prefill_tok_s.value()
+            << " tok/s)\n";
+    }
+    return out.str();
+}
+
+std::string format_contention_json(const BenchEnvironment& env, const std::string& command,
+                                   const ContentionResult& result,
+                                   std::optional<double> baseline_prefill_tok_s) {
+    std::ostringstream out;
+    out << std::setprecision(9);
+    out << "{\n"
+        << "  \"artifact_type\": \"" << kArtifactType << "_contention\",\n"
+        << "  \"schema_version\": " << kSchemaVersion << ",\n"
+        << "  \"command\": \"" << json_escape(command) << "\",\n"
+        << "  \"gpu\": \"" << json_escape(env.gpu_name) << "\",\n"
+        << "  \"config\": {\"max_context\": " << env.max_context
+        << ", \"prefill_chunk\": " << env.prefill_chunk
+        << ", \"mixed_forward\": " << env.mixed_forward
+        << ", \"mixed_forward_rounds\": " << env.mixed_forward_rounds
+        << ", \"mixed_forward_min_tokens\": " << env.mixed_forward_min_tokens
+        << ", \"concurrency\": " << env.concurrency << ", \"spec\": \""
+        << speculative_backend_name(env.speculative_backend)
+        << "\", \"draft_tokens\": " << env.draft_tokens
+        << ", \"adaptive_draft\": " << (env.adaptive_draft ? "true" : "false")
+        << ", \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\"},\n"
+        << "  \"contention\": {\n"
+        << "    \"prompt_tokens\": " << result.prompt_tokens << ",\n"
+        << "    \"prompts\": " << result.prompts << ",\n"
+        << "    \"context_tokens\": " << result.context_tokens << ",\n"
+        << "    \"lanes\": " << result.lanes << ",\n";
+    append_window_json(out, "decode_only_before", result.decode_only_before, true);
+    append_window_json(out, "contention_window", result.contention, true);
+    append_window_json(out, "decode_only_after", result.decode_only_after, true);
+    out << "    \"ttft_seconds\": [";
+    for (std::size_t i = 0; i < result.ttft_seconds.size(); ++i) {
+        out << (i == 0 ? "" : ", ") << result.ttft_seconds[i];
+    }
+    out << "],\n"
+        << "    \"decode_share\": " << result.decode_share();
+    if (const auto score = contention_score(result, baseline_prefill_tok_s)) {
+        out << ",\n    \"baseline_prefill_tok_s\": " << baseline_prefill_tok_s.value()
+            << ",\n    \"score\": " << *score;
+    }
+    out << "\n  }\n}\n";
+    return out.str();
 }
 
 } // namespace ninfer::bench

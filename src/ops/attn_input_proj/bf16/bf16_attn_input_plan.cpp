@@ -8,10 +8,6 @@ void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, 
         bf16_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
         return;
     }
-    if (x.ne[1] <= kBf16AttnInputSmallTDispatchEnd) {
-        bf16_attn_input_small_t_launch(x, weight, q, gate, k, v, stream);
-        return;
-    }
     bf16_attn_input_mma_launch(x, weight, q, gate, k, v, stream);
 }
 

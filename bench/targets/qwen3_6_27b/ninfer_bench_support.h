@@ -26,9 +26,14 @@ inline constexpr int kDefaultWarmup                   = 1;
 inline constexpr std::uint32_t kDefaultPrefillChunk   = 4096;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 inline constexpr std::uint32_t kKvPageTokens          = 64;
-inline constexpr std::uint32_t kMaxMtpDraftTokens     = 5;
-inline constexpr std::uint32_t kMaxDFlashDraftTokens  = 5;
+inline constexpr std::uint32_t kMaxDFlashDraftTokens  = 7;
 inline constexpr std::uint32_t kMaxDFlashVerifyWidth  = 16;
+inline constexpr std::uint32_t kMixedForwardAlignment = 256;
+// Contention mode: background decode lanes request this many tokens so none finishes inside the
+// measured windows, and each decode-only window lasts this long.
+inline constexpr std::uint32_t kContentionDecodeTokens = 6144;
+inline constexpr double kContentionDecodeWindowSeconds = 4.0;
+inline constexpr int kDefaultContentionContext         = 512;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };
 
@@ -64,21 +69,32 @@ struct BenchOptions {
     int repetitions = kDefaultRepetitions;
     int warmup      = kDefaultWarmup;
     std::optional<std::uint32_t> max_context;
-    std::uint32_t prefill_chunk    = kDefaultPrefillChunk;
-    KvCacheStorage kv_cache        = KvCacheStorage::Nvfp4;
-    bool sage_attn                 = false;
-    float keep_frac                = 1.0f;
-    float xattn_tau                = 1.0f;
-    std::uint32_t concurrency      = 1;
-    SpeculativeBackend spec_backend    = SpeculativeBackend::Mtp;
-    std::uint32_t draft_tokens         = 0;
-    std::uint32_t dflash_verify_width  = 0;
-    bool adaptive_draft                = false;
-    ProposalHead proposal_head         = ProposalHead::Full;
-    int device                     = 0;
-    bool use_cuda_graph            = true;
-    bool profile_measured          = false;
-    OutputFormat output            = OutputFormat::Table;
+    std::uint32_t prefill_chunk = kDefaultPrefillChunk;
+    // Explicit prefill-first control; product Engine/server defaults enable mixing.
+    std::uint32_t mixed_forward            = 0;
+    std::uint32_t mixed_forward_rounds     = 12;
+    std::uint32_t mixed_forward_min_tokens = 4096;
+    KvCacheStorage kv_cache                = KvCacheStorage::Nvfp4;
+    bool sage_attn                         = false;
+    float keep_frac                        = 1.0f;
+    float xattn_tau                        = 1.0f;
+    std::uint32_t concurrency              = 1;
+    // Contention mode (--contention P,R): R prompts of P tokens prefill back to back while
+    // contention_lanes requests of contention_context prompt tokens decode.
+    std::optional<std::pair<int, int>> contention;
+    int contention_context = kDefaultContentionContext;
+    std::optional<std::uint32_t> contention_lanes;
+    // Prefill tok/s of the same build and contention with mixed_forward 0, for the score.
+    std::optional<double> contention_baseline_prefill_tok_s;
+    SpeculativeBackend spec_backend   = SpeculativeBackend::None;
+    std::uint32_t draft_tokens        = 0;
+    std::uint32_t dflash_verify_width = 0;
+    bool adaptive_draft               = false;
+    ProposalHead proposal_head        = ProposalHead::Full;
+    int device                        = 0;
+    bool use_cuda_graph               = true;
+    bool profile_measured             = false;
+    OutputFormat output               = OutputFormat::Table;
     std::string output_file;
     bool help_requested = false;
 };
@@ -95,7 +111,7 @@ struct RepTiming {
 
 struct TestResult {
     BenchTest test;
-    std::uint32_t concurrency                  = 1;
+    std::uint32_t concurrency = 1;
     std::vector<RepTiming> reps;
     std::size_t workspace_peak_bytes           = 0;
     std::size_t workspace_allocator_peak_bytes = 0;
@@ -105,6 +121,35 @@ struct Stats {
     double mean   = 0.0;
     double stddev = 0.0;
     int count     = 0;
+};
+
+// Engine RuntimeStats deltas over one wall-clock window.
+struct ContentionWindow {
+    double seconds                        = 0.0;
+    std::uint64_t committed_decode_tokens = 0;
+    std::uint64_t decode_rounds           = 0;
+    std::uint64_t decode_row_rounds       = 0;
+    std::uint64_t computed_prefill_tokens = 0;
+
+    [[nodiscard]] double decode_tok_s() const noexcept;
+    [[nodiscard]] double decode_rounds_s() const noexcept;
+    [[nodiscard]] double prefill_tok_s() const noexcept;
+};
+
+struct ContentionResult {
+    int prompt_tokens   = 0;
+    int prompts         = 0;
+    int context_tokens  = 0;
+    std::uint32_t lanes = 0;
+    ContentionWindow decode_only_before;
+    ContentionWindow contention;
+    ContentionWindow decode_only_after;
+    // Submission-to-first-token seconds of each contended prompt.
+    std::vector<double> ttft_seconds;
+
+    // Decode rounds/s kept during the contention window over the decode-only rate. Rounds, not
+    // tokens, so acceptance drift between windows does not count.
+    [[nodiscard]] double decode_share() const noexcept;
 };
 
 struct BenchEnvironment {
@@ -120,16 +165,19 @@ struct BenchEnvironment {
 
     std::uint32_t max_context                      = 0;
     std::uint32_t prefill_chunk                    = kDefaultPrefillChunk;
+    std::uint32_t mixed_forward                    = 0;
+    std::uint32_t mixed_forward_rounds             = 12;
+    std::uint32_t mixed_forward_min_tokens         = 4096;
     KvCacheStorage kv_cache                        = KvCacheStorage::Nvfp4;
     bool sage_attn                                 = false;
     float keep_frac                                = 1.0f;
     float xattn_tau                                = 1.0f;
     std::uint32_t concurrency                      = 1;
     SpeculativeBackend speculative_backend         = SpeculativeBackend::None;
-    std::uint32_t draft_tokens                      = 0;
-    std::uint32_t dflash_verify_width               = 0;
-    bool adaptive_draft                             = false;
-    ProposalHead proposal_head                      = ProposalHead::Full;
+    std::uint32_t draft_tokens                     = 0;
+    std::uint32_t dflash_verify_width              = 0;
+    bool adaptive_draft                            = false;
+    ProposalHead proposal_head                     = ProposalHead::Full;
     bool use_cuda_graph                            = true;
     bool decode_graph_primed                       = false;
     std::uint32_t decode_graph_prime_output_tokens = 0;
@@ -172,6 +220,11 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
 std::string format_json(const BenchEnvironment& env, const std::string& command,
                         const std::vector<TestResult>& results);
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results);
+std::string format_contention_table(const BenchEnvironment& env, const ContentionResult& result,
+                                    std::optional<double> baseline_prefill_tok_s);
+std::string format_contention_json(const BenchEnvironment& env, const std::string& command,
+                                   const ContentionResult& result,
+                                   std::optional<double> baseline_prefill_tok_s);
 
 std::string json_escape(std::string_view value);
 std::string kv_cache_name(KvCacheStorage storage);

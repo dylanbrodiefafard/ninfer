@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
+#include "ninfer/ops/a8_activation.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -57,8 +59,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *   BF16_CTRL.
  *
  * `T` is the positive token extent of the Op contract. BF16_CTRL and W8G32_F16S admit only
- * LinearPolicy::A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 permits the private resolver to
- * select either a qualified A16 route or activation quantization to NVFP4 at every positive T.
+ * LinearPolicy::A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8; AllowA4 permits the private
+ * resolver to select either a qualified A16 route or activation quantization to NVFP4 at every
+ * positive T. NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=4, otherwise A16. Its
+ * per16-scale partial accumulation preserves the original represented NVFP4 weights.
  *
  * The oracle evaluates every projection independently with naive FP64 accumulation from the
  * logical values represented by the persistent weight and BF16 activation. The final four BF16
@@ -81,6 +85,28 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
  * Applies the A16-only single-parent Q/K/output-gate/V projection without transient workspace.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
+                     Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
+
+/**
+ * The NVFP4 AllowA8 single-parent projection of an already quantized activation
+ * (ninfer/ops/a8_activation.h) of [5120,T], T >= 2 (the widths at which AllowA8 selects W4A8).
+ * For the same BF16 activation the four outputs are bit-identical to the policy overload's. The
+ * weight is NVFP4 [14336,5120]; q/gate/k/v are as above. The oracle is the overload's, evaluated on
+ * the represented activation codes[k,t] * scales[t]. Invalid arguments throw
+ * std::invalid_argument. No workspace.
+ */
+void attn_input_proj(const A8Activation& x, const Weight& query_key_gate_value_weight, Tensor& q,
+                     Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
+
+/**
+ * The NVFP4 AllowA4 single-parent projection of an already quantized activation
+ * (ninfer/ops/a4_activation.h) of [5120,T], T >= kA4AttnInputMinTokens (the widths at which
+ * AllowA4 selects W4A4), whose input scale divisor equals the weight's. For the same BF16
+ * activation the four outputs are bit-identical to the policy overload's with AllowA4. The weight
+ * is NVFP4 [14336,5120]; q/gate/k/v are as above. The oracle is the overload's, evaluated on the
+ * represented activation. Invalid arguments throw std::invalid_argument. No workspace.
+ */
+void attn_input_proj(const A4Activation& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 
 /**

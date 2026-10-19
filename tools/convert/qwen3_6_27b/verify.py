@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from dataclasses import asdict, dataclass
 import json
-from pathlib import Path
 import tempfile
-from typing import Sequence
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
-from safetensors import safe_open
 import torch
+from safetensors import safe_open
 
 from tools.artifact.container import (
     Artifact,
@@ -33,7 +33,6 @@ from tools.artifact.numeric import QuantFormat, get_format
 from tools.convert.common.safetensors import ShardReader
 
 from . import draft_head, inventory, recipe
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -107,9 +106,7 @@ def validate_logical_bindings(
         layers = (None,) if view.layers is None else view.layers
         for layer in layers:
             parent_name = (
-                view.parent_pattern
-                if layer is None
-                else view.parent_pattern.format(l=layer)
+                view.parent_pattern if layer is None else view.parent_pattern.format(l=layer)
             )
             parent = index.get(parent_name)
             if not isinstance(parent, TensorObject):
@@ -153,13 +150,11 @@ def validate_structure(artifact: Artifact) -> StructureSummary:
     expected_identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
     if artifact.identity != expected_identity:
         _contract_error(
-            f"artifact identity is {artifact.identity!r}, expected "
-            f"{expected_identity!r}"
+            f"artifact identity is {artifact.identity!r}, expected {expected_identity!r}"
         )
     if len(artifact.objects) != len(inventory.OBJECT_SPECS):
         _contract_error(
-            f"artifact has {len(artifact.objects)} objects, expected "
-            f"{len(inventory.OBJECT_SPECS)}"
+            f"artifact has {len(artifact.objects)} objects, expected {len(inventory.OBJECT_SPECS)}"
         )
 
     cursor = 0
@@ -168,17 +163,13 @@ def validate_structure(artifact: Artifact) -> StructureSummary:
     formats: Counter[str] = Counter()
     layouts: Counter[str] = Counter()
     for position, (actual, expected) in enumerate(
-        zip(artifact.objects, inventory.OBJECT_SPECS)
+        zip(artifact.objects, inventory.OBJECT_SPECS, strict=True)
     ):
         if actual.name != expected.name:
-            _contract_error(
-                f"object {position} is {actual.name!r}, expected {expected.name!r}"
-            )
+            _contract_error(f"object {position} is {actual.name!r}, expected {expected.name!r}")
         expected_offset = align_up(cursor, object_alignment(actual))
         if actual.offset != expected_offset:
-            _contract_error(
-                f"{actual.name}: offset {actual.offset}, expected {expected_offset}"
-            )
+            _contract_error(f"{actual.name}: offset {actual.offset}, expected {expected_offset}")
 
         if isinstance(expected, inventory.TensorSpec):
             if not isinstance(actual, TensorObject):
@@ -186,9 +177,7 @@ def validate_structure(artifact: Artifact) -> StructureSummary:
             signature = (actual.shape, actual.format, actual.layout)
             registered = (expected.shape, expected.format, expected.layout)
             if signature != registered:
-                _contract_error(
-                    f"{actual.name}: signature {signature} does not match {registered}"
-                )
+                _contract_error(f"{actual.name}: signature {signature} does not match {registered}")
             required_bytes = encoded_size(actual.layout, actual.format, actual.shape)
             if actual.bytes != required_bytes:
                 _contract_error(
@@ -305,10 +294,7 @@ def _qproj_rows(
     if expression.shape != (per_head.shape[0] * part_rows, source.shape[-1]):
         return None
     source_rows = [
-        (row // part_rows) * per_head.shape[1]
-        + selected.begin
-        + (row % part_rows)
-        for row in rows
+        (row // part_rows) * per_head.shape[1] + selected.begin + (row % part_rows) for row in rows
     ]
     return sources.rows(source, source_rows)
 
@@ -376,9 +362,7 @@ def _materialize_rows(
         return torch.cat(selected_rows, dim=0)
 
     if isinstance(expression, recipe.Cast):
-        return _materialize_rows(
-            expression.source, rows, sources, draft_ids
-        ).to(torch.float32)
+        return _materialize_rows(expression.source, rows, sources, draft_ids).to(torch.float32)
 
     if isinstance(expression, recipe.GatherRows):
         source_rows = [int(draft_ids[row]) for row in rows]
@@ -415,9 +399,7 @@ def _profile_quantize_rows(
     )
     max_abs = np.max(np.abs(grouped), axis=-1)
     with np.errstate(over="ignore", invalid="ignore"):
-        raw_scale = (
-            max_abs.astype(np.float64) / float(format_spec.qmax)
-        ).astype(np.float32)
+        raw_scale = (max_abs.astype(np.float64) / float(format_spec.qmax)).astype(np.float32)
         scales = raw_scale.astype(np.float16)
     underflow = (scales == 0) & (max_abs > 0)
     if underflow.any():
@@ -427,14 +409,12 @@ def _profile_quantize_rows(
         _contract_error("quantized source probe has an invalid binary16 scale")
     reciprocal = np.zeros(scales.shape, dtype=np.float32)
     positive = scales > 0
-    reciprocal[positive] = (
-        1.0 / scales[positive].astype(np.float64)
-    ).astype(np.float32)
+    reciprocal[positive] = (1.0 / scales[positive].astype(np.float64)).astype(np.float32)
     # Products of two binary32 values are exact in binary64. Casting explicitly
     # supplies the specified binary32 rounding before integral ties-to-even.
-    normalized = (
-        grouped.astype(np.float64) * reciprocal.astype(np.float64)[..., None]
-    ).astype(np.float32)
+    normalized = (grouped.astype(np.float64) * reciprocal.astype(np.float64)[..., None]).astype(
+        np.float32
+    )
     codes = np.clip(
         np.rint(normalized),
         format_spec.qmin,
@@ -504,9 +484,7 @@ def _load_and_validate_draft_ids(
     token_ids = decode_direct(artifact.payload(obj), obj.format, obj.shape)
     validate_draft_token_ids(token_ids)
 
-    draft_expression = recipe.RECIPES_BY_NAME[
-        draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT
-    ].expression
+    draft_expression = recipe.RECIPES_BY_NAME[draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT].expression
     if not isinstance(draft_expression, recipe.DraftHeadTokenIds):
         _contract_error("draft ID recipe is not the registered derivation")
     context = draft_head.compute_shortlist(

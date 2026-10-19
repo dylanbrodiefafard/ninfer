@@ -76,7 +76,7 @@ void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected,
 Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t width,
                                              std::int32_t batch_size) {
     require_policy(policy, "fp8 GDN snapshot");
-    if (width <= 0 || batch_size <= 0 || batch_size > 4 || (batch_size > 1 && width > 16)) {
+    if (width <= 0 || batch_size <= 0 || batch_size > 6 || (batch_size > 1 && width > 16)) {
         throw std::invalid_argument("fp8 GDN snapshot: invalid B/W domain");
     }
     if (batch_size == 1) {
@@ -95,7 +95,7 @@ Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t w
 Fp8GdnConvPlan fp8_gdn_record_resolve_plan(LinearPolicy policy, std::int32_t width,
                                            std::int32_t batch_size) {
     require_policy(policy, "fp8 GDN record");
-    if (width < 2 || width > 16 || batch_size <= 0 || batch_size > 4) {
+    if (width < 2 || width > 16 || batch_size <= 0 || batch_size > 6) {
         throw std::invalid_argument("fp8 GDN record: invalid B/W domain");
     }
     // Record and snapshot must choose the same arithmetic for the same physical block.
@@ -112,7 +112,7 @@ std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy, std::
     }
     (void)fp8_gdn_snapshot_resolve_plan(policy, min_width, batch_size);
     (void)fp8_gdn_snapshot_resolve_plan(policy, max_width, batch_size);
-    const Fp8GdnConvPlan maximum = fp8_gdn_snapshot_resolve_plan(policy, max_width, 1);
+    const Fp8GdnConvPlan maximum            = fp8_gdn_snapshot_resolve_plan(policy, max_width, 1);
     std::int32_t largest_materialized_width = 0;
     if (max_width > kFp8LinearSmallTMax<Fp8GdnInputGeometry>) {
         largest_materialized_width = max_width;
@@ -173,7 +173,8 @@ void launch_record_plan(const Tensor& x, const Weight& weight, const Tensor& con
                         cudaStream_t stream, const Tensor* parent_index) {
     if (plan.schedule == Fp8GdnConvScheduleId::FusedA16) {
         fp8_gdn_record_fused_launch(x, weight, conv_weight, conv_states, valid_columns,
-                                    initial_slot, conv_record, query, key, value, z, stream, parent_index);
+                                    initial_slot, conv_record, query, key, value, z, stream,
+                                    parent_index);
         return;
     }
 
@@ -202,16 +203,15 @@ void fp8_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tens
         // Flattening W*B selects a different SmallT reduction and can also
         // replace a fused C=1 convolution with a materialized BF16 projection.
         for (std::int32_t row = 0; row < x.ne[2]; ++row) {
-            Tensor q = query.slice(2, row, 1);
-            Tensor k = key.slice(2, row, 1);
-            Tensor v = value.slice(2, row, 1);
+            Tensor q    = query.slice(2, row, 1);
+            Tensor k    = key.slice(2, row, 1);
+            Tensor v    = value.slice(2, row, 1);
             Tensor gate = z.slice(2, row, 1);
-            launch_snapshot_plan(
-                x.slice(2, row, 1), weight, conv_weight, conv_states,
-                valid_columns.data ? valid_columns.slice(0, row, 1) : Tensor{},
-                initial_slot.slice(0, row, 1),
-                snapshot_base_slot.slice(0, row, 1), q, k, v, gate,
-                fp8_gdn_snapshot_resolve_plan(policy, x.ne[1], 1), workspace, stream);
+            launch_snapshot_plan(x.slice(2, row, 1), weight, conv_weight, conv_states,
+                                 valid_columns.data ? valid_columns.slice(0, row, 1) : Tensor{},
+                                 initial_slot.slice(0, row, 1), snapshot_base_slot.slice(0, row, 1),
+                                 q, k, v, gate, fp8_gdn_snapshot_resolve_plan(policy, x.ne[1], 1),
+                                 workspace, stream);
         }
         return;
     }
@@ -228,19 +228,18 @@ void fp8_gdn_record_dispatch(const Tensor& x, const Weight& weight, const Tensor
                              const Tensor* parent_index) {
     if (x.ne[2] > 1) {
         for (std::int32_t row = 0; row < x.ne[2]; ++row) {
-            Tensor q = query.slice(2, row, 1);
-            Tensor k = key.slice(2, row, 1);
-            Tensor v = value.slice(2, row, 1);
-            Tensor gate = z.slice(2, row, 1);
+            Tensor q      = query.slice(2, row, 1);
+            Tensor k      = key.slice(2, row, 1);
+            Tensor v      = value.slice(2, row, 1);
+            Tensor gate   = z.slice(2, row, 1);
             Tensor record = conv_record.slice(2, row, 1);
             Tensor parents;
             if (parent_index != nullptr) { parents = parent_index->slice(1, row, 1); }
-            launch_record_plan(
-                x.slice(2, row, 1), weight, conv_weight, conv_states,
-                valid_columns.data ? valid_columns.slice(0, row, 1) : Tensor{},
-                initial_slot.slice(0, row, 1),
-                record, q, k, v, gate, fp8_gdn_record_resolve_plan(policy, x.ne[1], 1),
-                workspace, stream, parent_index != nullptr ? &parents : nullptr);
+            launch_record_plan(x.slice(2, row, 1), weight, conv_weight, conv_states,
+                               valid_columns.data ? valid_columns.slice(0, row, 1) : Tensor{},
+                               initial_slot.slice(0, row, 1), record, q, k, v, gate,
+                               fp8_gdn_record_resolve_plan(policy, x.ne[1], 1), workspace, stream,
+                               parent_index != nullptr ? &parents : nullptr);
         }
         return;
     }

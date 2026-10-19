@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import time
 
 from . import harness, registry
@@ -41,8 +40,14 @@ def run_diff(op_name: str, rel_tol: float = 1e-4, abs_tol: float = 1e-5) -> dict
         check=False,
     )
     if not result.ok or not os.path.exists(host_path):
-        return {"op": op.name, "ok": False, "error": result.output[-500:], "case": None,
-                "stages": [], "first": None}
+        return {
+            "op": op.name,
+            "ok": False,
+            "error": result.output[-500:],
+            "case": None,
+            "stages": [],
+            "first": None,
+        }
 
     with open(host_path) as handle:
         dump = json.load(handle)
@@ -53,19 +58,21 @@ def run_diff(op_name: str, rel_tol: float = 1e-4, abs_tol: float = 1e-5) -> dict
         ref = stage.get("ref", [])
         first = None
         max_rel = 0.0
-        for i, (kv, rv) in enumerate(zip(kernel, ref)):
+        for i, (kv, rv) in enumerate(zip(kernel, ref, strict=True)):
             denom = max(abs(rv), 1e-30)
             rel = abs(kv - rv) / denom
             max_rel = max(max_rel, rel)
             if abs(kv - rv) > abs_tol and rel > rel_tol and first is None:
                 first = {"stage": stage["name"], "index": i, "kernel": kv, "ref": rv, "rel": rel}
-        stages.append({
-            "name": stage["name"],
-            "rows": len(kernel),
-            "clean": first is None,
-            "max_rel": max_rel,
-            "first": first,
-        })
+        stages.append(
+            {
+                "name": stage["name"],
+                "rows": len(kernel),
+                "clean": first is None,
+                "max_rel": max_rel,
+                "first": first,
+            }
+        )
 
     # The pipeline's earliest divergent stage is the root-cause candidate.
     first_stage = next((s for s in stages if s["first"] is not None), None)
@@ -83,20 +90,28 @@ def run_diff(op_name: str, rel_tol: float = 1e-4, abs_tol: float = 1e-5) -> dict
 
 def render(report: dict) -> str:
     if not report.get("ok"):
-        return f"[kdev-diff] {report['op']}: could not produce dump:\n{report.get('error','')}"
-    lines = [f"[kdev-diff] {report['op']} case='{report['case']}' rows={report['rows']}"
-             f" (rel_tol={report['rel_tol']:.0e} abs_tol={report['abs_tol']:.0e})"]
+        return f"[kdev-diff] {report['op']}: could not produce dump:\n{report.get('error', '')}"
+    lines = [
+        (
+            f"[kdev-diff] {report['op']} case='{report['case']}' rows={report['rows']}"
+            f" (rel_tol={report['rel_tol']:.0e} abs_tol={report['abs_tol']:.0e})"
+        )
+    ]
     for stage in report["stages"]:
         if stage["clean"]:
             lines.append(f"  {stage['name']:<6} clean (max rel {stage['max_rel']:.2e})")
         else:
             f = stage["first"]
-            lines.append(f"  {stage['name']:<6} DIVERGES at index {f['index']}: "
-                         f"kernel={f['kernel']:.6g} ref={f['ref']:.6g} (rel {f['rel']:.3f})")
+            lines.append(
+                f"  {stage['name']:<6} DIVERGES at index {f['index']}: "
+                f"kernel={f['kernel']:.6g} ref={f['ref']:.6g} (rel {f['rel']:.3f})"
+            )
     if report["first"]:
         f = report["first"]
-        lines.append(f"  => first divergence: stage={f['stage']} index={f['index']} "
-                     f"(kernel {f['kernel']:.6g} vs ref {f['ref']:.6g})")
+        lines.append(
+            f"  => first divergence: stage={f['stage']} index={f['index']} "
+            f"(kernel {f['kernel']:.6g} vs ref {f['ref']:.6g})"
+        )
     else:
         lines.append("  => no divergence (all stages within tolerance)")
     return "\n".join(lines)
@@ -120,8 +135,15 @@ def run_s3_diff(op_name: str) -> dict:
         check=False,
     )
     if not result.ok or not os.path.exists(host_path):
-        return {"op": op.name, "ok": False, "error": result.output[-500:], "case": None,
-                "stages": [], "first": None, "verdict": None}
+        return {
+            "op": op.name,
+            "ok": False,
+            "error": result.output[-500:],
+            "case": None,
+            "stages": [],
+            "first": None,
+            "verdict": None,
+        }
 
     with open(host_path) as handle:
         dump = json.load(handle)
@@ -142,19 +164,29 @@ def run_s3_diff(op_name: str) -> dict:
 
 def render_s3(report: dict) -> str:
     if not report.get("ok"):
-        return f"[kdev-s3diff] {report['op']}: could not produce s3 dump:\n{report.get('error','')}"
-    lines = [f"[kdev-s3diff] {report['op']} case='{report['case']}' "
-             f"(heads={report.get('heads')} rows={report.get('rows')})"]
+        return (
+            f"[kdev-s3diff] {report['op']}: could not produce s3 dump:\n{report.get('error', '')}"
+        )
+    lines = [
+        (
+            f"[kdev-s3diff] {report['op']} case='{report['case']}' "
+            f"(heads={report.get('heads')} rows={report.get('rows')})"
+        )
+    ]
     for s in report["stages"]:
         name = s["name"]
         if name in ("p_code", "psf"):
-            stat = (f"flips={s.get('one_step_flips', 0)} "
-                    f"two_plus={s.get('two_plus', 0)} max_diff={s.get('max_diff', 0)}")
+            stat = (
+                f"flips={s.get('one_step_flips', 0)} "
+                f"two_plus={s.get('two_plus', 0)} max_diff={s.get('max_diff', 0)}"
+            )
         elif name == "v_scale":
             stat = f"diffs={s.get('diffs', 0)}"
         elif name == "acc":
-            stat = (f"kv-codes={s.get('max_rel_kernel_codes', 0):.2e} "
-                    f"ref-codes={s.get('max_rel_ref_codes', 0):.2e}")
+            stat = (
+                f"kv-codes={s.get('max_rel_kernel_codes', 0):.2e} "
+                f"ref-codes={s.get('max_rel_ref_codes', 0):.2e}"
+            )
         else:
             stat = f"max_rel={s.get('max_rel', 0):.2e}"
         state = "clean" if s["clean"] else "DIVERGES"

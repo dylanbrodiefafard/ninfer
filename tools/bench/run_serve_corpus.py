@@ -14,9 +14,9 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
-
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
@@ -28,12 +28,9 @@ TARGET_MODEL_IDS = {
 }
 TARGET_ORDER = tuple(TARGET_MODEL_IDS)
 SPECULATIVE_MODES = {
-    "mtp0": ("none", 0, 0),
-    "mtp1": ("mtp", 1, 0),
-    "mtp2": ("mtp", 2, 0),
-    "mtp3": ("mtp", 3, 0),
-    "mtp4": ("mtp", 4, 0),
-    "mtp5": ("mtp", 5, 0),
+    "ordinary": ("none", 0, 0),
+    "dflash1": ("dflash", 1, 0),
+    "dflash2": ("dflash", 2, 0),
     "dflash3": ("dflash", 3, 0),
     "dflash4": ("dflash", 4, 0),
     "dflash4w6": ("dflash", 4, 6),
@@ -42,7 +39,7 @@ SPECULATIVE_MODES = {
     "dflash7": ("dflash", 7, 0),
     "dflash11": ("dflash", 11, 0),
 }
-DEFAULT_MODES = ("mtp0", "mtp3")
+DEFAULT_MODES = ("ordinary", "dflash7")
 SAMPLING_MODES = ("stochastic", "p-less", "greedy")
 
 SEEDS = (
@@ -102,7 +99,7 @@ KV_CACHE_LOG_NAMES = {
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 5
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 17
+SERVER_LOG_SCHEMA_VERSION = 21
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -116,6 +113,7 @@ class Fixture:
     max_new: int
     suite: str
     category: str | None = None
+    tools: list[dict[str, Any]] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -147,9 +145,7 @@ class CampaignError(RuntimeError):
 
 
 class ServerLogTail:
-    def __init__(
-        self, path: Path, process: subprocess.Popen[bytes], initial_offset: int
-    ) -> None:
+    def __init__(self, path: Path, process: subprocess.Popen[bytes], initial_offset: int) -> None:
         self.path = path
         self.process = process
         self.offset = initial_offset
@@ -217,7 +213,7 @@ class RunningServer:
         self.process: subprocess.Popen[bytes] | None = None
         self.tail: ServerLogTail | None = None
 
-    def __enter__(self) -> "RunningServer":
+    def __enter__(self) -> RunningServer:
         initial_offset = self.log_path.stat().st_size if self.log_path.exists() else 0
         self.process = subprocess.Popen(self.command, cwd=REPO_ROOT)
         self.tail = ServerLogTail(self.log_path, self.process, initial_offset)
@@ -305,7 +301,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--mode",
         action="append",
         choices=tuple(SPECULATIVE_MODES),
-        help="benchmark only this mode; repeat to select multiple (default: mtp0 and mtp3)",
+        help="benchmark only this mode; repeat to select multiple (default: ordinary and dflash7)",
     )
     parser.add_argument(
         "--fixture",
@@ -404,7 +400,9 @@ def load_fixtures() -> dict[str, Fixture]:
                 category=category,
             )
         except (KeyError, OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise CampaignError(f"failed to load fixture {name!r} from the examples manifest: {exc}") from exc
+            raise CampaignError(
+                f"failed to load fixture {name!r} from the examples manifest: {exc}"
+            ) from exc
     return fixtures
 
 
@@ -412,7 +410,7 @@ def block_fixture_names(speculative_backend: str) -> tuple[str, ...]:
     scenarios = tuple(name for names in SCENARIO_FIXTURES.values() for name in names)
     if speculative_backend == "none":
         return NIAH_FIXTURES
-    if speculative_backend in {"mtp", "dflash"}:
+    if speculative_backend == "dflash":
         return (*LONG_DECODE_FIXTURES, *scenarios)
     raise CampaignError(f"unsupported speculative backend: {speculative_backend}")
 
@@ -467,7 +465,7 @@ def build_specs(
 
 
 def request_payload(model_id: str, fixture: Fixture, seed: int) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "model": model_id,
         "messages": fixture.messages,
         "max_completion_tokens": fixture.max_new,
@@ -475,6 +473,9 @@ def request_payload(model_id: str, fixture: Fixture, seed: int) -> dict[str, Any
         "stream": False,
         "enable_thinking": fixture.thinking,
     }
+    if fixture.tools:
+        payload["tools"] = fixture.tools
+    return payload
 
 
 def send_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> None:
@@ -564,9 +565,7 @@ def validate_server_start(
     }
     if actual != expected:
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
-    if event.get("sampling_defaults", {}).get("greedy") != (
-        spec.sampling_mode == "greedy"
-    ):
+    if event.get("sampling_defaults", {}).get("greedy") != (spec.sampling_mode == "greedy"):
         raise CampaignError("server_start sampling mode does not match the campaign")
     p_less = event.get("sampling_defaults", {}).get("server_overrides", {}).get("p_less")
     if p_less != (spec.sampling_mode == "p-less"):
@@ -641,8 +640,7 @@ def build_result_record(
 
     if backend != spec.speculative_backend:
         raise CampaignError(
-            f"request_done speculative backend {backend!r} != "
-            f"{spec.speculative_backend!r}"
+            f"request_done speculative backend {backend!r} != {spec.speculative_backend!r}"
         )
 
     usage = response.get("usage", {})
@@ -841,12 +839,9 @@ def run_block(
         / "server"
         / f"{first.target}_{first.speculative_mode}_{first.sampling_mode}.jsonl"
     )
-    command = server_command(
-        serve, first, server_log, port, device, kv_dtype, lm_head_draft
-    )
+    command = server_command(serve, first, server_log, port, device, kv_dtype, lm_head_draft)
     print(
-        f"start {first.target}/{first.speculative_mode}: "
-        f"{len(block_specs)} missing request(s)",
+        f"start {first.target}/{first.speculative_mode}: {len(block_specs)} missing request(s)",
         flush=True,
     )
     with RunningServer(command, "127.0.0.1", port, server_log) as server:
@@ -855,9 +850,7 @@ def run_block(
             server_start, first, device, kv_dtype, lm_head_draft
         )
 
-        connection = http.client.HTTPConnection(
-            "127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS
-        )
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS)
         last_request_id: int | None = None
         try:
             warmup = fixtures[WARMUP_FIXTURE]
@@ -898,7 +891,9 @@ def metric_values(records: Iterable[dict[str, Any]], name: str) -> list[float]:
     return values
 
 
-def sample_stats(records: Sequence[dict[str, Any]], name: str) -> tuple[int, float | None, float | None]:
+def sample_stats(
+    records: Sequence[dict[str, Any]], name: str
+) -> tuple[int, float | None, float | None]:
     values = metric_values(records, name)
     if not values:
         return 0, None, None
@@ -1020,9 +1015,7 @@ def build_summary_rows(
                             fixture,
                             mode_name,
                             sampling_mode,
-                            select_records(
-                                records, target, mode_name, sampling_mode, (fixture,)
-                            ),
+                            select_records(records, target, mode_name, sampling_mode, (fixture,)),
                         )
                     )
                 continue
@@ -1038,9 +1031,7 @@ def build_summary_rows(
                         fixture,
                         mode_name,
                         sampling_mode,
-                        select_records(
-                            records, target, mode_name, sampling_mode, (fixture,)
-                        ),
+                        select_records(records, target, mode_name, sampling_mode, (fixture,)),
                     )
                 )
 
@@ -1057,9 +1048,7 @@ def build_summary_rows(
                             fixture,
                             mode_name,
                             sampling_mode,
-                            select_records(
-                                records, target, mode_name, sampling_mode, (fixture,)
-                            ),
+                            select_records(records, target, mode_name, sampling_mode, (fixture,)),
                         )
                     )
 
@@ -1071,9 +1060,7 @@ def build_summary_rows(
                         "",
                         mode_name,
                         sampling_mode,
-                        select_records(
-                            records, target, mode_name, sampling_mode, category_present
-                        ),
+                        select_records(records, target, mode_name, sampling_mode, category_present),
                     )
                 )
     return rows
@@ -1113,11 +1100,9 @@ def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str
 def mode_display_name(mode_name: str) -> str:
     if mode_name not in SPECULATIVE_MODES:
         raise CampaignError(f"unsupported summary mode: {mode_name}")
-    backend, draft_tokens, verify_width = SPECULATIVE_MODES[mode_name]
+    backend, _draft_tokens, _verify_width = SPECULATIVE_MODES[mode_name]
     if backend == "none":
-        return "MTP0"
-    if backend == "mtp":
-        return f"MTP{draft_tokens}"
+        return "Ordinary"
     if mode_name == "dflash3":
         return "DFlash k=3 W=4 chain"
     if mode_name == "dflash4":
@@ -1148,15 +1133,9 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
     for mode_name in mode_names:
         label = mode_display_name(mode_name)
         mode_rows = [row for row in rows if row["speculative_mode"] == mode_name]
-        context_rows = [
-            row for row in mode_rows if row["section"] == "context_profile"
-        ]
-        long_decode_rows = [
-            row for row in mode_rows if row["section"] == "long_decode"
-        ]
-        category_rows = [
-            row for row in mode_rows if row["section"] == "scenario_category"
-        ]
+        context_rows = [row for row in mode_rows if row["section"] == "context_profile"]
+        long_decode_rows = [row for row in mode_rows if row["section"] == "long_decode"]
+        category_rows = [row for row in mode_rows if row["section"] == "scenario_category"]
 
         if context_rows:
             table = markdown_table(
@@ -1207,9 +1186,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         format_mean_stddev(row, "completion_tokens"),
                         format_mean_stddev(row, "decode_tok_s"),
                         format_percent_mean_stddev(row, "speculative_acceptance"),
-                        format_mean_stddev(
-                            row, "speculative_tokens_per_round", digits=2
-                        ),
+                        format_mean_stddev(row, "speculative_tokens_per_round", digits=2),
                     )
                     for row in long_decode_rows
                 ],
@@ -1235,9 +1212,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         str(row["samples"]),
                         format_mean_stddev(row, "decode_tok_s"),
                         format_percent_mean_stddev(row, "speculative_acceptance"),
-                        format_mean_stddev(
-                            row, "speculative_tokens_per_round", digits=2
-                        ),
+                        format_mean_stddev(row, "speculative_tokens_per_round", digits=2),
                     )
                     for row in category_rows
                 ],
@@ -1271,9 +1246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if len(mode_names) != len(set(mode_names)):
         raise CampaignError("duplicate --mode value")
     fixtures = load_fixtures()
-    specs = build_specs(
-        artifacts, fixtures, mode_names, args.sampling, args.fixtures, args.seeds
-    )
+    specs = build_specs(artifacts, fixtures, mode_names, args.sampling, args.fixtures, args.seeds)
     expected_specs = {spec.key: spec for spec in specs}
     total = len(expected_specs)
 

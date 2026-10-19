@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/host_copy.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
@@ -12,7 +13,6 @@
 
 #include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -29,15 +29,36 @@ namespace ninfer::targets::qwen3_6::detail {
 struct RamLadderHead {
     std::uint32_t frontier = 0;
     PrefixHash128 hash{};
-    ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
-    const void* conv       = nullptr;
-    const void* recurrent  = nullptr;
-    const void* hidden     = nullptr;
-    const void* dflash     = nullptr;
+    ContextCheckpointKind kind  = ContextCheckpointKind::Ladder;
+    const void* conv            = nullptr;
+    const void* recurrent       = nullptr;
+    const void* hidden          = nullptr;
+    const void* dflash          = nullptr;
     std::size_t conv_bytes      = 0;
     std::size_t recurrent_bytes = 0;
     std::size_t hidden_bytes    = 0;
     std::size_t dflash_bytes    = 0;
+    // The head's fence; capture re-records it after the host-callback reads of the images.
+    cudaEvent_t copies_done = nullptr;
+};
+
+// Lane-owned pinned rewrite-checkpoint images, in the LinearAttentionStatePool slot host-image
+// and CyclicKVCache lane host-image layouts. DFlash is null for non-DFlash engines. The tiers
+// copy the images by stream-ordered host callbacks after `copies_done`, the images' own fence,
+// and then re-record it on the stream that ran them; the owner's later readers and writers wait
+// on it.
+struct RewriteStateHostSource {
+    const void* conv        = nullptr;
+    const void* recurrent   = nullptr;
+    const void* dflash      = nullptr;
+    cudaEvent_t copies_done = nullptr;
+};
+
+struct RewriteStateHostTarget {
+    void* conv              = nullptr;
+    void* recurrent         = nullptr;
+    void* dflash            = nullptr;
+    cudaEvent_t copies_done = nullptr;
 };
 
 struct RamLadderIndex {
@@ -49,11 +70,11 @@ struct RamLadderIndex {
 struct RamLadderImage {
     std::uint32_t frontier = 0;
     PrefixHash128 hash{};
-    ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
-    const void* conv       = nullptr;
-    const void* recurrent  = nullptr;
-    const void* hidden     = nullptr;
-    const void* dflash     = nullptr;
+    ContextCheckpointKind kind  = ContextCheckpointKind::Ladder;
+    const void* conv            = nullptr;
+    const void* recurrent       = nullptr;
+    const void* hidden          = nullptr;
+    const void* dflash          = nullptr;
     std::size_t conv_bytes      = 0;
     std::size_t recurrent_bytes = 0;
     std::size_t hidden_bytes    = 0;
@@ -78,25 +99,30 @@ struct RamCaptureSource {
     PrefixHash128 hash_c{};
     bool hash_c_valid = false;
 
-    const PagedKVAllocation* text      = nullptr;
-    const PagedKVPool* text_pool       = nullptr;
-    const PagedKVAllocation* backend   = nullptr;
-    const PagedKVPool* backend_pool    = nullptr;
+    const PagedKVAllocation* text    = nullptr;
+    const PagedKVPool* text_pool     = nullptr;
+    const PagedKVAllocation* backend = nullptr;
+    const PagedKVPool* backend_pool  = nullptr;
+    // Leading mapped pages to store; nullopt stores every mapped page.
+    std::optional<std::uint32_t> text_pages;
+    std::optional<std::uint32_t> backend_pages;
 
     const LinearAttentionStatePool* gdn = nullptr;
     std::int32_t gdn_current_slot       = -1;
-    std::int32_t gdn_checkpoint_slot    = -1;
+    RewriteStateHostSource rewrite_state;
+    // When `conv` is set, the current GDN state and DFlash lane are copied from this host
+    // image instead of the device slot and lane (a capture cut at its rewrite checkpoint).
+    RewriteStateHostSource current_state;
 
-    const Tensor* tail_hidden                = nullptr;
-    const Tensor* rewrite_checkpoint_hidden  = nullptr;
+    const Tensor* tail_hidden               = nullptr;
+    const Tensor* rewrite_checkpoint_hidden = nullptr;
 
     std::vector<RamLadderHead> ladder_heads;
 
     std::uint64_t disk_entry_id = 0;
 
-    const CyclicKVCache* dflash_local      = nullptr;
-    const CyclicKVCache* dflash_checkpoint = nullptr;
-    std::int32_t dflash_lane               = 0;
+    const CyclicKVCache* dflash_local = nullptr;
+    std::int32_t dflash_lane          = 0;
 
     cudaStream_t stream = nullptr;
 };
@@ -109,19 +135,22 @@ struct RamRestoreTarget {
     PagedKVAllocation* backend      = nullptr;
     PagedKVPool* backend_pool       = nullptr;
 
-    LinearAttentionStatePool* gdn     = nullptr;
-    std::int32_t gdn_current_slot     = -1;
-    std::int32_t gdn_checkpoint_slot  = -1;
+    LinearAttentionStatePool* gdn = nullptr;
+    std::int32_t gdn_current_slot = -1;
+    RewriteStateHostTarget rewrite_state;
 
     Tensor* tail_hidden               = nullptr;
     Tensor* rewrite_checkpoint_hidden = nullptr;
 
     PrefixReusePath reuse    = PrefixReusePath::FullReset;
     std::uint32_t reuse_base = 0;
+    // False when the request drops the entry's rewrite checkpoint on an append or staged
+    // restore: nothing reads that set, so it is not restored. A rewrite-checkpoint restore
+    // likewise skips the frontier set it overwrites.
+    bool keep_rewrite_checkpoint = true;
 
-    CyclicKVCache* dflash_local      = nullptr;
-    CyclicKVCache* dflash_checkpoint = nullptr;
-    std::int32_t dflash_lane         = 0;
+    CyclicKVCache* dflash_local = nullptr;
+    std::int32_t dflash_lane    = 0;
 
     cudaStream_t stream = nullptr;
 };
@@ -146,9 +175,9 @@ struct RamRestoredHost {
 };
 
 struct RamMatch {
-    std::uint64_t entry_id     = 0;
-    PrefixReusePath reuse      = PrefixReusePath::FullReset;
-    std::uint32_t reuse_base   = 0;
+    std::uint64_t entry_id   = 0;
+    PrefixReusePath reuse    = PrefixReusePath::FullReset;
+    std::uint32_t reuse_base = 0;
 };
 
 enum class RamCaptureStatus { Captured, NeedsEviction, Dropped };
@@ -173,92 +202,144 @@ public:
                                                      std::span<const PrefixHash128> hash_chain,
                                                      const ReuseBackendPolicy& policy = {});
 
+    // Entries leave the index without waiting: a consumed, discarded or evicted entry is
+    // retired, and its pinned block is freed once its copy and block fences have completed and
+    // its last I/O pin (a disk spill still reading it) has dropped. Every mutating call reaps
+    // the retired entries that became free.
     void claim(std::uint64_t entry_id);
     void release(std::uint64_t entry_id);
+    // Retires a claimed entry after its restore.
     void consume(std::uint64_t entry_id);
+    // Completes a successful restore without retiring its source.
+    void release_restored(std::uint64_t entry_id);
+    // Retires an unclaimed entry the caller rolls back, even while a spill still reads it.
+    void discard(std::uint64_t entry_id);
     [[nodiscard]] bool is_claimed(std::uint64_t entry_id) const;
 
     [[nodiscard]] RamCaptureResult capture(const RamCaptureSource& source);
-    [[nodiscard]] std::optional<std::uint64_t> peek_oldest_unpinned() const;
     [[nodiscard]] std::vector<std::uint64_t> fifo_ids() const;
+    // Oldest-first ids that are neither claimed nor pinned for I/O.
+    [[nodiscard]] std::vector<std::uint64_t> unpinned_ids() const;
+    // Pins a live entry's block for a reader outside the cache; a retired entry cannot be pinned.
     void pin_for_io(std::uint64_t entry_id);
     void unpin_for_io(std::uint64_t entry_id);
+    // Retires an entry that is neither claimed nor I/O-pinned. Its block is free at return
+    // only when its copies have completed.
     bool evict_one_unpinned(std::uint64_t entry_id);
-    void set_disk_entry_id(std::uint64_t entry_id, std::uint64_t disk_entry_id);
+    // True while a retired block still waits for its fences or an I/O pin.
+    [[nodiscard]] bool retired_pending() const;
+    // True while a retired block holds no I/O pin and waits only for its fences.
+    [[nodiscard]] bool retired_fence_pending() const;
+    // Blocking: waits the fences of retired blocks that hold no I/O pin and frees them.
+    // Returns whether any block was freed.
+    bool wait_retired_copies();
+    void set_disk_entry_id(std::uint64_t entry_id, std::uint64_t disk_id);
     [[nodiscard]] std::uint64_t disk_entry_id(std::uint64_t entry_id) const;
     [[nodiscard]] const void* host_block(std::uint64_t entry_id) const;
     [[nodiscard]] std::size_t host_bytes(std::uint64_t entry_id) const;
 
     struct HostKvView {
-        std::uint32_t text_pages     = 0;
-        std::uint32_t backend_pages  = 0;
-        const std::uint8_t* text     = nullptr;
-        const std::uint8_t* backend  = nullptr;
-        const std::uint8_t* ledger   = nullptr;
-        std::size_t ledger_bytes     = 0;
-        const std::uint8_t* identity = nullptr;
-        std::size_t identity_bytes   = 0;
-        const std::uint8_t* gdn_conv_current = nullptr;
-        const std::uint8_t* gdn_recurrent_current = nullptr;
-        const std::uint8_t* gdn_conv_checkpoint = nullptr;
+        std::uint32_t text_pages                     = 0;
+        std::uint32_t backend_pages                  = 0;
+        const std::uint8_t* text                     = nullptr;
+        const std::uint8_t* backend                  = nullptr;
+        const std::uint8_t* ledger                   = nullptr;
+        std::size_t ledger_bytes                     = 0;
+        const std::uint8_t* identity                 = nullptr;
+        std::size_t identity_bytes                   = 0;
+        const std::uint8_t* gdn_conv_current         = nullptr;
+        const std::uint8_t* gdn_recurrent_current    = nullptr;
+        const std::uint8_t* gdn_conv_checkpoint      = nullptr;
         const std::uint8_t* gdn_recurrent_checkpoint = nullptr;
-        const std::uint8_t* tail_hidden = nullptr;
-        const std::uint8_t* rewrite_hidden = nullptr;
-        const std::uint8_t* dflash_local = nullptr;
-        const std::uint8_t* dflash_rewrite = nullptr;
-        std::size_t gdn_conv_bytes   = 0;
-        std::size_t gdn_recurrent_bytes = 0;
-        std::size_t hidden_bytes     = 0;
-        std::size_t rewrite_hidden_bytes = 0;
-        std::size_t cyclic_bytes     = 0;
+        const std::uint8_t* tail_hidden              = nullptr;
+        const std::uint8_t* rewrite_hidden           = nullptr;
+        const std::uint8_t* dflash_local             = nullptr;
+        const std::uint8_t* dflash_rewrite           = nullptr;
+        std::size_t gdn_conv_bytes                   = 0;
+        std::size_t gdn_recurrent_bytes              = 0;
+        std::size_t hidden_bytes                     = 0;
+        std::size_t rewrite_hidden_bytes             = 0;
+        std::size_t cyclic_bytes                     = 0;
         std::vector<RamLadderImage> ladder_images;
     };
+
     [[nodiscard]] HostKvView host_kv(std::uint64_t entry_id) const;
     RamRestoredHost unpack_device(std::uint64_t entry_id, const RamRestoreTarget& target);
+    // Copies out of a restored entry's block on the cache's host-copy stream after
+    // `image_fences` (the destination images' fences, re-recorded after the copies). No stream
+    // joins them and the entry's copy fence, which gates admission, does not cover them: the
+    // destinations' own fences order their readers, and a separate block fence keeps the block
+    // alive until the copies finish. The copies do not wait for the entry's H2D.
+    void copy_from_entry(std::uint64_t entry_id, std::span<const HostCopy> copies,
+                         std::span<const cudaEvent_t> image_fences);
 
     [[nodiscard]] RamRestoredHost load_host(std::uint64_t entry_id) const;
 
     [[nodiscard]] KvRamSnapshot snapshot() const noexcept;
+    // Bills the pending copies whose fences have completed; copies still in flight stay pending
+    // for a later harvest. A copy whose record retires before any harvest billed it counts only
+    // in the lifetime totals. Never waits.
     KvRamCopySeconds harvest_copy_seconds();
     [[nodiscard]] bool copies_ready(std::uint64_t entry_id) const;
     [[nodiscard]] bool pending_copies_ready() const;
     void wait_pending_copies_on_stream(cudaStream_t stream);
     void wait_pending_copies();
+    // Waits for one entry's device copies without waiting on unrelated entries.
+    void wait_entry_copies(std::uint64_t entry_id);
+
     [[nodiscard]] std::uint64_t index_version() const noexcept { return index_version_; }
+
     [[nodiscard]] std::uint64_t exact_comparisons() const noexcept { return exact_comparisons_; }
+
     void record_drop();
 
     void test_tamper_identity_digest(std::uint64_t entry_id, std::uint8_t byte);
     [[nodiscard]] std::size_t test_pending_copy_count() const noexcept;
+
     void test_fail_next_ticket_write() noexcept { fail_next_ticket_write_ = true; }
+
     void test_fail_next_capture() noexcept { fail_next_capture_ = true; }
+
     void test_fail_next_capture_metadata_allocation() noexcept {
         fail_next_capture_metadata_allocation_ = true;
     }
+
     static void test_fail_next_plan_metadata_allocation() noexcept {
         fail_next_plan_metadata_allocation_.store(true, std::memory_order_release);
     }
+
     [[nodiscard]] static bool test_plan_metadata_allocation_pending() noexcept {
         return fail_next_plan_metadata_allocation_.load(std::memory_order_acquire);
     }
+
     static void test_fail_next_restore_metadata_allocation() noexcept {
         fail_next_restore_metadata_allocation_.store(true, std::memory_order_release);
     }
+
     [[nodiscard]] static bool test_restore_metadata_failure_pending() noexcept {
         return fail_next_restore_metadata_allocation_.load(std::memory_order_acquire);
     }
+
     void test_fail_next_copy_snapshot_allocation(int stage = 0) noexcept {
         fail_copy_snapshot_allocation_stage_ = stage;
     }
+
     void test_fail_copy_event_allocation_after(int successful_events) noexcept {
         fail_copy_event_allocation_after_ = successful_events;
     }
-    [[nodiscard]] bool test_retirement_waiting_for_io() const noexcept {
-        return retirement_waiting_for_io_.load(std::memory_order_acquire);
-    }
-    void test_fail_next_copy_sync() noexcept { fail_next_copy_sync_ = true; }
+
     [[nodiscard]] std::uint32_t test_io_pins(std::uint64_t entry_id) const;
-    void test_set_copy_sync_stall_ms(int ms);
+
+    // Holds the next completion fence after all transfers have been submitted. The callback
+    // runs on the submitting host thread; its state must outlive the callback invocation.
+    void test_before_copy_completion(void (*callback)(void*, cudaStream_t), void* state) noexcept {
+        before_copy_completion_       = callback;
+        before_copy_completion_state_ = state;
+    }
+
+    // While held, blocking copy waits stop before their CUDA sync until released. Every call
+    // resets the entered observation.
+    void test_hold_copy_sync(bool held);
     [[nodiscard]] bool test_copy_sync_entered() const;
 
 private:
@@ -279,58 +360,74 @@ private:
     };
 
     struct Record {
-        std::uint64_t id               = 0;
+        std::uint64_t id = 0;
         PrefixHash128 hash_f{};
         PrefixHash128 hash_c{};
-        bool hash_c_valid              = false;
-        std::uint32_t execution_frontier = 0;
+        bool hash_c_valid                 = false;
+        std::uint32_t execution_frontier  = 0;
         std::uint32_t checkpoint_frontier = 0;
-        bool checkpoint_valid          = false;
-        PrefixReusePath checkpoint_path = PrefixReusePath::RestoreTurnCheckpoint;
+        bool checkpoint_valid             = false;
+        PrefixReusePath checkpoint_path   = PrefixReusePath::RestoreTurnCheckpoint;
         std::vector<RamLadderIndex> ladders;
-        void* block                    = nullptr;
-        std::size_t bytes              = 0;
-        bool pinned                    = false;
-        std::uint32_t io_pins          = 0;
-        std::uint64_t disk_entry_id    = 0;
-        bool copies_timed              = false;
-        cudaEvent_t copies_start       = nullptr;
-        cudaEvent_t copies_done        = nullptr;
+        void* block       = nullptr;
+        std::size_t bytes = 0;
+        bool pinned       = false;
+        // Out of the index; the block waits for its copy fence and I/O pins before it is freed.
+        bool retired                = false;
+        std::uint32_t io_pins       = 0;
+        std::uint64_t disk_entry_id = 0;
+        bool copies_timed           = false;
+        // The timed copy pair belongs to a restore H2D rather than the capture D2H.
+        bool copies_are_load     = false;
+        cudaEvent_t copies_start = nullptr;
+        cudaEvent_t copies_done  = nullptr;
+        // Copies out of the block that admission readiness does not wait for (restored ladder
+        // heads); only the block's lifetime does.
+        cudaEvent_t block_done = nullptr;
     };
 
     struct Layout {
-        std::size_t header_bytes                               = 0;
+        std::size_t header_bytes = 0;
         std::array<std::size_t, static_cast<std::size_t>(Section::Count)> offset{};
         std::array<std::size_t, static_cast<std::size_t>(Section::Count)> length{};
-        std::size_t entry_bytes                                = 0;
+        std::size_t entry_bytes = 0;
     };
 
+    // Live (unretired) entries only.
     [[nodiscard]] Record& require(std::uint64_t entry_id);
     [[nodiscard]] const Record& require(std::uint64_t entry_id) const;
-    void destroy_record(std::uint64_t entry_id, bool count_eviction,
-                        std::unique_lock<std::mutex>& lock);
+    // Live or retired entries; readers that hold an I/O pin may outlive retirement.
+    [[nodiscard]] const Record& require_block(std::uint64_t entry_id) const;
+    void retire_locked(std::uint64_t entry_id);
+    [[nodiscard]] bool retired_free_locked(const Record& record) const;
+    void free_block_locked(Record& record);
+    void reap_retired_locked();
     void create_copy_event(cudaEvent_t* event, unsigned int flags);
     void begin_copies(Record& record, cudaStream_t stream);
+    void before_copy_completion(cudaStream_t stream);
     void record_copies(Record& record, cudaStream_t stream);
     [[nodiscard]] bool copies_ready_locked(std::uint64_t entry_id) const;
     void wait_copies(Record& record);
     void wait_copies_on_stream(Record& record, cudaStream_t stream);
-    void wait_event_unlocked(std::unique_lock<std::mutex>& lock, cudaEvent_t event,
-                              std::uint64_t entry_id);
-    void maybe_copy_sync_stall() const;
+    void maybe_copy_sync_hold() const;
     double harvest_record(Record& record);
     [[nodiscard]] double copy_elapsed_seconds(const Record& record) const;
     void pin_pending_copy_events(std::vector<cudaEvent_t>& events, std::vector<std::uint64_t>& ids);
     void unpin_copy_events(const std::vector<std::uint64_t>& ids) noexcept;
     void drop_pending_save(std::uint64_t entry_id) noexcept;
+    void add_unbilled_seconds(const Record& record, double seconds) noexcept;
     void drop_pending_id(std::uint64_t entry_id) noexcept;
+
     void bump_version() noexcept { ++index_version_; }
 
     HostPinnedArena arena_;
+    // Rewrite and ladder image copies into and out of entry blocks. Destroyed (drained) before
+    // the arena its callbacks write.
+    HostCopyStream host_copies_;
     std::deque<std::uint64_t> fifo_;
     std::unordered_map<std::uint64_t, Record> records_;
     std::vector<std::uint64_t> pending_save_ids_;
-    std::optional<std::uint64_t> pending_load_id_;
+    std::vector<std::uint64_t> pending_load_ids_;
     std::uint64_t next_id_           = 1;
     std::uint64_t index_version_     = 1;
     std::uint64_t captures_          = 0;
@@ -340,20 +437,17 @@ private:
     std::uint64_t exact_comparisons_ = 0;
     double save_seconds_             = 0;
     double load_seconds_             = 0;
-    double orphaned_save_seconds_    = 0;
-    double orphaned_load_seconds_    = 0;
     mutable std::mutex io_mutex_;
-    std::condition_variable io_cv_;
-    bool fail_next_ticket_write_ = false;
-    bool fail_next_capture_      = false;
+    bool fail_next_ticket_write_                = false;
+    bool fail_next_capture_                     = false;
     bool fail_next_capture_metadata_allocation_ = false;
-    std::atomic<bool> retirement_waiting_for_io_{false};
-    int fail_copy_event_allocation_after_ = -1;
+    int fail_copy_event_allocation_after_       = -1;
     inline static std::atomic<bool> fail_next_restore_metadata_allocation_{false};
     inline static std::atomic<bool> fail_next_plan_metadata_allocation_{false};
-    int fail_copy_snapshot_allocation_stage_ = -1;
-    bool fail_next_copy_sync_   = false;
-    std::atomic<int> copy_sync_stall_ms_{0};
+    void (*before_copy_completion_)(void*, cudaStream_t) = nullptr;
+    void* before_copy_completion_state_                  = nullptr;
+    int fail_copy_snapshot_allocation_stage_             = -1;
+    std::atomic<bool> copy_sync_held_{false};
     mutable std::atomic<bool> copy_sync_entered_{false};
 };
 

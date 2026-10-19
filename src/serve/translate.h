@@ -22,11 +22,11 @@ struct ResolvedPromptSemantics {
     bool preserve_thinking = false;
 };
 
-ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
+ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
                                                  const ServeOptions& server,
                                                  const ninfer::PromptCapabilities& capabilities);
 
-ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
+ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media,
                                     std::string_view system_prepend = {});
@@ -34,7 +34,8 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
 // Build public request options (output budget, thinking, stop policy, sampler). The
 // sampler is resolved from the request's SamplingParams over the server defaults;
 // --greedy on the server forces exact argmax regardless of the request.
-ninfer::RequestOptions to_request_options(const GenerationRequest& req, const ServeOptions& server);
+ninfer::RequestOptions to_request_options(const GenerationRequest& request,
+                                          const ServeOptions& server);
 
 // Map an internal finish reason onto the OpenAI wire value. Cancelled maps to
 // "stop" (a disconnected client is not an error state on the wire).

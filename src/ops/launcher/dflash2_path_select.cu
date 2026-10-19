@@ -57,10 +57,9 @@ void dflash2_path_select_launch(const float* cand_val, const int* cand_idx,
                                 const Tensor& hidden_proj, const Tensor* pred_bf16,
                                 const Tensor* succ_bf16, const Weight* pred_nvfp4,
                                 const Weight* succ_nvfp4, const Tensor& anchors,
-                                const Tensor& logical_positions, Tensor& path,
-                                std::int32_t tokens, std::int32_t batch,
-                                const SamplingConfig* configs, cudaStream_t stream,
-                                Tensor* selector_ids, Tensor* selector_q,
+                                const Tensor& logical_positions, Tensor& path, std::int32_t tokens,
+                                std::int32_t batch, const SamplingConfig* configs,
+                                cudaStream_t stream, Tensor* selector_ids, Tensor* selector_q,
                                 unsigned long long seed_xor, std::int32_t position_offset,
                                 bool force_greedy) {
     dflash2_path_select_kernel<<<static_cast<unsigned int>(batch), kDflash2PathSelectBlock, 0,
@@ -76,26 +75,25 @@ void dflash2_path_select_launch(const float* cand_val, const int* cand_idx,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void dflash2_tree_select_launch(const float* cand_val, const int* cand_idx,
-                                const Tensor& hidden_proj, const Tensor* pred_bf16,
-                                const Tensor* succ_bf16, const Weight* pred_nvfp4,
-                                const Weight* succ_nvfp4, const Tensor& anchors,
-                                const Tensor& frontiers, Tensor& verify_ids, Tensor& parent_index,
-                                Tensor& cache_positions, Tensor& rope_positions,
-                                Tensor& ancestor_mask, Tensor& valid_columns, std::int32_t tokens,
-                                std::int32_t batch, std::int32_t out_width, cudaStream_t stream) {
+void dflash2_tree_select_launch(
+    const float* cand_val, const int* cand_idx, const Tensor& hidden_proj, const Tensor* pred_bf16,
+    const Tensor* succ_bf16, const Weight* pred_nvfp4, const Weight* succ_nvfp4,
+    const Tensor& anchors, const Tensor& frontiers, Tensor& verify_ids, Tensor& parent_index,
+    Tensor& cache_positions, Tensor& rope_positions, Tensor& ancestor_mask, Tensor& valid_columns,
+    std::int32_t tokens, std::int32_t batch, std::int32_t out_width, const SamplingConfig* configs,
+    float p_less_tree_temperature, cudaStream_t stream) {
     dflash2_tree_select_kernel<<<static_cast<unsigned int>(batch), kDflash2PathSelectBlock, 0,
                                  stream>>>(
         cand_val, cand_idx, static_cast<const __nv_bfloat16*>(hidden_proj.data),
         codebook_device(pred_bf16, pred_nvfp4), codebook_device(succ_bf16, succ_nvfp4),
         static_cast<const std::int32_t*>(anchors.data),
         static_cast<const std::int32_t*>(frontiers.data),
-        static_cast<std::int32_t*>(verify_ids.data),
-        static_cast<std::int32_t*>(parent_index.data),
+        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(parent_index.data),
         static_cast<std::int32_t*>(cache_positions.data),
         static_cast<std::int32_t*>(rope_positions.data),
         static_cast<std::int32_t*>(ancestor_mask.data),
-        static_cast<std::int32_t*>(valid_columns.data), tokens, batch, out_width);
+        static_cast<std::int32_t*>(valid_columns.data), tokens, batch, out_width, configs,
+        p_less_tree_temperature);
     CUDA_CHECK(cudaGetLastError());
 }
 

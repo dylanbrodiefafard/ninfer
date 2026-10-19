@@ -27,7 +27,7 @@ constexpr int kLogitSlots                = 256;
 
 struct Options {
     std::string shape;
-    int cols = 0;
+    int cols           = 0;
     bool suppress_stop = false;
 };
 
@@ -95,8 +95,8 @@ void run_shape(std::int32_t physical_rows, std::int32_t valid_rows, int cols, co
     host_config.suppressed_tokens[0]   = valid_rows - 1;
     host_config.suppressed_tokens[1]   = valid_rows - 2;
     DeviceBuffer device_config(sizeof(ops::SamplingConfig));
-    CUDA_CHECK(cudaMemcpy(device_config.p, &host_config, sizeof(host_config),
-                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(device_config.p, &host_config, sizeof(host_config), cudaMemcpyHostToDevice));
 
     const double bytes     = static_cast<double>(valid_rows) * 2.0 * static_cast<double>(cols);
     int launch             = 0;
@@ -138,8 +138,7 @@ int main(int argc, char** argv) {
             }
             run_shape(kFullPhysicalRows, kFullValidRows, 128, "full", options.suppress_stop);
             for (const int cols : {1, 120}) {
-                run_shape(kShortlistRows, kShortlistRows, cols, "shortlist",
-                          options.suppress_stop);
+                run_shape(kShortlistRows, kShortlistRows, cols, "shortlist", options.suppress_stop);
             }
         } else if (options.shape == "full") {
             run_shape(kFullPhysicalRows, kFullValidRows, options.cols, "full",

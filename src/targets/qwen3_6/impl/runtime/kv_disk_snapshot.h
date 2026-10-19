@@ -1,5 +1,8 @@
 #pragma once
 
+#include "ninfer/types.h"
+
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -19,8 +22,16 @@ struct KvDiskSnapshot {
     std::uint64_t restores     = 0;
     std::uint64_t evictions    = 0;
     std::uint64_t drops        = 0;
-    double save_seconds        = 0;
-    double load_seconds        = 0;
+    std::array<std::uint64_t, kKvDiskDropReasonCount> drop_reasons{};
+    double save_seconds          = 0;
+    double load_seconds          = 0;
+    bool spill_active            = false;
+    bool defrag_active           = false;
+    std::size_t storage_bytes    = 0;
+    bool restore_active          = false;
+    std::size_t pending_jobs     = 0;
+    double spill_elapsed_seconds = 0;
+    std::uint64_t sequence       = 0; // strictly increasing per read; later reads saw later state
 };
 
 } // namespace ninfer::targets::qwen3_6::detail

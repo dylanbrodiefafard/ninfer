@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
     bool control         = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--patches") && i + 1 < argc) {
-            selected_patches = std::atoi(argv[++i]);
+            selected_patches = parse_number<int>(argv[++i], "--patches");
         } else if (!std::strcmp(argv[i], "--control")) {
             control = true;
         } else {

@@ -21,7 +21,7 @@ cudaError_t launch_fixed(const chunk_output_config& cfg, dim3 grid, head_map qk_
     const dim3 block(kernel::THREADS, 1, 1);
 
     kernel::output_kernel<QK_F16, MULTI_JOB><<<grid, block, smem_bytes, cfg.stream>>>(
-        cfg.q, cfg.k, cfg.v_new, cfg.g_cumsum, cfg.h_chunk, cfg.attn_out, qk_map, cfg.scale,
+        cfg.q, cfg.k, cfg.v_new, cfg.g_cumsum, cfg.h_chunk, cfg.attn_out, qk_map, cfg.scale, cfg.L,
         chunks);
     return cudaGetLastError();
 }
@@ -31,14 +31,13 @@ cudaError_t launch_fixed(const chunk_output_config& cfg, dim3 grid, head_map qk_
 cudaError_t launch_output(const chunk_output_config& cfg) {
     stage_validator v{"launch_output", cfg.H_qk, cfg.H_v, cfg.L};
     NINFER_GATED_DELTA_NET_PROPAGATE(v.check_shape());
-    NINFER_GATED_DELTA_NET_PROPAGATE(v.check_full_chunks());
     if (cfg.q == nullptr || cfg.k == nullptr || cfg.v_new == nullptr || cfg.g_cumsum == nullptr ||
         cfg.h_chunk == nullptr || cfg.attn_out == nullptr) {
         return cudaErrorInvalidValue;
     }
 
     const auto qk_map     = head_map::of((int)cfg.H_qk, (int)cfg.H_v);
-    const std::int64_t NT = cfg.L / BT;
+    const std::int64_t NT = (cfg.L + BT - 1) / BT;
 
     // Keep at most one resident RTX 5090 wave and distribute chunks evenly
     // across it. Small grids retain one logical job per CTA.

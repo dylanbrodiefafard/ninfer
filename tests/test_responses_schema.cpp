@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <iterator>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -268,32 +270,32 @@ int test_typed_items_and_tools() {
     const Json body     = {
         {"model", "qwen3.6-27b"},
         {"input",
-             Json::array({Json{{"id", "rs_old"},
-                               {"type", "reasoning"},
-                               {"summary", Json::array()},
-                               {"content", Json::array({Json{{"type", "reasoning_text"},
-                                                             {"text", "need tools"}}})}},
-                          Json{{"id", "fc_old_1"},
-                               {"type", "function_call"},
-                               {"call_id", "call_1"},
-                               {"name", "weather"},
-                               {"arguments", R"({"city":"Paris"})"}},
-                          Json{{"id", "fc_old_2"},
-                               {"type", "function_call"},
-                               {"call_id", "call_2"},
-                               {"name", "weather"},
-                               {"arguments", R"({"city":"Rome"})"}},
-                          Json{{"id", "fco_old"},
-                               {"type", "function_call_output"},
-                               {"call_id", "call_1"},
-                               {"output", R"({"temp":20})"}},
-                          Json{{"type", "message"},
-                               {"role", "user"},
-                               {"content",
-                                Json::array({Json{{"type", "input_image"},
-                                                  {"image_url", "data:image/png;base64,AA=="},
-                                                  {"detail", "auto"}},
-                                             Json{{"type", "input_text"}, {"text", "describe"}}})}}})},
+         Json::array({Json{{"id", "rs_old"},
+                           {"type", "reasoning"},
+                           {"summary", Json::array()},
+                           {"content", Json::array({Json{{"type", "reasoning_text"},
+                                                         {"text", "need tools"}}})}},
+                      Json{{"id", "fc_old_1"},
+                           {"type", "function_call"},
+                           {"call_id", "call_1"},
+                           {"name", "weather"},
+                           {"arguments", R"({"city":"Paris"})"}},
+                      Json{{"id", "fc_old_2"},
+                           {"type", "function_call"},
+                           {"call_id", "call_2"},
+                           {"name", "weather"},
+                           {"arguments", R"({"city":"Rome"})"}},
+                      Json{{"id", "fco_old"},
+                           {"type", "function_call_output"},
+                           {"call_id", "call_1"},
+                           {"output", R"({"temp":20})"}},
+                      Json{{"type", "message"},
+                           {"role", "user"},
+                           {"content",
+                            Json::array({Json{{"type", "input_image"},
+                                              {"image_url", "data:image/png;base64,AA=="},
+                                              {"detail", "auto"}},
+                                         Json{{"type", "input_text"}, {"text", "describe"}}})}}})},
         {"tools", Json::array({function})},
         {"tool_choice", "auto"},
         {"parallel_tool_calls", true},
@@ -342,8 +344,25 @@ int test_explicit_rejections() {
     Json structured    = base;
     structured["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(api_code([&] { (void)parse_responses_request(structured, limits()); }) ==
-                          "structured_outputs_not_supported",
-                      "structured output rejected");
+                          "invalid_output_constraint",
+                      "incomplete schema format rejected");
+
+    structured["text"]["format"] = {{"type", "json_schema"},
+                                    {"name", "result"},
+                                    {"schema", {{"type", "object"}}},
+                                    {"strict", true}};
+    const auto constrained       = parse_responses_request(structured, limits());
+    failures += check(constrained.generation.output_constraint &&
+                          constrained.generation.output_constraint->kind ==
+                              ninfer::OutputConstraintKind::JsonSchema &&
+                          constrained.text_format == structured["text"]["format"],
+                      "Responses flattened schema was not preserved");
+    structured["text"]["format"]   = {{"type", "json_object"}};
+    const auto json_object_request = parse_responses_request(structured, limits());
+    failures += check(json_object_request.generation.output_constraint &&
+                          json_object_request.generation.output_constraint->kind ==
+                              ninfer::OutputConstraintKind::JsonObject,
+                      "Responses JSON object format was not translated");
 
     Json background          = base;
     background["background"] = true;
@@ -363,16 +382,37 @@ int test_explicit_rejections() {
                           "invalid_value",
                       "OpenAI minimum max_output_tokens enforced");
 
-    Json pin          = base;
-    pin["ninfer"]     = Json{{"capture_context_checkpoint", true}};
+    Json pin      = base;
+    pin["ninfer"] = Json{{"capture_context_checkpoint", true}};
     failures += check(parse_responses_request(pin, limits()).generation.capture_context_checkpoint,
                       "Responses ninfer capture flag parsed");
-    Json ninfer_null          = base;
-    ninfer_null["ninfer"]     = nullptr;
-    failures += check(!parse_responses_request(ninfer_null, limits()).generation.capture_context_checkpoint,
-                      "Responses ninfer null is omit");
-    Json unknown_ninfer          = base;
-    unknown_ninfer["ninfer"]     = Json{{"capture_context_checkpoint", true}, {"foo", 1}};
+    Json ninfer_null      = base;
+    ninfer_null["ninfer"] = nullptr;
+    failures +=
+        check(!parse_responses_request(ninfer_null, limits()).generation.capture_context_checkpoint,
+              "Responses ninfer null is omit");
+    failures += check(parse_responses_request(base, limits()).generation.cache_write,
+                      "Responses defaults to ordinary caching");
+    for (bool stream : {false, true}) {
+        Json disposable      = base;
+        disposable["stream"] = stream;
+        disposable["ninfer"] = Json{{"cache_write", false}};
+        failures += check(!parse_responses_request(disposable, limits()).generation.cache_write,
+                          "Responses accepts disposable turns");
+        disposable["ninfer"]["capture_context_checkpoint"] = true;
+        failures += check(api_code([&] { (void)parse_responses_request(disposable, limits()); }) ==
+                              "cache_write_conflict",
+                          "Responses rejects disposable capture before execution");
+        disposable["ninfer"] = Json{{"cache_write", "false"}};
+        failures += check(throws_api([&] { (void)parse_responses_request(disposable, limits()); }),
+                          "Responses rejects non-boolean cache_write");
+    }
+    Json ordinary      = base;
+    ordinary["ninfer"] = Json{{"cache_write", true}};
+    failures += check(parse_responses_request(ordinary, limits()).generation.cache_write,
+                      "Responses explicit true retains ordinary caching");
+    Json unknown_ninfer      = base;
+    unknown_ninfer["ninfer"] = Json{{"capture_context_checkpoint", true}, {"foo", 1}};
     failures += check(api_code([&] { (void)parse_responses_request(unknown_ninfer, limits()); }) ==
                           "ninfer_option_not_supported",
                       "Responses unknown ninfer key rejected");
@@ -440,6 +480,100 @@ int test_response_object() {
                           tool_response.at("output").back().at("call_id") == "call_weather" &&
                           !tool_response.at("output").back().at("id").get<std::string>().empty(),
                       "function call has distinct Item id and call_id");
+    return failures;
+}
+
+int test_logprobs() {
+    int failures          = 0;
+    const auto parse_with = [](const Json& extra) {
+        Json body = {{"model", "qwen3.6-27b"}, {"input", "hello"}, {"max_output_tokens", 32}};
+        body.update(extra);
+        return parse_responses_request(body, limits());
+    };
+    const ResponsesRequest off = parse_with(Json::object());
+    failures += check(!off.generation.top_logprobs.has_value(), "logprobs are off by default");
+    failures += check(!parse_with(Json{{"top_logprobs", 0}, {"include", Json::array()}})
+                           .generation.top_logprobs.has_value(),
+                      "top_logprobs 0 with an empty include reports nothing");
+    const ResponsesRequest included =
+        parse_with(Json{{"include", Json::array({"message.output_text.logprobs"})}});
+    failures += check(included.generation.top_logprobs == 0,
+                      "the include alone reports tokens without alternatives");
+    const ResponsesRequest ranked = parse_with(
+        Json{{"include", Json::array({"message.output_text.logprobs"})}, {"top_logprobs", 3}});
+    failures += check(ranked.generation.top_logprobs == 3 && ranked.top_logprobs == 3,
+                      "top_logprobs sets the alternatives per token");
+    failures += check(parse_with(Json{{"top_logprobs", 2}}).generation.top_logprobs == 2,
+                      "a positive top_logprobs enables the report");
+    failures +=
+        check(api_code([&] {
+                  (void)parse_with(Json{{"include", Json::array({"reasoning.encrypted_content"})}});
+              }) == "include_not_supported",
+              "other include fields stay rejected");
+    failures += check(throws_api([&] { (void)parse_with(Json{{"top_logprobs", 21}}); }),
+                      "top_logprobs above 20 rejected");
+    failures += check(throws_api([&] { (void)parse_with(Json{{"top_logprobs", -1}}); }),
+                      "negative top_logprobs rejected");
+
+    GenerationOutcome outcome = sample_outcome();
+    outcome.content_logprobs  = {
+        TokenLogprobEntry{.bytes   = "ans",
+                          .logprob = -0.5,
+                          .top     = {TokenLogprobAlternative{.bytes = "ans", .logprob = -0.5}}},
+        TokenLogprobEntry{.bytes = "wer", .logprob = -0.125, .top = {}},
+    };
+    const Json plain_part = make_response_object("resp_plain", 123, off, {}, outcome)
+                                .body.at("output")
+                                .back()
+                                .at("content")
+                                .at(0);
+    failures +=
+        check(!plain_part.contains("logprobs"), "no logprobs on the output text unless requested");
+    const Json body  = make_response_object("resp_logprobs", 123, ranked, {}, outcome).body;
+    const Json& part = body.at("output").back().at("content").at(0);
+    failures += check(body.at("top_logprobs") == 3, "response echoes top_logprobs");
+    failures +=
+        check(part.at("logprobs").size() == 2 && part.at("logprobs").at(0).at("token") == "ans" &&
+                  part.at("logprobs").at(0).at("logprob") == -0.5 &&
+                  part.at("logprobs").at(0).at("bytes") == Json::array({97, 110, 115}) &&
+                  part.at("logprobs").at(0).at("top_logprobs").at(0).at("token") == "ans" &&
+                  part.at("logprobs").at(1).at("top_logprobs").empty(),
+              "output text carries one logprob entry per content token");
+
+    ResponsesRequest streamed = ranked;
+    streamed.stream           = true;
+    ResponsesEventStream encoder("resp_logprob_stream", 123, streamed, {});
+    std::vector<std::string> wire = encoder.start();
+    const auto extend             = [&wire](std::vector<std::string> events) {
+        wire.insert(wire.end(), std::make_move_iterator(events.begin()),
+                    std::make_move_iterator(events.end()));
+    };
+    const std::span<const TokenLogprobEntry> tokens(outcome.content_logprobs);
+    // The first token is committed while its text is still held back.
+    extend(encoder.content_delta("", tokens.first(1)));
+    extend(encoder.content_delta("answer", tokens.subspan(1)));
+    ResponsesStreamFinish finish = encoder.finish(outcome);
+    extend(std::move(finish.events_before_terminal));
+
+    std::vector<std::size_t> delta_tokens;
+    std::string delta_text;
+    std::size_t done_tokens = 0;
+    Json done_part;
+    for (const std::string& event : wire) {
+        const Json payload = parse_event(event);
+        if (payload.at("type") == "response.output_text.delta") {
+            delta_tokens.push_back(payload.at("logprobs").size());
+            delta_text += payload.at("delta").get<std::string>();
+        }
+        if (payload.at("type") == "response.output_text.done") {
+            done_tokens = payload.at("logprobs").size();
+        }
+        if (payload.at("type") == "response.content_part.done") { done_part = payload.at("part"); }
+    }
+    failures += check(delta_tokens == std::vector<std::size_t>{1, 1} && delta_text == "answer",
+                      "stream deltas carry their committed tokens, including a textless delta");
+    failures += check(done_tokens == 2 && done_part.at("logprobs").size() == 2,
+                      "terminal text events carry every content token");
     return failures;
 }
 
@@ -537,11 +671,11 @@ int test_input_tokens_schema() {
                       limits());
               }) == "unknown_parameter",
               "input_tokens accepts only model and input");
-    failures += check(!parse_response_input_tokens_request(
-                              Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"ninfer", nullptr}},
-                              limits())
-                              .generation.capture_context_checkpoint,
-                      "input_tokens allows ninfer null");
+    failures += check(
+        !parse_response_input_tokens_request(
+             Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"ninfer", nullptr}}, limits())
+             .generation.capture_context_checkpoint,
+        "input_tokens allows ninfer null");
     failures += check(throws_api([&] {
                           (void)parse_response_input_tokens_request(
                               Json{{"model", "qwen3.6-27b"},
@@ -557,12 +691,11 @@ int test_system_prepend() {
     int failures = 0;
     ServeOptions server;
 
-    ResponsesRequest instructed =
-        parse_responses_request(Json{{"model", "m"},
-                                     {"input", "hello"},
-                                     {"instructions", "be concise"},
-                                     {"max_output_tokens", 32}},
-                                limits());
+    ResponsesRequest instructed = parse_responses_request(Json{{"model", "m"},
+                                                               {"input", "hello"},
+                                                               {"instructions", "be concise"},
+                                                               {"max_output_tokens", 32}},
+                                                          limits());
     compose_responses_generation_messages(instructed, {});
     failures += check(instructed.generation.messages[0].role == ninfer::ChatRole::Developer,
                       "instructions did not compose as Developer");
@@ -577,9 +710,8 @@ int test_system_prepend() {
                           instructed.input_turns[0].content[0].text == "hello",
                       "Responses input_turns changed when prepending instructions");
 
-    ResponsesRequest follow =
-        parse_responses_request(Json{{"model", "m"}, {"input", "q2"}, {"max_output_tokens", 32}},
-                                limits());
+    ResponsesRequest follow = parse_responses_request(
+        Json{{"model", "m"}, {"input", "q2"}, {"max_output_tokens", 32}}, limits());
     ChatTurn previous_user;
     previous_user.role = ninfer::ChatRole::User;
     ContentPart q1;
@@ -593,9 +725,10 @@ int test_system_prepend() {
     old.text = "old";
     previous_assistant.content.push_back(std::move(old));
     compose_responses_generation_messages(follow, {previous_user, previous_assistant});
-    const ninfer::PromptInput inserted = to_prompt_input(
-        follow.generation, resolve_prompt_semantics(follow.generation, server, effort_capabilities()),
-        unused_media, "P");
+    const ninfer::PromptInput inserted =
+        to_prompt_input(follow.generation,
+                        resolve_prompt_semantics(follow.generation, server, effort_capabilities()),
+                        unused_media, "P");
     failures += check(inserted.messages[0].role == ninfer::ChatRole::System &&
                           joined_text(inserted.messages[0]) == "P",
                       "Responses follow-up did not insert a leading System");
@@ -617,6 +750,7 @@ int main() {
     failures += test_typed_items_and_tools();
     failures += test_explicit_rejections();
     failures += test_response_object();
+    failures += test_logprobs();
     failures += test_sse_sequence();
     failures += test_sse_function_call();
     failures += test_input_tokens_schema();

@@ -27,9 +27,8 @@ constexpr std::size_t kMaxToolNameLength = 128;
     throw ApiException(std::move(error));
 }
 
-const Json& require_object(const Json& body) {
+void require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
-    return body;
 }
 
 bool get_bool(const Json& obj, const char* key, bool fallback) {
@@ -485,7 +484,7 @@ void parse_output_config(const Json& body, GenerationRequest& out) {
         bad_request("output_config.effort must be one of low, medium, high, xhigh, or max",
                     "output_config.effort");
     }
-    out.reasoning_effort       = *effort;
+    out.reasoning_effort       = effort;
     out.reasoning_effort_param = "output_config.effort";
 }
 
@@ -573,7 +572,10 @@ std::string make_messages_response(const std::string& id, const std::string& mod
                                    const CompletionUsage& usage) {
     Json blocks = Json::array();
     if (!reasoning.empty()) {
-        blocks.push_back(Json{{"type", "thinking"}, {"thinking", reasoning}, {"signature", ""}});
+        // Claude clients expect a non-empty opaque signature and echo it back with the block.
+        // NInfer lowers returned thinking text directly into history, so the message id serves
+        // as the value without adding signing state.
+        blocks.push_back(Json{{"type", "thinking"}, {"thinking", reasoning}, {"signature", id}});
     }
     if (!content.empty()) { blocks.push_back(Json{{"type", "text"}, {"text", content}}); }
     for (const ToolCall& call : tool_calls) {
@@ -644,6 +646,13 @@ std::string make_content_block_delta_thinking(int index, const std::string& delt
                Json{{"type", "content_block_delta"},
                     {"index", index},
                     {"delta", Json{{"type", "thinking_delta"}, {"thinking", delta_text}}}});
+}
+
+std::string make_content_block_delta_signature(int index, const std::string& signature) {
+    return sse("content_block_delta",
+               Json{{"type", "content_block_delta"},
+                    {"index", index},
+                    {"delta", Json{{"type", "signature_delta"}, {"signature", signature}}}});
 }
 
 std::string make_content_block_delta_tool_json(int index, const std::string& partial_json) {

@@ -29,13 +29,14 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kFullHeadDim   = 256;
-constexpr std::int32_t kPrefixHeadDim = 128;
-constexpr std::int32_t kPrefixKvHeads = 8;
-constexpr std::int32_t kKvGroup       = 64;
-constexpr std::int32_t kRingCapacity  = 4096;
-constexpr std::size_t kFlushBytes     = std::size_t{256} << 20;
-constexpr double kRtx5090DramGBs      = 1792.0;
+constexpr std::int32_t kFullHeadDim     = 256;
+constexpr std::int32_t kPrefixHeadDim   = 128;
+constexpr std::int32_t kPrefixKvHeads   = 8;
+constexpr std::int32_t kKvGroup         = 64;
+constexpr std::int32_t kFullScaleGroups = kFullHeadDim / kKvGroup;
+constexpr std::int32_t kRingCapacity    = 4096;
+constexpr std::size_t kFlushBytes       = std::size_t{256} << 20;
+constexpr double kRtx5090DramGBs        = 1792.0;
 
 enum class Mode : std::uint8_t { Full, Prefix, All };
 enum class FullGeometryChoice : std::uint8_t { Kv4, Kv2, All };
@@ -441,10 +442,9 @@ const char* execution_name(Execution execution) {
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
 double full_vector_bytes(DType dtype) {
-    return dtype == DType::BF16
-               ? static_cast<double>(kFullHeadDim * dtype_size(DType::BF16))
-               : static_cast<double>(kFullHeadDim * dtype_size(DType::I8) +
-                                     (kFullHeadDim / kKvGroup) * dtype_size(DType::FP16));
+    return dtype == DType::BF16 ? static_cast<double>(kFullHeadDim * dtype_size(DType::BF16))
+                                : static_cast<double>(kFullHeadDim * dtype_size(DType::I8) +
+                                                      kFullScaleGroups * dtype_size(DType::FP16));
 }
 
 double full_useful_bytes(const FullGeometry& geometry, DType dtype, std::int32_t tokens) {

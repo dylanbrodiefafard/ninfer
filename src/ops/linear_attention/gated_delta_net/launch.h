@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/gdn_replay_records.h"
+#include "core/gdn_history.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 
@@ -19,8 +20,19 @@ struct alignas(8) GdnReplayFoldKernelRow {
 };
 
 struct alignas(16) GdnReplayFoldKernelRows {
-    GdnReplayFoldKernelRow row[4];
+    GdnReplayFoldKernelRow row[6];
 };
+
+void launch_history_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                           const Tensor& beta, float scale, const Tensor& states,
+                           const Tensor& valid, const Tensor& slots, Tensor& key_record,
+                           Tensor& value_record, Tensor& gate_record, Tensor& out,
+                           const GdnHistoryLayer& history, cudaStream_t stream,
+                           const std::int32_t* schedule);
+void launch_history_commit(const GdnReplayRecords& records, const GdnHistory& history,
+                           LinearAttentionStateAllLayersView states,
+                           const GdnReplayFoldKernelRows& rows, std::int32_t batch,
+                           bool force_flush, cudaStream_t stream);
 
 void launch_recurrent_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                            const Tensor& beta, float scale, Tensor& ssm_state, Tensor& out,
@@ -46,18 +58,11 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
                              Tensor& out, cudaStream_t stream,
-                             const std::int32_t* parent_index = nullptr);
+                             const std::int32_t* tree_schedule = nullptr);
 
-// Record replay inputs and produce packed GDN out with ordinary T=1 snapshot arithmetic on
-// scratch SSM in one pass.
-// overlay_states is FP32 [128,128,Hv,B*(W+1)]; column t of row b is slot t*B+b,
-// and sequential ping-pong uses slot W*B+b. Does not write live ssm_states.
-void launch_recurrent_overlay(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                              const Tensor& beta, float scale, const Tensor& ssm_states,
-                              const Tensor& valid_columns, const Tensor& initial_state_slots,
-                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                              Tensor& out, float* overlay_states,
-                              const std::int32_t* parent_index, cudaStream_t stream);
+void launch_tree_schedule(const std::int32_t* parent_index, const std::int32_t* valid_columns,
+                          std::int32_t width, std::int32_t batch, std::int32_t* schedule,
+                          cudaStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

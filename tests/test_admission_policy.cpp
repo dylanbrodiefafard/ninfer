@@ -122,9 +122,9 @@ int main() {
         3, 13, large, std::span<const ActiveAdmissionSnapshot>(two_large), pool);
     failures += check(pooled.donor_count == 1 && pooled.donor_ids[0] == 12,
                       "C=3 leftover-2 protection did not freeze the earliest 4-page donor");
-    failures += check(
-        ninfer::runtime::persistent_backfill_is_safe(pooled, two_large, tiny, pool),
-        "2-page fits-now backfill was rejected with 2 leftover pages and a free lane");
+    failures +=
+        check(ninfer::runtime::persistent_backfill_is_safe(pooled, two_large, tiny, pool),
+              "2-page fits-now backfill was rejected with 2 leftover pages and a free lane");
     failures += check(
         !ninfer::runtime::persistent_backfill_is_safe(pooled, two_large, large, pool),
         "4-page candidate backfilled into leftover-2 capacity reserved for the protected head");
@@ -135,14 +135,15 @@ int main() {
     std::array<ActiveAdmissionSnapshot, 3> after_tiny{
         two_large[0],
         two_large[1],
-        ActiveAdmissionSnapshot{.request_id     = 14,
-                                .resources      = tiny,
+        ActiveAdmissionSnapshot{.request_id            = 14,
+                                .resources             = tiny,
                                 .remaining_work_quanta = 2,
-                                .backfill_epoch = 3,
-                                .backfill_class = BackfillClass::Persistent},
+                                .backfill_epoch        = 3,
+                                .backfill_class        = BackfillClass::Persistent},
     };
-    failures += check(!ninfer::runtime::persistent_backfill_is_safe(pooled, after_tiny, tiny, pool),
-                      "second 2-page backfill ignored the first persistent occupant of leftover pages");
+    failures +=
+        check(!ninfer::runtime::persistent_backfill_is_safe(pooled, after_tiny, tiny, pool),
+              "second 2-page backfill ignored the first persistent occupant of leftover pages");
 
     const AdmissionResources five{.active_lanes = 1, .main_kv_pages = 5, .backend_kv_pages = 0};
     std::array<ActiveAdmissionSnapshot, 2> two_five{
@@ -151,24 +152,25 @@ int main() {
     };
     const auto leftover0 = ninfer::runtime::make_admission_protection(
         4, 23, five, std::span<const ActiveAdmissionSnapshot>(two_five), pool);
-    failures += check(
-        !ninfer::runtime::persistent_backfill_is_safe(leftover0, two_five, tiny, pool),
-        "2-page backfill entered a leftover-0 5+5 occupancy that cannot spare pages");
+    failures +=
+        check(!ninfer::runtime::persistent_backfill_is_safe(leftover0, two_five, tiny, pool),
+              "2-page backfill entered a leftover-0 5+5 occupancy that cannot spare pages");
 
-    const AdmissionResources two_lanes{.active_lanes = 2, .main_kv_pages = 10, .backend_kv_pages = 0};
+    const AdmissionResources two_lanes{
+        .active_lanes = 2, .main_kv_pages = 10, .backend_kv_pages = 0};
     const auto no_lane = ninfer::runtime::make_admission_protection(
         5, 33, large, std::span<const ActiveAdmissionSnapshot>(two_large), two_lanes);
-    failures += check(
-        !ninfer::runtime::persistent_backfill_is_safe(no_lane, two_large, tiny, two_lanes),
-        "2-page leftover fit ignored that both lanes are occupied");
+    failures +=
+        check(!ninfer::runtime::persistent_backfill_is_safe(no_lane, two_large, tiny, two_lanes),
+              "2-page leftover fit ignored that both lanes are occupied");
 
     // Decode debt state machine: one ready donor in C=3 freezes two admissions. A terminal
     // prefill freeing its lane does not refund debt, so a continuous stream cannot starve decode.
     ninfer::runtime::DecodeAdmissionBurst burst;
     burst.observe_membership(3, 1, 1);
-    failures += check(burst.remaining_budget() == 2 && burst.allows_admission() &&
-                          burst.admissions() == 0,
-                      "first decode membership did not freeze all free lanes as debt");
+    failures +=
+        check(burst.remaining_budget() == 2 && burst.allows_admission() && burst.admissions() == 0,
+              "first decode membership did not freeze all free lanes as debt");
     burst.consume_admission(); // terminal or cancelled prefill: active slots can still be one.
     failures += check(burst.remaining_budget() == 1 && burst.admissions() == 1,
                       "terminal admission incorrectly refunded decode debt");
@@ -176,20 +178,18 @@ int main() {
     failures += check(burst.remaining_budget() == 1,
                       "later boundary recomputed rather than preserving frozen debt");
     burst.consume_admission();
-    failures += check(!burst.allows_admission() && burst.remaining_budget() == 0 &&
-                          burst.admissions() == 2,
-                      "C-1 admissions did not force the donor decode");
+    failures +=
+        check(!burst.allows_admission() && burst.remaining_budget() == 0 && burst.admissions() == 2,
+              "C-1 admissions did not force the donor decode");
     bool exhausted_rejected = false;
     try {
         burst.consume_admission();
-    } catch (const std::logic_error&) {
-        exhausted_rejected = true;
-    }
+    } catch (const std::logic_error&) { exhausted_rejected = true; }
     failures += check(exhausted_rejected, "exhausted decode debt admitted another prefill");
     burst.complete_decode();
-    failures += check(!burst.remaining_budget() && burst.admissions() == 0 &&
-                          burst.allows_admission(),
-                      "decode completion did not start a fresh admission interval");
+    failures +=
+        check(!burst.remaining_budget() && burst.admissions() == 0 && burst.allows_admission(),
+              "decode completion did not start a fresh admission interval");
 
     // Empty membership is startup/pure-prefill mode, not decode debt. Membership transitions
     // reset stale debt, while malformed worker snapshots are rejected before scheduling work.
@@ -199,24 +199,18 @@ int main() {
     bool invalid_membership_rejected = false;
     try {
         burst.observe_membership(3, 1, 2);
-    } catch (const std::logic_error&) {
-        invalid_membership_rejected = true;
-    }
-    failures += check(invalid_membership_rejected,
-                      "membership larger than active slots was accepted");
+    } catch (const std::logic_error&) { invalid_membership_rejected = true; }
+    failures +=
+        check(invalid_membership_rejected, "membership larger than active slots was accepted");
     bool over_capacity_rejected = false;
     try {
         burst.observe_membership(3, 4, 1);
-    } catch (const std::logic_error&) {
-        over_capacity_rejected = true;
-    }
+    } catch (const std::logic_error&) { over_capacity_rejected = true; }
     failures += check(over_capacity_rejected, "active slots beyond concurrency were accepted");
     bool absent_budget_rejected = false;
     try {
         burst.consume_admission();
-    } catch (const std::logic_error&) {
-        absent_budget_rejected = true;
-    }
+    } catch (const std::logic_error&) { absent_budget_rejected = true; }
     failures += check(absent_budget_rejected, "startup admission consumed nonexistent decode debt");
     burst.observe_membership(3, 3, 2);
     failures += check(burst.remaining_budget() == 0 && !burst.allows_admission(),

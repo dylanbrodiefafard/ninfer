@@ -75,7 +75,11 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void nvfp4_gdn_conv_post_kernel(
     for (int tile = warp; tile < token_tiles; tile += WarpsPerCta) {
         const int token0        = tile * TokenTile;
         const auto load_history = [&](int token) {
-            if (token < 0) { return shared.initial[token + 3][lane]; }
+            if (token < 0) {
+                // Tiles start at token 0 and read at most three tokens back.
+                __builtin_assume(token >= -3);
+                return shared.initial[token + 3][lane];
+            }
             return __bfloat162float(
                 projected[static_cast<std::int64_t>(token) * kNvfp4GdnChannels + row]);
         };
@@ -141,14 +145,6 @@ void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_
                                   static_cast<const std::int32_t*>(snapshot_base_slot.data),
                                   kNvfp4GdnChannels},
            stream);
-}
-
-void nvfp4_gdn_record_post_launch(const Tensor& conv_record, const Tensor& conv_weight,
-                                  const Tensor& conv_states, const Tensor& valid_columns,
-                                  const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                  Tensor& value, cudaStream_t stream) {
-    launch(conv_record, conv_weight, conv_states, valid_columns, initial_slot, query, key, value,
-           NoHistoryPublish{}, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -34,8 +34,8 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kFp8LastSmallT) {
         const std::int32_t active = std::min(kFp8LastSmallT, x.ne[1] - token_begin);
-        auto* input               = static_cast<std::uint8_t*>(x.data) +
-                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
+        auto* input  = static_cast<std::uint8_t*>(x.data) +
+                       static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
         auto* output = static_cast<std::uint8_t*>(residual.data) +
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});

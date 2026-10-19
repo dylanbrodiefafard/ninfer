@@ -21,6 +21,16 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+# Every checkout that builds or tests uses the repository commit hook (.githooks/pre-commit):
+# it formats and lints staged files and folds the fixes into the commit.
+if [[ "$(git -C "$ROOT" config --get core.hooksPath || true)" != ".githooks" ]]; then
+  git -C "$ROOT" config core.hooksPath .githooks
+  echo "Enabled the commit hook (core.hooksPath=.githooks)."
+fi
+if ! command -v pre-commit >/dev/null 2>&1 && ! command -v prek >/dev/null 2>&1; then
+  echo "The commit hook needs its runner: python3 -m pip install pre-commit==4.6.2" >&2
+fi
+
 if [[ "${NINFER_REBUILD_BUILDER:-0}" == "1" ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "Building builder image ${IMAGE} from Dockerfile build stage..."
   docker build --target build --tag "$IMAGE" "$ROOT"
@@ -28,9 +38,24 @@ fi
 
 docker volume create "$BUILD_VOL" >/dev/null
 
+# Hard memory limit for everything run in the builder (builds, tests, sanitizers), with no swap
+# on top: a runaway process is OOM-killed inside the container instead of exhausting the host.
+# The default leaves a quarter of host RAM for the desktop, the page cache, and driver-pinned
+# memory, which the cgroup does not account. Override with NINFER_BUILDER_MEMORY_GIB.
+host_mem_kib="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+MEMORY_GIB="${NINFER_BUILDER_MEMORY_GIB:-$((host_mem_kib * 3 / 4 / 1024 / 1024))}"
+if ! [[ "$MEMORY_GIB" =~ ^[1-9][0-9]*$ ]] || ((MEMORY_GIB * 1024 * 1024 >= host_mem_kib)); then
+  echo "NINFER_BUILDER_MEMORY_GIB=${MEMORY_GIB} must be a whole number of GiB below host RAM" >&2
+  exit 1
+fi
+memory_args=(--memory "${MEMORY_GIB}g" --memory-swap "${MEMORY_GIB}g")
+
 create_args=(
   --name "$BUILDER"
   --gpus all
+  "${memory_args[@]}"
+  # A crashing CUDA process must not hand a multi-gigabyte core to the host crash handler.
+  --ulimit core=0
   -v "${ROOT}:/src:rw"
   -v "${BUILD_VOL}:/build"
   -w /src
@@ -44,6 +69,17 @@ if ! docker ps -a --format '{{.Names}}' | grep -qx "$BUILDER"; then
   docker create "${create_args[@]}" "$IMAGE" sleep infinity >/dev/null
 fi
 
+# Containers created before the limit existed, or with another value, take it here. Updating a
+# running container rewrites its cgroup and drops its GPU device access, so the update is applied
+# only when the limit differs and the container is restarted afterwards.
+memory_bytes=$((MEMORY_GIB * 1024 * 1024 * 1024))
+if [[ "$(docker inspect -f '{{.HostConfig.Memory}}' "$BUILDER")" != "$memory_bytes" ]]; then
+  docker update "${memory_args[@]}" "$BUILDER" >/dev/null
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$BUILDER")" == "true" ]]; then
+    docker restart "$BUILDER" >/dev/null
+  fi
+fi
+
 if [[ "$(docker inspect -f '{{.State.Running}}' "$BUILDER")" != "true" ]]; then
   docker start "$BUILDER" >/dev/null
 fi
@@ -55,12 +91,19 @@ pkgs=()
 command -v git >/dev/null 2>&1 || pkgs+=(git)
 command -v patch >/dev/null 2>&1 || pkgs+=(patch)
 command -v python3 >/dev/null 2>&1 || pkgs+=(python3)
+python3 -c "import venv, ensurepip" >/dev/null 2>&1 || pkgs+=(python3-venv)
 command -v ccache >/dev/null 2>&1 || pkgs+=(ccache)
 pkg-config --exists libzstd || pkgs+=(libzstd-dev)
 if ((${#pkgs[@]})); then
   echo "Installing missing builder packages: ${pkgs[*]}"
   apt-get update -qq
   apt-get install -y -qq "${pkgs[@]}"
+fi
+clang_tidy_version="$(sed -n "s/^CLANG_TIDY_VERSION = \"\(.*\)\"$/\1/p" /src/scripts/run-clang-tidy.py)"
+if ! /opt/ninfer-lint/bin/clang-tidy --version 2>/dev/null | grep -q "version ${clang_tidy_version}"; then
+  echo "Installing clang-tidy ${clang_tidy_version} into /opt/ninfer-lint"
+  python3 -m venv /opt/ninfer-lint
+  /opt/ninfer-lint/bin/pip install -q --no-cache-dir "clang-tidy==${clang_tidy_version}"
 fi
 '
 
@@ -101,6 +144,7 @@ echo "container : $BUILDER (running=$(docker inspect -f '{{.State.Running}}' "$B
 echo "image     : $IMAGE"
 echo "repo      : ${ROOT} -> /src"
 echo "build     : volume ${BUILD_VOL} -> /build"
+echo "memory    : ${MEMORY_GIB} GiB limit, no swap"
 echo "testing   : $(docker exec "$BUILDER" bash -lc 'grep -E "^BUILD_TESTING:BOOL=" /build/CMakeCache.txt')"
 echo "gpu       : $(docker exec "$BUILDER" bash -lc 'nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo NO-GPU')"
 echo

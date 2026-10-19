@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import torch
 from safetensors import safe_open
@@ -43,7 +43,7 @@ class ShardReader:
         reader = cls.__new__(cls)
         reader.model_dir = path.parent
         with safe_open(str(path), framework="pt", device="cpu") as handle:
-            reader.weight_map = {name: path.name for name in handle.keys()}
+            reader.weight_map = dict.fromkeys(handle.keys(), path.name)
         reader._reset_handle()
         return reader
 

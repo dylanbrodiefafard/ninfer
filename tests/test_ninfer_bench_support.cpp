@@ -64,6 +64,15 @@ int test_cli_contract() {
     const qb::BenchOptions default_options =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer"});
     failures += expect_u32(default_options.prefill_chunk, 4096, "default prefill chunk");
+    failures += expect_u32(default_options.mixed_forward_rounds, 12, "default mixed cadence");
+    failures +=
+        expect_u32(default_options.mixed_forward_min_tokens, 4096, "default mixed threshold");
+    const auto fixed_cadence =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--mixed-forward", "4096",
+                        "--mixed-forward-rounds", "3", "--mixed-forward-min-tokens", "0"});
+    failures += expect(fixed_cadence.mixed_forward_rounds == 3 &&
+                           fixed_cadence.mixed_forward_min_tokens == 0,
+                       "explicit fixed cadence override");
     const qb::BenchOptions parsed = parse_for_test({
         "ninfer_bench",
         "--weights",
@@ -85,7 +94,7 @@ int test_cli_contract() {
         "--kv-dtype",
         "int8",
         "--spec",
-        "mtp",
+        "dflash",
         "--draft-tokens",
         "5",
         "--lm-head-draft",
@@ -109,8 +118,8 @@ int test_cli_contract() {
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
     failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
     failures += expect(parsed.concurrency == 1, "default concurrency");
-    failures += expect(parsed.spec_backend == ninfer::SpeculativeBackend::Mtp, "MTP backend");
-    failures += expect(parsed.draft_tokens == 5, "MTP window");
+    failures += expect(parsed.spec_backend == ninfer::SpeculativeBackend::DFlash, "DFlash backend");
+    failures += expect(parsed.draft_tokens == 5, "DFlash window");
     failures +=
         expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");
     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
@@ -118,6 +127,12 @@ int test_cli_contract() {
     failures +=
         expect(parsed.output == qb::OutputFormat::Json && parsed.output_file == "report.json",
                "output settings");
+
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp"});
+        },
+        "disabled MTP backend");
 
     const auto defaults = qb::expand_tests(qb::BenchOptions{});
     failures +=
@@ -133,17 +148,17 @@ int test_cli_contract() {
         [] {
             (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--lm-head-draft"});
         },
-        "optimized head without MTP");
+        "optimized head without DFlash");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
                 {"ninfer_bench", "--weights", "model.ninfer", "--draft-tokens", "6"});
         },
-        "unsupported MTP window");
+        "unsupported DFlash window");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash",
-                                  "--draft-tokens", "6"});
+                                  "--draft-tokens", "8"});
         },
         "unsupported DFlash window");
     failures += expect_throws<std::invalid_argument>(
@@ -158,22 +173,25 @@ int test_cli_contract() {
                 {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
         },
         "unsupported KV storage");
-    failures += expect(
-        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "nvfp4"})
-            .kv_cache == ninfer::KvCacheStorage::Nvfp4,
-        "NVFP4 KV");
-    failures += expect(
-        parse_for_test({"ninfer_bench", "--weights", "model.ninfer"}).kv_cache ==
-            ninfer::KvCacheStorage::Nvfp4,
-        "default KV is NVFP4");
+    failures +=
+        expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "nvfp4"})
+                       .kv_cache == ninfer::KvCacheStorage::Nvfp4,
+               "NVFP4 KV");
+    failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer"}).kv_cache ==
+                           ninfer::KvCacheStorage::Nvfp4,
+                       "default KV is NVFP4");
     failures += expect_u32(
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "2"})
             .concurrency,
         2, "concurrency 2");
+    failures += expect_u32(
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "6"})
+            .concurrency,
+        6, "concurrency 6");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "5"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "7"});
         },
         "unsupported concurrency");
     return failures;
@@ -190,31 +208,32 @@ int test_measurement_contract() {
     failures +=
         expect_u32(combined.requested_output_tokens(), 129, "combined begin plus G outputs");
     const ninfer::SpeculativeOptions none{};
-    const ninfer::SpeculativeOptions mtp5{.backend      = ninfer::SpeculativeBackend::Mtp,
-                                         .draft_tokens = 5};
+    const ninfer::SpeculativeOptions dflash5{.backend      = ninfer::SpeculativeBackend::DFlash,
+                                             .draft_tokens = 5};
     failures += expect_u32(pp.required_context(none), 512, "pp context");
-    failures += expect_u32(pp.required_context(mtp5), 522, "MTP pp context");
+    failures += expect_u32(pp.required_context(dflash5), 524, "DFlash pp context");
     failures += expect_u32(tg.required_context(none), 129, "tg context");
-    failures += expect_u32(tg.required_context(mtp5), 139, "MTP tg context");
-    failures += expect_u32(combined.required_context(mtp5), 2186, "MTP combined context");
+    failures += expect_u32(tg.required_context(dflash5), 141, "DFlash tg context");
+    failures += expect_u32(combined.required_context(dflash5), 2188, "DFlash combined context");
     failures +=
-        expect_u32(qb::decode_graph_prime_output_tokens(mtp5), 13, "MTP graph-prime outputs");
-    failures +=
-        expect_u32(qb::decode_graph_prime_required_context(mtp5), 23, "MTP graph-prime context");
+        expect_u32(qb::decode_graph_prime_output_tokens(dflash5), 13, "DFlash graph-prime outputs");
+    failures += expect_u32(qb::decode_graph_prime_required_context(dflash5), 23,
+                           "DFlash graph-prime context");
 
     const std::vector<qb::BenchTest> matrix = {pp, tg, combined};
-    failures +=
-        expect_u32(qb::resolve_max_context(matrix, std::nullopt, mtp5, true), 2186, "auto context");
-    failures +=
-        expect_u32(qb::resolve_max_context(matrix, std::optional<std::uint32_t>(4096), mtp5, true),
-                   4096, "explicit context");
+    failures += expect_u32(qb::resolve_max_context(matrix, std::nullopt, dflash5, true), 2188,
+                           "auto context");
+    failures += expect_u32(
+        qb::resolve_max_context(matrix, std::optional<std::uint32_t>(4096), dflash5, true), 4096,
+        "explicit context");
     failures += expect_throws<std::invalid_argument>(
         [&] {
-            (void)qb::resolve_max_context(matrix, std::optional<std::uint32_t>(2048), mtp5, true);
+            (void)qb::resolve_max_context(matrix, std::optional<std::uint32_t>(2048), dflash5,
+                                          true);
         },
         "undersized context");
-    failures += expect_u32(qb::concurrent_kv_capacity_tokens(50134, 2), 100352,
-                           "C=2 page-aligned Main KV");
+    failures +=
+        expect_u32(qb::concurrent_kv_capacity_tokens(50134, 2), 100352, "C=2 page-aligned Main KV");
     failures += expect_u32(qb::concurrent_kv_capacity_tokens(64, 1), 64, "exact page C=1");
     return failures;
 }
@@ -242,17 +261,15 @@ ninfer::SpeculativeStats speculative(std::uint64_t rounds, std::uint64_t drafted
 std::vector<qb::TestResult> sample_results() {
     qb::TestResult pp;
     pp.test = {qb::TestKind::Prefill, 512, 0, "pp512"};
-    pp.reps = {
-        {timings(0.01, 0.5, 0.0, 0.52), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1, 0.52},
-        {timings(0.02, 0.25, 0.0, 0.28), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1, 0.28}};
+    pp.reps = {{timings(0.01, 0.5, 0.0, 0.52), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1, 0.52},
+               {timings(0.02, 0.25, 0.0, 0.28), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1, 0.28}};
     pp.workspace_peak_bytes           = 5ULL * 1024ULL * 1024ULL * 1024ULL;
     pp.workspace_allocator_peak_bytes = 4ULL * 1024ULL * 1024ULL;
 
     qb::TestResult tg;
     tg.test = {qb::TestKind::Decode, 0, 3, "tg3"};
-    tg.reps = {
-        {timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4, 0.62},
-        {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4, 1.13}};
+    tg.reps = {{timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4, 0.62},
+               {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4, 1.13}};
     tg.workspace_peak_bytes           = 1024ULL * 1024ULL;
     tg.workspace_allocator_peak_bytes = 512ULL * 1024ULL;
     return {std::move(pp), std::move(tg)};
@@ -288,7 +305,7 @@ qb::BenchEnvironment sample_environment() {
     env.max_context                       = 4096;
     env.prefill_chunk                     = 1024;
     env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
-    env.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
+    env.speculative_backend               = ninfer::SpeculativeBackend::DFlash;
     env.draft_tokens                      = 5;
     env.proposal_head                     = ninfer::ProposalHead::Optimized;
     env.use_cuda_graph                    = true;
@@ -308,7 +325,7 @@ int test_report_contract() {
     Json report;
     try {
         report = Json::parse(qb::format_json(
-            env, "ninfer_bench --weights model.ninfer --spec mtp --draft-tokens 5", results));
+            env, "ninfer_bench --weights model.ninfer --spec dflash --draft-tokens 5", results));
     } catch (const nlohmann::json::exception& error) {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
@@ -330,7 +347,7 @@ int test_report_contract() {
     failures += expect(report.at("memory").at("cuda_graph_allowance_bytes") == 150000000ULL,
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
-    failures += expect(report.at("config").at("spec") == "mtp", "spec backend");
+    failures += expect(report.at("config").at("spec") == "dflash", "spec backend");
     failures += expect(report.at("config").at("draft_tokens") == 5, "draft tokens");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
     failures += expect(report.at("config").at("concurrency") == 1, "default concurrency in report");
@@ -358,18 +375,20 @@ int test_report_contract() {
     failures += expect_near(tg.at("decode_engine_tok_s_mean").get<double>(), 7.5,
                             "decode engine throughput");
 
-    qb::TestResult concurrent               = sample_results()[1];
-    concurrent.concurrency                  = 2;
-    const qb::Stats concurrent_output       = qb::compute_stats(qb::decode_output_tok_s_series(concurrent));
-    const qb::Stats concurrent_engine       = qb::compute_stats(qb::decode_engine_tok_s_series(concurrent));
+    qb::TestResult concurrent = sample_results()[1];
+    concurrent.concurrency    = 2;
+    const qb::Stats concurrent_output =
+        qb::compute_stats(qb::decode_output_tok_s_series(concurrent));
+    const qb::Stats concurrent_engine =
+        qb::compute_stats(qb::decode_engine_tok_s_series(concurrent));
     failures += expect_near(concurrent_output.mean, 9.0, "C=2 decode output throughput");
-    failures += expect_near(concurrent_engine.mean, 7.5, "C=2 decode engine throughput is not doubled");
+    failures +=
+        expect_near(concurrent_engine.mean, 7.5, "C=2 decode engine throughput is not doubled");
 
     qb::TestResult concurrent_pp = sample_results()[0];
     concurrent_pp.concurrency    = 2;
     for (qb::RepTiming& rep : concurrent_pp.reps) { rep.wave_seconds *= 2.0; }
-    const qb::Stats concurrent_prefill =
-        qb::compute_stats(qb::prefill_tok_s_series(concurrent_pp));
+    const qb::Stats concurrent_prefill = qb::compute_stats(qb::prefill_tok_s_series(concurrent_pp));
     const qb::Stats concurrent_prefill_active =
         qb::compute_stats(qb::prefill_active_tok_s_series(concurrent_pp));
     failures += expect_near(concurrent_prefill.mean, 1406.5934065934,

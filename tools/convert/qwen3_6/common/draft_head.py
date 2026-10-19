@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import torch
@@ -30,9 +30,7 @@ def load_total_counts(path: str | Path, vocab: int) -> np.ndarray:
     file_bytes = ranking.stat().st_size
     row_bytes = vocab * word_bytes
     if file_bytes == 0 or file_bytes % row_bytes:
-        raise ValueError(
-            f"ranking size {file_bytes} is not a positive multiple of {row_bytes}"
-        )
+        raise ValueError(f"ranking size {file_bytes} is not a positive multiple of {row_bytes}")
     total = np.fromfile(ranking, dtype="<i8", count=vocab)
     if total.size != vocab:
         raise ValueError(f"ranking total row has {total.size} entries, expected {vocab}")
@@ -51,9 +49,7 @@ def read_special_ids(tokenizer_dir: str | Path) -> tuple[int, ...]:
         sorted(
             {
                 int(token_id)
-                for token_id, metadata in config.get(
-                    "added_tokens_decoder", {}
-                ).items()
+                for token_id, metadata in config.get("added_tokens_decoder", {}).items()
                 if isinstance(metadata, dict) and metadata.get("special", False)
             }
         )
@@ -110,9 +106,7 @@ def compute_shortlist(
     """Compute a shortlist constrained to an explicitly supplied tokenizer domain."""
 
     if tokenizer_vocab_size <= 0 or tokenizer_vocab_size > vocab:
-        raise ValueError(
-            f"tokenizer domain {tokenizer_vocab_size} is outside 1..{vocab}"
-        )
+        raise ValueError(f"tokenizer domain {tokenizer_vocab_size} is outside 1..{vocab}")
     ranking = Path(ranking_path)
     tokenizer = Path(tokenizer_dir)
     forced = read_special_ids(tokenizer)

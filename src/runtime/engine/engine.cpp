@@ -9,6 +9,8 @@
 
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include <exception>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -23,11 +25,16 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
-    resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
-    resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+    resolved.execution.requested_output_tokens    = options.execution.requested_output_tokens;
+    resolved.execution.allow_prefix_reuse         = options.execution.allow_prefix_reuse;
+    resolved.execution.cache_write                = options.execution.cache_write;
     resolved.execution.capture_context_checkpoint = options.execution.capture_context_checkpoint;
-    resolved.stop                              = std::move(options.stop);
-    resolved.output                            = options.output;
+    if (options.output.top_logprobs && *options.output.top_logprobs > kMaximumTopLogprobs) {
+        throw std::invalid_argument("top_logprobs exceeds kMaximumTopLogprobs");
+    }
+    resolved.execution.token_logprobs = options.output.top_logprobs.has_value();
+    resolved.stop                     = std::move(options.stop);
+    resolved.output                   = options.output;
     return resolved;
 }
 
@@ -42,8 +49,8 @@ class PreparedPrompt::Impl {
 public:
     Impl(PromptSummary prompt_summary, double frontend_seconds, SamplingMode mode,
          targets::qwen3_6::PreparedPrompt prepared)
-        : summary(std::move(prompt_summary)), prepare_seconds(frontend_seconds),
-          sampling_mode(mode), value(std::move(prepared)) {}
+        : summary(prompt_summary), prepare_seconds(frontend_seconds), sampling_mode(mode),
+          value(std::move(prepared)) {}
 
     PromptSummary summary;
     double prepare_seconds     = 0.0;
@@ -59,8 +66,11 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 PreparedPrompt::PreparedPrompt(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 const PromptSummary& PreparedPrompt::summary() const noexcept {
-    static const PromptSummary empty;
-    return impl_ != nullptr ? impl_->summary : empty;
+    if (impl_ == nullptr) {
+        static const PromptSummary empty;
+        return empty;
+    }
+    return impl_->summary;
 }
 
 std::span<const TokenId> PreparedPrompt::token_ids() const {
@@ -159,10 +169,27 @@ public:
     }
 
     ~Impl() noexcept {
-        executor.emplace<std::monostate>();
+        device.bind_to_current_thread_noexcept();
+        // Destroying the executor joins its worker, so no CUDA work is issued after this point.
+        visit_loaded_executor([](auto& loaded) noexcept { loaded.reset(); });
+        // The final drain only orders teardown of device resources owned by later members; a
+        // destructor has no caller to report a sticky device error to, and every allocation is
+        // released by its own RAII owner regardless.
         try {
             device.synchronize_all();
-        } catch (...) {}
+            // NOLINTNEXTLINE(bugprone-empty-catch): unreportable teardown drain; see above.
+        } catch (const std::exception&) {}
+    }
+
+    // Calls visitor with the active executor's owning pointer; does nothing before an executor
+    // is constructed. std::get_if keeps this path free of std::bad_variant_access.
+    template <class Visitor>
+    void visit_loaded_executor(Visitor&& visitor) noexcept {
+        if (auto* loaded27 = std::get_if<std::unique_ptr<Executor27>>(&executor)) {
+            std::forward<Visitor>(visitor)(*loaded27);
+        } else if (auto* loaded35 = std::get_if<std::unique_ptr<Executor35>>(&executor)) {
+            std::forward<Visitor>(visitor)(*loaded35);
+        }
     }
 
     EngineOptions options;
@@ -174,7 +201,10 @@ public:
     mutable targets::qwen3_6::frontend_internal::EncodedHistoryCache host_encode_cache;
 };
 
-Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
+Engine::Engine(EngineOptions options) {
+    validate_speculative_backend(options.speculative.backend);
+    impl_ = std::make_shared<Impl>(std::move(options));
+}
 
 Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;
@@ -244,6 +274,16 @@ PromptCapabilities Engine::prompt_capabilities() const {
         impl_->active);
 }
 
+std::string Engine::token_bytes(TokenId token) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [token](const auto& target_ptr) {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return std::string(target_ptr->loaded->frontend.token_bytes(token));
+        },
+        impl_->active);
+}
+
 ModelSamplingDefaults Engine::sampling_defaults() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->sampling_defaults;
@@ -279,6 +319,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
     }
     const double prepare_seconds = prompt.impl_->prepare_seconds;
+    if (!resolved_options.execution.cache_write &&
+        resolved_options.execution.capture_context_checkpoint) {
+        throw RequestError(RequestErrorKind::CacheWriteConflict,
+                           "capture_context_checkpoint=true requires cache_write=true because it "
+                           "creates a retained context checkpoint.");
+    }
     if (resolved_options.execution.capture_context_checkpoint &&
         !context_checkpoint_capture_available(resolved_options.execution.allow_prefix_reuse,
                                               impl_->options.speculative.backend)) {
@@ -311,10 +357,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                auto submission = executor->submit(std::move(prompt.impl_->value), prompt_summary,
-                                                   prepare_seconds, std::move(resolved_options),
-                                                   delivery, pending_deadline,
-                                                   std::move(host_input));
+                auto submission = executor->submit(
+                    std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
+                    std::move(resolved_options), delivery, pending_deadline, std::move(host_input));
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
@@ -396,14 +441,7 @@ RuntimeStats Engine::runtime_stats() const {
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
-    std::visit(
-        [](auto& executor) {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (!std::is_same_v<Executor, std::monostate>) {
-                executor->reset_memory_peaks();
-            }
-        },
-        impl_->executor);
+    impl_->visit_loaded_executor([](auto& executor) noexcept { executor->reset_memory_peaks(); });
 }
 
 } // namespace ninfer

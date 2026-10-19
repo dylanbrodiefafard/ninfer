@@ -41,12 +41,14 @@ std::string format_bytes(std::size_t bytes) {
 
 int main(int argc, char** argv) {
     try {
-        const ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
+        ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
         if (options.help_requested) {
             std::cout << ninfer::serve::serve_usage_text(argv[0]);
             return 0;
         }
 
+        options.speculative = ninfer::product::resolve_speculative_startup(
+            options.artifact_path, options.speculative_selection, options.speculative);
         using Clock = std::chrono::steady_clock;
         ninfer::serve::HttpServer server(options);
         if (!server.bind()) {
@@ -64,7 +66,8 @@ int main(int argc, char** argv) {
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "loading model...");
         if (!options.generation_recovery) {
             ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Warning,
-                "generation recovery disabled: no cycle exclusions or internal retries; tool grammar remains enabled");
+                                             "generation recovery disabled: no cycle exclusions or "
+                                             "internal retries; tool grammar remains enabled");
         }
         auto load_progress_options        = ninfer::product::stderr_load_progress_options();
         load_progress_options.line_prefix = [] {
@@ -95,6 +98,8 @@ int main(int argc, char** argv) {
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
                  << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
                  << format_bytes(memory.cuda_graph_allowance_bytes)
+                 << " ckpt-pin=" << format_bytes(memory.checkpoint_image_host_bytes)
+                 << " ckpt-heads=" << memory.checkpoint_image_pool_heads
                  << " kv-ram=" << ninfer::serve::format_kv_ram_occupancy(memory)
                  << " kv-disk=" << ninfer::serve::format_kv_disk_occupancy(memory);
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());

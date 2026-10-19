@@ -41,7 +41,7 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
 void vision_attention_oracle(const std::vector<float>& q, const std::vector<float>& k,
                              const std::vector<float>& v, const std::vector<int>& cu_seqlens,
                              std::vector<double>& out) {
-    constexpr double scale = 1.0 / std::sqrt(72.0);
+    const double scale = 1.0 / std::sqrt(72.0);
     out.assign(q.size(), 0.0);
 
     for (std::size_t segment = 0; segment + 1 < cu_seqlens.size(); ++segment) {
@@ -254,11 +254,9 @@ int main() {
         std::cerr << "vision_attention rectangular capacity missed its maximal legal pair\n";
         ++failures;
     }
-    try {
-        (void)ops::vision_attention_workspace_capacity_bytes(1, 2, 3, 4);
-        std::cerr << "vision_attention accepted an envelope without a legal segment pair\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    failures += expect_invalid_argument(
+        [&] { return ops::vision_attention_workspace_capacity_bytes(1, 2, 3, 4); },
+        "vision_attention accepted an envelope without a legal segment pair");
     failures += run_case({0, 4}, 1u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena);
     failures += run_case({0, 4, 11}, 7u, StorageProfile::InterleavedQkv,
                          PublicEntry::CuSeqlensArena, InputProfile::SegmentIsolation);

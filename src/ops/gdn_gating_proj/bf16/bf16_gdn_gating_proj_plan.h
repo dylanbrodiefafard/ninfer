@@ -2,6 +2,8 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
+#include "ninfer/ops/a8_activation.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 
 #include <cuda_runtime.h>
@@ -12,9 +14,7 @@
 namespace ninfer::ops::detail {
 
 enum class Bf16GdnGatingScheduleId {
-    GemvPairedRows,
-    SmallTSplit10,
-    SmallTFusedCooperative,
+    MmaCooperativeSplit40,
     SimtWarpRowC4,
     SimtWarpRowC8,
     MmaCooperativeSplit32,
@@ -54,8 +54,18 @@ bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept;
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
                                                     const Bf16GdnGatingProblem& problem);
-Bf16GdnGatingPlan bf16_gdn_gating_resolve_packed_w5_plan(
-    const Bf16GdnGatingProblem& problem);
+// Small 27B panels and packed verify (T<=48, C<=6 x W<=8) use the same split-40 MMA reduction.
+// Token tiling changes neither the K partition nor the order of the final reduction.
+inline constexpr std::int32_t kBf16GdnGatingPackedMaxCols  = 48;
+inline constexpr std::int32_t kBf16GdnGatingPackedMaxBatch = 6;
+
+[[nodiscard]] constexpr bool bf16_gdn_gating_packed_aggregates(std::int32_t sequence_width,
+                                                               std::int32_t batch) noexcept {
+    return batch >= 2 && sequence_width >= 2 && sequence_width <= 16 &&
+           sequence_width * batch <= kBf16GdnGatingPackedMaxCols;
+}
+
+Bf16GdnGatingPlan bf16_gdn_gating_resolve_packed_plan(const Bf16GdnGatingProblem& problem);
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
                                                      std::int32_t min_cols, std::int32_t max_cols);
@@ -80,13 +90,27 @@ void bf16_gdn_gating_execute_candidate(Bf16GdnGatingScheduleId schedule, const T
 void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                               const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                               Tensor& g, Tensor& beta, cudaStream_t stream);
+
+// The quantized forms of the normalized input h a caller asks the norm to publish besides the
+// BF16 h: none, its A8 activation, or its A4 activation (at most one is non-null).
+struct Bf16GdnHiddenActivation {
+    A8Activation* a8 = nullptr;
+    A4Activation* a4 = nullptr;
+};
+
+// A quantized h output requires the composed (27B) schedule, whose normalization is a
+// standalone RMSNorm; other schedules throw.
+
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
-                                   const Weight& a_weight, const Weight& b_weight,
-                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                                   Tensor& g, Tensor& beta, cudaStream_t stream);
-void bf16_gdn_norm_gating_packed_w5_dispatch(
-    const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h, const Weight& a_weight,
-    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-    Tensor& g, Tensor& beta, cudaStream_t stream);
+                                   Bf16GdnHiddenActivation h_activation, const Weight& a_weight,
+                                   const Weight& b_weight, const Tensor& A_log,
+                                   const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
+                                   Tensor& beta, cudaStream_t stream);
+void bf16_gdn_norm_gating_packed_dispatch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                          Tensor& h, A8Activation* h_activation,
+                                          const Weight& a_weight, const Weight& b_weight,
+                                          const Tensor& A_log, const Tensor& dt_bias,
+                                          WorkspaceArena& ws, Tensor& g, Tensor& beta,
+                                          cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

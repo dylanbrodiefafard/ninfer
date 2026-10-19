@@ -109,7 +109,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
             const int token       = token_begin + local_token;
             const int kk          = k8 * 8;
             auto* destination     = &activation_shared[stage * BN * BK + local_token * BK +
-                                                   fp8_a16_shared_col_64(local_token, kk)];
+                                                       fp8_a16_shared_col_64(local_token, kk)];
             if constexpr (FullTokens) {
                 cp_async<16, Schedule::kActivationCache>(
                     destination, x + static_cast<std::int64_t>(token) * K + k_begin + kk);

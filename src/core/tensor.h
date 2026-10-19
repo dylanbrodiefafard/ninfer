@@ -15,7 +15,7 @@ struct Tensor {
     std::int64_t nb[4] = {0, 0, 0, 0};
 
     Tensor() noexcept = default;
-    Tensor(void* data, DType dtype, std::initializer_list<std::int32_t> shape);
+    Tensor(void* data_in, DType dtype_in, std::initializer_list<std::int32_t> shape);
 
     std::int64_t numel() const;
     std::size_t bytes() const;

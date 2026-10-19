@@ -1,4 +1,4 @@
-"""Print the Layer 0–3 kernel-iteration recipe, filled when a Linear point is given.
+"""Print the Layer 0-3 kernel-iteration recipe, filled when a Linear point is given.
 
 The contract is docs/maintainer/kernel-iteration.md. Without geometry this command
 prints the procedure, idea catalog, and exact public-Op commands. With a Linear
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 
 from . import bound, registry
 
@@ -24,6 +25,7 @@ _NCU_QUESTIONS = (
     "tensor-pipe busy",
     "spills",
     "DRAM bytes vs model_bytes",
+    "source/SASS or phase attribution for the stated overhead hypothesis",
 )
 
 
@@ -48,6 +50,9 @@ def recipe_cmd(card: dict, *, measured_placeholder: bool = False) -> str:
         parts.append("--measured-us <median>")
     elif card.get("measured_us") is not None:
         parts.append(f"--measured-us {card['measured_us']}")
+    for flag in ("bottleneck", "profile_evidence", "hypothesis"):
+        if card.get(flag):
+            parts.append(f"--{flag.replace('_', '-')} {shlex.quote(card[flag])}")
     return " ".join(parts)
 
 
@@ -58,11 +63,10 @@ def args_qtype_overridden(card: dict) -> bool:
     return card["problem"]["qtype"] != bound.PRESETS[preset]["qtype"]
 
 
-def linear_bench_cmd(n: int, k: int, t: int, qtype: str, policy: str, *, profile: bool = False) -> str:
-    cmd = (
-        f"{_LINEAR_BENCH} --qtype {qtype} --policy {policy} "
-        f"--n {n} --k {k} --t {t}"
-    )
+def linear_bench_cmd(
+    n: int, k: int, t: int, qtype: str, policy: str, *, profile: bool = False
+) -> str:
+    cmd = f"{_LINEAR_BENCH} --qtype {qtype} --policy {policy} --n {n} --k {k} --t {t}"
     if profile:
         return f"ncu --profile-from-start off --set full {cmd} --profile"
     return cmd
@@ -108,6 +112,13 @@ def _matching_roof(card: dict) -> str:
         atom = bound.fp8_compute_atom(problem["n"], problem["k"], problem["t"], problem["policy"])
         rate = card["useful_flops"] / (card["t_comp_us"] * 1e6)
         return f"measured {atom.upper()} MMA roof ({rate:.3f} TFLOP/s; padded issue count included)"
+    if (
+        card["problem"]["qtype"] == "nvfp4"
+        and card["problem"]["policy"] == "a8"
+        and card["mma_atom"]["k"] == 16
+    ):
+        rate = card["useful_flops"] / (card["t_comp_us"] * 1e6)
+        return f"measured FP8 K16 MMA roof ({rate:.3f} TFLOP/s; block-scale arithmetic excluded)"
     t_issue = card.get("t_issue_us")
     t_comp = card["t_comp_us"]
     if t_issue is not None and t_issue >= t_comp:
@@ -144,7 +155,20 @@ def _classified(card: dict) -> list[dict]:
     p = card["problem"]
     rows = []
     for name in bound.IDEAS:
-        rows.append(bound.classify_idea(name, card["bound"], p["t"], p["phase"]))
+        rows.append(
+            bound.classify_idea(
+                name,
+                card["bound"],
+                p["t"],
+                p["phase"],
+                profiled_ctas=card.get("profiled_ctas"),
+                profiled_dram_gbs=card.get("profiled_dram_gbs"),
+                measured_us=card.get("measured_us"),
+                bottleneck=card.get("bottleneck"),
+                profile_evidence=card.get("profile_evidence"),
+                hypothesis=card.get("hypothesis"),
+            )
+        )
     return rows
 
 
@@ -200,26 +224,27 @@ def render_filled(card: dict) -> str:
     layer2 = _layer2(card)
     status = status_of(card)
     label = card.get("label") or ""
-    t_issue = (
-        f"{card['t_issue_us']:.2f}us" if card["t_issue_us"] is not None else "n/a"
-    )
+    t_issue = f"{card['t_issue_us']:.2f}us" if card["t_issue_us"] is not None else "n/a"
     hint = _policy_hint(p)
     lines = [
         "NInfer kernel gate card — Linear  RTX 5090 / sm_120a",
         "Authority: docs/maintainer/kernel-iteration.md",
         "",
         f"1. Op     linear  n={p['n']} k={p['k']} T={p['t']} qtype={p['qtype']} "
-        f"policy={p['policy']}  phase={p['phase']}"
-        + (f"  ({label})" if label else ""),
+        f"policy={p['policy']}  phase={p['phase']}" + (f"  ({label})" if label else ""),
         f"2. Floor  bound={card['bound']}  model_bytes={_fmt_bytes(card['model_bytes'])}",
-        f"          weight={_fmt_bytes(card['weight_bytes'])}  "
-        f"act={_fmt_bytes(card['activation_bytes'])}",
+        (
+            f"          weight={_fmt_bytes(card['weight_bytes'])}  "
+            f"act={_fmt_bytes(card['activation_bytes'])}"
+        ),
         f"          useful_flops={_fmt_flops(card['useful_flops'])}  "
         f"AI={card['ai_flop_per_byte']:.1f} FLOP/B  "
         f"ridge={card['ridge_flop_per_byte']:.0f} FLOP/B"
         + (f"  ridge_T≈{card['ridge_t']:.0f}" if card.get("ridge_t") else ""),
-        f"          t_mem={card['t_mem_us']:.2f}us  t_comp={card['t_comp_us']:.2f}us  "
-        f"t_issue={t_issue}  floor={card['floor_us']:.2f}us",
+        (
+            f"          t_mem={card['t_mem_us']:.2f}us  t_comp={card['t_comp_us']:.2f}us  "
+            f"t_issue={t_issue}  floor={card['floor_us']:.2f}us"
+        ),
     ]
     if hint:
         lines.append(f"          note: {hint}")
@@ -240,7 +265,12 @@ def render_filled(card: dict) -> str:
         lines.append(f"4. Idea   {idea['name']}  verdict={idea['verdict'].upper()}")
         lines.append(f"          {idea['reason']}")
     else:
-        lines.append("4. Idea   unknown  — pass --idea <class>. If it does not attack this bound, stop.")
+        lines.append(
+            "4. Idea   unknown  — pass --idea <class>. Address the bound or a profiler-attributed cost limiting achieved throughput."
+        )
+    for field in ("bottleneck", "profile_evidence", "hypothesis"):
+        if card.get(field):
+            lines.append(f"          {field}: {card[field]}")
     if card["sm120"]["legal"]:
         atom = card["mma_atom"]
         lines.append(
@@ -249,10 +279,24 @@ def render_filled(card: dict) -> str:
         )
     else:
         lines.append("5. SM120  ILLEGAL  " + "; ".join(card["sm120"]["reasons"]))
-    if card["bound"] == "DRAM":
+    if idea and idea["name"] == "quality_tradeoff":
+        lines.append(
+            "6. Family Requested precision candidate; preserve represented weights. Baseline atom/roof above does not model candidate arithmetic."
+        )
+    elif idea and idea["name"] == "profiled_overhead":
+        lines.append(
+            "6. Family Bounded profiler-supported change in the current legal family. "
+            + idea["reason"]
+        )
+    elif idea and idea["name"] == "grid_underfill":
+        lines.append(
+            "6. Family Evidence-gated output-row partitioning only; preserve K reduction and one weight pass. "
+            + idea["reason"]
+        )
+    elif card["bound"] == "DRAM":
         lines.append(
             "6. Family DRAM-bound. Do not fork a compute family. "
-            "Attack extra bytes or raise T per weight pass."
+            "Attack extra bytes, raise T per weight pass, or establish a profiled_overhead hypothesis."
         )
     else:
         lines.append(
@@ -260,10 +304,20 @@ def render_filled(card: dict) -> str:
             "Search tile/TMA/pipeline; do not invent a new MMA ISA."
         )
     lines.append(f"7. Layer2 {layer2['bench']}")
-    lines.append("          Oracle first, then this public Op at the exact point. Fast-but-wrong is invalid.")
-    lines.append("          NCU is one named question, not an open report: " + "; ".join(_NCU_QUESTIONS) + ".")
+    lines.append(
+        "          Oracle first, then this public Op at the exact point. Fast-but-wrong is invalid."
+    )
+    lines.append(
+        "          NCU is one named question, not an open report: "
+        + "; ".join(_NCU_QUESTIONS)
+        + "."
+    )
     lines.append(f"          {layer2['ncu']}")
-    lines.append("          No Engine / ninfer_bench / serve A/B until this Op wins.")
+    lines.append(
+        "          Measure public-Op latency before paired model quality."
+        if idea and idea["name"] == "quality_tradeoff"
+        else "          No Engine / ninfer_bench / serve A/B until this Op wins."
+    )
     lines.append("8. Lose   Delete the candidate. Do not leave a second path.")
     lines.append("")
     lines.extend(_group_lines(_classified(card)))
@@ -305,14 +359,14 @@ def _guide_payload() -> dict:
         },
         "presets": presets,
         "ideas": ideas,
-        "linear_bench": (
-            f"{_LINEAR_BENCH} --qtype QTYPE --policy a16|a4 --n N --k K --t T"
-        ),
+        "linear_bench": (f"{_LINEAR_BENCH} --qtype QTYPE --policy a16|a4 --n N --k K --t T"),
         "kdev_ops": registry.names(),
         "fill": [
             "python3 -m tools.kdev recipe --preset attn_in --t 1 --idea occupancy",
-            "python3 -m tools.kdev recipe --n 14336 --k 5120 --t 1024 --qtype nvfp4 "
-            "--policy a4 --measured-us 152.6 --idea tile_shape",
+            (
+                "python3 -m tools.kdev recipe --n 14336 --k 5120 --t 1024 --qtype nvfp4 "
+                "--policy a4 --measured-us 152.6 --idea tile_shape"
+            ),
         ],
     }
 
@@ -324,6 +378,10 @@ def render_guide() -> str:
         "profiles/kdev/mma_issue.json present — bound/recipe will set t_issue."
         if mma_present
         else "profiles/kdev/mma_issue.json absent — t_issue=n/a; 1676 TFLOP/s datasheet fallback."
+    )
+    presets = "\n".join(
+        f"  {name:10} n={spec['n']:<6} k={spec['k']:<6} {spec['qtype']}  {spec['label']}"
+        for name, spec in bound.PRESETS.items()
     )
     return f"""\
 NInfer kernel iteration — RTX 5090 / sm_120a
@@ -339,8 +397,9 @@ Fill this card for a Linear point (host, no GPU):
   python3 -m tools.kdev recipe --list-presets
 
 Layer 0  bound (host). Predicted time = max(t_mem, t_comp[, t_issue]).
-  DRAM (typical decode T≲16; ridge_T≈380 on 27B NVFP4 attn-in): only ideas that cut
-  extra bytes or raise useful work per weight pass (weight_replay, aggregate_T).
+  DRAM (typical decode T≲16; ridge_T≈380 on 27B NVFP4 attn-in): cut extra bytes,
+  raise useful work per weight pass (weight_replay, aggregate_T), or use profiled_overhead
+  with a measured baseline, same-kernel attribution, and a bounded hypothesis.
   tensor-core (typical prefill T=1024): tile / TMA / pipeline / epilogue inside the
   existing SM120 NVFP4 family.
   STOP if verdict=refuse or sm120=ILLEGAL. Do not write CUDA.
@@ -358,7 +417,7 @@ Layer 2  public Op at the exact point. Oracle first. Fast-but-wrong is invalid.
   Registered kdev ops ({ops}):
     python3 -m tools.kdev <op> --fast --bench
     python3 -m tools.kdev <op> --fast --bench --profile
-  NCU is one named question, not an open report: {'; '.join(_NCU_QUESTIONS)}.
+  NCU is one named question, not an open report: {"; ".join(_NCU_QUESTIONS)}.
   Temporary candidate sweeps may call private launchers; keep one winner and delete the rest.
 
 Layer 3  qualify the reachable production route against the independent oracle, then
@@ -369,7 +428,7 @@ Idea classes (name one; the classifier gates it for this bound):
 {bound.format_idea_catalog()}
 
 27B NVFP4 Linear presets (--preset):
-{chr(10).join(f'  {name:10} n={spec["n"]:<6} k={spec["k"]:<6} {spec["qtype"]}  {spec["label"]}' for name, spec in bound.PRESETS.items())}
+{presets}
 
 Gate: any unknown means measure, do not implement.
   1 Op + exact (N,K,T,qtype,policy) + phase
@@ -419,7 +478,13 @@ def _self_test() -> int:
     check("t1-status", status_of(refuse) == "stop", status_of(refuse))
 
     allow = bound.analyze(
-        14336, 5120, 1024, "nvfp4", policy="a4", idea="tile_shape", measured_us=152.6,
+        14336,
+        5120,
+        1024,
+        "nvfp4",
+        policy="a4",
+        idea="tile_shape",
+        measured_us=152.6,
     )
     text_go = render_filled(allow)
     check("t1024-tc", "bound=tensor-core" in text_go)
@@ -429,13 +494,22 @@ def _self_test() -> int:
     check("t1024-pct", "floor/measured=" in text_go)
 
     for policy, atom, rate in (("a8", "FP8", 523.98702592), ("a16", "BF16", 261.8960128)):
-        fp8 = bound.analyze(34816, 5120, 4096, "fp8", policy=policy,
-                            mma_per_s=rate * 1e12 / (8192 if policy == "a8" else 4096),
-                            measured_us=6000, idea="tile_shape")
+        fp8 = bound.analyze(
+            34816,
+            5120,
+            4096,
+            "fp8",
+            policy=policy,
+            mma_per_s=rate * 1e12 / (8192 if policy == "a8" else 4096),
+            measured_us=6000,
+            idea="tile_shape",
+        )
         roof = _matching_roof(fp8)
-        check("fp8-matching-roof-" + policy,
-              f"measured {atom} MMA roof ({rate:.3f} TFLOP/s" in roof and "dense FP4" not in roof,
-              roof)
+        check(
+            "fp8-matching-roof-" + policy,
+            f"measured {atom} MMA roof ({rate:.3f} TFLOP/s" in roof and "dense FP4" not in roof,
+            roof,
+        )
 
     baseline = bound.analyze(14336, 5120, 1024, "nvfp4", idea="tile_shape")
     check("no-us-measure", status_of(baseline) == "measure", status_of(baseline))
@@ -451,6 +525,31 @@ def _self_test() -> int:
     no_idea = bound.analyze(14336, 5120, 1, "nvfp4", measured_us=30.0)
     check("no-idea-fill", status_of(no_idea) == "fill", status_of(no_idea))
 
+    evidence = dict(
+        measured_us=104.448,
+        bottleneck="instruction",
+        profile_evidence="NCU report: codec's instruction share",
+        hypothesis="replace sign assembly; preserve exact bytes",
+    )
+    profiled = bound.analyze(14336, 5120, 8, "nvfp4", idea="profiled_overhead", **evidence)
+    check("profiled-go", status_of(profiled) == "go")
+    parser = argparse.ArgumentParser()
+    bound.add_problem_arguments(parser)
+    reconstructed = shlex.split(recipe_cmd(profiled))[4:]
+    restored = bound.analyze_from_args(parser.parse_args(reconstructed))
+    check("profiled-roundtrip", all(restored[k] == v for k, v in evidence.items()))
+    check(
+        "profiled-readable",
+        all(
+            evidence[k] in render_filled(profiled)
+            for k in ("bottleneck", "profile_evidence", "hypothesis")
+        ),
+    )
+    missing = dict(profiled, hypothesis=None)
+    check(
+        "profiled-missing-evidence",
+        _classified(missing)[bound.IDEAS.index("profiled_overhead")]["verdict"] == "measure",
+    )
     payload = filled_payload(allow)
     check("json-status", payload["status"] == "go")
     check("json-layer2", "--t 1024" in payload["layer2"]["bench"])
@@ -489,13 +588,27 @@ def main(argv=None) -> int:
         return 0
 
     filling = bound.problem_is_complete(args)
-    wants_fill = any((
-        args.preset, args.n is not None, args.k is not None, args.t is not None,
-        args.idea, args.measured_us is not None, args.qtype,
-        args.mma_json, args.mma_per_s is not None,
-        args.needs_tmem, args.needs_tcgen05, args.smem_bytes is not None,
-        args.cluster != 1, args.phase is not None,
-    ))
+    wants_fill = any(
+        (
+            args.preset,
+            args.n is not None,
+            args.k is not None,
+            args.t is not None,
+            args.idea,
+            args.bottleneck,
+            args.profile_evidence,
+            args.hypothesis,
+            args.measured_us is not None,
+            args.qtype,
+            args.mma_json,
+            args.mma_per_s is not None,
+            args.needs_tmem,
+            args.needs_tcgen05,
+            args.smem_bytes is not None,
+            args.cluster != 1,
+            args.phase is not None,
+        )
+    )
     if wants_fill and not filling:
         parser.error("filling the card requires --preset or --n/--k, plus --t")
 

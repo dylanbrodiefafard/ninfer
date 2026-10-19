@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 from types import MethodType
-from typing import Any, Iterable
+from typing import Any
 
 from .multimodal import MultimodalBatch, batch_from_processor_output
-
 
 _SPECIAL_TOKEN_IDS = {
     "<|vision_start|>": 248053,
@@ -26,12 +26,10 @@ def _fetch_videos_opencv(_processor, video_or_videos, sample_indices_fn=None):
 
     if isinstance(video_or_videos, list):
         fetched = [
-            _fetch_videos_opencv(
-                _processor, item, sample_indices_fn=sample_indices_fn
-            )
+            _fetch_videos_opencv(_processor, item, sample_indices_fn=sample_indices_fn)
             for item in video_or_videos
         ]
-        return list(zip(*fetched))
+        return list(zip(*fetched, strict=True))
     return load_video(
         video_or_videos,
         backend="opencv",
@@ -67,9 +65,7 @@ class Frontend:
             directory = Path(temporary)
             for filename, resource in files:
                 (directory / filename).write_bytes(binding.resource_bytes(resource))
-            self.processor = AutoProcessor.from_pretrained(
-                directory, local_files_only=True
-            )
+            self.processor = AutoProcessor.from_pretrained(directory, local_files_only=True)
             self.generation_config = GenerationConfig.from_pretrained(
                 directory, local_files_only=True
             )
@@ -91,8 +87,7 @@ class Frontend:
         missing = sorted(required - names)
         if missing:
             raise RuntimeError(
-                "the installed Transformers processor lacks Qwen3.6 inputs: "
-                f"{missing}"
+                f"the installed Transformers processor lacks Qwen3.6 inputs: {missing}"
             )
         if len(self.tokenizer) != _TOKENIZER_SIZE:
             raise ValueError(
@@ -115,9 +110,7 @@ class Frontend:
             return {values}
         return {int(value) for value in values}
 
-    def process(
-        self, messages: list[dict[str, Any]], *, thinking: bool
-    ) -> MultimodalBatch:
+    def process(self, messages: list[dict[str, Any]], *, thinking: bool) -> MultimodalBatch:
         output = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -136,12 +129,8 @@ class Frontend:
             thinking=thinking,
         )
 
-    def decode(
-        self, token_ids: Iterable[int], *, skip_special_tokens: bool = True
-    ) -> str:
-        return self.tokenizer.decode(
-            list(token_ids), skip_special_tokens=skip_special_tokens
-        )
+    def decode(self, token_ids: Iterable[int], *, skip_special_tokens: bool = True) -> str:
+        return self.tokenizer.decode(list(token_ids), skip_special_tokens=skip_special_tokens)
 
 
 __all__ = ["Frontend"]

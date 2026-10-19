@@ -17,6 +17,9 @@ struct GqaGeometry {
     static constexpr int GroupSize        = QHeads / KVHeads;
     static constexpr int DecodeSplitScale = DecodeSplitScaleValue;
     static constexpr int DecodeSplits     = 85 * DecodeSplitScale;
+    // Small-T decode stages every (token, group-query) row of one KV head in at most three
+    // 16-row MMA tiles: 27B (group of six) reaches T=8, 35B (group of eight) T=6.
+    static constexpr int SmallTMaxTokens = 48 / GroupSize;
 };
 
 using Gqa27Geometry = GqaGeometry<24, 4, 1>;

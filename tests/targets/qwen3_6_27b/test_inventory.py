@@ -81,7 +81,7 @@ def test_format_layout_counts_and_key_signatures() -> None:
     assert tensors["vision/patch_embedding"].shape == (1152, 1536)
     assert tensors["vision/merger/fc2"].shape == (5120, 4608)
 
-    assert inventory.FULL_ATTENTION_LAYERS == tuple(range(3, 64, 4))
+    assert tuple(range(3, 64, 4)) == inventory.FULL_ATTENTION_LAYERS
     assert len(inventory.GDN_LAYERS) == 48
 
 

@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "targets/qwen3_6/impl/runtime/cache_cuda_event.h"
 
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sampling.h"
@@ -11,36 +12,29 @@
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
-namespace {
 
 DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
     if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
         throw std::logic_error("DFlash prefill controls are unavailable");
     }
-    return dflash_feature_sink(
-        state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
-            auto& frame  = *state.execution.io.dflash_decode;
-            Tensor count = frame.append_counts.slice(0, 0, 1);
-            Tensor lane  = frame.lanes.slice(0, 0, 1);
-            Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
-            ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
-            const auto exact = static_cast<std::uint32_t>(features.ne[1]);
-            dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
-            if (rewrite_checkpoint) {
-                state.dflash->save_rewrite_checkpoint(state.dflash_host_ingress->lanes[0],
-                                                      state.execution.device.stream);
-            }
-        });
+    return dflash_feature_sink(state, [&state](const Tensor& features, const Tensor& positions) {
+        // The program stages the owner in the last ingress row (stage_dflash_prefill_owner).
+        auto& frame              = *state.execution.io.dflash_decode;
+        const std::int32_t owner = frame.lanes.ne[0] - 1;
+        Tensor count             = frame.append_counts.slice(0, owner, 1);
+        Tensor lane              = frame.lanes.slice(0, owner, 1);
+        Tensor row               = frame.dflash_kv_table_rows.slice(0, owner, 1);
+        ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
+        const auto exact = static_cast<std::uint32_t>(features.ne[1]);
+        dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
+    });
 }
-
-} // namespace
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
-                         std::int32_t rewrite_checkpoint_state_slot,
                          std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
-    card.set_linear_state_slots(current_state_slot, rewrite_checkpoint_state_slot);
+    card.set_linear_state_slot(current_state_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
     card.set_prefill_skip(execution.keep_frac, execution.xattn_tau, execution.xattn_min_len);
@@ -62,7 +56,7 @@ PrefillChunkResult prefill_text_chunk(
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+                        state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
@@ -77,6 +71,119 @@ PrefillChunkResult prefill_text_chunk(
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }
 
+MixedForwardStreams::MixedForwardStreams() {
+    CUDA_CHECK(cudaStreamCreateWithFlags(&owner_stream_, cudaStreamNonBlocking));
+    try {
+        qwen3_6::detail::create_cache_cuda_event(&owner_done_, cudaEventDisableTiming);
+        qwen3_6::detail::create_cache_cuda_event(&verify_done_, cudaEventDisableTiming);
+    } catch (...) {
+        if (owner_done_ != nullptr) { CUDA_CHECK(cudaEventDestroy(owner_done_)); }
+        CUDA_CHECK(cudaStreamDestroy(owner_stream_));
+        throw;
+    }
+}
+
+MixedForwardStreams::~MixedForwardStreams() {
+    CUDA_CHECK(cudaStreamSynchronize(owner_stream_));
+    CUDA_CHECK(cudaEventDestroy(verify_done_));
+    CUDA_CHECK(cudaEventDestroy(owner_done_));
+    CUDA_CHECK(cudaStreamDestroy(owner_stream_));
+}
+
+void MixedForwardStreams::fork(cudaStream_t verify_stream) {
+    CUDA_CHECK(cudaEventRecord(verify_done_, verify_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(owner_stream_, verify_done_, 0));
+}
+
+void MixedForwardStreams::join_layer(cudaStream_t verify_stream) {
+    CUDA_CHECK(cudaEventRecord(owner_done_, owner_stream_));
+    CUDA_CHECK(cudaEventRecord(verify_done_, verify_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(verify_stream, owner_done_, 0));
+    CUDA_CHECK(cudaStreamWaitEvent(owner_stream_, verify_done_, 0));
+}
+
+void MixedForwardStreams::join_owner(cudaStream_t verify_stream) {
+    CUDA_CHECK(cudaEventRecord(owner_done_, owner_stream_));
+    CUDA_CHECK(cudaStreamWaitEvent(verify_stream, owner_done_, 0));
+}
+
+MixedPrefillOwner::MixedPrefillOwner(
+    PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
+    std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end,
+    MixedForwardStreams& streams, WorkspaceArena& owner_work)
+    : state_(state), streams_(streams),
+      card_(state.execution.device, state.execution.model, owner_work, state.text_kv,
+            state.execution.linear_attention, state.execution.io, state.execution.prefill_hidden,
+            state.execution.prefill_chunk, state.text_kv_base, state.mtp_kv, &state.text_cache,
+            state.mtp_cache, streams.owner_stream()),
+      sink_(make_dflash_prefill_sink(state)), prompt_(ids.data(), ids.size()),
+      nominal_length_(nominal_length), finalize_at_end_(finalize_at_end) {
+    if (state.dflash == nullptr || state.mtp_kv.valid()) {
+        throw std::logic_error("a mixed-round prefill owner requires DFlash without MTP");
+    }
+    configure_text_card(card_, state.execution, state.sampling, state.current_state_slot,
+                        state.mtp_proposal_extent);
+    card_.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+    card_.set_prefill_rewrite_checkpoint_frontier(
+        rewrite_checkpoint_capture_frontier
+            ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
+            : -1);
+    forward_ = [this](const LayerPartner& partner) {
+        if (forwarded_) { throw std::logic_error("mixed-round prefill owner ran twice"); }
+        const auto verify_stream = state_.execution.device.stream;
+        streams_.fork(verify_stream);
+        const LayerPartner concurrent_partner = [&](int layer) {
+            partner(layer);
+            streams_.join_layer(verify_stream);
+        };
+        try {
+            forwarded_ = card_.prefill_chunk(prompt_, state_.text_kv_base, nominal_length_,
+                                             finalize_at_end_, sink_, concurrent_partner);
+        } catch (...) {
+            // Existing primary-stream failure cleanup must drain owner work before rollback.
+            streams_.join_owner(verify_stream);
+            throw;
+        }
+        streams_.join_owner(verify_stream);
+    };
+}
+
+void MixedPrefillOwner::append_context() {
+    if (!forwarded_ || appended_) {
+        throw std::logic_error("mixed-round prefill owner appends once, after its forward");
+    }
+    state_.execution.work.reset();
+    sink_.consume_prefill_chunk(static_cast<std::int32_t>(forwarded_->processed_tokens));
+    appended_ = true;
+}
+
+PrefillChunkResult MixedPrefillOwner::result() const {
+    if (!appended_) { throw std::logic_error("mixed-round prefill owner has not completed"); }
+    return forwarded_.value();
+}
+
+PrefillChunkResult prefill_mrope_text_chunk(
+    PrefillContext& state, const PreparedPromptData& prompt, std::uint32_t nominal_length,
+    std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end) {
+    TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.execution.prefill_hidden, state.execution.prefill_chunk,
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
+                        state.mtp_proposal_extent);
+    card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+    card.set_prefill_rewrite_checkpoint_frontier(
+        rewrite_checkpoint_capture_frontier
+            ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
+            : -1);
+    if (state.dflash != nullptr) {
+        DFlashFeatureSink sink = make_dflash_prefill_sink(state);
+        return card.prefill_mrope_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                                        sink);
+    }
+    return card.prefill_mrope_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
+}
+
 PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
                          VisionPrefillSession& vision, std::uint32_t nominal_length,
@@ -87,7 +194,7 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+                        state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
@@ -107,6 +214,9 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
         bridge.position < 0 ||
         static_cast<std::uint32_t>(bridge.position) + 1 != state.text_kv_base) {
         throw std::logic_error("multimodal MTP bridge does not match the reusable frontier");
+    }
+    if (!state.execution.io.mtp) {
+        throw std::logic_error("multimodal MTP bridge requires MTP round state");
     }
 
     Tensor bridge_token = state.execution.io.mtp->target_input_ids.slice(0, 0, 1);
@@ -153,6 +263,10 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
+    qwen3_6::record_round_logprobs(
+        state.execution.io.prefill_logprobs, Tensor(logits.data, DType::BF16, {logits.ne[0], 1, 1}),
+        Tensor(state.execution.io.token.data, DType::I32, {1, 1}), nullptr, nullptr,
+        TextConfig::token_domain, state.execution.device.stream);
     state.execution.work.reset();
 }
 

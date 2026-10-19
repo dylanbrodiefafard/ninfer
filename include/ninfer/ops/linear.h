@@ -66,8 +66,9 @@ enum class LinearPolicy : std::uint8_t {
  * [5120,6144], [5120,17408], [5120,25600], [6144,5120], [5120,4096],
  * [1280,5120], [256,5120], [5120,10240]}` accept every positive T. The five
  * DFlash2-only geometries are A16-only; AllowA4 still resolves them to A16.
- * MTP `fc` `[5120,10240]` admits W4A4 at T≥8 (residual-class N; T=4/6 stay A16). Text and MTP packed-weight problems accept
- * every positive column extent T. Registered W8 problems `[5120,25600]`, `[5120,4096]`,
+ * MTP `fc` `[5120,10240]` admits W4A4 at T≥8 (residual-class N; T=4/6 stay A16). Text and MTP
+ * packed-weight problems accept every positive column extent T. Registered W8 problems
+ * `[5120,25600]`, `[5120,4096]`,
  * `[1280,5120]`, and `[256,5120]`, and registered Q4 problems `[5120,25600]`, `[5120,4096]`,
  * `[5120,17408]`, `[1280,5120]`, and `[256,5120]`, also accept every positive T. Registered Vision
  * problems accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix
@@ -87,9 +88,14 @@ enum class LinearPolicy : std::uint8_t {
  * `policy` specifies the permitted private activation-compute set. A permission does not require a
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
  * choice. BF16_CTRL admits only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
- * LinearPolicy::A16Only and LinearPolicy::AllowA8. NVFP4 admits A16Only and AllowA4; AllowA4
- * permits the private resolver to select either a qualified A16 route or activation quantization
- * to NVFP4 at every positive T. The selected route depends only on the registered problem and T.
+ * LinearPolicy::A16Only and LinearPolicy::AllowA8. NVFP4 admits A16Only, AllowA4 and AllowA8;
+ * AllowA4 permits the private resolver to select either a qualified A16 route or activation
+ * quantization to NVFP4 at every positive T. The selected route depends only on the registered
+ * problem and T. NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=2 for [14336,5120],
+ * [16384,5120], [34816,5120], [5120,6144], and [5120,17408]. Other NVFP4 shapes and T<2
+ * retain A16. Weight codes and per16 E4M3 scales remain unchanged: exact code expansion and
+ * separately scaled K16 partials introduce no additional weight quantization. The canonical
+ * oracle retains original BF16 inputs; independent codec attribution supplements its check.
  * FP8 admits A16Only and AllowA8. Its vocabulary projection always uses A16 and also accepts
  * AllowA4 without enabling A4. FP8 packed sequences retain independent per-sequence routes.
  * Callers that pack B independent sequences as `T = sequence_width * B` must use
@@ -132,10 +138,9 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
  * SmallT, Q4 draft-head, and W8/Q4 SIMT/MMA routes are specialized by exact T, so launching once
  * at `T=width*B` can select a different kernel than sequential C=1 (`T=width`). This entry
  * launches one Linear per sequence by default. Qualified exceptions aggregate the A16 W8
- * vocabulary W=5 profile across B=2..4 and aggregate selected NVFP4 DFlash and Q4 27B draft-head
- * profiles. `T` must be a positive multiple of `sequence_width`. Tensor, weight, aliasing,
- * policy, and workspace
- * requirements match `linear`.
+ * vocabulary W=2..6 profile in passes of at most 32 same-reduction columns and aggregate selected
+ * NVFP4 DFlash and Q4 27B draft-head profiles. `T` must be a positive multiple of `sequence_width`.
+ * Tensor, weight, aliasing, policy, and workspace requirements match `linear`.
  *
  * @param[in] sequence_width Per-sequence column count (the C=1 T).
  */
@@ -145,5 +150,31 @@ void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, Line
 
 void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
                              std::int32_t sequence_width);
+
+/**
+ * @brief Projects the K and V row ranges of one registered fused QKV weight.
+ *
+ * @details `w` is the original immutable `[6144,5120]` descriptor in block-scaled NVFP4 or
+ * RowSplit W8G32_F16S/Q4G64_F16S, including its full payload and original scale planes.
+ * `x` is contiguous BF16 `[5120,T]`; `key` and
+ * `value` are distinct contiguous BF16 `[1024,T]` outputs. The ideal results are the complete
+ * dot products of represented BF16 inputs with exactly decoded original weight rows
+ * `[4096,5120)` and `[5120,6144)`, respectively. Outputs use Linear's A16 numerical criterion;
+ * activation quantization is not admitted. No Q output is produced.
+ *
+ * Tensor and weight-plane pointers must be non-null and 16-byte aligned. Outputs cannot overlap
+ * each other, the input, or the original weight payload. Inputs and weights remain unchanged. `T`
+ * and `sequence_width` are positive; `T` is a multiple of `sequence_width` representing one to six
+ * packed sequences. Packed requests retain their C=1 arithmetic route: NVFP4 width 1 uses
+ * independent GEMV panels and widths >= 2 share the qualified ascending-K A16 MMA reduction.
+ * RowSplit formats retain independent per-sequence Linear calls on their valid K/V row views.
+ * No workspace or internal device allocation is required.
+ *
+ * Execution is enqueued on `stream`; caller-owned tensors and weight planes must remain live
+ * until execution completes. Invalid tensors, original weight descriptors, or packed shapes
+ * throw `std::invalid_argument`; CUDA failures propagate with launch context.
+ */
+void linear_kv_projection(const Tensor& x, const Weight& w, Tensor& key, Tensor& value,
+                          cudaStream_t stream, std::int32_t sequence_width);
 
 } // namespace ninfer::ops

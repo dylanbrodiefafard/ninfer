@@ -8,10 +8,14 @@
 #
 # Usage:
 #   ./scripts/run-unit-tests.sh                  # full unit suite
+#   ./scripts/run-unit-tests.sh --fast           # skip the tests labelled slow (minutes each)
 #   ./scripts/run-unit-tests.sh -R ninfer_sampling_test
 #   ./scripts/run-unit-tests.sh --real           # include real-artifact tests
 #   ./scripts/run-unit-tests.sh --print-weights  # show which .ninfer files were found
 #   ./scripts/run-unit-tests.sh --python         # also run the host Python pytest suite
+#   ./scripts/run-unit-tests.sh --compute-sanitizer memcheck -R ninfer_arena_test
+#                                                # run tests under compute-sanitizer
+#                                                # (memcheck, racecheck, synccheck, initcheck)
 #
 # --real auto-finds exact filenames in models/, out/, /models, the builder's
 # models mount, and sibling folders of that mount. Override with env vars or
@@ -23,20 +27,21 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILDER="${NINFER_DEV_CONTAINER:-ninfer-builder}"
-JOBS="${NINFER_DEV_JOBS:-$(nproc)}"
+JOBS="${NINFER_DEV_JOBS:-8}"
 MIN_FREE_GIB="${NINFER_MIN_FREE_VRAM_GIB:-20}"
 MIN_FREE_MIB=$((MIN_FREE_GIB * 1024))
 INNER=0
 INCLUDE_REAL=0
 PRINT_WEIGHTS=0
 RUN_PYTHON=0
+SANITIZER_TOOL=""
+FAST=0
 CTEST_ARGS=()
 
 WEIGHT_VARS=(
   NINFER_QWEN3_6_27B_NVFP4_WEIGHTS
   NINFER_QWEN3_6_27B_WEIGHTS
   NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS
-  NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS
   NINFER_QWEN3_6_35B_A3B_WEIGHTS
 )
 
@@ -44,10 +49,17 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --inner) INNER=1; shift ;;
     --real) INCLUDE_REAL=1; shift ;;
+    --fast) FAST=1; shift ;;
     --print-weights) PRINT_WEIGHTS=1; shift ;;
     --python) RUN_PYTHON=1; shift ;;
+    --compute-sanitizer)
+      case "${2:-}" in
+        memcheck|racecheck|synccheck|initcheck) SANITIZER_TOOL="$2"; shift 2 ;;
+        *) echo "--compute-sanitizer needs memcheck, racecheck, synccheck, or initcheck" >&2; exit 2 ;;
+      esac
+      ;;
     --help|-h)
-      sed -n '2,21p' "$0"
+      sed -n '2,25p' "$0"
       exit 0
       ;;
     --) shift; CTEST_ARGS+=("$@"); break ;;
@@ -93,9 +105,6 @@ weight_filenames() {
         qwen3_8_27b_nvfp4_dflash_w8.ninfer \
         qwen3_8_27b_nvfp4_dflash_nvfp4_codebook.ninfer
       ;;
-    NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS)
-      printf '%s\n' qwen3_8_27b_nvfp4_mtp.ninfer qwen3_8_27b_nvfp4_mtp_nvfp4.ninfer
-      ;;
     NINFER_QWEN3_6_35B_A3B_WEIGHTS)
       printf '%s\n' qwen3_6_35b_a3b.ninfer
       ;;
@@ -105,16 +114,13 @@ weight_filenames() {
 weight_tests() {
   case "$1" in
     NINFER_QWEN3_6_27B_NVFP4_WEIGHTS)
-      echo "prefix, ram, checkpoint, serve-prepend"
+      echo "prefix, ram, recovery-kv, checkpoint, serve-prepend"
       ;;
     NINFER_QWEN3_6_27B_WEIGHTS)
-      echo "prefix, ram, checkpoint, serve-prepend, load-plan"
+      echo "prefix, ram, recovery-kv, checkpoint, serve-prepend, load-plan"
       ;;
     NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS)
-      echo "ninfer_qwen3_8_27b_dflash_real_test"
-      ;;
-    NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS)
-      echo "ninfer_qwen3_8_27b_mtp_nvfp4_real_test"
+      echo "ninfer_qwen3_8_27b_dflash_real_test, logprobs, recovery-kv"
       ;;
     NINFER_QWEN3_6_35B_A3B_WEIGHTS)
       echo "35B real, ram, dflash, load-plan"
@@ -263,7 +269,7 @@ configure_weights() {
   WEIGHT_SOURCE=()
   WEIGHT_MISSING=()
   WEIGHT_UNMAPPED=()
-  local var names name path mapped source
+  local var name path mapped source
   for var in "${WEIGHT_VARS[@]}"; do
     path="${!var:-}"
     source=""
@@ -313,7 +319,7 @@ configure_weights() {
 }
 
 print_weights_report() {
-  local entry var path source tests
+  local entry var rest path source
   echo "=== real-artifact weights ==="
   if [[ ${#WEIGHT_SOURCE[@]} -gt 0 ]]; then
     for entry in "${WEIGHT_SOURCE[@]}"; do
@@ -482,17 +488,42 @@ run_cpp_suite() {
       -DNINFER_BUILD_APPS=ON \
       -DBUILD_TESTING=ON
   fi
+  # The test launcher changes only CTest registration, so switching it does not recompile.
+  local launcher=""
+  if [[ -n "$SANITIZER_TOOL" ]]; then
+    launcher="compute-sanitizer;--tool;${SANITIZER_TOOL};--error-exitcode;1"
+  fi
+  if [[ "$(sed -n 's/^NINFER_TEST_LAUNCHER:STRING=//p' "${build}/CMakeCache.txt")" != "$launcher" ]]; then
+    cmake -S "$src" -B "$build" "-DNINFER_TEST_LAUNCHER=${launcher}" >/dev/null
+  fi
   echo "=== cmake --build ${build} ==="
   cmake --build "$build" --parallel "$JOBS"
   local ctest_cmd=(ctest --test-dir "$build" --output-on-failure)
   if [[ "$INCLUDE_REAL" -eq 0 ]]; then
     ctest_cmd+=(-E '_real_test$')
   fi
+  if [[ "$FAST" -eq 1 ]]; then
+    ctest_cmd+=(-LE slow)
+  fi
   if [[ ${#CTEST_ARGS[@]} -gt 0 ]]; then
     ctest_cmd+=("${CTEST_ARGS[@]}")
   fi
+  # Disk-tier tests fsync heavily. Keep their scratch files on the source tree's
+  # filesystem instead of the container overlay, unless the caller chose a TMPDIR.
+  local scratch=""
+  if [[ -z "${TMPDIR:-}" ]]; then
+    mkdir -p "${src}/build"
+    scratch="$(mktemp -d "${src}/build/test-tmp.XXXXXX")"
+    export TMPDIR="$scratch"
+  fi
   echo "=== ${ctest_cmd[*]} ==="
-  "${ctest_cmd[@]}"
+  local status=0
+  "${ctest_cmd[@]}" || status=$?
+  if [[ -n "$scratch" ]]; then
+    rm -rf "$scratch"
+    unset TMPDIR
+  fi
+  return "$status"
 }
 
 run_inner() {
@@ -536,6 +567,12 @@ if command -v docker >/dev/null 2>&1 && "${ROOT}/scripts/dev-setup.sh"; then
   inner_args=(--inner)
   if [[ "$INCLUDE_REAL" -eq 1 ]]; then
     inner_args+=(--real)
+  fi
+  if [[ "$FAST" -eq 1 ]]; then
+    inner_args+=(--fast)
+  fi
+  if [[ -n "$SANITIZER_TOOL" ]]; then
+    inner_args+=(--compute-sanitizer "$SANITIZER_TOOL")
   fi
   echo "=== docker exec ${BUILDER} ==="
   docker_cmd=(docker exec

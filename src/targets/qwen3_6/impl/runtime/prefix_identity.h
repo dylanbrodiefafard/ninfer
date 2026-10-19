@@ -19,6 +19,7 @@ struct PrefixHash128 {
     [[nodiscard]] friend bool operator==(const PrefixHash128& a, const PrefixHash128& b) noexcept {
         return a.lo == b.lo && a.hi == b.hi;
     }
+
     [[nodiscard]] friend bool operator!=(const PrefixHash128& a, const PrefixHash128& b) noexcept {
         return !(a == b);
     }
@@ -39,10 +40,14 @@ public:
     [[nodiscard]] std::span<const std::uint8_t> token_types() const noexcept {
         return token_types_;
     }
+
     [[nodiscard]] std::span<const std::int32_t> positions(std::size_t axis) const {
         return positions_.at(axis);
     }
-    [[nodiscard]] std::span<const VisionItem> vision_items() const noexcept { return vision_items_; }
+
+    [[nodiscard]] std::span<const VisionItem> vision_items() const noexcept {
+        return vision_items_;
+    }
 
     [[nodiscard]] std::size_t packed_bytes() const;
     void pack(void* dst) const;
@@ -65,10 +70,11 @@ private:
                                   std::size_t count);
 
 // Longest identical represented input prefix, ending outside any Vision item.
-[[nodiscard]] std::size_t longest_matching_prefix(
-    std::span<const TokenId> left_tokens, const ResidentPrefixIdentity& left,
-    std::span<const TokenId> right_tokens, const ResidentPrefixIdentity& right,
-    std::size_t limit);
+[[nodiscard]] std::size_t longest_matching_prefix(std::span<const TokenId> left_tokens,
+                                                  const ResidentPrefixIdentity& left,
+                                                  std::span<const TokenId> right_tokens,
+                                                  const ResidentPrefixIdentity& right,
+                                                  std::size_t limit);
 
 [[nodiscard]] std::vector<PrefixHash128> prefix_hash_chain(const PreparedPromptData& prompt);
 
@@ -76,10 +82,35 @@ private:
                                            const ResidentPrefixIdentity& identity,
                                            std::size_t count);
 
+// prefix_hash_at values of one resident ledger/identity pair, kept so a capture does not rehash
+// the whole context. at(k) == prefix_hash_at(tokens, identity, k); entries past the cached
+// extent are derived from the resident inputs on demand, so appending to the ledger and
+// identity needs no notice. The owner truncates to at most p before changing any token,
+// identity entry, or Vision item at or after position p, and assigns a prompt's
+// prefix_hash_chain together with that prompt.
+class ResidentPrefixHashes {
+public:
+    void reserve(std::size_t tokens);
+
+    void clear() noexcept { hashes_.clear(); }
+
+    void assign(std::span<const PrefixHash128> chain);
+
+    void truncate(std::size_t tokens) noexcept {
+        if (tokens + 1 < hashes_.size()) { hashes_.resize(tokens + 1); }
+    }
+
+    [[nodiscard]] PrefixHash128 at(std::span<const TokenId> tokens,
+                                   const ResidentPrefixIdentity& identity, std::size_t count);
+
+private:
+    std::vector<PrefixHash128> hashes_;
+};
+
 // D17: RAM DFlash checkpoint reuse is gated on a captured backend image, not live sequence.kv.
-[[nodiscard]] constexpr bool dflash_rewrite_checkpoint_ready(
-    bool backend_image_present, std::uint32_t dflash_context_frontier,
-    std::uint32_t reuse_base) noexcept {
+[[nodiscard]] constexpr bool dflash_rewrite_checkpoint_ready(bool backend_image_present,
+                                                             std::uint32_t dflash_context_frontier,
+                                                             std::uint32_t reuse_base) noexcept {
     return backend_image_present && dflash_context_frontier >= reuse_base;
 }
 

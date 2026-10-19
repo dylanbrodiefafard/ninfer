@@ -2,10 +2,14 @@
 
 // ninfer::ops - RMSNorm kernels over contiguous BF16 rows.
 
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
+#include "ops/kernel/a4_activation.cuh"
+#include "ops/kernel/a8_activation.cuh"
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 
@@ -17,6 +21,17 @@ enum class RmsEpilogue {
     Gated,
 };
 
+// Which representations of the normalized row a kernel publishes: the BF16 tensor, the
+// row-scaled E4M3 activation (include/ninfer/ops/a8_activation.h) of those BF16 values, both, or
+// the NVFP4 activation (include/ninfer/ops/a4_activation.h) of those BF16 values.
+enum class RmsOutput {
+    Bf16,
+    A8,
+    Bf16AndA8,
+    A4,
+    Bf16AndA4,
+};
+
 template <RmsEpilogue Epilogue>
 __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weight, float z) {
     if constexpr (Epilogue == RmsEpilogue::Offset) { weight += 1.0f; }
@@ -25,32 +40,27 @@ __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weig
     return value;
 }
 
-// Fast geometry for D in {64, 128, 192, 256}. One warp owns one row, keeps the input in
-// registers, and uses only warp shuffles for the reduction. Block is a scheduling choice rather
-// than part of the row geometry.
-template <RmsEpilogue Epilogue, int Block>
-__launch_bounds__(Block) __global__
-    void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                    const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
-                                    std::int64_t rows, float eps) {
-    static_assert(Block % kWarpSize == 0);
-    constexpr int kWarpsPerBlock   = Block / kWarpSize;
-    constexpr int kMaxPairsPerLane = 4;
-    const int lane                 = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-    const int warp                 = static_cast<int>(threadIdx.x) / kWarpSize;
-    const std::int64_t row         = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
-    if (row >= rows) { return; }
+inline constexpr int kRmsWarpMaxPairsPerLane = 4;
 
-    const int pairs             = d / 2;
-    const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
-    __nv_bfloat162 values[kMaxPairsPerLane];
+// One warp normalizes one row of D in {64, 128, 192, 256}: lane l holds BF16 pairs l + 32k,
+// reduces its sum of squares with warp shuffles, and returns the BF16-rounded normalized pairs in
+// `normalized` (entries for pairs >= D/2 are left unset). Every lane of the warp must call it.
+// rmsnorm_warp_bf16x2_kernel and the per-token A8 producer share this function so that both
+// publish identical BF16 values for a row.
+template <RmsEpilogue Epilogue>
+__device__ __forceinline__ void
+rmsnorm_warp_row(const __nv_bfloat162* x_row, const __nv_bfloat162* weight,
+                 const __nv_bfloat162* z_row, std::int32_t d, float eps, int lane,
+                 __nv_bfloat162 (&normalized)[kRmsWarpMaxPairsPerLane]) {
+    const int pairs = d / 2;
+    __nv_bfloat162 values[kRmsWarpMaxPairsPerLane];
     float sum = 0.0f;
 
 #pragma unroll
-    for (int k = 0; k < kMaxPairsPerLane; ++k) {
+    for (int k = 0; k < kRmsWarpMaxPairsPerLane; ++k) {
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
-            values[k]       = x[row_base + pair];
+            values[k]       = x_row[pair];
             const float2 xf = __bfloat1622float2(values[k]);
             sum += xf.x * xf.x + xf.y * xf.y;
         }
@@ -61,20 +71,101 @@ __launch_bounds__(Block) __global__
     inv       = __shfl_sync(kFullWarpMask, inv, 0);
 
 #pragma unroll
-    for (int k = 0; k < kMaxPairsPerLane; ++k) {
+    for (int k = 0; k < kRmsWarpMaxPairsPerLane; ++k) {
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
             float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) {
-                zf = __bfloat1622float2(z[row_base + pair]);
-            }
-            out[row_base + pair] =
+            if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(z_row[pair]); }
+            normalized[k] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
         }
     }
+}
+
+// Fast geometry for D in {64, 128, 192, 256}. One warp owns one row (rmsnorm_warp_row). Block is
+// a scheduling choice rather than part of the row geometry.
+template <RmsEpilogue Epilogue, int Block>
+__launch_bounds__(Block) __global__
+    void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                    const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
+                                    std::int64_t rows, float eps) {
+    static_assert(Block % kWarpSize == 0);
+    constexpr int kWarpsPerBlock = Block / kWarpSize;
+    const int lane               = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp               = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::int64_t row       = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    if (row >= rows) { return; }
+
+    const int pairs             = d / 2;
+    const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
+    __nv_bfloat162 normalized[kRmsWarpMaxPairsPerLane];
+    rmsnorm_warp_row<Epilogue>(x + row_base, weight,
+                               Epilogue == RmsEpilogue::Gated ? z + row_base : nullptr, d, eps,
+                               lane, normalized);
+#pragma unroll
+    for (int k = 0; k < kRmsWarpMaxPairsPerLane; ++k) {
+        const int pair = lane + k * kWarpSize;
+        if (pair < pairs) { out[row_base + pair] = normalized[k]; }
+    }
+}
+
+// Implements: include/ninfer/ops/gated_rmsnorm.h (gated_rmsnorm_a8)
+// Match: aligned contiguous BF16 x/z [HeadDim, Heads, T], gated epilogue, HeadDim 128.
+// Grid: one CTA per token column. Each of the Block/32 warps normalizes heads warp, warp + W, ...
+// with rmsnorm_warp_row, so every head's BF16 values equal gated_rmsnorm's; the CTA then encodes
+// the whole Heads*HeadDim column with one A8 scale. Lane l of a warp holds pairs l and l + 32 of
+// each of its heads. Shared memory: Block/32 + 1 floats for the column maximum. Two
+// __syncthreads() inside a8_block_column_scale; no early return before them.
+template <int HeadDim, int Heads, int Block>
+__launch_bounds__(Block) __global__
+    void gated_rmsnorm_a8_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                 const __nv_bfloat162* z, std::uint8_t* codes, float* scales,
+                                 float eps) {
+    static_assert(HeadDim == 128, "two BF16 pairs per lane per head");
+    static_assert(Block % kWarpSize == 0 && Heads % (Block / kWarpSize) == 0);
+    constexpr int kWarps         = Block / kWarpSize;
+    constexpr int kHeadsPerWarp  = Heads / kWarps;
+    constexpr int kPairsPerHead  = HeadDim / 2;
+    constexpr int kPairsPerLane  = kPairsPerHead / kWarpSize;
+    constexpr int kPairsPerToken = Heads * kPairsPerHead;
+    static_assert(kPairsPerLane <= kRmsWarpMaxPairsPerLane);
+
+    const int lane              = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp              = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::int64_t token    = static_cast<std::int64_t>(blockIdx.x);
+    const std::int64_t col_base = token * kPairsPerToken;
+
+    __nv_bfloat162 normalized[kHeadsPerWarp][kRmsWarpMaxPairsPerLane];
+    float maximum = 0.0F;
+#pragma unroll
+    for (int slot = 0; slot < kHeadsPerWarp; ++slot) {
+        const std::int64_t head_base = col_base + (warp + slot * kWarps) * kPairsPerHead;
+        rmsnorm_warp_row<RmsEpilogue::Gated>(x + head_base, weight, z + head_base, HeadDim, eps,
+                                             lane, normalized[slot]);
+#pragma unroll
+        for (int k = 0; k < kPairsPerLane; ++k) {
+            maximum = fmaxf(maximum, a8_pair_maximum(normalized[slot][k]));
+        }
+    }
+
+    __shared__ float warp_maxima[kWarps];
+    __shared__ float column_scale;
+    const float scale   = a8_block_column_scale<Block>(maximum, warp_maxima, &column_scale);
+    const float inverse = a8_inverse_scale(scale);
+    auto* code_pairs    = reinterpret_cast<std::uint16_t*>(codes);
+#pragma unroll
+    for (int slot = 0; slot < kHeadsPerWarp; ++slot) {
+        const std::int64_t head_base = col_base + (warp + slot * kWarps) * kPairsPerHead;
+#pragma unroll
+        for (int k = 0; k < kPairsPerLane; ++k) {
+            code_pairs[head_base + lane + k * kWarpSize] =
+                a8_encode_pair(normalized[slot][k], inverse);
+        }
+    }
+    if (threadIdx.x == 0) { scales[token] = scale; }
 }
 
 // Implements: include/ninfer/ops/rmsnorm.h
@@ -123,12 +214,27 @@ __launch_bounds__(Block) __global__
 
 // Fast geometry for wide rows. One CTA owns one row and keeps up to MaxPairsPerThread BF16x2
 // values per lane. The launcher admits only widths evenly divisible by the CTA vector span.
-template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread>
-__launch_bounds__(Block) __global__
-    void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                   const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
-                                   std::int64_t rows, float eps) {
+// Output selects the published representations: the A8 codes/scales encode exactly the BF16
+// values written to `out` (A8 alone keeps them in registers instead). The A8 epilogue's
+// a8_block_column_scale adds two __syncthreads(); every thread of the CTA reaches it. The A4
+// outputs (D = A4Rows only) publish codes and tiled scales of the same BF16 values through
+// a4_publish_pair: thread i holds pairs i + k * Block, so a 16-value group's eight pairs sit in
+// eight consecutive lanes, and the per-k guard is uniform across the CTA, so whole warps call it
+// together.
+template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread,
+          RmsOutput Output = RmsOutput::Bf16, int A4Rows = 0>
+__device__ __forceinline__ void
+rmsnorm_cta_bf16x2_body(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                        const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
+                        std::int64_t rows, float eps, std::uint8_t* codes = nullptr,
+                        float* scales = nullptr, std::uint8_t* a4_scales = nullptr,
+                        float a4_input_scale_divisor = 0.0F) {
     static_assert(Block % kWarpSize == 0);
+    constexpr bool kWritesBf16 = Output == RmsOutput::Bf16 || Output == RmsOutput::Bf16AndA8 ||
+                                 Output == RmsOutput::Bf16AndA4;
+    constexpr bool kWritesA8   = Output == RmsOutput::A8 || Output == RmsOutput::Bf16AndA8;
+    constexpr bool kWritesA4   = Output == RmsOutput::A4 || Output == RmsOutput::Bf16AndA4;
+    static_assert(!kWritesA4 || (A4Rows > 0 && Block % 8 == 0));
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 
@@ -155,6 +261,7 @@ __launch_bounds__(Block) __global__
     __syncthreads();
     const float inv = inv_shared;
 
+    float maximum = 0.0F;
 #pragma unroll
     for (int k = 0; k < MaxPairsPerThread; ++k) {
         if (k < pairs_per_thread) {
@@ -165,11 +272,110 @@ __launch_bounds__(Block) __global__
             if constexpr (Epilogue == RmsEpilogue::Gated) {
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
-            out[row_base + pair] =
+            const auto normalized =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
+            if constexpr (kWritesBf16) { out[row_base + pair] = normalized; }
+            if constexpr (kWritesA4) {
+                a4_publish_pair<A4Rows>(codes, a4_scales, a4_input_scale_divisor,
+                                        static_cast<int>(row), pair, normalized);
+            }
+            if constexpr (kWritesA8) {
+                values[k] = normalized;
+                maximum   = fmaxf(maximum, a8_pair_maximum(normalized));
+            }
         }
     }
+    if constexpr (kWritesA8) {
+        // warp_sums is free again: block_reduce_sum ends with a barrier and inv_shared was read
+        // after the following one.
+        const float scale   = a8_block_column_scale<Block>(maximum, warp_sums, &inv_shared);
+        const float inverse = a8_inverse_scale(scale);
+        auto* code_pairs    = reinterpret_cast<std::uint16_t*>(codes);
+#pragma unroll
+        for (int k = 0; k < MaxPairsPerThread; ++k) {
+            if (k < pairs_per_thread) {
+                code_pairs[row_base + threadIdx.x + k * Block] = a8_encode_pair(values[k], inverse);
+            }
+        }
+        if (threadIdx.x == 0) { scales[row] = scale; }
+    }
+}
+
+template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread,
+          RmsOutput Output = RmsOutput::Bf16>
+__launch_bounds__(Block) __global__
+    void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                   const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
+                                   std::int64_t rows, float eps, std::uint8_t* codes = nullptr,
+                                   float* scales = nullptr) {
+    rmsnorm_cta_bf16x2_body<Epilogue, Block, MaxPairsPerThread, Output>(x, weight, z, out, d, rows,
+                                                                        eps, codes, scales);
+}
+
+// Implements: include/ninfer/ops/gated_rmsnorm.h (gated_rmsnorm_a4)
+// Match: contiguous 16-byte aligned BF16 x/z [HeadDim, Heads, T]. Publishes only the NVFP4
+// activation of the BF16 output as a [HeadDim * Heads, T] column per token. One warp owns one head
+// row (rmsnorm_warp_row, so the values equal gated_rmsnorm's): lane l holds pairs l + 32k, so each
+// 16-value group's eight pairs sit in eight consecutive lanes and the per-k guard is uniform
+// across the warp. The grid covers exactly round_up(T, 16) * Heads rows; warps of rows past
+// T * Heads write their head's zero scales. No shared memory or block barriers.
+template <int HeadDim, int Heads, int Block>
+__launch_bounds__(Block) __global__
+    void gated_rmsnorm_a4_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                 const __nv_bfloat162* z, std::int32_t tokens, float eps,
+                                 std::uint8_t* codes, std::uint8_t* scales,
+                                 float input_scale_divisor) {
+    static_assert(Block % kWarpSize == 0 && HeadDim % 16 == 0);
+    static_assert(HeadDim / 2 <= kRmsWarpMaxPairsPerLane * kWarpSize);
+    constexpr int kRows          = HeadDim * Heads;
+    constexpr int kPairs         = HeadDim / 2;
+    constexpr int kWarpsPerBlock = Block / kWarpSize;
+    const int lane               = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int row =
+        static_cast<int>(blockIdx.x) * kWarpsPerBlock + static_cast<int>(threadIdx.x) / kWarpSize;
+    const int token = row / Heads;
+    const int head  = row - token * Heads;
+    // The dependency also protects padding stores in caller-owned activation storage.
+    pdl::wait_for_dependencies();
+    if (token >= tokens) {
+        if (token < (tokens + 15) / 16 * 16 && lane < HeadDim / 16) {
+            scales[a4_scale_offset<kRows / 16>(token, head * (HeadDim / 16) + lane)] = 0;
+        }
+        return;
+    }
+    const std::int64_t row_base = static_cast<std::int64_t>(row) * kPairs;
+    __nv_bfloat162 normalized[kRmsWarpMaxPairsPerLane];
+    rmsnorm_warp_row<RmsEpilogue::Gated>(x + row_base, weight, z + row_base, HeadDim, eps, lane,
+                                         normalized);
+#pragma unroll
+    for (int k = 0; k < kRmsWarpMaxPairsPerLane; ++k) {
+        if (k * kWarpSize < kPairs) {
+            a4_publish_pair<kRows>(codes, scales, input_scale_divisor, token,
+                                   head * kPairs + lane + k * kWarpSize, normalized[k]);
+        }
+    }
+}
+
+// Unit-offset RMSNorm of D = A4Rows publishing the NVFP4 activation of its BF16 output, and that
+// BF16 output too when Output is Bf16AndA4. CTA r < rows normalizes row r; the grid extends to the
+// next multiple of 16 rows, and those padding CTAs write the zero scales of their token and return
+// before any block barrier.
+template <int Block, int MaxPairsPerThread, int A4Rows, RmsOutput Output>
+__launch_bounds__(Block) __global__
+    void rmsnorm_a4_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                           __nv_bfloat162* out, std::int64_t rows, float eps, std::uint8_t* codes,
+                           std::uint8_t* scales, float input_scale_divisor) {
+    static_assert(Output == RmsOutput::A4 || Output == RmsOutput::Bf16AndA4);
+    // Wait before both represented input reads and writes to reused padding storage.
+    pdl::wait_for_dependencies();
+    if (static_cast<std::int64_t>(blockIdx.x) >= rows) {
+        a4_zero_scales<A4Rows>(scales, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x),
+                               Block);
+        return;
+    }
+    rmsnorm_cta_bf16x2_body<RmsEpilogue::Offset, Block, MaxPairsPerThread, Output, A4Rows>(
+        x, weight, nullptr, out, A4Rows, rows, eps, codes, nullptr, scales, input_scale_divisor);
 }
 
 // Implements: include/ninfer/ops/rmsnorm.h
@@ -220,10 +426,9 @@ __launch_bounds__(512) __global__
 // Functional fallback outside the aligned fast domains. It intentionally favors a simple complete
 // implementation over another family of shape-specific paths.
 template <RmsEpilogue Epilogue>
-__launch_bounds__(256) __global__
-    void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
-                                std::int64_t rows, float eps) {
+__device__ __forceinline__ void
+rmsnorm_generic_body(const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* z,
+                     __nv_bfloat16* out, std::int32_t d, std::int64_t rows, float eps) {
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 
@@ -251,6 +456,14 @@ __launch_bounds__(256) __global__
         if constexpr (Epilogue == RmsEpilogue::Gated) { zv = __bfloat162float(z[index]); }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
     }
+}
+
+template <RmsEpilogue Epilogue>
+__launch_bounds__(256) __global__
+    void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
+                                std::int64_t rows, float eps) {
+    rmsnorm_generic_body<Epilogue>(x, weight, z, out, d, rows, eps);
 }
 
 } // namespace ninfer::ops

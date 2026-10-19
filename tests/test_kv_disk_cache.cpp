@@ -5,6 +5,7 @@
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 #include "cuda_stream_gate.h"
+#include "rewrite_state_host_image.h"
 #include "targets/qwen3_6/impl/runtime/kv_disk_cache.h"
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -32,6 +33,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/file.h>
 #include <thread>
 #include <tuple>
@@ -43,13 +45,18 @@
 thread_local bool fail_disk_caller_allocations = false;
 std::atomic<std::size_t> denied_disk_caller_allocations{0};
 std::atomic<std::size_t> publication_guard_entries{0};
-thread_local bool fail_next_disk_allocation = false;
+thread_local bool fail_next_disk_allocation         = false;
 thread_local int startup_allocations_before_failure = -1;
 std::atomic<unsigned> startup_allocation_failures{0};
+
 void* operator new(std::size_t bytes) {
-    if (startup_allocations_before_failure >= 0 && startup_allocations_before_failure-- == 0) {
-        startup_allocation_failures.fetch_add(1, std::memory_order_release);
-        throw std::bad_alloc();
+    if (startup_allocations_before_failure >= 0) {
+        const bool fail_this_allocation = startup_allocations_before_failure == 0;
+        --startup_allocations_before_failure;
+        if (fail_this_allocation) {
+            startup_allocation_failures.fetch_add(1, std::memory_order_release);
+            throw std::bad_alloc();
+        }
     }
     if (std::exchange(fail_next_disk_allocation, false)) { throw std::bad_alloc(); }
     if (fail_disk_caller_allocations) {
@@ -59,11 +66,24 @@ void* operator new(std::size_t bytes) {
     if (void* p = std::malloc(bytes == 0 ? 1 : bytes)) { return p; }
     throw std::bad_alloc();
 }
+
 void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+
+// The replacement operator new above allocates with malloc, so free is the matching release.
+// GCC 13 still pairs a std::allocator call to the replaceable operator new with this body once
+// it is inlined, and reports a malloc/new mismatch that cannot occur.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+
 void operator delete(void* p) noexcept { std::free(p); }
+
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+
 void operator delete[](void* p) noexcept { std::free(p); }
+
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+
+#pragma GCC diagnostic pop
 
 namespace {
 
@@ -75,6 +95,69 @@ int fail(const char* message) {
     return 1;
 }
 
+// The FIFO-oldest entry that is neither claimed nor I/O-pinned: the victim production reads
+// from unpinned_ids().
+std::optional<std::uint64_t>
+oldest_unpinned(const ninfer::targets::qwen3_6::detail::KVRamCache& cache) {
+    const auto ids = cache.unpinned_ids();
+    if (ids.empty()) { return std::nullopt; }
+    return ids.front();
+}
+
+// Owning, direct-I/O aligned images for every checkpoint slot load_host advertises, in the
+// caller-sized layout the Program's pool heads use.
+struct DecodedCheckpointImage {
+    std::uint32_t frontier = 0;
+    q36::detail::PrefixHash128 hash{};
+    q36::detail::ContextCheckpointKind kind = q36::detail::ContextCheckpointKind::Ladder;
+    std::shared_ptr<ninfer::PinnedHostBuffer> conv;
+    std::shared_ptr<ninfer::PinnedHostBuffer> recurrent;
+    std::shared_ptr<ninfer::PinnedHostBuffer> hidden;
+    std::shared_ptr<ninfer::PinnedHostBuffer> dflash;
+};
+
+struct CheckpointImageBytes {
+    std::size_t conv      = 0;
+    std::size_t recurrent = 0;
+    std::size_t hidden    = 0;
+    std::size_t dflash    = 0;
+};
+
+std::optional<std::vector<DecodedCheckpointImage>>
+decode_checkpoint_images(q36::detail::KVDiskCache& disk, const q36::detail::DiskRestoredHost& host,
+                         CheckpointImageBytes bytes) {
+    const auto buffer = [](std::size_t n) -> std::shared_ptr<ninfer::PinnedHostBuffer> {
+        if (n == 0) { return nullptr; }
+        return std::make_shared<ninfer::PinnedHostBuffer>(n, q36::detail::kDiskPageIoAlignment);
+    };
+    const auto data = [](const std::shared_ptr<ninfer::PinnedHostBuffer>& image) {
+        return image ? image->data() : nullptr;
+    };
+    std::vector<DecodedCheckpointImage> images;
+    std::vector<q36::detail::DiskCheckpointImageTarget> targets;
+    for (const auto& ladder : host.ladders) {
+        DecodedCheckpointImage image{
+            ladder.frontier,         ladder.hash,          ladder.kind,         buffer(bytes.conv),
+            buffer(bytes.recurrent), buffer(bytes.hidden), buffer(bytes.dflash)};
+        targets.push_back(q36::detail::DiskCheckpointImageTarget{
+            .frontier        = image.frontier,
+            .hash            = image.hash,
+            .kind            = image.kind,
+            .conv            = data(image.conv),
+            .conv_bytes      = bytes.conv,
+            .recurrent       = data(image.recurrent),
+            .recurrent_bytes = bytes.recurrent,
+            .hidden          = data(image.hidden),
+            .hidden_bytes    = bytes.hidden,
+            .dflash          = data(image.dflash),
+            .dflash_bytes    = bytes.dflash,
+        });
+        images.push_back(std::move(image));
+    }
+    if (!disk.populate_checkpoint_images(host.disk_entry_id, targets)) { return std::nullopt; }
+    return images;
+}
+
 struct PackedObjectLocation {
     fs::path path;
     std::uint64_t offset = 0;
@@ -82,9 +165,8 @@ struct PackedObjectLocation {
     std::uint64_t stored = 0;
 };
 
-std::optional<PackedObjectLocation> packed_object_location(const fs::path& root,
-                                                           q36::detail::DiskObjectKind kind,
-                                                           std::uint64_t id) {
+std::optional<PackedObjectLocation>
+packed_object_location(const fs::path& root, q36::detail::DiskObjectKind kind, std::uint64_t id) {
     const auto bytes = [&]() -> std::vector<std::uint8_t> {
         std::ifstream in(root / "PACKSET", std::ios::binary);
         std::vector<std::uint8_t> out((std::istreambuf_iterator<char>(in)), {});
@@ -102,12 +184,12 @@ std::optional<PackedObjectLocation> packed_object_location(const fs::path& root,
         std::memcpy(&stored, payload.data() + 32, sizeof(stored));
         char name[32]{};
         std::snprintf(name, sizeof(name), "%08u.pack", segment);
-        const char* dir = kind == q36::detail::DiskObjectKind::Main ? "main" :
-                          kind == q36::detail::DiskObjectKind::Backend ? "backend" :
-                          kind == q36::detail::DiskObjectKind::State ? "state" :
-                          kind == q36::detail::DiskObjectKind::Ledger ? "ledger" : "identity";
-        return PackedObjectLocation{root / "packs" / std::to_string(generation) / dir / name,
-                                    offset, extent, stored};
+        const char* dir = kind == q36::detail::DiskObjectKind::Main      ? "main"
+                          : kind == q36::detail::DiskObjectKind::Backend ? "backend"
+                          : kind == q36::detail::DiskObjectKind::State   ? "state"
+                          : kind == q36::detail::DiskObjectKind::Ledger  ? "ledger"
+                                                                         : "identity";
+        return PackedObjectLocation{root / "packs" / "1" / dir / name, offset, extent, stored};
     };
     std::optional<PackedObjectLocation> found;
     std::ifstream base(root / "maps" / ("objects-" + std::to_string(generation) + ".base"),
@@ -139,8 +221,8 @@ std::optional<PackedObjectLocation> packed_object_location(const fs::path& root,
         in.read(reinterpret_cast<char*>(frame_payload.data()), frame_payload.size());
         in.read(reinterpret_cast<char*>(&crc), sizeof(crc));
         if (!in) { return found; }
-        if (frame_payload[0] != 1 || frame_payload[1] != 0 || frame_payload[2] != 0 ||
-            frame_payload[3] != 0) {
+        if ((frame_payload[0] != 1 && frame_payload[0] != 2 && frame_payload[0] != 3) ||
+            frame_payload[1] != 0 || frame_payload[2] != 0 || frame_payload[3] != 0) {
             return std::nullopt;
         }
         std::array<std::uint8_t, 52> payload{};
@@ -148,12 +230,16 @@ std::optional<PackedObjectLocation> packed_object_location(const fs::path& root,
         std::uint64_t seen = 0;
         std::memcpy(&seen, payload.data(), sizeof(seen));
         if (seen != id || payload[8] != static_cast<std::uint8_t>(kind)) { continue; }
-        found = location_from_payload(payload);
+        if (frame_payload[0] == 2) {
+            found.reset();
+        } else {
+            found = location_from_payload(payload);
+        }
     }
 }
 
-bool packed_read_prefix(const fs::path& root, q36::detail::DiskObjectKind kind,
-                        std::uint64_t id, void* dst, std::size_t bytes) {
+bool packed_read_prefix(const fs::path& root, q36::detail::DiskObjectKind kind, std::uint64_t id,
+                        void* dst, std::size_t bytes) {
     const auto loc = packed_object_location(root, kind, id);
     if (!loc || bytes > loc->stored) { return false; }
     std::ifstream in(loc->path, std::ios::binary);
@@ -162,14 +248,14 @@ bool packed_read_prefix(const fs::path& root, q36::detail::DiskObjectKind kind,
     return static_cast<bool>(in);
 }
 
-bool packed_write_prefix(const fs::path& root, q36::detail::DiskObjectKind kind,
-                         std::uint64_t id, const void* src, std::size_t bytes) {
+bool packed_write_prefix(const fs::path& root, q36::detail::DiskObjectKind kind, std::uint64_t id,
+                         const void* src, std::size_t bytes) {
     const auto loc = packed_object_location(root, kind, id);
     if (!loc || bytes > loc->extent) { return false; }
     const int fd = ::open(loc->path.c_str(), O_WRONLY);
     if (fd < 0) { return false; }
     const ssize_t written = ::pwrite(fd, src, bytes, static_cast<off_t>(loc->offset));
-    const bool ok = written == static_cast<ssize_t>(bytes) && ::fsync(fd) == 0;
+    const bool ok         = written == static_cast<ssize_t>(bytes) && ::fsync(fd) == 0;
     ::close(fd);
     return ok;
 }
@@ -180,9 +266,8 @@ bool packed_write_at(const fs::path& root, q36::detail::DiskObjectKind kind, std
     if (!loc || relative > loc->extent || bytes > loc->extent - relative) { return false; }
     const int fd = ::open(loc->path.c_str(), O_WRONLY);
     if (fd < 0) { return false; }
-    const ssize_t written = ::pwrite(fd, src, bytes,
-                                     static_cast<off_t>(loc->offset + relative));
-    const bool ok = written == static_cast<ssize_t>(bytes) && ::fsync(fd) == 0;
+    const ssize_t written = ::pwrite(fd, src, bytes, static_cast<off_t>(loc->offset + relative));
+    const bool ok         = written == static_cast<ssize_t>(bytes) && ::fsync(fd) == 0;
     ::close(fd);
     return ok;
 }
@@ -299,11 +384,15 @@ std::optional<std::uint64_t> capture_or_evict(q36::detail::KVRamCache& cache,
         if (result.status == ninfer::targets::qwen3_6::detail::RamCaptureStatus::Dropped) {
             return std::nullopt;
         }
-        const auto victim = cache.peek_oldest_unpinned();
+        // The blocking caller's policy: a victim's block is reusable once its copies land,
+        // and a retired block once its fence completes.
+        const auto victim = oldest_unpinned(cache);
         if (!victim) {
+            if (cache.wait_retired_copies()) { continue; }
             cache.record_drop();
             return std::nullopt;
         }
+        cache.wait_entry_copies(*victim);
         cache.evict_one_unpinned(*victim);
     }
 }
@@ -315,28 +404,35 @@ void fill_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
     for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
         const ninfer::Tensor& tensor = pool.plane(plane);
         std::vector<unsigned char> host(tensor.bytes(), 0);
-        CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
         for (std::size_t i = 0; i < pages.size(); ++i) {
             const unsigned char value =
                 static_cast<unsigned char>(seed + plane * 17U + static_cast<unsigned>(i) + 1U);
             if (order == ninfer::PagedKVPlaneOrder::PageMajor) {
                 const std::size_t begin = static_cast<std::size_t>(pages[i] * tensor.nb[3]);
-                std::memset(host.data() + begin, value, static_cast<std::size_t>(tensor.nb[3]));
+                std::fill(host.begin() + static_cast<std::ptrdiff_t>(begin),
+                          host.begin() + static_cast<std::ptrdiff_t>(begin + tensor.nb[3]), value);
+                CUDA_CHECK(cudaMemcpy(static_cast<unsigned char*>(tensor.data) + begin,
+                                      host.data() + begin, tensor.nb[3], cudaMemcpyHostToDevice));
             } else {
-                for (std::int64_t head = 0; head < tensor.ne[3]; ++head) {
+                for (std::int32_t head = 0; head < tensor.ne[3]; ++head) {
                     const std::size_t begin =
-                        static_cast<std::size_t>(pages[i]) * static_cast<std::size_t>(tensor.nb[2]) +
-                        static_cast<std::size_t>(head) * static_cast<std::size_t>(tensor.nb[3]);
-                    std::memset(host.data() + begin, value, static_cast<std::size_t>(tensor.nb[2]));
+                        static_cast<std::size_t>(head * tensor.nb[3] + pages[i] * tensor.nb[2]);
+                    std::fill(host.begin() + static_cast<std::ptrdiff_t>(begin),
+                              host.begin() + static_cast<std::ptrdiff_t>(begin + tensor.nb[2]),
+                              static_cast<unsigned char>(value + static_cast<unsigned>(head)));
+                    CUDA_CHECK(cudaMemcpy(static_cast<unsigned char*>(tensor.data) + begin,
+                                          host.data() + begin, tensor.nb[2],
+                                          cudaMemcpyHostToDevice));
                 }
             }
         }
-        CUDA_CHECK(cudaMemcpy(tensor.data, host.data(), host.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 }
 
 struct TmpDir {
     fs::path path;
+
     explicit TmpDir(const char* tag) {
         static std::uint32_t seq = 0;
         path = fs::temp_directory_path() / ("ninfer-kv-disk-" + std::to_string(::getpid()) + "-" +
@@ -344,18 +440,21 @@ struct TmpDir {
         fs::remove_all(path);
         fs::create_directories(path);
     }
+
     ~TmpDir() {
         std::error_code ec;
         fs::remove_all(path, ec);
     }
+
     TmpDir(const TmpDir&)            = delete;
     TmpDir& operator=(const TmpDir&) = delete;
 };
 
 q36::detail::RamCaptureSource make_source(q36::PreparedPromptData& retained,
                                           q36::detail::ResidentPrefixIdentity& identity,
-                                          ninfer::PagedKVAllocation& alloc, ninfer::PagedKVPool& pool,
-                                          cudaStream_t stream, std::uint32_t execution_frontier) {
+                                          ninfer::PagedKVAllocation& alloc,
+                                          ninfer::PagedKVPool& pool, cudaStream_t stream,
+                                          std::uint32_t execution_frontier) {
     retained.token_types.assign(retained.token_ids.size(), 0);
     const std::size_t tokens = retained.token_ids.size();
     retained.positions.resize(3 * tokens);
@@ -373,9 +472,8 @@ q36::detail::RamCaptureSource make_source(q36::PreparedPromptData& retained,
     source.tail_hidden_valid  = true;
     source.ledger             = retained.token_ids;
     source.identity           = &identity;
-    source.hash_f =
-        q36::detail::prefix_hash_at(retained.token_ids, identity, execution_frontier);
-    source.text      = &alloc;
+    source.hash_f = q36::detail::prefix_hash_at(retained.token_ids, identity, execution_frontier);
+    source.text   = &alloc;
     source.text_pool = &pool;
     source.stream    = stream;
     return source;
@@ -398,8 +496,7 @@ std::uint64_t capture_tokens(q36::detail::KVRamCache& ram, ninfer::PagedKVPool& 
 }
 
 std::uint64_t capture_prepared_prompt(q36::detail::KVRamCache& ram, ninfer::PagedKVPool& pool,
-                                      ninfer::PagedKVAllocation& alloc,
-                                      ninfer::DeviceContext& ctx,
+                                      ninfer::PagedKVAllocation& alloc, ninfer::DeviceContext& ctx,
                                       const q36::PreparedPromptData& prompt) {
     const std::size_t tokens = prompt.token_ids.size();
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
@@ -426,8 +523,8 @@ std::uint64_t capture_prepared_prompt(q36::detail::KVRamCache& ram, ninfer::Page
     source.tail_hidden_valid  = true;
     source.ledger             = retained.token_ids;
     source.identity           = &identity;
-    source.hash_f = q36::detail::prefix_hash_at(retained.token_ids, identity,
-                                                 source.execution_frontier);
+    source.hash_f =
+        q36::detail::prefix_hash_at(retained.token_ids, identity, source.execution_frontier);
     source.text      = &alloc;
     source.text_pool = &pool;
     source.stream    = ctx.copy_stream;
@@ -439,15 +536,15 @@ std::uint64_t capture_prepared_prompt(q36::detail::KVRamCache& ram, ninfer::Page
 }
 
 std::uint64_t capture_tokens_hidden(q36::detail::KVRamCache& ram, ninfer::PagedKVPool& pool,
-                                      ninfer::PagedKVAllocation& alloc, ninfer::DeviceContext& ctx,
-                                      const std::vector<ninfer::TokenId>& prompt_tokens,
-                                      ninfer::Tensor& hidden) {
+                                    ninfer::PagedKVAllocation& alloc, ninfer::DeviceContext& ctx,
+                                    const std::vector<ninfer::TokenId>& prompt_tokens,
+                                    ninfer::Tensor& hidden) {
     auto prompt   = text_prompt(prompt_tokens);
     auto retained = prompt;
     retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity;
-    auto source = make_source(retained, identity, alloc, pool, ctx.copy_stream,
-                               static_cast<std::uint32_t>(prompt_tokens.size()));
+    auto source        = make_source(retained, identity, alloc, pool, ctx.copy_stream,
+                                     static_cast<std::uint32_t>(prompt_tokens.size()));
     source.tail_hidden = &hidden;
     auto id            = capture_or_evict(ram, source);
     if (!id) { throw std::runtime_error("RAM capture failed"); }
@@ -465,6 +562,52 @@ bool wait_pred(Pred pred, std::chrono::milliseconds limit) {
     return pred();
 }
 
+// Holds one unlocked disk-I/O window open, and releases it from a watchdog if a call under
+// test blocks on the held window instead of returning, so a regression fails instead of
+// hanging.
+struct UnlockedIoHold {
+    q36::detail::KVDiskCache& disk;
+    q36::detail::DiskUnlockedIo window;
+    std::atomic<bool> done{false};
+    std::atomic<bool> fired{false};
+    std::jthread watchdog;
+
+    UnlockedIoHold(q36::detail::KVDiskCache& cache, q36::detail::DiskUnlockedIo held)
+        : disk(cache), window(held) {
+        disk.test_hold_unlocked_io(window, true);
+    }
+
+    bool entered() const {
+        return wait_pred([&] { return disk.test_unlocked_io_entered(window); },
+                         std::chrono::seconds(10));
+    }
+
+    void arm() {
+        if (watchdog.joinable()) { watchdog.join(); }
+        done.store(false);
+        watchdog = std::jthread([this] {
+            if (!wait_pred([&] { return done.load(); }, std::chrono::seconds(10))) {
+                fired.store(true);
+                disk.test_hold_unlocked_io(window, false);
+            }
+        });
+    }
+
+    // True when every armed call returned while the window was still held.
+    bool disarm() {
+        done.store(true);
+        if (watchdog.joinable()) { watchdog.join(); }
+        return !fired.load();
+    }
+
+    void release() { disk.test_hold_unlocked_io(window, false); }
+
+    ~UnlockedIoHold() {
+        done.store(true);
+        release();
+    }
+};
+
 // Keep executor mutations serial while opening a dequeued worker gate only
 // after cancellation has invalidated that job's generation.
 void cancel_restore_releasing_dequeued_job(q36::detail::KVDiskCache& disk) {
@@ -481,9 +624,9 @@ q36::detail::DiskOpenConfig
 disk_config(const fs::path& location, q36::detail::KVRamCache& ram, ninfer::PagedKVPool& text,
             const ninfer::PagedKVPool* backend, ninfer::SpeculativeBackend speculative,
             std::size_t capacity, std::uint32_t max_context,
-            ninfer::KvDiskCompress compress = ninfer::KvDiskCompress::Off,
+            ninfer::KvDiskCompress compress             = ninfer::KvDiskCompress::Off,
             const ninfer::LinearAttentionStatePool* gdn = nullptr,
-            const ninfer::CyclicKVCache* cyclic = nullptr) {
+            const ninfer::CyclicKVCache* cyclic         = nullptr) {
     q36::detail::DiskOpenConfig cfg;
     cfg.location       = location;
     cfg.capacity_bytes = capacity;
@@ -491,23 +634,14 @@ disk_config(const fs::path& location, q36::detail::KVRamCache& ram, ninfer::Page
     cfg.max_context    = max_context;
     cfg.ram            = &ram;
     cfg.fingerprint    = q36::detail::make_disk_fingerprint(
-        "qwen3.6-27b", "groupwise-int", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64, speculative, text,
-        backend, gdn, cyclic);
+        "qwen3.6-27b", "groupwise-int", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
+        speculative, text, backend, gdn, cyclic);
     cfg.text_pool          = &text;
     cfg.backend_pool       = backend;
     cfg.logical_page_bytes = ninfer::paged_kv_logical_page_bytes(text);
     if (backend != nullptr) {
         cfg.logical_page_bytes =
             std::max(cfg.logical_page_bytes, ninfer::paged_kv_logical_page_bytes(*backend));
-    }
-    cfg.gdn_staging_bytes = 256;
-    if (gdn != nullptr) {
-        cfg.gdn_staging_bytes =
-            std::max(cfg.gdn_staging_bytes,
-                     gdn->conv_host_image_bytes() + gdn->recurrent_host_image_bytes());
-    }
-    if (cyclic != nullptr) {
-        cfg.gdn_staging_bytes = std::max(cfg.gdn_staging_bytes, cyclic->lane_host_bytes());
     }
     return cfg;
 }
@@ -538,9 +672,9 @@ int wait_restore_bounded(q36::detail::KVDiskCache& disk, ninfer::DeviceContext& 
 }
 
 int claim_and_restore_match(q36::detail::KVDiskCache& disk, ninfer::DeviceContext& ctx,
-                             ninfer::PagedKVPool& pool, const q36::detail::DiskMatch& match,
-                             std::uint32_t text_dst_pages, const char* claim_fail,
-                             const char* hung) {
+                            ninfer::PagedKVPool& pool, const q36::detail::DiskMatch& match,
+                            std::uint32_t text_dst_pages, const char* claim_fail,
+                            const char* hung) {
     if (!disk.claim(match.entry_id, match.hash_f, match.execution_frontier)) {
         return fail(claim_fail);
     }
@@ -571,10 +705,10 @@ int claim_and_restore_match(q36::detail::KVDiskCache& disk, ninfer::DeviceContex
 
 int test_gather_both_orders(ninfer::DeviceContext& ctx) {
     int failures = 0;
-    for (auto order : {ninfer::PagedKVPlaneOrder::PageMajor, ninfer::PagedKVPlaneOrder::HeadMajor}) {
-        auto plan = plan_paged_cache(6, 6, 2,
-                                     {{ninfer::DType::I8, 64, 2}, {ninfer::DType::FP16, 1, 2}},
-                                     order);
+    for (auto order :
+         {ninfer::PagedKVPlaneOrder::PageMajor, ninfer::PagedKVPlaneOrder::HeadMajor}) {
+        auto plan = plan_paged_cache(
+            6, 6, 2, {{ninfer::DType::I8, 64, 2}, {ninfer::DType::FP16, 1, 2}}, order);
         ninfer::DeviceArena arena(plan.bytes);
         ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
         auto alloc = pool.reserve(4);
@@ -628,7 +762,7 @@ int test_batch_page_unpack(ninfer::DeviceContext& ctx) {
     fill_logical_pages(pool, src, 19);
     ctx.synchronize_all();
     const std::size_t page_bytes = ninfer::paged_kv_logical_page_bytes(pool);
-    auto dest = pool.reserve(3);
+    auto dest                    = pool.reserve(3);
     dest.materialize_pages(3, ctx.stream);
     for (std::uint32_t i = 0; i < 3; ++i) {
         std::vector<unsigned char> packed(page_bytes);
@@ -651,8 +785,8 @@ int test_batch_page_unpack(ninfer::DeviceContext& ctx) {
 }
 
 int test_device_scatter_page_unpack(ninfer::DeviceContext& ctx) {
-    for (auto order : {ninfer::PagedKVPlaneOrder::PageMajor,
-                       ninfer::PagedKVPlaneOrder::HeadMajor}) {
+    for (auto order :
+         {ninfer::PagedKVPlaneOrder::PageMajor, ninfer::PagedKVPlaneOrder::HeadMajor}) {
         auto layout = plan_paged_cache(12, 6, 2,
                                        {{ninfer::DType::I8, 64, 2},
                                         {ninfer::DType::I8, 64, 2},
@@ -724,16 +858,16 @@ int test_lock_and_fingerprint(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
         threw = std::string(e.what()).find("model_id") != std::string::npos;
     }
     if (!threw) { return fail("fingerprint mismatch did not name model_id"); }
-    cfg.fingerprint.model_id = "qwen3.6-27b";
-    cfg.fingerprint.artifact_file_identity = "different-file-same-model-and-weights";
-    threw = false;
+    cfg.fingerprint.model_id                 = "qwen3.6-27b";
+    cfg.fingerprint.artifact_tensor_identity = "different-file-same-model-and-weights";
+    threw                                    = false;
     try {
         q36::detail::KVDiskCache mismatch(cfg);
     } catch (const std::runtime_error& e) {
-        threw = std::string(e.what()).find("artifact_file_identity") != std::string::npos;
+        threw = std::string(e.what()).find("artifact_tensor_identity") != std::string::npos;
     }
     if (!threw) { return fail("same-profile different artifact reused the disk cache"); }
-    cfg.fingerprint.artifact_file_identity = "disk-test-artifact";
+    cfg.fingerprint.artifact_tensor_identity = "disk-test-artifact";
     { q36::detail::KVDiskCache unchanged(cfg); }
     (void)ctx;
     return 0;
@@ -744,10 +878,8 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
                                                      const char* tag) {
     TmpDir dir(tag);
     const std::vector<ninfer::PagedKVPlaneSpec> nvfp4_planes = {
-        {ninfer::DType::U8, 128, 4},
-        {ninfer::DType::U8, 128, 4},
-        {ninfer::DType::FP8_E4M3FN, 16, 4},
-        {ninfer::DType::FP8_E4M3FN, 16, 4},
+        {ninfer::DType::U8, 128, 4},        {ninfer::DType::U8, 128, 4},
+        {ninfer::DType::FP8_E4M3FN, 16, 4}, {ninfer::DType::FP8_E4M3FN, 16, 4},
         {ninfer::DType::FP32, 4, 4},
     };
     auto source_plan = plan_paged_cache(18, 12, 2, nvfp4_planes, order);
@@ -761,9 +893,8 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
     source.materialize_pages(1, ctx.stream);
 
     std::vector<std::uint8_t> expected(ninfer::paged_kv_logical_page_bytes(source_pool));
-    std::uint64_t pattern = order == ninfer::PagedKVPlaneOrder::PageMajor
-                                ? 0x42e7a1c95b3d680fULL
-                                : 0xd19f307a84c26e5bULL;
+    std::uint64_t pattern = order == ninfer::PagedKVPlaneOrder::PageMajor ? 0x42e7a1c95b3d680fULL
+                                                                          : 0xd19f307a84c26e5bULL;
     for (std::uint8_t& byte : expected) {
         pattern ^= pattern >> 12;
         pattern ^= pattern << 25;
@@ -784,16 +915,16 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
 
     auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 17));
     for (std::size_t token = 16; token < 20; ++token) {
-        prompt.token_types[token] = 1;
-        prompt.positions[64 + token] = static_cast<std::int32_t>(token - 16);
+        prompt.token_types[token]     = 1;
+        prompt.positions[64 + token]  = static_cast<std::int32_t>(token - 16);
         prompt.positions[128 + token] = static_cast<std::int32_t>(token % 4);
     }
     q36::VisionItem item;
-    item.modality      = q36::PromptModality::Image;
-    item.grid          = {.temporal = 1, .height = 4, .width = 4};
-    item.patch_begin   = 0;
-    item.patch_count   = 16;
-    item.token_spans   = {{.begin = 16, .count = 4}};
+    item.modality    = q36::PromptModality::Image;
+    item.grid        = {.temporal = 1, .height = 4, .width = 4};
+    item.patch_begin = 0;
+    item.patch_count = 16;
+    item.token_spans = {{.begin = 16, .count = 4}};
     item.content_digest.fill(0xa5);
     prompt.vision_items.push_back(item);
     prompt.prepare.media_items   = 1;
@@ -802,8 +933,8 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
     (void)q36::build_vision_control(prompt);
 
     const auto ram_id = capture_prepared_prompt(source_ram, source_pool, source, ctx, prompt);
-    auto source_cfg = disk_config(dir.path, source_ram, source_pool, nullptr,
-                                  ninfer::SpeculativeBackend::None, 32ULL << 20, 4096);
+    auto source_cfg   = disk_config(dir.path, source_ram, source_pool, nullptr,
+                                    ninfer::SpeculativeBackend::None, 32ULL << 20, 4096);
     source_cfg.fingerprint.model_id   = "qwen3.8-27b";
     source_cfg.fingerprint.weights_id = "nvfp4";
     source_cfg.fingerprint.kv_cache   = ninfer::KvCacheStorage::Nvfp4;
@@ -847,8 +978,8 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
 
         auto changed_media = prompt;
         changed_media.vision_items[0].content_digest[0] ^= 0xff;
-        const auto changed = reopened.plan_match(changed_media,
-                                                 q36::detail::prefix_hash_chain(changed_media));
+        const auto changed =
+            reopened.plan_match(changed_media, q36::detail::prefix_hash_chain(changed_media));
         if (changed && changed->reuse_base > item.token_spans.front().begin) {
             source.release();
             return fail("Vision disk identity reused beyond changed media content");
@@ -860,8 +991,7 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
         }
         auto destination = target_pool.reserve(2);
         destination.materialize_pages(1, ctx.stream);
-        if (destination.page_ids()[0] == 0 ||
-            destination.page_ids()[0] == source.page_ids()[0]) {
+        if (destination.page_ids()[0] == 0 || destination.page_ids()[0] == source.page_ids()[0]) {
             reopened.release(match->entry_id);
             destination.release();
             source.release();
@@ -874,8 +1004,8 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
         target.stream         = ctx.copy_stream;
         reopened.restore_device(match->entry_id, target);
         try {
-            if (const int rc = wait_restore_bounded(reopened, ctx,
-                                                     "Vision capacity-change restore hung");
+            if (const int rc =
+                    wait_restore_bounded(reopened, ctx, "Vision capacity-change restore hung");
                 rc != 0) {
                 reopened.release(match->entry_id);
                 destination.release();
@@ -903,10 +1033,9 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
         }
     }
 
-    auto incompatible_planes = nvfp4_planes;
+    auto incompatible_planes              = nvfp4_planes;
     incompatible_planes[0].leading_extent = 64;
-    auto incompatible_plan =
-        plan_paged_cache(12, 9, 3, std::move(incompatible_planes), order);
+    auto incompatible_plan = plan_paged_cache(12, 9, 3, std::move(incompatible_planes), order);
     ninfer::DeviceArena incompatible_arena(incompatible_plan.bytes);
     ninfer::PagedKVPool incompatible_pool(
         {incompatible_arena.base(), incompatible_arena.capacity()}, incompatible_plan.layout);
@@ -915,7 +1044,7 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
     incompatible_cfg.fingerprint.model_id   = "qwen3.8-27b";
     incompatible_cfg.fingerprint.weights_id = "nvfp4";
     incompatible_cfg.fingerprint.kv_cache   = ninfer::KvCacheStorage::Nvfp4;
-    bool rejected = false;
+    bool rejected                           = false;
     try {
         q36::detail::KVDiskCache incompatible(incompatible_cfg);
     } catch (const std::runtime_error& e) {
@@ -923,6 +1052,45 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
     }
     source.release();
     if (!rejected) { return fail("disk cache accepted an incompatible logical plane schema"); }
+    for (const std::string_view setting : {"sage_attn", "keep_frac", "xattn_tau"}) {
+        auto changed = target_cfg;
+        if (setting == "sage_attn") {
+            changed.fingerprint.attention.sage_attn = true;
+        } else if (setting == "keep_frac") {
+            changed.fingerprint.attention.keep_frac = 0.5f;
+        } else {
+            changed.fingerprint.attention.xattn_tau = 0.9f;
+        }
+        rejected = false;
+        try {
+            q36::detail::KVDiskCache incompatible(changed);
+        } catch (const std::runtime_error& error) {
+            rejected = std::string_view(error.what()).find(setting) != std::string_view::npos;
+        }
+        if (!rejected) { return fail("disk cache accepted a changed attention profile"); }
+        // Equal nondefault profiles must also survive serialization and reopen.
+        TmpDir profile_dir("attention-profile");
+        changed.location = profile_dir.path;
+        { q36::detail::KVDiskCache first(changed); }
+        { q36::detail::KVDiskCache reopened(changed); }
+    }
+    auto inactive                                = target_cfg;
+    inactive.fingerprint.attention.xattn_min_len = 0;
+    { q36::detail::KVDiskCache reopened(inactive); }
+    TmpDir xattn_dir("xattn-threshold");
+    auto active                            = target_cfg;
+    active.location                        = xattn_dir.path;
+    active.fingerprint.attention.xattn_tau = 0.9f;
+    { q36::detail::KVDiskCache first(active); }
+    { q36::detail::KVDiskCache reopened(active); }
+    active.fingerprint.attention.xattn_min_len = 0;
+    rejected                                   = false;
+    try {
+        q36::detail::KVDiskCache incompatible(active);
+    } catch (const std::runtime_error& error) {
+        rejected = std::string_view(error.what()).find("xattn_min_len") != std::string_view::npos;
+    }
+    if (!rejected) { return fail("disk cache accepted a changed active XAttention threshold"); }
     return 0;
 }
 
@@ -941,9 +1109,9 @@ int test_ram_io_pin_and_capture_id(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     alloc.materialize_pages(1, ctx.stream);
     q36::detail::KVRamCache ram(8ULL << 20);
     const auto id = capture_tokens(ram, pool, alloc, ctx, {10, 11, 12, 13});
-    if (!ram.peek_oldest_unpinned() || *ram.peek_oldest_unpinned() != id) {
+    if (oldest_unpinned(ram) != std::optional<std::uint64_t>(id)) {
         alloc.release();
-        return fail("peek_oldest_unpinned did not return the captured id");
+        return fail("oldest unpinned RAM entry is not the captured id");
     }
     ram.pin_for_io(id);
     const auto prompt = text_prompt({10, 11, 12, 13});
@@ -952,26 +1120,22 @@ int test_ram_io_pin_and_capture_id(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
         alloc.release();
         return fail("plan_match hid an I/O-pinned RAM entry");
     }
+    // consume never waits for a spill's I/O pin: the entry leaves the index at once and its
+    // block is freed by the last unpin.
+    const auto entry_bytes = ram.snapshot().used_bytes;
     ram.claim(id);
-    std::atomic<bool> consumed{false};
-    std::thread waiter([&] {
-        ram.consume(id);
-        consumed.store(true);
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    if (consumed.load()) {
-        waiter.join();
-        alloc.release();
-        return fail("consume did not wait for I/O pin");
+    ram.consume(id);
+    int failures = 0;
+    if (ram.snapshot().entry_count != 0 || ram.snapshot().used_bytes != entry_bytes ||
+        ram.test_io_pins(id) != 1) {
+        failures += fail("consume of an I/O-pinned entry kept it indexed or freed its block");
     }
     ram.unpin_for_io(id);
-    waiter.join();
-    if (!consumed.load()) {
-        alloc.release();
-        return fail("consume did not finish after unpin");
+    if (ram.snapshot().used_bytes != 0 || ram.retired_pending()) {
+        failures += fail("the last I/O unpin did not free the consumed block");
     }
     alloc.release();
-    return 0;
+    return failures;
 }
 
 int test_flush_reports_progress(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
@@ -1077,7 +1241,7 @@ int test_spill_match_extend_branch(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
         alloc.release();
         return fail("unaligned chat did not match");
     }
-    const auto pages_u = disk.test_main_page_ids(match_u->entry_id);
+    const auto pages_u                         = disk.test_main_page_ids(match_u->entry_id);
     std::vector<ninfer::TokenId> unaligned_ext = unaligned;
     unaligned_ext.push_back(0);
     unaligned_ext.resize(80, 10);
@@ -1123,8 +1287,7 @@ int test_spill_match_extend_branch(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     return 0;
 }
 
-int test_spill_sharing_respects_identity(ninfer::DeviceContext& ctx,
-                                        ninfer::PagedKVPool& pool) {
+int test_spill_sharing_respects_identity(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     int failures = 0;
     for (const bool extend : {false, true}) {
         for (const bool changed_media : {false, true}) {
@@ -1135,45 +1298,59 @@ int test_spill_sharing_respects_identity(ninfer::DeviceContext& ctx,
             fill_logical_pages(pool, alloc, 11);
             auto parent = text_prompt(std::vector<ninfer::TokenId>(128, 7));
             q36::VisionItem item;
-            item.modality = q36::PromptModality::Image;
-            item.grid = {.temporal = 1, .height = 4, .width = 4};
+            item.modality    = q36::PromptModality::Image;
+            item.grid        = {.temporal = 1, .height = 4, .width = 4};
             item.patch_count = 16;
             item.token_spans = {{.begin = 80, .count = 4}};
             item.content_digest.fill(0xa5);
             parent.vision_items.push_back(item);
             for (std::size_t i = 80; i < 84; ++i) { parent.token_types[i] = 1; }
-            auto child = text_prompt(std::vector<ninfer::TokenId>(extend ? 192 : 128, 7));
+            auto child         = text_prompt(std::vector<ninfer::TokenId>(extend ? 192 : 128, 7));
             child.vision_items = parent.vision_items;
-            std::copy(parent.token_types.begin(), parent.token_types.end(), child.token_types.begin());
+            std::copy(parent.token_types.begin(), parent.token_types.end(),
+                      child.token_types.begin());
             if (extend) { child.token_ids[128] = 0; }
-            if (changed_media) { child.vision_items[0].content_digest[0] ^= 0xff; }
-            else { child.positions[child.token_ids.size() + 80] += 1; }
-            auto cfg = disk_config(dir.path, ram, pool, nullptr,
-                                   ninfer::SpeculativeBackend::None, 64ULL << 20, 4096);
+            if (changed_media) {
+                child.vision_items[0].content_digest[0] ^= 0xff;
+            } else {
+                child.positions[child.token_ids.size() + 80] += 1;
+            }
+            auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   64ULL << 20, 4096);
             std::vector<std::vector<std::uint8_t>> expected(
-                extend ? 3 : 2, std::vector<std::uint8_t>(ninfer::paged_kv_logical_page_bytes(pool)));
+                extend ? 3 : 2,
+                std::vector<std::uint8_t>(ninfer::paged_kv_logical_page_bytes(pool)));
             {
                 q36::detail::KVDiskCache disk(cfg);
                 const auto ram_parent = capture_prepared_prompt(ram, pool, alloc, ctx, parent);
                 disk.note_ram_resident(ram_parent, 0);
-                if (!disk.emergency_spill_ram(ram_parent)) { return fail("identity parent spill failed"); }
-                const auto parent_match = disk.plan_match(parent, q36::detail::prefix_hash_chain(parent));
+                if (!disk.emergency_spill_ram(ram_parent)) {
+                    return fail("identity parent spill failed");
+                }
+                const auto parent_match =
+                    disk.plan_match(parent, q36::detail::prefix_hash_chain(parent));
                 if (!parent_match) { return fail("identity parent match failed"); }
                 const auto parent_pages = disk.test_main_page_ids(parent_match->entry_id);
-                ninfer::pack_paged_kv_logical_page_to_host(alloc, pool, 0, expected[0].data(), ctx.stream);
+                ninfer::pack_paged_kv_logical_page_to_host(alloc, pool, 0, expected[0].data(),
+                                                           ctx.stream);
                 ctx.synchronize_all();
                 fill_logical_pages(pool, alloc, 99);
                 // The first page precedes the changed image/position and is still reusable.
-                ninfer::unpack_paged_kv_logical_page_from_host(alloc, pool, expected[0].data(), 0, ctx.stream);
+                ninfer::unpack_paged_kv_logical_page_from_host(alloc, pool, expected[0].data(), 0,
+                                                               ctx.stream);
                 for (std::size_t page = 1; page < expected.size(); ++page) {
-                    ninfer::pack_paged_kv_logical_page_to_host(alloc, pool, page, expected[page].data(), ctx.stream);
+                    ninfer::pack_paged_kv_logical_page_to_host(alloc, pool, page,
+                                                               expected[page].data(), ctx.stream);
                 }
                 ctx.synchronize_all();
                 const auto ram_child = capture_prepared_prompt(ram, pool, alloc, ctx, child);
                 ram.set_disk_entry_id(ram_child, parent_match->entry_id);
                 disk.note_ram_resident(ram_child, parent_match->entry_id);
-                if (!disk.emergency_spill_ram(ram_child)) { return fail("identity child spill failed"); }
-                const auto child_match = disk.plan_match(child, q36::detail::prefix_hash_chain(child));
+                if (!disk.emergency_spill_ram(ram_child)) {
+                    return fail("identity child spill failed");
+                }
+                const auto child_match =
+                    disk.plan_match(child, q36::detail::prefix_hash_chain(child));
                 if (!child_match) { return fail("identity child match failed"); }
                 const auto child_pages = disk.test_main_page_ids(child_match->entry_id);
                 if (child_pages[0] != parent_pages[0] || child_pages[1] == parent_pages[1]) {
@@ -1183,21 +1360,29 @@ int test_spill_sharing_respects_identity(ninfer::DeviceContext& ctx,
             {
                 q36::detail::KVDiskCache disk(cfg);
                 const auto match = disk.plan_match(child, q36::detail::prefix_hash_chain(child));
-                if (!match || !disk.claim(match->entry_id)) { return fail("identity child reopen failed"); }
+                if (!match || !disk.claim(match->entry_id)) {
+                    return fail("identity child reopen failed");
+                }
                 auto dest = pool.reserve(4);
                 dest.materialize_pages(expected.size(), ctx.stream);
                 q36::detail::DiskRestoreTarget target;
-                target.text = &dest;
-                target.text_pool = &pool;
+                target.text           = &dest;
+                target.text_pool      = &pool;
                 target.text_dst_pages = expected.size();
-                target.stream = ctx.copy_stream;
-                const auto epoch = disk.restore_device(match->entry_id, target);
-                if (const int rc = wait_restore_bounded(disk, ctx, "identity restore hung"); rc != 0) { return rc; }
+                target.stream         = ctx.copy_stream;
+                const auto epoch      = disk.restore_device(match->entry_id, target);
+                if (const int rc = wait_restore_bounded(disk, ctx, "identity restore hung");
+                    rc != 0) {
+                    return rc;
+                }
                 std::vector<std::uint8_t> actual(expected[0].size());
                 for (std::size_t page = 0; page < expected.size(); ++page) {
-                    ninfer::pack_paged_kv_logical_page_to_host(dest, pool, page, actual.data(), ctx.stream);
+                    ninfer::pack_paged_kv_logical_page_to_host(dest, pool, page, actual.data(),
+                                                               ctx.stream);
                     ctx.synchronize_all();
-                    if (actual != expected[page]) { failures += fail("identity restore returned stale parent KV"); }
+                    if (actual != expected[page]) {
+                        failures += fail("identity restore returned stale parent KV");
+                    }
                 }
                 disk.release_restore_ticket(epoch);
                 disk.consume(match->entry_id);
@@ -1220,13 +1405,14 @@ int test_mtp_f1_backend_pages(ninfer::DeviceContext& ctx) {
     auto text_alloc    = text.reserve(2);
     auto backend_alloc = backend.reserve(2);
     text_alloc.materialize_pages(1, ctx.stream);
+    fill_logical_pages(text, text_alloc, 41);
     TmpDir dir("mtp");
     q36::detail::KVRamCache ram(16ULL << 20);
     auto prompt   = text_prompt({42});
     auto retained = prompt;
     retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity;
-    auto source = make_source(retained, identity, text_alloc, text, ctx.copy_stream, 1);
+    auto source         = make_source(retained, identity, text_alloc, text, ctx.copy_stream, 1);
     source.mtp_kv_valid = 0;
     source.backend      = &backend_alloc;
     source.backend_pool = &backend;
@@ -1280,23 +1466,23 @@ int test_ladders_and_rollback(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
     source.tail_hidden = &hidden;
     std::vector<unsigned char> hidden_host(64, 0x11);
     q36::detail::RamLadderHead rollback;
-    rollback.frontier = 3;
-    rollback.hash     = q36::detail::prefix_hash_at(retained.token_ids, identity, 3);
-    rollback.kind     = q36::detail::ContextCheckpointKind::TurnRollback;
-    rollback.hidden   = hidden_host.data();
-    rollback.hidden_bytes = 64;
+    rollback.frontier             = 3;
+    rollback.hash                 = q36::detail::prefix_hash_at(retained.token_ids, identity, 3);
+    rollback.kind                 = q36::detail::ContextCheckpointKind::TurnRollback;
+    rollback.hidden               = hidden_host.data();
+    rollback.hidden_bytes         = 64;
     q36::detail::RamLadderHead l1 = rollback;
     l1.frontier                   = 4;
-    l1.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
-    l1.kind = q36::detail::ContextCheckpointKind::Ladder;
+    l1.hash                       = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    l1.kind                       = q36::detail::ContextCheckpointKind::Ladder;
     q36::detail::RamLadderHead l2 = l1;
     l2.frontier                   = 6;
-    l2.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 6);
+    l2.hash                       = q36::detail::prefix_hash_at(retained.token_ids, identity, 6);
     q36::detail::RamLadderHead l3 = l1;
     l3.frontier                   = 5;
-    l3.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
-    source.ladder_heads = {rollback, l1, l2, l3};
-    auto id             = capture_or_evict(ram, source);
+    l3.hash                       = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
+    source.ladder_heads           = {rollback, l1, l2, l3};
+    auto id                       = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("ladder capture failed");
@@ -1343,10 +1529,14 @@ int test_dflash_cyclic(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     const auto cyclic_layout = ninfer::plan_cyclic_kv_cache(cyclic_builder, 2, 32, 2, 8, 3);
     ninfer::DeviceArena cyclic_arena(cyclic_builder.finish(256));
     ninfer::CyclicKVCache cyclic({cyclic_arena.base(), cyclic_arena.capacity()}, cyclic_layout);
+    std::vector<unsigned char> cyclic_state(cyclic.lane_host_bytes(), 0x5a);
+    cyclic.copy_lane_from_host(cyclic_state.data(), 0, ctx.stream);
+    ctx.synchronize_all();
     ninfer::CyclicKVCacheLayerView layer = cyclic.layer_view(0);
     std::vector<unsigned char> k_pattern(layer.k.slice(3, 0, 1).bytes(), 0x3c);
     CUDA_CHECK(cudaMemcpy(layer.k.slice(3, 0, 1).data, k_pattern.data(), k_pattern.size(),
                           cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
     alloc.materialize_pages(1, ctx.stream);
@@ -1354,9 +1544,9 @@ int test_dflash_cyclic(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     auto retained = prompt;
     retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity;
-    auto source            = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
-    source.dflash_local    = &cyclic;
-    source.dflash_lane     = 0;
+    auto source         = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
+    source.dflash_local = &cyclic;
+    source.dflash_lane  = 0;
     q36::detail::RamLadderHead ladder;
     ladder.frontier     = 2;
     ladder.hash         = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
@@ -1375,28 +1565,66 @@ int test_dflash_cyclic(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::DFlash,
-                           32ULL << 20, 4096);
-    cfg.fingerprint =
-        q36::detail::make_disk_fingerprint("qwen3.6-27b", "groupwise-int", "disk-test-artifact",
-                                           ninfer::KvCacheStorage::Int8Group64,
-                                           ninfer::SpeculativeBackend::DFlash, pool, nullptr,
-                                           nullptr, &cyclic);
-    q36::detail::KVDiskCache disk(std::move(cfg));
-    disk.note_ram_resident(*id, 0);
-    if (!disk.emergency_spill_ram(*id)) {
-        alloc.release();
-        return fail("DFlash cyclic spill failed");
+    auto cfg        = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::DFlash,
+                                  32ULL << 20, 4096);
+    cfg.fingerprint = q36::detail::make_disk_fingerprint(
+        "qwen3.6-27b", "groupwise-int", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
+        ninfer::SpeculativeBackend::DFlash, pool, nullptr, nullptr, &cyclic);
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        disk.note_ram_resident(*id, 0);
+        if (!disk.emergency_spill_ram(*id)) {
+            alloc.release();
+            return fail("DFlash cyclic spill failed");
+        }
+        const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+        if (!match) {
+            alloc.release();
+            return fail("DFlash cyclic match failed");
+        }
+        const auto meta = disk.test_load_meta(match->entry_id);
+        if (meta.ladders[0].dflash_id == 0 || meta.current_cyclic_id == 0) {
+            alloc.release();
+            return fail("DFlash cyclic missing on kept heads");
+        }
     }
-    const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
-    if (!match) {
+    ninfer::LayoutBuilder destination_builder;
+    const auto destination_layout =
+        ninfer::plan_cyclic_kv_cache(destination_builder, 2, 32, 2, 8, 1);
+    ninfer::DeviceArena destination_arena(destination_builder.finish(256));
+    ninfer::CyclicKVCache destination({destination_arena.base(), destination_arena.capacity()},
+                                      destination_layout);
+    cfg.fingerprint = q36::detail::make_disk_fingerprint(
+        "qwen3.6-27b", "groupwise-int", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
+        ninfer::SpeculativeBackend::DFlash, pool, nullptr, nullptr, &destination);
+    q36::detail::KVDiskCache reopened(cfg);
+    const auto match = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match || !reopened.claim(match->entry_id)) {
         alloc.release();
-        return fail("DFlash cyclic match failed");
+        return fail("DFlash cyclic did not reopen across a lane count change");
     }
-    const auto meta = disk.test_load_meta(match->entry_id);
-    if (meta.ladders[0].dflash_id == 0 || meta.current_cyclic_id == 0) {
+    q36::detail::DiskRestoreTarget target;
+    target.text           = &alloc;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 1;
+    target.dflash_local   = &destination;
+    target.dflash_lane    = 0;
+    target.stream         = ctx.copy_stream;
+    reopened.restore_device(match->entry_id, target);
+    const int restore_rc = wait_restore_bounded(reopened, ctx, "DFlash lane count restore hung");
+    ctx.synchronize_all();
+    reopened.cancel_restore();
+    reopened.release(match->entry_id);
+    if (restore_rc != 0) {
         alloc.release();
-        return fail("DFlash cyclic missing on kept heads");
+        return restore_rc;
+    }
+    std::vector<unsigned char> restored(destination.lane_host_bytes());
+    destination.copy_lane_to_host(0, restored.data(), ctx.stream);
+    ctx.synchronize_all();
+    if (restored != cyclic_host) {
+        alloc.release();
+        return fail("DFlash cyclic bytes changed across a lane count restore");
     }
     alloc.release();
     return 0;
@@ -1477,9 +1705,9 @@ int test_skip_too_long_gc(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool)
         alloc.release();
         return fail("skipped too-long tree was billed against unique_bytes");
     }
-    if (small.plan_match(text_prompt(std::vector<ninfer::TokenId>(80, 1)),
-                         q36::detail::prefix_hash_chain(
-                             text_prompt(std::vector<ninfer::TokenId>(80, 1))))) {
+    if (small.plan_match(
+            text_prompt(std::vector<ninfer::TokenId>(80, 1)),
+            q36::detail::prefix_hash_chain(text_prompt(std::vector<ninfer::TokenId>(80, 1))))) {
         alloc.release();
         return fail("skipped too-long entry remained hittable");
     }
@@ -1534,8 +1762,9 @@ int test_zstd_fail_writes_raw(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
         return fail("zstd-fail did not persist hidden");
     }
     unsigned char codec = 0xff;
-    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State,
-                            meta.current_hidden_id, &codec, 1) || codec != 0) {
+    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State, meta.current_hidden_id,
+                            &codec, 1) ||
+        codec != 0) {
         alloc.release();
         return fail("zstd-fail did not write a raw codec header");
     }
@@ -1565,8 +1794,8 @@ int test_zstd_reopen_with_compress_off(ninfer::DeviceContext& ctx, ninfer::Paged
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096, ninfer::KvDiskCompress::Zstd);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096, ninfer::KvDiskCompress::Zstd);
     cfg.hidden_bytes = 256;
     std::uint64_t entry = 0;
     {
@@ -1581,11 +1810,12 @@ int test_zstd_reopen_with_compress_off(ninfer::DeviceContext& ctx, ninfer::Paged
             alloc.release();
             return fail("zstd spill did not match");
         }
-        entry = match->entry_id;
-        const auto meta = disk.test_load_meta(entry);
+        entry               = match->entry_id;
+        const auto meta     = disk.test_load_meta(entry);
         unsigned char codec = 0xff;
         if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State,
-                                meta.current_hidden_id, &codec, 1) || codec != 1) {
+                                meta.current_hidden_id, &codec, 1) ||
+            codec != 1) {
             alloc.release();
             return fail("zstd spill did not write a zstd codec header");
         }
@@ -1610,7 +1840,8 @@ int test_zstd_reopen_with_compress_off(ninfer::DeviceContext& ctx, ninfer::Paged
     reopened.claim(entry);
     reopened.restore_device(entry, target);
     try {
-        if (const int rc = wait_restore_bounded(reopened, ctx, "zstd-reopen restore hung"); rc != 0) {
+        if (const int rc = wait_restore_bounded(reopened, ctx, "zstd-reopen restore hung");
+            rc != 0) {
             reopened.release(entry);
             dest.release();
             alloc.release();
@@ -1626,7 +1857,8 @@ int test_zstd_reopen_with_compress_off(ninfer::DeviceContext& ctx, ninfer::Paged
     ctx.synchronize_all();
     std::vector<unsigned char> got(256);
     CUDA_CHECK(cudaMemcpy(got.data(), hid_out.p, got.size(), cudaMemcpyDeviceToHost));
-    const auto bad = std::find_if(got.begin(), got.end(), [](unsigned char c) { return c != 0xcd; });
+    const auto bad =
+        std::find_if(got.begin(), got.end(), [](unsigned char c) { return c != 0xcd; });
     if (bad != got.end()) {
         std::cerr << "compress-off hidden mismatch at " << std::distance(got.begin(), bad)
                   << ": got=" << static_cast<unsigned>(*bad) << " expected=205\n";
@@ -1643,8 +1875,7 @@ int test_zstd_reopen_with_compress_off(ninfer::DeviceContext& ctx, ninfer::Paged
     return 0;
 }
 
-int test_zstd_capacity_uses_physical_bytes(ninfer::DeviceContext& ctx,
-                                           ninfer::PagedKVPool& pool) {
+int test_zstd_capacity_uses_physical_bytes(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("zstd-capacity");
     q36::detail::KVRamCache ram(16ULL << 20);
     auto alloc = pool.reserve(2);
@@ -1652,15 +1883,14 @@ int test_zstd_capacity_uses_physical_bytes(ninfer::DeviceContext& ctx,
     constexpr std::size_t hidden_bytes = 1U << 20;
     ninfer::DeviceBuffer hid(hidden_bytes);
     hid.fill(0x5a);
-    ninfer::Tensor hidden(hid.p, ninfer::DType::U8,
-                          {static_cast<std::int64_t>(hidden_bytes)});
-    auto prompt = text_prompt({4, 6, 8, 10});
+    ninfer::Tensor hidden(hid.p, ninfer::DType::U8, {static_cast<std::int64_t>(hidden_bytes)});
+    auto prompt   = text_prompt({4, 6, 8, 10});
     auto retained = prompt;
     retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity;
-    auto source = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
+    auto source        = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
     source.tail_hidden = &hidden;
-    const auto ram_id = capture_or_evict(ram, source);
+    const auto ram_id  = capture_or_evict(ram, source);
     if (!ram_id) {
         alloc.release();
         return fail("zstd-capacity capture failed");
@@ -1669,12 +1899,11 @@ int test_zstd_capacity_uses_physical_bytes(ninfer::DeviceContext& ctx,
     ram.wait_pending_copies();
     const std::size_t logical_page = ninfer::paged_kv_logical_page_bytes(pool);
     const std::size_t page_file =
-        (logical_page + q36::detail::kDiskPageHeaderBytes +
-         q36::detail::kDiskPageIoAlignment - 1) &
+        (logical_page + q36::detail::kDiskPageHeaderBytes + q36::detail::kDiskPageIoAlignment - 1) &
         ~(static_cast<std::size_t>(q36::detail::kDiskPageIoAlignment) - 1);
     const std::size_t capacity = page_file + (128U << 10);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           capacity, 4096, ninfer::KvDiskCompress::Zstd);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None, capacity,
+                           4096, ninfer::KvDiskCompress::Zstd);
     cfg.hidden_bytes = hidden_bytes;
     q36::detail::KVDiskCache disk(std::move(cfg));
     disk.note_ram_resident(*ram_id, 0);
@@ -1700,9 +1929,7 @@ int test_packset_bootstrap_recovery(ninfer::DeviceContext& ctx, ninfer::PagedKVP
     q36::detail::KVRamCache fresh_ram(8ULL << 20);
     auto fresh_cfg = disk_config(fresh.path, fresh_ram, pool, nullptr,
                                  ninfer::SpeculativeBackend::None, 32ULL << 20, 4096);
-    {
-        q36::detail::KVDiskCache disk(fresh_cfg);
-    }
+    { q36::detail::KVDiskCache disk(fresh_cfg); }
     std::error_code ec;
     fs::remove(fresh.path / "PACKSET", ec);
     if (ec) { return fail("bootstrap could not create a partial PACKSET tree"); }
@@ -1720,20 +1947,16 @@ int test_packset_bootstrap_recovery(ninfer::DeviceContext& ctx, ninfer::PagedKVP
     q36::detail::KVRamCache partial_map_ram(8ULL << 20);
     auto partial_map_cfg = disk_config(partial_map.path, partial_map_ram, pool, nullptr,
                                        ninfer::SpeculativeBackend::None, 32ULL << 20, 4096);
-    {
-        q36::detail::KVDiskCache disk(partial_map_cfg);
-    }
+    { q36::detail::KVDiskCache disk(partial_map_cfg); }
     fs::remove(partial_map.path / "PACKSET", ec);
     if (ec) { return fail("partial map fixture could not remove PACKSET"); }
     const auto partial_base = partial_map.path / "maps" / "objects-1.base";
     append_bytes(partial_base, {0x01});
     const auto partial_before = read_bytes(partial_base);
-    bool partial_rejected = false;
+    bool partial_rejected     = false;
     try {
         q36::detail::KVDiskCache should_reject(partial_map_cfg);
-    } catch (const std::exception&) {
-        partial_rejected = true;
-    }
+    } catch (const std::exception&) { partial_rejected = true; }
     if (!partial_rejected) { return fail("bootstrap accepted a partial map-only tree"); }
     if (read_bytes(partial_base) != partial_before || fs::exists(partial_map.path / "PACKSET")) {
         return fail("bootstrap mutated a partial map-only tree");
@@ -1743,8 +1966,8 @@ int test_packset_bootstrap_recovery(ninfer::DeviceContext& ctx, ninfer::PagedKVP
     q36::detail::KVRamCache nonempty_ram(16ULL << 20);
     auto alloc = pool.reserve(2);
     alloc.materialize_pages(1, ctx.stream);
-    auto nonempty_cfg = disk_config(nonempty.path, nonempty_ram, pool, nullptr,
-                                    ninfer::SpeculativeBackend::None, 32ULL << 20, 4096);
+    auto nonempty_cfg     = disk_config(nonempty.path, nonempty_ram, pool, nullptr,
+                                        ninfer::SpeculativeBackend::None, 32ULL << 20, 4096);
     std::uint64_t main_id = 0;
     {
         q36::detail::KVDiskCache disk(nonempty_cfg);
@@ -1755,15 +1978,15 @@ int test_packset_bootstrap_recovery(ninfer::DeviceContext& ctx, ninfer::PagedKVP
             return fail("bootstrap nonempty fixture spill failed");
         }
         const auto prompt = text_prompt({7, 8, 9, 10});
-        const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+        const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
         if (!match || disk.test_main_page_ids(match->entry_id).empty()) {
             alloc.release();
             return fail("bootstrap nonempty fixture has no indexed main page");
         }
         main_id = disk.test_main_page_ids(match->entry_id).front();
     }
-    const auto pack = packed_object_location(
-        nonempty.path, q36::detail::DiskObjectKind::Main, main_id);
+    const auto pack =
+        packed_object_location(nonempty.path, q36::detail::DiskObjectKind::Main, main_id);
     if (!pack) {
         alloc.release();
         return fail("bootstrap nonempty fixture has no main pack");
@@ -1777,9 +2000,7 @@ int test_packset_bootstrap_recovery(ninfer::DeviceContext& ctx, ninfer::PagedKVP
     bool rejected = false;
     try {
         q36::detail::KVDiskCache should_reject(nonempty_cfg);
-    } catch (const std::exception&) {
-        rejected = true;
-    }
+    } catch (const std::exception&) { rejected = true; }
     const auto after = read_bytes(pack->path);
     alloc.release();
     if (!rejected) { return fail("bootstrap overwrote a nonempty tree without PACKSET"); }
@@ -1823,9 +2044,7 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
                                64ULL << 20, 4096);
         try {
             q36::detail::KVDiskCache disk(cfg);
-        } catch (const std::exception&) {
-            return true;
-        }
+        } catch (const std::exception&) { return true; }
         return false;
     };
     auto first_main_frame = [](const std::vector<std::uint8_t>& bytes) {
@@ -1835,7 +2054,8 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
             if (frame != 60) { break; }
             if (bytes[off + 16] == static_cast<std::uint8_t>(q36::detail::DiskObjectKind::Main)) {
                 return std::vector<std::uint8_t>(bytes.begin() + static_cast<std::ptrdiff_t>(off),
-                                                 bytes.begin() + static_cast<std::ptrdiff_t>(off + 64));
+                                                 bytes.begin() +
+                                                     static_cast<std::ptrdiff_t>(off + 64));
             }
             off += 64;
         }
@@ -1845,7 +2065,7 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
     {
         TmpDir dir("map-tail");
         if (!create_store(dir.path, 8)) { return fail("map-tail fixture spill failed"); }
-        const auto log = active_map_path(dir.path, ".log");
+        const auto log    = active_map_path(dir.path, ".log");
         const auto before = read_bytes(log);
         append_bytes(log, {0xa5, 0, 0, 0});
         if (!matches(dir.path)) { return fail("torn map-log tail hid a valid entry"); }
@@ -1856,8 +2076,8 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
     {
         TmpDir dir("map-over-64m");
         if (!create_store(dir.path, 8)) { return fail("large-map fixture spill failed"); }
-        const auto log = active_map_path(dir.path, ".log");
-        auto bytes = read_bytes(log);
+        const auto log   = active_map_path(dir.path, ".log");
+        auto bytes       = read_bytes(log);
         const auto frame = first_main_frame(bytes);
         if (frame.empty()) { return fail("large-map fixture has no main Put"); }
         constexpr std::size_t kFormerHostReadLimit = 64ULL << 20;
@@ -1874,7 +2094,7 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
         TmpDir dir("orphan-map-missing-roll");
         if (!create_store(dir.path, 8)) { return fail("orphan-roll fixture spill failed"); }
         const auto log = active_map_path(dir.path, ".log");
-        auto orphan = first_main_frame(read_bytes(log));
+        auto orphan    = first_main_frame(read_bytes(log));
         if (orphan.empty()) { return fail("orphan-roll fixture has no main Put"); }
         std::uint64_t id = 0;
         std::memcpy(&id, orphan.data() + 8, sizeof(id));
@@ -1912,7 +2132,7 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
         TmpDir dir("map-base-crc");
         if (!create_store(dir.path, 8)) { return fail("base-crc fixture spill failed"); }
         const auto path = active_map_path(dir.path, ".base");
-        auto bytes = read_bytes(path);
+        auto bytes      = read_bytes(path);
         if (bytes.size() < 4) { return fail("base-crc fixture is too short"); }
         bytes.back() ^= 1U;
         write_bytes(path, bytes);
@@ -1931,7 +2151,7 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
         TmpDir dir("map-log-crc");
         if (!create_store(dir.path, 8)) { return fail("log-crc fixture spill failed"); }
         const auto log = active_map_path(dir.path, ".log");
-        auto bytes = read_bytes(log);
+        auto bytes     = read_bytes(log);
         if (bytes.size() < 64) { return fail("log-crc fixture has no complete frame"); }
         bytes[60] ^= 1U;
         write_bytes(log, bytes);
@@ -1941,9 +2161,9 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
         TmpDir dir("map-log-type");
         if (!create_store(dir.path, 8)) { return fail("log-type fixture spill failed"); }
         const auto log = active_map_path(dir.path, ".log");
-        auto bytes = read_bytes(log);
+        auto bytes     = read_bytes(log);
         if (bytes.size() < 64) { return fail("log-type fixture has no complete frame"); }
-        bytes[4] = 2;
+        bytes[4]                = 255;
         const std::uint32_t crc = test_crc32c(bytes.data(), 60);
         std::memcpy(bytes.data() + 60, &crc, sizeof(crc));
         write_bytes(log, bytes);
@@ -1952,12 +2172,12 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
     {
         TmpDir dir("map-duplicate");
         if (!create_store(dir.path, 8)) { return fail("duplicate-map fixture spill failed"); }
-        const auto log = active_map_path(dir.path, ".log");
+        const auto log   = active_map_path(dir.path, ".log");
         const auto frame = first_main_frame(read_bytes(log));
         if (frame.empty()) { return fail("duplicate-map fixture has no main Put"); }
         append_bytes(log, frame);
         if (!matches(dir.path)) { return fail("identical duplicate Put was rejected"); }
-        auto conflict = frame;
+        auto conflict        = frame;
         std::uint64_t offset = 0;
         std::memcpy(&offset, conflict.data() + 24, sizeof(offset));
         offset += q36::detail::kDiskPageIoAlignment;
@@ -1965,15 +2185,17 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
         const std::uint32_t crc = test_crc32c(conflict.data(), 60);
         std::memcpy(conflict.data() + 60, &crc, sizeof(crc));
         append_bytes(log, conflict);
-        if (!construction_rejected(dir.path)) { return fail("conflicting duplicate Put was accepted"); }
+        if (!construction_rejected(dir.path)) {
+            return fail("conflicting duplicate Put was accepted");
+        }
     }
     {
         TmpDir dir("map-overlap");
         if (!create_store(dir.path, 8)) { return fail("overlap-map fixture spill failed"); }
-        const auto log = active_map_path(dir.path, ".log");
+        const auto log   = active_map_path(dir.path, ".log");
         const auto frame = first_main_frame(read_bytes(log));
         if (frame.empty()) { return fail("overlap-map fixture has no main Put"); }
-        auto overlap = frame;
+        auto overlap     = frame;
         std::uint64_t id = 0;
         std::memcpy(&id, overlap.data() + 8, sizeof(id));
         id += 1ULL << 40;
@@ -1981,7 +2203,9 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
         const std::uint32_t crc = test_crc32c(overlap.data(), 60);
         std::memcpy(overlap.data() + 60, &crc, sizeof(crc));
         append_bytes(log, overlap);
-        if (!construction_rejected(dir.path)) { return fail("overlapping distinct map extents were accepted"); }
+        if (!construction_rejected(dir.path)) {
+            return fail("overlapping distinct map extents were accepted");
+        }
     }
     return 0;
 }
@@ -2004,7 +2228,7 @@ int test_pack_page_batch_variants(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
             return fail("pack page batch variant spill failed");
         }
         const auto prompt = text_prompt(tokens);
-        const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+        const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
         if (!match) {
             alloc.release();
             return fail("pack page batch variant was not hittable");
@@ -2014,10 +2238,10 @@ int test_pack_page_batch_variants(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
             alloc.release();
             return fail("pack page batch variant stored too few pages");
         }
-        const auto first = packed_object_location(dir.path, q36::detail::DiskObjectKind::Main,
-                                                  pages[0]);
-        const auto second = packed_object_location(dir.path, q36::detail::DiskObjectKind::Main,
-                                                   pages[1]);
+        const auto first =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, pages[0]);
+        const auto second =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, pages[1]);
         if (!first || !second || first->path != second->path ||
             second->offset != first->offset + first->extent) {
             alloc.release();
@@ -2028,8 +2252,710 @@ int test_pack_page_batch_variants(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
     return 0;
 }
 
-int test_disk_match_filters_unready_heads(ninfer::DeviceContext& ctx,
-                                          ninfer::PagedKVPool& pool) {
+int expect_mapped_pages_equal(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocation& src,
+                              const ninfer::PagedKVAllocation& dst, std::uint32_t pages,
+                              ninfer::DeviceContext& ctx, const char* label);
+
+std::uint64_t pack_file_bytes(const fs::path& root) {
+    std::uint64_t bytes = 0;
+    for (const auto& file : fs::recursive_directory_iterator(root / "packs")) {
+        if (file.is_regular_file()) { bytes += file.file_size(); }
+    }
+    return bytes;
+}
+
+int test_idle_defrag_large_state(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    TmpDir dir("idle-defrag-state");
+    constexpr std::size_t hidden_bytes = 5ULL << 20;
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto source = pool.reserve(2);
+    source.materialize_pages(1, ctx.stream);
+    fill_logical_pages(pool, source, 39);
+    ninfer::DeviceBuffer hidden_data(hidden_bytes);
+    ninfer::Tensor hidden(hidden_data.p, ninfer::DType::U8,
+                          {static_cast<std::int64_t>(hidden_bytes)});
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
+    cfg.hidden_bytes = hidden_bytes;
+    const auto kept  = text_prompt(std::vector<ninfer::TokenId>(64, 143));
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        for (int round = 0; round < 3; ++round) {
+            hidden_data.fill(static_cast<std::uint8_t>(71 + round));
+            auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 141 + round));
+            prompt.token_ids.push_back(0);
+            q36::detail::ResidentPrefixIdentity identity;
+            auto capture        = make_source(prompt, identity, source, pool, ctx.copy_stream, 64);
+            capture.tail_hidden = &hidden;
+            const auto id       = capture_or_evict(ram, capture);
+            if (!id) {
+                source.release();
+                return fail("large defrag RAM capture failed");
+            }
+            ctx.synchronize_all();
+            ram.wait_pending_copies();
+            disk.note_ram_resident(*id, 0);
+            if (!disk.emergency_spill_ram(*id)) {
+                source.release();
+                return fail("large defrag spill failed");
+            }
+            if (!ram.evict_one_unpinned(*id)) {
+                source.release();
+                return fail("large defrag RAM retirement failed");
+            }
+            disk.forget_ram_resident(*id);
+        }
+        disk.wait_idle_and_fsync();
+        const auto match = disk.plan_match(kept, q36::detail::prefix_hash_chain(kept));
+        if (!match) {
+            source.release();
+            return fail("large defrag entry missing");
+        }
+        const auto id = disk.test_load_meta(match->entry_id).current_hidden_id;
+        const auto before =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::State, id);
+        if (!before || before->offset == 0) {
+            source.release();
+            return fail("large defrag location missing");
+        }
+        if (!disk.test_fifo_evict_one() || !disk.test_fifo_evict_one()) {
+            source.release();
+            return fail("large defrag eviction failed");
+        }
+        const auto storage = pack_file_bytes(dir.path);
+        {
+            UnlockedIoHold first_move(disk, q36::detail::DiskUnlockedIo::DefragMapped);
+            disk.set_cache_idle(true);
+            if (!first_move.entered()) {
+                first_move.release();
+                source.release();
+                return fail("large defrag first page did not move");
+            }
+            UnlockedIoHold hold(disk, q36::detail::DiskUnlockedIo::DefragCopy);
+            first_move.release();
+            if (!hold.entered()) {
+                hold.release();
+                source.release();
+                return fail("large defrag copy did not start");
+            }
+            disk.set_cache_idle(false);
+            hold.release();
+            disk.wait_idle_and_fsync();
+        }
+        const auto cancelled =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::State, id);
+        if (!cancelled || cancelled->offset != before->offset) {
+            source.release();
+            return fail("partial large relocation published");
+        }
+        disk.set_cache_idle(true);
+        if (!wait_pred(
+                [&] {
+                    const auto now =
+                        packed_object_location(dir.path, q36::detail::DiskObjectKind::State, id);
+                    return now && now->offset < before->offset &&
+                           fs::file_size(now->path) < before->offset + before->extent;
+                },
+                std::chrono::seconds(5))) {
+            disk.wait_idle_and_fsync();
+            source.release();
+            return fail("large state defrag did not finish");
+        }
+        disk.wait_idle_and_fsync();
+        if (pack_file_bytes(dir.path) > storage ||
+            disk.snapshot().storage_bytes != pack_file_bytes(dir.path)) {
+            source.release();
+            return fail("large state defrag grew storage");
+        }
+    }
+    q36::detail::KVDiskCache reopened(cfg);
+    const auto match = reopened.plan_match(kept, q36::detail::prefix_hash_chain(kept));
+    if (!match || !reopened.claim(match->entry_id)) {
+        source.release();
+        return fail("large defrag reopen failed");
+    }
+    auto destination = pool.reserve(2);
+    destination.materialize_pages(1, ctx.stream);
+    ninfer::DeviceBuffer result(hidden_bytes);
+    ninfer::Tensor result_tensor(result.p, ninfer::DType::U8,
+                                 {static_cast<std::int64_t>(hidden_bytes)});
+    q36::detail::DiskRestoreTarget target;
+    target.text           = &destination;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 1;
+    target.tail_hidden    = &result_tensor;
+    target.stream         = ctx.copy_stream;
+    reopened.restore_device(match->entry_id, target);
+    int failures = wait_restore_bounded(reopened, ctx, "large defrag restore stalled");
+    if (failures == 0) {
+        std::vector<std::uint8_t> actual(hidden_bytes);
+        CUDA_CHECK(cudaMemcpy(actual.data(), result.p, actual.size(), cudaMemcpyDeviceToHost));
+        if (!std::all_of(actual.begin(), actual.end(), [](auto value) { return value == 73; })) {
+            failures += fail("defrag changed a multi-chunk state payload");
+        }
+        failures +=
+            expect_mapped_pages_equal(pool, source, destination, 1, ctx, "large state defrag KV");
+    }
+    reopened.release(match->entry_id);
+    destination.release();
+    source.release();
+    return failures;
+}
+
+int test_idle_defrag(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    using Fault  = q36::detail::DiskFaultPoint;
+    using Window = q36::detail::DiskUnlockedIo;
+    // Success, four durability failures, interrupted copy/publication, a held reader,
+    // and crash snapshots on either side of durable location publication.
+    for (int scenario = 0; scenario < 11; ++scenario) {
+        TmpDir dir("idle-defrag");
+        q36::detail::KVRamCache ram(32ULL << 20);
+        auto source = pool.reserve(2);
+        source.materialize_pages(2, ctx.stream);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               256ULL << 10, 4096);
+        std::uint64_t page = 0;
+        std::vector<std::uint8_t> expected;
+        const std::vector<ninfer::TokenId> kept(128, 103);
+        {
+            q36::detail::KVDiskCache disk(cfg);
+            for (int round = 0; round < 3; ++round) {
+                fill_logical_pages(pool, source, static_cast<std::uint8_t>(51 + round));
+                const auto ram_id = capture_tokens(ram, pool, source, ctx,
+                                                   std::vector<ninfer::TokenId>(128, 101 + round));
+                disk.note_ram_resident(ram_id, 0);
+                if (!disk.emergency_spill_ram(ram_id)) {
+                    source.release();
+                    return fail("defrag fixture spill failed");
+                }
+                if (!ram.evict_one_unpinned(ram_id)) {
+                    source.release();
+                    return fail("defrag fixture RAM retirement failed");
+                }
+                disk.forget_ram_resident(ram_id);
+            }
+            disk.wait_idle_and_fsync();
+            const auto prompt = text_prompt(kept);
+            const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+            if (!match) {
+                source.release();
+                return fail("defrag fixture missing");
+            }
+            page = disk.test_main_page_ids(match->entry_id).at(0);
+            const auto before =
+                packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+            if (!before || before->offset == 0) {
+                source.release();
+                return fail("defrag fixture has no movable page");
+            }
+            expected.resize(before->stored);
+            if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::Main, page,
+                                    expected.data(), expected.size())) {
+                source.release();
+                return fail("defrag oracle read failed");
+            }
+            if (!disk.test_fifo_evict_one() || !disk.test_fifo_evict_one()) {
+                source.release();
+                return fail("defrag fixture eviction failed");
+            }
+            const auto storage_before = pack_file_bytes(dir.path);
+            // Write-behind permission alone must not trigger relocation during active decoding.
+            disk.request_idle_spill();
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            const auto active_location =
+                packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+            if (!active_location || active_location->offset != before->offset) {
+                source.release();
+                return fail("write-behind triggered defrag without Engine idle permission");
+            }
+            if (scenario >= 1 && scenario <= 4) {
+                constexpr std::array faults{Fault::AfterMoveCopy, Fault::AfterMovePackSync,
+                                            Fault::AfterMoveAppend, Fault::AfterMoveSync};
+                const auto drops = disk.snapshot().drops;
+                disk.test_arm_fault(faults[static_cast<std::size_t>(scenario - 1)]);
+                disk.set_cache_idle(true);
+                if (!wait_pred([&] { return disk.snapshot().drops > drops; },
+                               std::chrono::seconds(5))) {
+                    source.release();
+                    return fail("defrag durability fault did not execute");
+                }
+                disk.wait_idle_and_fsync();
+                const auto failed =
+                    packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+                if (!failed || failed->offset != before->offset) {
+                    source.release();
+                    return fail("failed relocation changed the durable location");
+                }
+            } else if (scenario == 5 || scenario == 6) {
+                UnlockedIoHold hold(disk,
+                                    scenario == 5 ? Window::DefragCopy : Window::DefragPublish);
+                disk.set_cache_idle(true);
+                if (!hold.entered()) {
+                    hold.release();
+                    source.release();
+                    return fail("defrag interruption window was not reached");
+                }
+                disk.set_cache_idle(false);
+                hold.release();
+                disk.wait_idle_and_fsync();
+                const auto cancelled =
+                    packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+                if (!cancelled || cancelled->offset != before->offset) {
+                    source.release();
+                    return fail("interrupted relocation published its destination");
+                }
+            } else if (scenario == 7) {
+                UnlockedIoHold hold(disk, Window::PayloadRead);
+                std::vector<std::uint8_t> actual(expected.size());
+                std::atomic<bool> read_ok{false};
+                std::jthread reader([&] {
+                    read_ok.store(disk.test_read_object(q36::detail::DiskObjectKind::Main, page,
+                                                        actual.data(), actual.size()));
+                });
+                if (!hold.entered()) {
+                    hold.release();
+                    reader.join();
+                    source.release();
+                    return fail("defrag held reader did not enter");
+                }
+                disk.set_cache_idle(true);
+                const bool moved = wait_pred(
+                    [&] {
+                        const auto now = packed_object_location(
+                            dir.path, q36::detail::DiskObjectKind::Main, page);
+                        return now && now->offset < before->offset;
+                    },
+                    std::chrono::seconds(5));
+                const bool preserved =
+                    fs::file_size(before->path) >= before->offset + before->extent;
+                hold.release();
+                reader.join();
+                if (!moved || !preserved || !read_ok.load() || actual != expected) {
+                    source.release();
+                    return fail("defrag overwrote or truncated a reader's old location");
+                }
+            } else if (scenario == 8 || scenario == 9) {
+                UnlockedIoHold hold(disk,
+                                    scenario == 8 ? Window::DefragPublish : Window::DefragMapped);
+                disk.set_cache_idle(true);
+                if (!hold.entered()) {
+                    hold.release();
+                    source.release();
+                    return fail("defrag crash window was not reached");
+                }
+                TmpDir crash("defrag-crash");
+                fs::copy(dir.path, crash.path,
+                         fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+                // Repeated idle permission must preserve the in-flight relocation.
+                disk.set_cache_idle(true);
+                hold.release();
+                auto recovered_cfg     = cfg;
+                recovered_cfg.location = crash.path;
+                q36::detail::KVDiskCache recovered(recovered_cfg);
+                std::vector<std::uint8_t> actual(expected.size());
+                const auto location =
+                    packed_object_location(crash.path, q36::detail::DiskObjectKind::Main, page);
+                const bool was_moved = location && location->offset < before->offset;
+                if (!location || was_moved != (scenario == 9) ||
+                    !recovered.test_read_object(q36::detail::DiskObjectKind::Main, page,
+                                                actual.data(), actual.size()) ||
+                    actual != expected) {
+                    source.release();
+                    return fail("defrag crash recovery selected invalid payload or location");
+                }
+            }
+            if (scenario == 10) {
+                const auto drops = disk.snapshot().drops;
+                disk.test_arm_fault_sequence(Fault::AfterMoveAppend, Fault::BeforeMapRollback);
+                disk.set_cache_idle(true);
+                if (!wait_pred([&] { return disk.snapshot().drops > drops; },
+                               std::chrono::seconds(5))) {
+                    source.release();
+                    return fail("defrag rollback failure did not execute");
+                }
+                disk.wait_idle_and_fsync();
+                const auto frozen_storage = pack_file_bytes(dir.path);
+                const auto unsaved =
+                    capture_tokens(ram, pool, source, ctx, std::vector<ninfer::TokenId>(64, 199));
+                disk.note_ram_resident(unsaved, 0);
+                std::vector<std::uint8_t> actual(expected.size());
+                if (disk.emergency_spill_ram(unsaved) ||
+                    pack_file_bytes(dir.path) != frozen_storage ||
+                    fs::file_size(before->path) < before->offset + before->extent ||
+                    !disk.test_read_object(q36::detail::DiskObjectKind::Main, page, actual.data(),
+                                           actual.size()) ||
+                    actual != expected) {
+                    source.release();
+                    return fail("ambiguous relocation reused space or corrupted its source");
+                }
+            } else {
+                disk.set_cache_idle(true);
+                if (!wait_pred(
+                        [&] {
+                            const auto now = packed_object_location(
+                                dir.path, q36::detail::DiskObjectKind::Main, page);
+                            return now && now->offset < before->offset &&
+                                   fs::file_size(now->path) < before->offset + before->extent;
+                        },
+                        std::chrono::seconds(5))) {
+                    disk.wait_idle_and_fsync();
+                    const auto now =
+                        packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+                    std::cerr << "defrag scenario=" << scenario << " before=" << before->offset
+                              << " after=" << (now ? now->offset : UINT64_MAX)
+                              << " file_bytes=" << fs::file_size(before->path)
+                              << " drops=" << disk.snapshot().drops << '\n';
+                    source.release();
+                    return fail("idle defrag did not reuse a hole and trim the sparse tail");
+                }
+                disk.wait_idle_and_fsync();
+                const auto pages = disk.test_main_page_ids(match->entry_id);
+                const auto first = packed_object_location(
+                    dir.path, q36::detail::DiskObjectKind::Main, pages.at(0));
+                const auto second = packed_object_location(
+                    dir.path, q36::detail::DiskObjectKind::Main, pages.at(1));
+                if (!first || !second || first->path != second->path ||
+                    second->offset != first->offset + first->extent) {
+                    source.release();
+                    return fail("defrag split a contiguous page run despite an adequate hole");
+                }
+            }
+            if (pack_file_bytes(dir.path) > storage_before ||
+                disk.snapshot().storage_bytes != pack_file_bytes(dir.path)) {
+                source.release();
+                return fail("idle defrag grew pack storage or lost its accounting");
+            }
+        }
+        q36::detail::KVDiskCache reopened(cfg);
+        const auto prompt = text_prompt(kept);
+        const auto match  = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+        if (!match || !reopened.claim(match->entry_id)) {
+            source.release();
+            return fail("defrag lost its retained entry on reopen");
+        }
+        auto destination = pool.reserve(2);
+        destination.materialize_pages(2, ctx.stream);
+        q36::detail::DiskRestoreTarget target;
+        target.text           = &destination;
+        target.text_pool      = &pool;
+        target.text_dst_pages = 2;
+        target.stream         = ctx.copy_stream;
+        reopened.restore_device(match->entry_id, target);
+        int result = wait_restore_bounded(reopened, ctx, "defrag restored payload stalled");
+        if (result == 0) {
+            result = expect_mapped_pages_equal(pool, source, destination, 2, ctx,
+                                               "defrag exact restored payload");
+        }
+        reopened.release(match->entry_id);
+        destination.release();
+        source.release();
+        if (result != 0) { return result; }
+    }
+    return test_idle_defrag_large_state(ctx, pool);
+}
+
+int test_bounded_storage_churn(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool,
+                               q36::detail::DiskFaultPoint fault) {
+    TmpDir dir("bounded-storage");
+    q36::detail::KVRamCache ram(32ULL << 20);
+    auto source = pool.reserve(2);
+    source.materialize_pages(1, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           128ULL << 10, 4096);
+    std::vector<ninfer::TokenId> latest;
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        disk.test_arm_fault(fault);
+        for (int round = 0; round < 320; ++round) {
+            fill_logical_pages(pool, source, static_cast<std::uint8_t>(round));
+            latest.assign(64, 2000 + round);
+            const auto ram_id = capture_tokens(ram, pool, source, ctx, latest);
+            disk.note_ram_resident(ram_id, 0);
+            if (!disk.emergency_spill_ram(ram_id)) {
+                source.release();
+                return fail("bounded storage churn could not reuse evicted space");
+            }
+            disk.wait_idle_and_fsync();
+            const auto physical = pack_file_bytes(dir.path);
+            if (physical > cfg.capacity_bytes || disk.snapshot().storage_bytes != physical) {
+                source.release();
+                return fail("pack growth exceeded physical capacity or escaped accounting");
+            }
+            std::uint64_t metadata = 0;
+            for (const auto& file : fs::recursive_directory_iterator(dir.path)) {
+                if (file.is_regular_file() && file.path().extension() != ".pack") {
+                    metadata += file.file_size();
+                }
+            }
+            if (metadata > (256ULL << 10)) {
+                source.release();
+                return fail("metadata grew without a bounded index checkpoint");
+            }
+        }
+        if (fault != q36::detail::DiskFaultPoint::None && disk.snapshot().drops == 0) {
+            source.release();
+            return fail("index checkpoint fault did not execute during storage churn");
+        }
+    }
+    q36::detail::KVDiskCache reopened(cfg);
+    const auto prompt = text_prompt(latest);
+    const auto match  = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match || !reopened.claim(match->entry_id)) {
+        source.release();
+        return fail("bounded storage lost its newest entry after restart");
+    }
+    auto destination = pool.reserve(2);
+    destination.materialize_pages(1, ctx.stream);
+    q36::detail::DiskRestoreTarget target;
+    target.text           = &destination;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 1;
+    target.stream         = ctx.copy_stream;
+    reopened.restore_device(match->entry_id, target);
+    int result = wait_restore_bounded(reopened, ctx, "bounded storage restore stalled");
+    if (result == 0) {
+        result = expect_mapped_pages_equal(pool, source, destination, 1, ctx,
+                                           "bounded storage reused payload");
+    }
+    reopened.release(match->entry_id);
+    destination.release();
+    source.release();
+    return result;
+}
+
+int test_retirement_waits_for_payload_reader(ninfer::DeviceContext& ctx,
+                                             ninfer::PagedKVPool& pool) {
+    TmpDir dir("retired-reader");
+    q36::detail::KVRamCache ram(32ULL << 20);
+    auto source = pool.reserve(2);
+    source.materialize_pages(1, ctx.stream);
+    fill_logical_pages(pool, source, 31);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           32ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(cfg);
+    const std::vector<ninfer::TokenId> first(64, 71);
+    const auto ram_id = capture_tokens(ram, pool, source, ctx, first);
+    disk.note_ram_resident(ram_id, 0);
+    if (!disk.emergency_spill_ram(ram_id)) {
+        source.release();
+        return fail("reader lease spill failed");
+    }
+    const auto prompt = text_prompt(first);
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match) {
+        source.release();
+        return fail("reader lease fixture is missing");
+    }
+    const auto page     = disk.test_main_page_ids(match->entry_id).front();
+    const auto location = packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+    if (!location) {
+        source.release();
+        return fail("reader lease page is missing");
+    }
+    std::vector<std::uint8_t> expected(location->stored), actual(location->stored);
+    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::Main, page, expected.data(),
+                            expected.size())) {
+        source.release();
+        return fail("reader lease oracle read failed");
+    }
+    UnlockedIoHold hold(disk, q36::detail::DiskUnlockedIo::PayloadRead);
+    std::atomic<bool> read_ok{false};
+    std::jthread reader([&] {
+        read_ok.store(disk.test_read_object(q36::detail::DiskObjectKind::Main, page, actual.data(),
+                                            actual.size()));
+    });
+    if (!hold.entered()) {
+        hold.release();
+        reader.join();
+        source.release();
+        return fail("reader lease did not reach the unlocked read");
+    }
+    hold.arm();
+    const bool evicted = disk.test_fifo_evict_one();
+    fill_logical_pages(pool, source, 97);
+    const auto next_ram =
+        capture_tokens(ram, pool, source, ctx, std::vector<ninfer::TokenId>(64, 83));
+    disk.note_ram_resident(next_ram, 0);
+    const bool spilled  = disk.emergency_spill_ram(next_ram);
+    const bool returned = hold.disarm();
+    hold.release();
+    reader.join();
+    disk.wait_idle_and_fsync();
+    source.release();
+    if (!evicted || !spilled || !returned || !read_ok.load() || expected != actual) {
+        return fail("retirement blocked on or overwrote an in-flight payload reader");
+    }
+    if (packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page)) {
+        return fail("retired extent was not released after its reader drained");
+    }
+    return 0;
+}
+
+int test_backing_file_recovery(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    for (int damage = 0; damage < 3; ++damage) {
+        TmpDir dir("backing-recovery");
+        q36::detail::KVRamCache ram(32ULL << 20);
+        auto source = pool.reserve(2);
+        source.materialize_pages(1, ctx.stream);
+        fill_logical_pages(pool, source, 47);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               128ULL << 10, 4096);
+        const std::vector<ninfer::TokenId> original(64, 51);
+        fs::path path;
+        {
+            q36::detail::KVDiskCache disk(cfg);
+            const auto id = capture_tokens(ram, pool, source, ctx, original);
+            disk.note_ram_resident(id, 0);
+            if (!disk.emergency_spill_ram(id)) {
+                source.release();
+                return fail("backing recovery fixture spill failed");
+            }
+            disk.wait_idle_and_fsync();
+            const auto prompt = text_prompt(original);
+            const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+            if (!match) {
+                source.release();
+                return fail("backing recovery fixture missing");
+            }
+            const auto pages = disk.test_main_page_ids(match->entry_id);
+            const auto location =
+                packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, pages.at(0));
+            if (!location) {
+                source.release();
+                return fail("backing recovery location missing");
+            }
+            path = location->path;
+        }
+        if (damage == 0) {
+            fs::remove(path);
+        } else if (damage == 1) {
+            fs::resize_file(path, 1);
+        } else {
+            fs::resize_file(path, 2ULL << 30);
+        }
+        q36::detail::KVDiskCache disk(cfg);
+        const auto prompt = text_prompt(original);
+        const bool retained =
+            disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt)).has_value();
+        if (retained != (damage == 2) ||
+            disk.snapshot().storage_bytes != pack_file_bytes(dir.path) ||
+            pack_file_bytes(dir.path) > cfg.capacity_bytes) {
+            source.release();
+            return fail("backing recovery retained invalid data or miscounted storage");
+        }
+        for (int round = 0; round < 12; ++round) {
+            const auto id = capture_tokens(ram, pool, source, ctx,
+                                           std::vector<ninfer::TokenId>(64, 60 + round));
+            disk.note_ram_resident(id, 0);
+            if (!disk.emergency_spill_ram(id)) {
+                source.release();
+                return fail("backing recovery prevented reuse");
+            }
+            disk.wait_idle_and_fsync();
+            if (pack_file_bytes(dir.path) > cfg.capacity_bytes ||
+                disk.snapshot().storage_bytes != pack_file_bytes(dir.path)) {
+                source.release();
+                return fail("backing recovery permitted uncharged growth");
+            }
+        }
+        source.release();
+    }
+    return 0;
+}
+
+int test_retirement_durability_failure(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    using Fault = q36::detail::DiskFaultPoint;
+    for (const auto fault : {Fault::AfterDeleteAppend, Fault::AfterDeleteSync}) {
+        TmpDir dir("retire-failure");
+        q36::detail::KVRamCache ram(32ULL << 20);
+        auto source = pool.reserve(2);
+        source.materialize_pages(1, ctx.stream);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               128ULL << 10, 4096);
+        {
+            q36::detail::KVDiskCache disk(cfg);
+            for (int round = 0; round < 2; ++round) {
+                fill_logical_pages(pool, source, static_cast<std::uint8_t>(30 + round));
+                const auto id = capture_tokens(ram, pool, source, ctx,
+                                               std::vector<ninfer::TokenId>(64, 90 + round));
+                disk.note_ram_resident(id, 0);
+                if (!disk.emergency_spill_ram(id)) {
+                    source.release();
+                    return fail("retirement fault fixture failed");
+                }
+            }
+            disk.wait_idle_and_fsync();
+            disk.test_arm_fault(fault);
+            bool failed = false;
+            try {
+                (void)disk.test_fifo_evict_one();
+            } catch (const std::runtime_error&) { failed = true; }
+            if (!failed) {
+                source.release();
+                return fail("retirement durability fault was not exercised");
+            }
+            fill_logical_pages(pool, source, 32);
+            const auto id =
+                capture_tokens(ram, pool, source, ctx, std::vector<ninfer::TokenId>(64, 92));
+            disk.note_ram_resident(id, 0);
+            if (!disk.emergency_spill_ram(id)) {
+                source.release();
+                return fail("retirement fault prevented retry");
+            }
+            disk.wait_idle_and_fsync();
+            if (pack_file_bytes(dir.path) > cfg.capacity_bytes ||
+                pack_file_bytes(dir.path) != disk.snapshot().storage_bytes) {
+                source.release();
+                return fail("retirement failure lost physical accounting");
+            }
+        }
+        q36::detail::KVDiskCache reopened(cfg);
+        for (int round = 1; round < 3; ++round) {
+            const auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 90 + round));
+            const auto match  = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+            if (!match || !reopened.claim(match->entry_id)) {
+                source.release();
+                return fail("retirement fault lost a retained entry");
+            }
+            fill_logical_pages(pool, source, static_cast<std::uint8_t>(30 + round));
+            auto destination = pool.reserve(2);
+            destination.materialize_pages(1, ctx.stream);
+            q36::detail::DiskRestoreTarget target;
+            target.text           = &destination;
+            target.text_pool      = &pool;
+            target.text_dst_pages = 1;
+            target.stream         = ctx.copy_stream;
+            reopened.restore_device(match->entry_id, target);
+            int result = wait_restore_bounded(reopened, ctx, "retirement fault restore stalled");
+            if (result == 0) {
+                result = expect_mapped_pages_equal(pool, source, destination, 1, ctx,
+                                                   "retirement failure retained payload");
+            }
+            reopened.release(match->entry_id);
+            destination.release();
+            if (result != 0) {
+                source.release();
+                return result;
+            }
+        }
+        source.release();
+    }
+    return 0;
+}
+
+int test_bounded_storage(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    using Fault  = q36::detail::DiskFaultPoint;
+    int failures = test_retirement_waits_for_payload_reader(ctx, pool);
+    failures += test_backing_file_recovery(ctx, pool);
+    failures += test_retirement_durability_failure(ctx, pool);
+    for (const auto fault : {Fault::None, Fault::AfterIndexBaseSync, Fault::AfterIndexLogSync,
+                             Fault::AfterPacksetRename, Fault::AfterPacksetRootSync}) {
+        failures += test_bounded_storage_churn(ctx, pool, fault);
+    }
+    return failures;
+}
+
+int test_disk_match_filters_unready_heads(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     using ninfer::SpeculativeBackend;
     for (int scenario = 0; scenario < 9; ++scenario) {
         TmpDir dir("match-unready");
@@ -2037,20 +2963,21 @@ int test_disk_match_filters_unready_heads(ninfer::DeviceContext& ctx,
         auto source_pages = pool.reserve(2);
         source_pages.materialize_pages(2, ctx.stream);
         fill_logical_pages(pool, source_pages, 63);
-        const auto backend = scenario == 0 || scenario == 6 ? SpeculativeBackend::None :
-                             scenario == 2 || scenario == 4 || scenario == 7 ?
-                                 SpeculativeBackend::DFlash : SpeculativeBackend::Mtp;
-        const q36::detail::ReuseBackendPolicy policy{
-            backend, backend == SpeculativeBackend::Mtp, backend == SpeculativeBackend::DFlash, false};
-        auto cfg = disk_config(dir.path, ram, pool,
-                               backend == SpeculativeBackend::None ? nullptr : &pool,
-                               backend, 64ULL << 20, 4096);
-        const auto prompt = text_prompt(std::vector<ninfer::TokenId>(128, 63));
-        const auto chain = q36::detail::prefix_hash_chain(prompt);
-        std::uint64_t expected = 0;
+        const auto backend = scenario == 0 || scenario == 6 ? SpeculativeBackend::None
+                             : scenario == 2 || scenario == 4 || scenario == 7
+                                 ? SpeculativeBackend::DFlash
+                                 : SpeculativeBackend::Mtp;
+        const q36::detail::ReuseBackendPolicy policy{backend, backend == SpeculativeBackend::Mtp,
+                                                     backend == SpeculativeBackend::DFlash, false};
+        auto cfg =
+            disk_config(dir.path, ram, pool, backend == SpeculativeBackend::None ? nullptr : &pool,
+                        backend, 64ULL << 20, 4096);
+        const auto prompt        = text_prompt(std::vector<ninfer::TokenId>(128, 63));
+        const auto chain         = q36::detail::prefix_hash_chain(prompt);
+        std::uint64_t expected   = 0;
         const auto expected_base = scenario >= 5 ? 64U : 128U;
-        const auto expected_path = scenario == 8 ? ninfer::PrefixReusePath::RestoreContextCheckpoint :
-                                                  ninfer::PrefixReusePath::AppendAtFrontier;
+        const auto expected_path = scenario == 8 ? ninfer::PrefixReusePath::RestoreContextCheckpoint
+                                                 : ninfer::PrefixReusePath::AppendAtFrontier;
         {
             q36::detail::KVDiskCache disk(cfg);
             auto capture = [&](std::uint32_t frontier, bool valid) {
@@ -2058,23 +2985,28 @@ int test_disk_match_filters_unready_heads(ninfer::DeviceContext& ctx,
                 retained.token_ids.resize(frontier);
                 retained.token_ids.push_back(0);
                 q36::detail::ResidentPrefixIdentity identity;
-                auto source = make_source(retained, identity, source_pages, pool,
-                                           ctx.copy_stream, frontier);
+                auto source =
+                    make_source(retained, identity, source_pages, pool, ctx.copy_stream, frontier);
                 source.tail_hidden_valid = valid || scenario == 3 || scenario == 4 || scenario == 7;
-                source.mtp_kv_valid = valid ? frontier - 1 : scenario == 3 ? 32 : scenario == 8 ? 63 : 127;
-                source.dflash_context_frontier = valid ? frontier : scenario == 4 || scenario == 7 ? 64 : 128;
+                source.mtp_kv_valid      = valid           ? frontier - 1
+                                           : scenario == 3 ? 32
+                                           : scenario == 8 ? 63
+                                                           : 127;
+                source.dflash_context_frontier = valid                            ? frontier
+                                                 : scenario == 4 || scenario == 7 ? 64
+                                                                                  : 128;
                 if (backend != SpeculativeBackend::None) {
-                    source.backend = &source_pages;
+                    source.backend      = &source_pages;
                     source.backend_pool = &pool;
                 }
                 if (scenario == 8) {
-                    source.rewrite_valid = true;
+                    source.rewrite_valid    = true;
                     source.rewrite_frontier = 96;
-                    source.hash_c_valid = true;
+                    source.hash_c_valid     = true;
                     source.hash_c = q36::detail::prefix_hash_at(retained.token_ids, identity, 96);
                     q36::detail::RamLadderHead head;
                     head.frontier = 64;
-                    head.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 64);
+                    head.hash     = q36::detail::prefix_hash_at(retained.token_ids, identity, 64);
                     source.ladder_heads.push_back(head);
                 }
                 const auto id = capture_or_evict(ram, source);
@@ -2087,12 +3019,12 @@ int test_disk_match_filters_unready_heads(ninfer::DeviceContext& ctx,
                 return ram.load_host(*id).disk_entry_id;
             };
             const auto invalid = capture(128, false);
-            expected = scenario == 8 ? invalid : capture(expected_base, true);
-            const auto match = disk.plan_match(prompt, chain, policy);
+            expected           = scenario == 8 ? invalid : capture(expected_base, true);
+            const auto match   = disk.plan_match(prompt, chain, policy);
             if (!match || match->entry_id != expected || match->reuse_base != expected_base ||
                 match->reuse != expected_path || match->committed_generation == 0) {
                 std::cerr << "unready disk scenario=" << scenario << " expected=" << expected
-                          << " actual=" << (match ? match->entry_id : 0) << std::endl;
+                          << " actual=" << (match ? match->entry_id : 0) << '\n';
                 return fail("unusable disk head shadowed usable candidate");
             }
         }
@@ -2101,15 +3033,16 @@ int test_disk_match_filters_unready_heads(ninfer::DeviceContext& ctx,
             const auto match = reopened.plan_match(prompt, chain, policy);
             if (!match || match->entry_id != expected || match->reuse_base != expected_base ||
                 match->reuse != expected_path) {
-                std::cerr << "disk reopen readiness scenario=" << scenario << " expected=" << expected
-                          << " actual=" << (match ? match->entry_id : 0)
-                          << " base=" << (match ? match->reuse_base : 0) << std::endl;
+                std::cerr << "disk reopen readiness scenario=" << scenario
+                          << " expected=" << expected << " actual=" << (match ? match->entry_id : 0)
+                          << " base=" << (match ? match->reuse_base : 0) << '\n';
                 return fail("disk readiness changed after reopen");
             }
             if (scenario == 8) {
                 const auto backend_ids = reopened.test_backend_page_ids(expected);
                 if (backend_ids.empty()) { return fail("MTP valid extent was not stored"); }
-                reopened.test_break_object(backend_ids.front(), q36::detail::DiskObjectKind::Backend);
+                reopened.test_break_object(backend_ids.front(),
+                                           q36::detail::DiskObjectKind::Backend);
             }
         }
         if (scenario == 8) {
@@ -2125,36 +3058,42 @@ int test_disk_match_filters_unready_heads(ninfer::DeviceContext& ctx,
 }
 
 int test_disk_claim_rejects_refreshed_generation(ninfer::DeviceContext& ctx,
-                                                ninfer::PagedKVPool& pool) {
+                                                 ninfer::PagedKVPool& pool) {
     TmpDir dir("claim-generation");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto pages = pool.reserve(1);
     pages.materialize_pages(1, ctx.stream);
     fill_logical_pages(pool, pages, 71);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr,
-                           ninfer::SpeculativeBackend::None, 64ULL << 20, 4096);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
     q36::detail::KVDiskCache disk(cfg);
     const auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 71));
-    auto capture = [&](bool valid, std::uint64_t ticket) {
+    auto capture      = [&](bool valid, std::uint64_t ticket) {
         auto retained = prompt;
         retained.token_ids.push_back(0);
         q36::detail::ResidentPrefixIdentity identity;
         auto source = make_source(retained, identity, pages, pool, ctx.copy_stream, 64);
         source.tail_hidden_valid = valid;
-        const auto id = capture_or_evict(ram, source);
+        const auto id            = capture_or_evict(ram, source);
         if (!id) { throw std::runtime_error("generation fixture capture failed"); }
         ram.wait_pending_copies();
         disk.note_ram_resident(*id, ticket);
-        if (!disk.emergency_spill_ram(*id)) { throw std::runtime_error("generation fixture spill failed"); }
+        if (!disk.emergency_spill_ram(*id)) {
+            throw std::runtime_error("generation fixture spill failed");
+        }
         return ram.load_host(*id).disk_entry_id;
     };
-    const auto id = capture(true, 0);
+    const auto id    = capture(true, 0);
     const auto chain = q36::detail::prefix_hash_chain(prompt);
     const auto match = disk.plan_match(prompt, chain);
-    if (!match || match->committed_generation == 0) { return fail("generation fixture match missing"); }
-    if (capture(false, id) != id) { return fail("generation fixture failed to refresh same entry"); }
-    if (disk.claim(id, match->hash_f, match->execution_frontier, match->reuse_base,
-                    match->reuse, match->committed_generation)) {
+    if (!match || match->committed_generation == 0) {
+        return fail("generation fixture match missing");
+    }
+    if (capture(false, id) != id) {
+        return fail("generation fixture failed to refresh same entry");
+    }
+    if (disk.claim(id, match->hash_f, match->execution_frontier, match->reuse_base, match->reuse,
+                   match->committed_generation)) {
         disk.release(id);
         return fail("claim accepted changed same-hash frontier generation");
     }
@@ -2162,43 +3101,89 @@ int test_disk_claim_rejects_refreshed_generation(ninfer::DeviceContext& ctx,
     if (capture(true, id) != id) { return fail("generation retry refresh failed"); }
     const auto fresh = disk.plan_match(prompt, chain);
     if (!fresh || fresh->committed_generation <= match->committed_generation ||
-        !disk.claim(id, fresh->hash_f, fresh->execution_frontier, fresh->reuse_base,
-                    fresh->reuse, fresh->committed_generation)) {
+        !disk.claim(id, fresh->hash_f, fresh->execution_frontier, fresh->reuse_base, fresh->reuse,
+                    fresh->committed_generation)) {
         return fail("fresh generation could not be claimed after stale-plan rejection");
     }
     disk.release(id);
-    // The claim begins against the old generation while an idle refresh is
-    // outside the mutex after rename. Failed rollback publishes the new one.
+    // The claim lands while an idle refresh is outside the mutex after its meta rename. It
+    // claims the old generation without waiting; the refresh abandons, its meta rollback
+    // fails, and the new generation is published. The stale claim's restore must then be a
+    // CacheRestoreFailure cache miss at setup, never a restore of the newer generation.
     auto retained = prompt;
     retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity;
-    auto source = make_source(retained, identity, pages, pool, ctx.copy_stream, 64);
+    auto source            = make_source(retained, identity, pages, pool, ctx.copy_stream, 64);
     const auto refresh_ram = capture_or_evict(ram, source);
-    if (!refresh_ram) { return fail("claim-wait refresh capture failed"); }
+    if (!refresh_ram) { return fail("claim-during-refresh capture failed"); }
     ram.wait_pending_copies();
     disk.note_ram_resident(*refresh_ram, id);
-    disk.test_arm_stall_after_meta_rename();
-    disk.test_arm_fail_rollback_meta();
-    disk.request_idle_spill();
-    if (!wait_pred([&] { return disk.test_meta_renamed(); }, std::chrono::seconds(5))) {
-        disk.cancel_idle_spill();
-        return fail("claim-wait refresh did not reach rename");
+    bool claimed = false;
+    {
+        UnlockedIoHold fsync(disk, q36::detail::DiskUnlockedIo::CommitMetaRenamed);
+        disk.test_arm_fail_rollback_meta();
+        disk.request_idle_spill();
+        if (!fsync.entered()) {
+            fsync.release();
+            disk.cancel_idle_spill();
+            return fail("claim-during-refresh never reached the meta rename");
+        }
+        fsync.arm();
+        claimed = disk.claim(id, fresh->hash_f, fresh->execution_frontier, fresh->reuse_base,
+                             fresh->reuse, fresh->committed_generation);
+        if (!fsync.disarm()) {
+            if (claimed) { disk.release(id); }
+            return fail("claim waited for the in-flight refresh commit");
+        }
+        fsync.release();
     }
-    if (disk.claim(id, fresh->hash_f, fresh->execution_frontier, fresh->reuse_base,
-                    fresh->reuse, fresh->committed_generation)) {
+    if (!claimed) { return fail("claim of the current generation failed during a refresh"); }
+    disk.wait_idle_and_fsync();
+    const auto stale_restore_misses = [&](auto&& restore) {
+        try {
+            restore();
+        } catch (const ninfer::runtime::CacheRestoreFailure& error) {
+            return error.kind() == ninfer::runtime::CacheRestoreFailureKind::StalePlan;
+        } catch (const std::exception& e) {
+            std::cerr << "stale-generation restore threw " << e.what() << '\n';
+        }
+        return false;
+    };
+    if (!stale_restore_misses([&] { (void)disk.load_host(id, fresh->committed_generation); })) {
         disk.release(id);
-        return fail("claim accepted generation replaced during idle-wait");
+        return fail("stale claim's host load did not miss on the published generation");
     }
-    if (!disk.test_claim_waited_for_idle()) { return fail("claim-wait schedule missed idle refresh"); }
-    const auto after_wait = disk.plan_match(prompt, chain);
-    if (!after_wait || after_wait->committed_generation <= fresh->committed_generation ||
-        !disk.claim(id, after_wait->hash_f, after_wait->execution_frontier, after_wait->reuse_base,
-                    after_wait->reuse, after_wait->committed_generation)) {
-        return fail("claim-wait rejection prevented fresh generation claim");
+    {
+        auto dest = pool.reserve(1);
+        dest.materialize_pages(1, ctx.stream);
+        q36::detail::DiskRestoreTarget target;
+        target.text                 = &dest;
+        target.text_pool            = &pool;
+        target.text_dst_pages       = 1;
+        target.stream               = ctx.copy_stream;
+        target.committed_generation = fresh->committed_generation;
+        const bool missed = stale_restore_misses([&] { (void)disk.restore_device(id, target); });
+        dest.release();
+        if (!missed) {
+            disk.cancel_restore();
+            disk.release(id);
+            return fail("stale claim's restore did not miss on the published generation");
+        }
+    }
+    // Planning skips a claimed entry, so the published generation is visible once released.
+    disk.release(id);
+    const auto after_refresh = disk.plan_match(prompt, chain);
+    if (!after_refresh || after_refresh->committed_generation <= fresh->committed_generation) {
+        return fail("failed refresh rollback did not publish the new generation");
+    }
+    if (!disk.claim(id, after_refresh->hash_f, after_refresh->execution_frontier,
+                    after_refresh->reuse_base, after_refresh->reuse,
+                    after_refresh->committed_generation)) {
+        return fail("published refresh generation could not be claimed");
     }
     disk.release(id);
     pages.release();
-    std::cout << "disk generation: before-claim and during-idle-wait refresh cases passed\n";
+    std::cout << "disk generation: before-claim and during-refresh claim cases passed\n";
     return 0;
 }
 
@@ -2210,25 +3195,29 @@ int test_unlink_retry_under_allocation_pressure(ninfer::DeviceContext& ctx,
         auto source = pool.reserve(1);
         source.materialize_pages(1, ctx.stream);
         fill_logical_pages(pool, source, 31);
-        auto cfg = disk_config(dir.path, ram, pool, nullptr,
-                               ninfer::SpeculativeBackend::None, 64ULL << 20, 4096);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               64ULL << 20, 4096);
         const auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 31));
         {
             q36::detail::KVDiskCache disk(cfg);
-            const auto ram_id = capture_tokens(ram, pool, source, ctx, std::vector<ninfer::TokenId>(64, 31));
+            const auto ram_id =
+                capture_tokens(ram, pool, source, ctx, std::vector<ninfer::TokenId>(64, 31));
             disk.note_ram_resident(ram_id, 0);
             if (!disk.emergency_spill_ram(ram_id)) { return fail("unlink pressure spill failed"); }
             disk.test_arm_fail_entry_unlink();
             if (!disk.test_fifo_evict_one_unpersisted()) {
                 return fail("unlink pressure did not tombstone entry");
             }
-            bool escaped = false;
-            bool removed = false;
+            bool escaped                 = false;
+            bool removed                 = false;
             fail_disk_caller_allocations = true;
-            try { removed = disk.test_flush_pending_unlinks(unlock); }
-            catch (const std::bad_alloc&) { escaped = true; }
+            try {
+                removed = disk.test_flush_pending_unlinks(unlock);
+            } catch (const std::bad_alloc&) { escaped = true; }
             fail_disk_caller_allocations = false;
-            if (escaped || removed) { return fail("unlink retry bookkeeping escaped allocation failure"); }
+            if (escaped || removed) {
+                return fail("unlink retry bookkeeping escaped allocation failure");
+            }
             // Reacquiring the mutex proves the unlocked cleanup path restored
             // its caller's ownership even though filesystem work threw.
             if (disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {
@@ -2249,14 +3238,14 @@ int test_unlink_retry_under_allocation_pressure(ninfer::DeviceContext& ctx,
 
 int test_spill_batch_allocation_and_promotion(ninfer::DeviceContext& ctx) {
     auto plan = plan_paged_cache(20, 8, 2,
-                                {{ninfer::DType::I8, 64, 2},
-                                 {ninfer::DType::I8, 64, 2},
-                                 {ninfer::DType::FP16, 1, 2},
-                                 {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     auto source = pool.reserve(8);
-    auto dest = pool.reserve(8);
+    auto dest   = pool.reserve(8);
     source.materialize_pages(8, ctx.stream);
     dest.materialize_pages(8, ctx.stream);
     fill_logical_pages(pool, source, 119);
@@ -2264,8 +3253,8 @@ int test_spill_batch_allocation_and_promotion(ninfer::DeviceContext& ctx) {
         for (std::uint32_t batch : {2U, 4U, 8U}) {
             TmpDir dir("batch-allocation");
             q36::detail::KVRamCache ram(32ULL << 20);
-            auto cfg = disk_config(dir.path, ram, pool, nullptr,
-                                   ninfer::SpeculativeBackend::None, 64ULL << 20, 4096);
+            auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   64ULL << 20, 4096);
             cfg.pack_page_batch = batch;
             q36::detail::KVDiskCache disk(cfg);
             const std::vector<ninfer::TokenId> tokens(512, 53);
@@ -2276,8 +3265,9 @@ int test_spill_batch_allocation_and_promotion(ninfer::DeviceContext& ctx) {
             std::atomic<bool> done{false};
             bool spilled = false;
             std::thread operation([&] {
-                if (emergency) { spilled = disk.emergency_spill_ram(ram_id); }
-                else {
+                if (emergency) {
+                    spilled = disk.emergency_spill_ram(ram_id);
+                } else {
                     disk.request_idle_spill();
                     (void)wait_pred([&] { return disk.test_failed_page_batch_size() != 0; },
                                     std::chrono::seconds(5));
@@ -2286,44 +3276,48 @@ int test_spill_batch_allocation_and_promotion(ninfer::DeviceContext& ctx) {
                 done.store(true);
             });
             if (!wait_pred([&] { return done.load(); }, std::chrono::seconds(8))) {
-                std::cerr << "batch allocation hung: emergency=" << emergency
-                          << " batch=" << batch << " inflight="
-                          << disk.test_payload_io_inflight() << std::endl;
+                std::cerr << "batch allocation hung: emergency=" << emergency << " batch=" << batch
+                          << " inflight=" << disk.test_payload_io_inflight() << '\n';
                 std::_Exit(1);
             }
             operation.join();
             if (spilled || disk.ram_is_durable(ram_id) || disk.snapshot().drops <= drops ||
-                disk.test_payload_io_inflight() != 0 || disk.test_failed_page_batch_size() != batch) {
+                disk.test_payload_io_inflight() != 0 ||
+                disk.test_failed_page_batch_size() != batch) {
                 std::cerr << "batch allocation emergency=" << emergency << " batch=" << batch
                           << " observed=" << disk.test_failed_page_batch_size()
                           << " spilled=" << spilled << " durable=" << disk.ram_is_durable(ram_id)
                           << " drops=" << disk.snapshot().drops - drops
-                          << " inflight=" << disk.test_payload_io_inflight() << std::endl;
+                          << " inflight=" << disk.test_payload_io_inflight() << '\n';
                 return fail("batch allocation did not retire all acquired jobs");
             }
             disk.cancel_idle_spill();
-            if (!ram.peek_oldest_unpinned() || !disk.emergency_spill_ram(ram_id)) {
+            if (!oldest_unpinned(ram) || !disk.emergency_spill_ram(ram_id)) {
                 return fail("batch allocation prevented subsequent spill");
             }
             const auto prompt = text_prompt(tokens);
-            auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+            auto match        = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
             if (!match || !disk.claim(match->entry_id, match->hash_f, match->execution_frontier)) {
                 return fail("batch allocation retry did not produce a claimable entry");
             }
             q36::detail::DiskRestoreTarget target;
-            target.text = &dest;
-            target.text_pool = &pool;
+            target.text           = &dest;
+            target.text_pool      = &pool;
             target.text_dst_pages = 8;
-            target.stream = ctx.copy_stream;
-            const auto ticket = disk.restore_device(match->entry_id, target);
-            if (wait_restore_bounded(disk, ctx, "batch allocation retry restore hung")) { return 1; }
+            target.stream         = ctx.copy_stream;
+            const auto ticket     = disk.restore_device(match->entry_id, target);
+            if (wait_restore_bounded(disk, ctx, "batch allocation retry restore hung")) {
+                return 1;
+            }
             disk.release_restore_ticket(ticket);
             disk.release(match->entry_id);
             std::vector<std::uint8_t> expected(ninfer::paged_kv_logical_page_bytes(pool));
             std::vector<std::uint8_t> actual(expected.size());
             for (std::uint32_t page = 0; page < 8; ++page) {
-                ninfer::pack_paged_kv_logical_page_to_host(source, pool, page, expected.data(), ctx.stream);
-                ninfer::pack_paged_kv_logical_page_to_host(dest, pool, page, actual.data(), ctx.stream);
+                ninfer::pack_paged_kv_logical_page_to_host(source, pool, page, expected.data(),
+                                                           ctx.stream);
+                ninfer::pack_paged_kv_logical_page_to_host(dest, pool, page, actual.data(),
+                                                           ctx.stream);
                 ctx.synchronize_all();
                 if (expected != actual) { return fail("batch allocation retry page mismatch"); }
             }
@@ -2332,11 +3326,11 @@ int test_spill_batch_allocation_and_promotion(ninfer::DeviceContext& ctx) {
     {
         TmpDir dir("promotion-allocation");
         q36::detail::KVRamCache ram(32ULL << 20);
-        auto cfg = disk_config(dir.path, ram, pool, nullptr,
-                               ninfer::SpeculativeBackend::None, 64ULL << 20, 4096);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               64ULL << 20, 4096);
         q36::detail::KVDiskCache disk(cfg);
-        const auto ram_id = capture_tokens(ram, pool, source, ctx,
-                                          std::vector<ninfer::TokenId>(512, 59));
+        const auto ram_id =
+            capture_tokens(ram, pool, source, ctx, std::vector<ninfer::TokenId>(512, 59));
         disk.note_ram_resident(ram_id, 0);
         disk.test_arm_payload_take_barrier();
         disk.request_idle_spill();
@@ -2350,16 +3344,16 @@ int test_spill_batch_allocation_and_promotion(ninfer::DeviceContext& ctx) {
         std::thread release([&] {
             while (!entered.load()) { std::this_thread::yield(); }
             // Wait until the caller changes the session priority under mutex.
-            (void)wait_pred([&] { return disk.test_emergency_queued(); },
-                            std::chrono::seconds(5));
+            (void)wait_pred([&] { return disk.test_emergency_queued(); }, std::chrono::seconds(5));
             disk.test_release_payload_take_barrier();
         });
-        bool spilled = false;
-        bool escaped = false;
+        bool spilled                 = false;
+        bool escaped                 = false;
         fail_disk_caller_allocations = true;
         entered.store(true);
-        try { spilled = disk.emergency_spill_ram(ram_id); }
-        catch (const std::bad_alloc&) { escaped = true; }
+        try {
+            spilled = disk.emergency_spill_ram(ram_id);
+        } catch (const std::bad_alloc&) { escaped = true; }
         fail_disk_caller_allocations = false;
         disk.test_release_payload_take_barrier();
         release.join();
@@ -2367,7 +3361,7 @@ int test_spill_batch_allocation_and_promotion(ninfer::DeviceContext& ctx) {
             return fail("promotion allocated or failed to complete under caller memory pressure");
         }
         disk.wait_idle_and_fsync();
-        if (!ram.peek_oldest_unpinned()) { return fail("promotion leaked RAM pin"); }
+        if (!oldest_unpinned(ram)) { return fail("promotion leaked RAM pin"); }
     }
     source.release();
     dest.release();
@@ -2375,10 +3369,9 @@ int test_spill_batch_allocation_and_promotion(ninfer::DeviceContext& ctx) {
     return 0;
 }
 
-int test_pack_rollover_and_partial_pwritev(ninfer::DeviceContext& ctx,
-                                           ninfer::PagedKVPool& pool) {
+int test_pack_rollover_and_partial_pwritev(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     constexpr std::uint64_t kSegmentBytes = 1ULL << 30;
-    const std::uint64_t payload = ninfer::paged_kv_logical_page_bytes(pool);
+    const std::uint64_t payload           = ninfer::paged_kv_logical_page_bytes(pool);
     const std::uint64_t extent =
         (q36::detail::kDiskPageHeaderBytes + payload + q36::detail::kDiskPageIoAlignment - 1) &
         ~(static_cast<std::uint64_t>(q36::detail::kDiskPageIoAlignment) - 1);
@@ -2390,7 +3383,7 @@ int test_pack_rollover_and_partial_pwritev(ninfer::DeviceContext& ctx,
         alloc.materialize_pages(1, ctx.stream);
         fill_logical_pages(pool, alloc, partial ? 41 : 57);
         auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                               64ULL << 20, 4096);
+                               2ULL << 30, 4096);
         const std::vector<ninfer::TokenId> tokens(64, partial ? 41 : 57);
         {
             q36::detail::KVDiskCache disk(cfg);
@@ -2403,17 +3396,16 @@ int test_pack_rollover_and_partial_pwritev(ninfer::DeviceContext& ctx,
                 return fail("pack rollover/partial spill failed");
             }
             const auto prompt = text_prompt(tokens);
-            const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+            const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
             if (!match) {
                 alloc.release();
                 return fail("pack rollover/partial entry was not hittable");
             }
             const auto pages = disk.test_main_page_ids(match->entry_id);
-            const auto loc = pages.empty()
-                                 ? std::optional<PackedObjectLocation>{}
-                                 : packed_object_location(dir.path,
-                                                          q36::detail::DiskObjectKind::Main,
-                                                          pages.front());
+            const auto loc =
+                pages.empty() ? std::optional<PackedObjectLocation>{}
+                              : packed_object_location(dir.path, q36::detail::DiskObjectKind::Main,
+                                                       pages.front());
             if (!loc || loc->offset != expected_offset ||
                 loc->path.filename() !=
                     (expected_segment == 0 ? "00000000.pack" : "00000001.pack") ||
@@ -2432,118 +3424,24 @@ int test_pack_rollover_and_partial_pwritev(ninfer::DeviceContext& ctx,
         return 0;
     };
 
-    if (const int rc = exercise("pack-roll-exact", kSegmentBytes - extent, 0,
-                                kSegmentBytes - extent, true);
+    if (const int rc =
+            exercise("pack-roll-exact", kSegmentBytes - extent, 0, kSegmentBytes - extent, true);
         rc != 0) {
         return rc;
     }
-    return exercise("pack-roll-next", kSegmentBytes - extent +
-                                          q36::detail::kDiskPageIoAlignment,
-                    1, 0, false);
+    return exercise("pack-roll-next", kSegmentBytes - extent + q36::detail::kDiskPageIoAlignment, 1,
+                    0, false);
 }
 
-int test_compaction_reclaims_retired_pack_generation(ninfer::DeviceContext& ctx,
-                                                     ninfer::PagedKVPool& pool) {
-    TmpDir dir("pack-compaction");
-    q36::detail::KVRamCache ram(64ULL << 20);
-    auto alloc = pool.reserve(4);
-    alloc.materialize_pages(3, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
-    const std::vector<ninfer::TokenId> tokens_a(64, 31);
-    const std::vector<ninfer::TokenId> tokens_b(128, 47);
-    std::uint64_t entry_b = 0;
-    {
-        q36::detail::KVDiskCache disk(cfg);
-        const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
-        disk.note_ram_resident(ram_a, 0);
-        if (!disk.emergency_spill_ram(ram_a)) {
-            alloc.release();
-            return fail("pack-compaction spill A failed");
-        }
-        const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
-        disk.note_ram_resident(ram_b, 0);
-        if (!disk.emergency_spill_ram(ram_b)) {
-            alloc.release();
-            return fail("pack-compaction spill B failed");
-        }
-        const auto match_b =
-            disk.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-        if (!match_b) {
-            alloc.release();
-            return fail("pack-compaction could not find B before eviction");
-        }
-        entry_b = match_b->entry_id;
-        if (!disk.test_fifo_evict_one()) {
-            alloc.release();
-            return fail("pack-compaction could not evict A");
-        }
-    }
-    const auto old_packset = read_bytes(dir.path / "PACKSET");
-    if (old_packset.size() != 32) {
-        alloc.release();
-        return fail("pack-compaction PACKSET is missing before reopen");
-    }
-        std::uint64_t old_generation = 0;
-        std::memcpy(&old_generation, old_packset.data() + 12, sizeof(old_generation));
-        const auto old_base =
-            dir.path / "maps" / ("objects-" + std::to_string(old_generation) + ".base");
-        const auto old_log =
-            dir.path / "maps" / ("objects-" + std::to_string(old_generation) + ".log");
-        {
-            q36::detail::KVDiskCache reopened(cfg);
-            auto old_generation_lease = reopened.test_hold_active_generation();
-        const auto match_b =
-            reopened.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-        if (!match_b || match_b->entry_id != entry_b) {
-            alloc.release();
-            return fail("pack-compaction lost the retained entry on reopen");
-        }
-        // Reopen leaves the evicted map entry as a zero-ref map record.  The
-        // idle maintenance path must compact it away and release the retired
-        // generation without losing B.
-        reopened.wait_idle_and_fsync();
-        const auto new_packset = read_bytes(dir.path / "PACKSET");
-        if (new_packset.size() != 32) {
-            alloc.release();
-            return fail("pack-compaction PACKSET is missing after compaction");
-        }
-        std::uint64_t new_generation = 0;
-        std::memcpy(&new_generation, new_packset.data() + 12, sizeof(new_generation));
-        if (new_generation <= old_generation ||
-            !fs::exists(dir.path / "packs" / std::to_string(old_generation)) ||
-            !fs::exists(old_base) || !fs::exists(old_log)) {
-            alloc.release();
-            return fail("pack-compaction ignored a held retired-generation pack/map lease");
-        }
-        const auto retained =
-            reopened.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-        if (!retained || retained->entry_id != entry_b) {
-            alloc.release();
-            return fail("pack-compaction lost the retained entry after rewrite");
-        }
-        old_generation_lease.reset();
-        reopened.wait_idle_and_fsync();
-        if (fs::exists(dir.path / "packs" / std::to_string(old_generation)) ||
-            fs::exists(old_base) || fs::exists(old_log)) {
-            alloc.release();
-            return fail("pack-compaction did not reap released generation pack/maps");
-        }
-    }
-    alloc.release();
-    return 0;
-}
-
-int test_spill_durability_phase_matrix(ninfer::DeviceContext& ctx,
-                                       ninfer::PagedKVPool& pool) {
-    using Fault = q36::detail::DiskFaultPoint;
+int test_spill_durability_phase_matrix(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    using Fault               = q36::detail::DiskFaultPoint;
     const std::array pre_meta = {
-        Fault::AfterRecordWrite, Fault::AfterPackSync, Fault::AfterMapAppend,
-        Fault::AfterMapSync, Fault::AfterMetaTmpWrite, Fault::AfterMetaTmpSync,
+        Fault::AfterRecordWrite, Fault::AfterPackSync,     Fault::AfterMapAppend,
+        Fault::AfterMapSync,     Fault::AfterMetaTmpWrite, Fault::AfterMetaTmpSync,
     };
     const std::array post_rename = {Fault::AfterMetaRename, Fault::AfterEntryDirSync,
                                     Fault::AfterEntryParentSync};
-    auto exercise = [&](Fault point, bool published, int ordinal) -> int {
+    auto exercise                = [&](Fault point, bool published, int ordinal) -> int {
         TmpDir dir((std::string("spill-phase-") + std::to_string(ordinal)).c_str());
         q36::detail::KVRamCache ram(32ULL << 20);
         auto alloc = pool.reserve(2);
@@ -2560,8 +3458,8 @@ int test_spill_durability_phase_matrix(ninfer::DeviceContext& ctx,
         }
         q36::detail::KVDiskCache reopened(cfg);
         const auto prompt = text_prompt(tokens);
-        const bool matched = static_cast<bool>(
-            reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt)));
+        const bool matched =
+            static_cast<bool>(reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt)));
         if (matched != published) {
             alloc.release();
             return fail("spill durability phase exposed the wrong restart generation");
@@ -2580,22 +3478,20 @@ int test_spill_durability_phase_matrix(ninfer::DeviceContext& ctx,
 }
 
 int test_packset_bootstrap_phase_matrix(ninfer::PagedKVPool& pool) {
-    using Fault = q36::detail::DiskFaultPoint;
+    using Fault             = q36::detail::DiskFaultPoint;
     const std::array points = {Fault::AfterPacksetTmpWrite, Fault::AfterPacksetTmpSync,
                                Fault::AfterPacksetRename, Fault::AfterPacksetRootSync};
-    int ordinal = 0;
+    int ordinal             = 0;
     for (Fault point : points) {
         TmpDir dir((std::string("packset-phase-") + std::to_string(ordinal++)).c_str());
         q36::detail::KVRamCache ram(8ULL << 20);
         auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                                16ULL << 20, 4096);
         cfg.test_fault_point = point;
-        bool threw = false;
+        bool threw           = false;
         try {
             q36::detail::KVDiskCache failed(cfg);
-        } catch (...) {
-            threw = true;
-        }
+        } catch (...) { threw = true; }
         if (!threw) { return fail("PACKSET bootstrap phase fault did not interrupt publication"); }
         cfg.test_fault_point = Fault::None;
         try {
@@ -2608,99 +3504,11 @@ int test_packset_bootstrap_phase_matrix(ninfer::PagedKVPool& pool) {
     return 0;
 }
 
-int test_compaction_publication_phase_matrix(ninfer::DeviceContext& ctx,
-                                             ninfer::PagedKVPool& pool) {
-    using Fault = q36::detail::DiskFaultPoint;
-    const std::array points = {
-        Fault::CompactionAfterPackCopy, Fault::CompactionAfterPackSync,
-        Fault::CompactionAfterBaseWrite, Fault::CompactionAfterBaseSync,
-        Fault::CompactionAfterLogWrite, Fault::CompactionAfterLogSync,
-        Fault::CompactionAfterPacksetTmpWrite, Fault::CompactionAfterPacksetTmpSync,
-        Fault::CompactionAfterPacksetRename, Fault::CompactionAfterRootSync,
-    };
-    int ordinal = 0;
-    for (Fault point : points) {
-        TmpDir dir((std::string("compact-phase-") + std::to_string(ordinal)).c_str());
-        q36::detail::KVRamCache ram(48ULL << 20);
-        auto alloc = pool.reserve(3);
-        alloc.materialize_pages(2, ctx.stream);
-        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                               64ULL << 20, 4096);
-        const std::vector<ninfer::TokenId> dropped(64, 121 + ordinal);
-        const std::vector<ninfer::TokenId> retained(128, 141 + ordinal);
-        {
-            q36::detail::KVDiskCache disk(cfg);
-            for (const auto* tokens : {&dropped, &retained}) {
-                const auto ram_id = capture_tokens(ram, pool, alloc, ctx, *tokens);
-                disk.note_ram_resident(ram_id, 0);
-                if (!disk.emergency_spill_ram(ram_id)) {
-                    alloc.release();
-                    return fail("compaction phase fixture spill failed");
-                }
-            }
-            if (!disk.test_fifo_evict_one()) {
-                alloc.release();
-                return fail("compaction phase fixture eviction failed");
-            }
-        }
-        {
-            q36::detail::KVDiskCache disk(cfg);
-            const auto packset = read_bytes(dir.path / "PACKSET");
-            if (packset.size() != 32) {
-                alloc.release();
-                return fail("compaction phase PACKSET fixture is invalid");
-            }
-            std::uint64_t old_generation = 0;
-            std::memcpy(&old_generation, packset.data() + 12, sizeof(old_generation));
-            const auto old_base =
-                dir.path / "maps" / ("objects-" + std::to_string(old_generation) + ".base");
-            const auto old_log =
-                dir.path / "maps" / ("objects-" + std::to_string(old_generation) + ".log");
-            if (point == Fault::CompactionAfterPacksetRename) {
-                disk.test_arm_fault_sequence(point,
-                    Fault::CompactionRecoveryBeforeRootSync);
-            } else {
-                disk.test_arm_fault(point);
-            }
-            disk.wait_idle_and_fsync();
-            if (point == Fault::CompactionAfterPacksetRename) {
-                const auto old_root = dir.path / "packs" / std::to_string(old_generation);
-                if (!fs::exists(old_root) || !fs::exists(old_base) || !fs::exists(old_log)) {
-                    alloc.release();
-                    return fail("uncertain PACKSET publication reaped old generation pack/maps");
-                }
-                disk.wait_idle_and_fsync();
-                if (fs::exists(old_root) || fs::exists(old_base) || fs::exists(old_log)) {
-                    alloc.release();
-                    return fail("durable PACKSET retry did not reap old generation pack/maps");
-                }
-            }
-        }
-        try {
-            q36::detail::KVDiskCache reopened(cfg);
-            const auto prompt = text_prompt(retained);
-            if (!reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {
-                alloc.release();
-                return fail("compaction phase lost the retained restart generation");
-            }
-            reopened.wait_idle_and_fsync();
-        } catch (const std::exception& e) {
-            std::cerr << "compaction phase " << ordinal << " reopen threw: " << e.what() << '\n';
-            alloc.release();
-            return fail("compaction phase left an unreadable published generation");
-        }
-        ++ordinal;
-        alloc.release();
-    }
-    return 0;
-}
-
-int test_tombstone_durability_phase_matrix(ninfer::DeviceContext& ctx,
-                                           ninfer::PagedKVPool& pool) {
-    using Fault = q36::detail::DiskFaultPoint;
+int test_tombstone_durability_phase_matrix(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    using Fault             = q36::detail::DiskFaultPoint;
     const std::array points = {Fault::AfterTombstoneTmpWrite, Fault::AfterTombstoneTmpSync,
                                Fault::AfterTombstoneRename, Fault::AfterTombstoneDirSync};
-    int ordinal = 0;
+    int ordinal             = 0;
     for (Fault point : points) {
         TmpDir dir((std::string("tombstone-phase-") + std::to_string(ordinal)).c_str());
         q36::detail::KVRamCache ram(24ULL << 20);
@@ -2720,15 +3528,18 @@ int test_tombstone_durability_phase_matrix(ninfer::DeviceContext& ctx,
             disk.test_arm_fault(point);
             (void)disk.test_fifo_evict_one();
         }
+        // A failed eviction returns the entry to service and removes any tombstone its
+        // attempt renamed, so every phase reopens with the entry.
         q36::detail::KVDiskCache reopened(cfg);
         const auto prompt = text_prompt(tokens);
-        const bool matched = static_cast<bool>(
-            reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt)));
-        const bool tombstone_published =
-            point == Fault::AfterTombstoneRename || point == Fault::AfterTombstoneDirSync;
-        if (matched == tombstone_published) {
+        const bool matched =
+            static_cast<bool>(reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt)));
+        std::error_code ec;
+        const bool tombstoned =
+            fs::exists(dir.path / "tombstones", ec) && !fs::is_empty(dir.path / "tombstones", ec);
+        if (!matched || tombstoned) {
             alloc.release();
-            return fail("tombstone durability phase exposed the wrong restart generation");
+            return fail("failed tombstone phase dropped an entry that returned to service");
         }
         ++ordinal;
         alloc.release();
@@ -2754,6 +3565,11 @@ int test_physical_preflight_rejects_before_pack_write(ninfer::DeviceContext& ctx
         alloc.release();
         return fail("pack-preflight admitted a spill with no physical room");
     }
+    if (disk.snapshot()
+            .drop_reasons[static_cast<std::size_t>(ninfer::KvDiskDropReason::SpillNoRoom)] != 1) {
+        alloc.release();
+        return fail("pack-preflight refusal was not attributed to spill_no_room");
+    }
     const auto after = read_bytes(active_map_path(dir.path, ".log"));
     if (before != after || disk.snapshot().used_bytes != 0 ||
         disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
@@ -2764,8 +3580,8 @@ int test_physical_preflight_rejects_before_pack_write(ninfer::DeviceContext& ctx
     return 0;
 }
 
-int test_low_free_subthreshold_garbage_rejects_without_write(
-    ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_low_free_recycled_extent_rejects_without_write(ninfer::DeviceContext& ctx,
+                                                        ninfer::PagedKVPool& pool) {
     TmpDir dir("pack-low-free-garbage");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(2);
@@ -2803,19 +3619,19 @@ int test_low_free_subthreshold_garbage_rejects_without_write(
     }
     if (!disk.test_fifo_evict_one()) {
         alloc.release();
-        return fail("low-free fixture could not create sub-threshold garbage");
+        return fail("low-free fixture could not create reusable extents");
     }
-    const auto before_packs = file_size_snapshot(dir.path / "packs");
-    const auto before_maps = file_size_snapshot(dir.path / "maps");
+    const auto before_packs   = file_size_snapshot(dir.path / "packs");
+    const auto before_maps    = file_size_snapshot(dir.path / "maps");
     const auto before_packset = read_bytes(dir.path / "PACKSET");
     const std::vector<ninfer::TokenId> rejected(64, 99);
     const auto rejected_ram = capture_tokens(ram, pool, alloc, ctx, rejected);
     disk.note_ram_resident(rejected_ram, 0);
-    constexpr std::uint64_t kSegmentSlack = 1ULL << 30;
-    disk.test_set_free_bytes_override(append_bytes + kSegmentSlack - 1);
+    constexpr std::uint64_t kMetadataSlack = 1ULL << 20;
+    disk.test_set_free_bytes_override(append_bytes + kMetadataSlack - 1);
     if (disk.emergency_spill_ram(rejected_ram)) {
         alloc.release();
-        return fail("low-free sub-threshold-garbage spill was admitted");
+        return fail("low-free recycled-extent spill was admitted");
     }
     if (file_size_snapshot(dir.path / "packs") != before_packs ||
         file_size_snapshot(dir.path / "maps") != before_maps ||
@@ -2838,7 +3654,7 @@ int test_low_free_subthreshold_garbage_rejects_without_write(
     const std::vector<ninfer::TokenId> accepted(64, 100);
     const auto accepted_ram = capture_tokens(ram, pool, alloc, ctx, accepted);
     disk.note_ram_resident(accepted_ram, 0);
-    disk.test_set_free_bytes_override(append_bytes + kSegmentSlack);
+    disk.test_set_free_bytes_override(append_bytes + kMetadataSlack);
     if (!disk.emergency_spill_ram(accepted_ram)) {
         alloc.release();
         return fail("low-free exact append-plus-slack boundary was rejected");
@@ -2928,8 +3744,10 @@ int test_cancelled_restore_job_does_not_poison_next(ninfer::DeviceContext& ctx,
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                            32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_restore_job_barrier(); }
     } barrier{disk};
 
@@ -2947,8 +3765,8 @@ int test_cancelled_restore_job_does_not_poison_next(ninfer::DeviceContext& ctx,
     }
     const auto prompt_a = text_prompt({2, 3, 4, 5});
     const auto prompt_b = text_prompt({6, 7, 8, 9});
-    const auto match_a = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
-    const auto match_b = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+    const auto match_a  = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+    const auto match_b  = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
     if (!match_a || !match_b || match_a->entry_id == match_b->entry_id) {
         alloc.release();
         return fail("stale-job did not persist two distinct entries");
@@ -3104,21 +3922,24 @@ int test_stale_state_load_does_not_publish_wrong_head(ninfer::DeviceContext& ctx
     rollback.hidden       = rollback_host.data();
     rollback.hidden_bytes = 64;
     source.ladder_heads   = {rollback};
-    auto id = capture_or_evict(ram, source);
+    auto id               = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("stale-state capture failed");
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
     cfg.hidden_bytes = 64;
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_restore_state_barrier(); }
     } barrier{disk};
+
     disk.note_ram_resident(*id, 0);
     if (!disk.emergency_spill_ram(*id)) {
         alloc.release();
@@ -3129,11 +3950,9 @@ int test_stale_state_load_does_not_publish_wrong_head(ninfer::DeviceContext& ctx
         alloc.release();
         return fail("stale-state exact match failed");
     }
-    auto prompt3 = text_prompt({3, 3, 3});
-    const auto rb =
-        disk.plan_match(prompt3, q36::detail::prefix_hash_chain(prompt3));
-    if (!rb || rb->reuse_base != 3 ||
-        rb->reuse != ninfer::PrefixReusePath::RestoreTurnRollback) {
+    auto prompt3  = text_prompt({3, 3, 3});
+    const auto rb = disk.plan_match(prompt3, q36::detail::prefix_hash_chain(prompt3));
+    if (!rb || rb->reuse_base != 3 || rb->reuse != ninfer::PrefixReusePath::RestoreTurnRollback) {
         alloc.release();
         return fail("stale-state did not advertise the rollback head");
     }
@@ -3216,25 +4035,27 @@ int test_stale_state_failure_does_not_poison_next(ninfer::DeviceContext& ctx,
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
     alloc.materialize_pages(1, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
     cfg.hidden_bytes = 64;
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_restore_state_barrier(); }
     } barrier{disk};
 
     ninfer::DeviceBuffer hid_a(64);
     hid_a.fill(0x11);
     ninfer::Tensor hidden_a(hid_a.p, ninfer::DType::U8, {64});
-    auto prompt_a = text_prompt({2, 3, 4, 5});
+    auto prompt_a   = text_prompt({2, 3, 4, 5});
     auto retained_a = prompt_a;
     retained_a.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity_a;
-    auto source_a = make_source(retained_a, identity_a, alloc, pool, ctx.copy_stream, 4);
+    auto source_a        = make_source(retained_a, identity_a, alloc, pool, ctx.copy_stream, 4);
     source_a.tail_hidden = &hidden_a;
-    auto ram_a = capture_or_evict(ram, source_a);
+    auto ram_a           = capture_or_evict(ram, source_a);
     if (!ram_a) {
         alloc.release();
         return fail("stale-fail capture A failed");
@@ -3250,13 +4071,13 @@ int test_stale_state_failure_does_not_poison_next(ninfer::DeviceContext& ctx,
     ninfer::DeviceBuffer hid_b(64);
     hid_b.fill(0x22);
     ninfer::Tensor hidden_b(hid_b.p, ninfer::DType::U8, {64});
-    auto prompt_b = text_prompt({6, 7, 8, 9});
+    auto prompt_b   = text_prompt({6, 7, 8, 9});
     auto retained_b = prompt_b;
     retained_b.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity_b;
-    auto source_b = make_source(retained_b, identity_b, alloc, pool, ctx.copy_stream, 4);
+    auto source_b        = make_source(retained_b, identity_b, alloc, pool, ctx.copy_stream, 4);
     source_b.tail_hidden = &hidden_b;
-    auto ram_b = capture_or_evict(ram, source_b);
+    auto ram_b           = capture_or_evict(ram, source_b);
     if (!ram_b) {
         alloc.release();
         return fail("stale-fail capture B failed");
@@ -3349,7 +4170,7 @@ int test_stale_state_failure_does_not_poison_next(ninfer::DeviceContext& ctx,
 }
 
 int test_copy_event_lease_survives_next_restore(ninfer::DeviceContext& ctx,
-                                               ninfer::PagedKVPool& pool) {
+                                                ninfer::PagedKVPool& pool) {
     TmpDir dir("copy-lease");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -3357,8 +4178,10 @@ int test_copy_event_lease_survives_next_restore(ninfer::DeviceContext& ctx,
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                            32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_copy_lease_barrier(); }
     } barrier{disk};
 
@@ -3376,8 +4199,8 @@ int test_copy_event_lease_survives_next_restore(ninfer::DeviceContext& ctx,
     }
     const auto prompt_a = text_prompt({2, 3, 4, 5});
     const auto prompt_b = text_prompt({6, 7, 8, 9});
-    const auto match_a   = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
-    const auto match_b   = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+    const auto match_a  = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+    const auto match_b  = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
     if (!match_a || !match_b || match_a->entry_id == match_b->entry_id) {
         alloc.release();
         return fail("copy-lease did not persist two entries");
@@ -3442,8 +4265,8 @@ int test_copy_event_lease_survives_next_restore(ninfer::DeviceContext& ctx,
     target_b.stream         = ctx.copy_stream;
     disk.restore_device(match_b->entry_id, target_b);
     const auto live_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
-    cudaEvent_t live = nullptr;
-    std::size_t retired = disk.test_retired_copy_events();
+    cudaEvent_t live         = nullptr;
+    std::size_t retired      = disk.test_retired_copy_events();
     while (std::chrono::steady_clock::now() < live_deadline) {
         disk.pump_restore(ctx.copy_stream);
         live    = disk.test_copies_done();
@@ -3501,7 +4324,7 @@ int test_copy_event_lease_survives_next_restore(ninfer::DeviceContext& ctx,
 }
 
 int test_wait_copies_does_not_follow_replacement_generation(ninfer::DeviceContext& ctx,
-                                                       ninfer::PagedKVPool& pool) {
+                                                            ninfer::PagedKVPool& pool) {
     TmpDir dir("wait-epoch");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -3509,8 +4332,10 @@ int test_wait_copies_does_not_follow_replacement_generation(ninfer::DeviceContex
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                            32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() {
             disk.test_release_restore_job_barrier();
             disk.test_release_wait_epoch_barrier();
@@ -3531,8 +4356,8 @@ int test_wait_copies_does_not_follow_replacement_generation(ninfer::DeviceContex
     }
     const auto prompt_a = text_prompt({2, 3, 4, 5});
     const auto prompt_b = text_prompt({6, 7, 8, 9});
-    const auto match_a   = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
-    const auto match_b   = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+    const auto match_a  = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+    const auto match_b  = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
     if (!match_a || !match_b || match_a->entry_id == match_b->entry_id) {
         alloc.release();
         return fail("wait-epoch did not persist two entries");
@@ -3633,7 +4458,7 @@ int test_wait_copies_does_not_follow_replacement_generation(ninfer::DeviceContex
 }
 
 int test_disk_load_timing_survives_session_close(ninfer::DeviceContext& ctx,
-                                                ninfer::PagedKVPool& pool) {
+                                                 ninfer::PagedKVPool& pool) {
     TmpDir dir("load-timing");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -3928,7 +4753,8 @@ int test_h2d_not_billed_until_wait_copies(ninfer::DeviceContext& ctx, ninfer::Pa
     return 0;
 }
 
-int test_abandoned_prefetch_does_not_bill_load(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_abandoned_prefetch_does_not_bill_load(ninfer::DeviceContext& ctx,
+                                               ninfer::PagedKVPool& pool) {
     TmpDir dir("prefetch-bill");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -3978,7 +4804,7 @@ int test_abandoned_prefetch_does_not_bill_load(ninfer::DeviceContext& ctx, ninfe
 }
 
 int test_cancelled_state_read_does_not_bill_load(ninfer::DeviceContext& ctx,
-                                                   ninfer::PagedKVPool& pool) {
+                                                 ninfer::PagedKVPool& pool) {
     TmpDir dir("state-bill");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -3993,24 +4819,27 @@ int test_cancelled_state_read_does_not_bill_load(ninfer::DeviceContext& ctx,
     hid_cur.fill(0xaa);
     ninfer::Tensor hidden_cur(hid_cur.p, ninfer::DType::U8, {64});
     source.tail_hidden = &hidden_cur;
-    auto id = capture_or_evict(ram, source);
+    auto id            = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("state-bill capture failed");
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
     cfg.hidden_bytes = 64;
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() {
             disk.test_set_state_decode_stall_ms(0);
             disk.test_release_restore_state_barrier();
         }
     } barrier{disk};
+
     disk.note_ram_resident(*id, 0);
     if (!disk.emergency_spill_ram(*id)) {
         alloc.release();
@@ -4060,9 +4889,7 @@ int test_cancelled_state_read_does_not_bill_load(ninfer::DeviceContext& ctx,
     disk.release(match->entry_id);
     dest.release();
     alloc.release();
-    if (extra.load > 0.0) {
-        return fail("cancelled state read billed SSD time onto pending load");
-    }
+    if (extra.load > 0.0) { return fail("cancelled state read billed SSD time onto pending load"); }
     return 0;
 }
 
@@ -4073,21 +4900,22 @@ int test_wait_copies_injected_failure_is_not_pread(ninfer::PagedKVPool& pool) {
                            32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
     disk.test_arm_fail_wait_copies();
+    bool injected_failure_thrown = false;
     try {
         disk.wait_copies();
-        return fail("injected wait_copies did not throw");
     } catch (const std::logic_error&) {
+        injected_failure_thrown = true;
     } catch (const std::exception& e) {
         std::cerr << "injected wait_copies threw " << e.what() << '\n';
         return 1;
     }
-    if (disk.restore_failed()) {
-        return fail("injected wait_copies set restore_failed_");
-    }
+    if (!injected_failure_thrown) { return fail("injected wait_copies did not throw"); }
+    if (disk.restore_failed()) { return fail("injected wait_copies set restore_failed_"); }
     return 0;
 }
 
-int test_wait_copies_after_close_leases_ticket(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_wait_copies_after_close_leases_ticket(ninfer::DeviceContext& ctx,
+                                               ninfer::PagedKVPool& pool) {
     TmpDir dir("wait-ticket");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -4157,7 +4985,7 @@ int test_wait_copies_after_close_leases_ticket(ninfer::DeviceContext& ctx, ninfe
 }
 
 int test_released_prefetch_does_not_poison_restore(ninfer::DeviceContext& ctx,
-                                                    ninfer::PagedKVPool& pool) {
+                                                   ninfer::PagedKVPool& pool) {
     TmpDir dir("prefetch-release");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -4165,8 +4993,10 @@ int test_released_prefetch_does_not_poison_restore(ninfer::DeviceContext& ctx,
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                            32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_restore_job_barrier(); }
     } barrier{disk};
 
@@ -4184,8 +5014,8 @@ int test_released_prefetch_does_not_poison_restore(ninfer::DeviceContext& ctx,
     }
     const auto prompt_a = text_prompt({2, 3, 4, 5});
     const auto prompt_b = text_prompt({6, 7, 8, 9});
-    const auto match_a   = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
-    const auto match_b   = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+    const auto match_a  = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+    const auto match_b  = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
     if (!match_a || !match_b || match_a->entry_id == match_b->entry_id) {
         alloc.release();
         return fail("prefetch-release did not persist two entries");
@@ -4263,7 +5093,7 @@ int test_released_prefetch_does_not_poison_restore(ninfer::DeviceContext& ctx,
 }
 
 int test_stale_prefetch_does_not_survive_inplace_extend(ninfer::DeviceContext& ctx,
-                                                     ninfer::PagedKVPool& pool) {
+                                                        ninfer::PagedKVPool& pool) {
     TmpDir dir("prefetch-extend");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -4279,8 +5109,8 @@ int test_stale_prefetch_does_not_survive_inplace_extend(ninfer::DeviceContext& c
         alloc.release();
         return fail("prefetch-extend parent spill failed");
     }
-    const auto match_p = disk.plan_match(text_prompt(parent_tokens),
-                                           q36::detail::prefix_hash_chain(text_prompt(parent_tokens)));
+    const auto match_p = disk.plan_match(
+        text_prompt(parent_tokens), q36::detail::prefix_hash_chain(text_prompt(parent_tokens)));
     if (!match_p || match_p->reuse_base != 63) {
         alloc.release();
         return fail("prefetch-extend parent did not match at frontier 63");
@@ -4318,7 +5148,7 @@ int test_stale_prefetch_does_not_survive_inplace_extend(ninfer::DeviceContext& c
         return fail("prefetch-extend in-place spill failed");
     }
     const auto match_c = disk.plan_match(text_prompt(child_tokens),
-                                           q36::detail::prefix_hash_chain(text_prompt(child_tokens)));
+                                         q36::detail::prefix_hash_chain(text_prompt(child_tokens)));
     if (!match_c || match_c->entry_id != entry_id) {
         alloc.release();
         return fail("prefetch-extend did not refresh the same disk entry");
@@ -4380,8 +5210,8 @@ int test_stale_prefetch_does_not_survive_inplace_extend(ninfer::DeviceContext& c
     return 0;
 }
 
-int test_abandoned_prefetch_failure_does_not_poison_other_restore(
-    ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_abandoned_prefetch_failure_does_not_poison_other_restore(ninfer::DeviceContext& ctx,
+                                                                  ninfer::PagedKVPool& pool) {
     TmpDir dir("prefetch-fail-other");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -4389,8 +5219,10 @@ int test_abandoned_prefetch_failure_does_not_poison_other_restore(
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                            32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_page_read_barrier(); }
     } barrier{disk};
 
@@ -4408,8 +5240,8 @@ int test_abandoned_prefetch_failure_does_not_poison_other_restore(
     }
     const auto prompt_a = text_prompt({2, 3, 4, 5});
     const auto prompt_b = text_prompt({6, 7, 8, 9});
-    const auto match_a   = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
-    const auto match_b   = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+    const auto match_a  = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+    const auto match_b  = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
     if (!match_a || !match_b || match_a->entry_id == match_b->entry_id) {
         alloc.release();
         return fail("prefetch-fail-other did not persist two entries");
@@ -4509,10 +5341,10 @@ int test_restore_ticket_survives_host_wait_until_stream_wait(ninfer::DeviceConte
     auto dest = pool.reserve(2);
     dest.materialize_pages(1, ctx.stream);
     q36::detail::DiskRestoreTarget target;
-    target.text           = &dest;
-    target.text_pool      = &pool;
-    target.text_dst_pages = 1;
-    target.stream         = ctx.copy_stream;
+    target.text                = &dest;
+    target.text_pool           = &pool;
+    target.text_dst_pages      = 1;
+    target.stream              = ctx.copy_stream;
     const std::uint64_t ticket = disk.restore_device(match->entry_id, target);
     if (ticket == 0) {
         disk.cancel_restore();
@@ -4570,7 +5402,7 @@ int test_restore_ticket_survives_host_wait_until_stream_wait(ninfer::DeviceConte
 }
 
 int test_restore_state_setup_failure_does_not_spin(ninfer::DeviceContext& ctx,
-                                                     ninfer::PagedKVPool& pool) {
+                                                   ninfer::PagedKVPool& pool) {
     TmpDir dir("state-setup-fail");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -4597,10 +5429,10 @@ int test_restore_state_setup_failure_does_not_spin(ninfer::DeviceContext& ctx,
     auto dest = pool.reserve(2);
     dest.materialize_pages(1, ctx.stream);
     q36::detail::DiskRestoreTarget target;
-    target.text           = &dest;
-    target.text_pool      = &pool;
-    target.text_dst_pages = 1;
-    target.stream         = ctx.copy_stream;
+    target.text             = &dest;
+    target.text_pool        = &pool;
+    target.text_dst_pages   = 1;
+    target.stream           = ctx.copy_stream;
     const auto drops_before = disk.snapshot().drops;
     disk.test_arm_fail_restore_state_setup();
     disk.restore_device(match->entry_id, target);
@@ -4613,9 +5445,7 @@ int test_restore_state_setup_failure_does_not_spin(ninfer::DeviceContext& ctx,
             alloc.release();
             return rc;
         }
-    } catch (const std::exception&) {
-        threw = true;
-    }
+    } catch (const std::exception&) { threw = true; }
     if (!threw || !disk.restore_failed()) {
         disk.cancel_restore();
         disk.release(match->entry_id);
@@ -4645,9 +5475,7 @@ int test_restore_state_setup_failure_does_not_spin(ninfer::DeviceContext& ctx,
             alloc.release();
             return rc;
         }
-    } catch (const std::exception&) {
-        threw = true;
-    }
+    } catch (const std::exception&) { threw = true; }
     if (!threw || !disk.restore_failed() || disk.snapshot().drops <= post_spawn_drops) {
         disk.cancel_restore();
         disk.release(match->entry_id);
@@ -4659,8 +5487,8 @@ int test_restore_state_setup_failure_does_not_spin(ninfer::DeviceContext& ctx,
 
     disk.restore_device(match->entry_id, target);
     try {
-        if (const int rc = wait_restore_bounded(
-                disk, ctx, "restore after checkpoint-prepare failure hung");
+        if (const int rc =
+                wait_restore_bounded(disk, ctx, "restore after checkpoint-prepare failure hung");
             rc != 0) {
             disk.release(match->entry_id);
             dest.release();
@@ -4683,7 +5511,7 @@ int test_restore_state_setup_failure_does_not_spin(ninfer::DeviceContext& ctx,
 }
 
 int test_cancel_before_h2d_releases_ticket_event(ninfer::DeviceContext& ctx,
-                                                   ninfer::PagedKVPool& pool) {
+                                                 ninfer::PagedKVPool& pool) {
     TmpDir dir("cancel-no-h2d");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -4691,8 +5519,10 @@ int test_cancel_before_h2d_releases_ticket_event(ninfer::DeviceContext& ctx,
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                            32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_restore_job_barrier(); }
     } barrier{disk};
 
@@ -4748,17 +5578,20 @@ int test_cancel_before_h2d_releases_ticket_event(ninfer::DeviceContext& ctx,
     return 0;
 }
 
-int test_stale_state_io_aborts_between_objects(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_stale_state_io_aborts_between_objects(ninfer::DeviceContext& ctx,
+                                               ninfer::PagedKVPool& pool) {
     TmpDir dir("stale-decode");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
     alloc.materialize_pages(1, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
     cfg.hidden_bytes = 64;
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() {
             disk.test_set_state_decode_stall_ms(0);
             disk.test_release_restore_state_barrier();
@@ -4772,7 +5605,7 @@ int test_stale_state_io_aborts_between_objects(ninfer::DeviceContext& ctx, ninfe
     auto retained_a = prompt_a;
     retained_a.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity_a;
-    auto source_a = make_source(retained_a, identity_a, alloc, pool, ctx.copy_stream, 8);
+    auto source_a        = make_source(retained_a, identity_a, alloc, pool, ctx.copy_stream, 8);
     source_a.tail_hidden = &hidden_a;
     std::vector<unsigned char> hid_host(64, 0x11);
     q36::detail::RamLadderHead rollback;
@@ -4787,10 +5620,10 @@ int test_stale_state_io_aborts_between_objects(ninfer::DeviceContext& ctx, ninfe
     l1.kind = q36::detail::ContextCheckpointKind::Ladder;
     q36::detail::RamLadderHead l2 = rollback;
     l2.frontier                   = 5;
-    l2.hash = q36::detail::prefix_hash_at(retained_a.token_ids, identity_a, 5);
-    l2.kind = q36::detail::ContextCheckpointKind::Ladder;
+    l2.hash               = q36::detail::prefix_hash_at(retained_a.token_ids, identity_a, 5);
+    l2.kind               = q36::detail::ContextCheckpointKind::Ladder;
     source_a.ladder_heads = {rollback, l1, l2};
-    auto ram_a = capture_or_evict(ram, source_a);
+    auto ram_a            = capture_or_evict(ram, source_a);
     if (!ram_a) {
         alloc.release();
         return fail("stale-decode capture A failed");
@@ -4810,9 +5643,9 @@ int test_stale_state_io_aborts_between_objects(ninfer::DeviceContext& ctx, ninfe
     auto retained_b = prompt_b;
     retained_b.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity_b;
-    auto source_b = make_source(retained_b, identity_b, alloc, pool, ctx.copy_stream, 4);
+    auto source_b        = make_source(retained_b, identity_b, alloc, pool, ctx.copy_stream, 4);
     source_b.tail_hidden = &hidden_b;
-    auto ram_b = capture_or_evict(ram, source_b);
+    auto ram_b           = capture_or_evict(ram, source_b);
     if (!ram_b) {
         alloc.release();
         return fail("stale-decode capture B failed");
@@ -4849,7 +5682,8 @@ int test_stale_state_io_aborts_between_objects(ninfer::DeviceContext& ctx, ninfe
     disk.test_arm_restore_state_barrier();
     disk.restore_device(match_a->entry_id, target);
     const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!disk.test_restore_state_entered() && std::chrono::steady_clock::now() < entered_deadline) {
+    while (!disk.test_restore_state_entered() &&
+           std::chrono::steady_clock::now() < entered_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (!disk.test_restore_state_entered()) {
@@ -4902,7 +5736,7 @@ int test_stale_state_io_aborts_between_objects(ninfer::DeviceContext& ctx, ninfe
 }
 
 int test_page_read_throw_does_not_stick_inflight(ninfer::DeviceContext& ctx,
-                                                ninfer::PagedKVPool& pool) {
+                                                 ninfer::PagedKVPool& pool) {
     TmpDir dir("page-throw");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -4925,8 +5759,8 @@ int test_page_read_throw_does_not_stick_inflight(ninfer::DeviceContext& ctx,
     }
     const auto prompt_a = text_prompt({2, 3, 4, 5});
     const auto prompt_b = text_prompt({6, 7, 8, 9});
-    const auto match_a = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
-    const auto match_b = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+    const auto match_a  = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+    const auto match_b  = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
     if (!match_a || !match_b || match_a->entry_id == match_b->entry_id) {
         alloc.release();
         return fail("page-throw did not persist two entries");
@@ -4944,7 +5778,8 @@ int test_page_read_throw_does_not_stick_inflight(ninfer::DeviceContext& ctx,
     target.stream         = ctx.copy_stream;
     disk.test_arm_fail_page_read();
     disk.restore_device(match_a->entry_id, target);
-    bool threw = false;
+    bool threw       = false;
+    bool recoverable = false;
     try {
         if (const int rc = wait_restore_bounded(disk, ctx, "page-throw A restore hung"); rc != 0) {
             disk.release(match_a->entry_id);
@@ -4952,13 +5787,16 @@ int test_page_read_throw_does_not_stick_inflight(ninfer::DeviceContext& ctx,
             alloc.release();
             return rc;
         }
+    } catch (const ninfer::runtime::CacheRestoreFailure&) {
+        threw = recoverable = true;
     } catch (const std::exception&) { threw = true; }
-    if (!threw) {
+    if (!threw || !recoverable) {
         disk.cancel_restore();
         disk.release(match_a->entry_id);
         dest.release();
         alloc.release();
-        return fail("injected page-read throw did not fail restore");
+        return fail(threw ? "worker I/O failure escaped as a non-recoverable error"
+                          : "injected page-read throw did not fail restore");
     }
     disk.cancel_restore();
     disk.release(match_a->entry_id);
@@ -4995,7 +5833,7 @@ int test_capture_returns_id(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& poo
     alloc.materialize_pages(1, ctx.stream);
     q36::detail::KVRamCache ram(8ULL << 20);
     const auto first = capture_tokens(ram, pool, alloc, ctx, {1, 1, 1, 1});
-    if (!ram.peek_oldest_unpinned() || *ram.peek_oldest_unpinned() != first) {
+    if (oldest_unpinned(ram) != std::optional<std::uint64_t>(first)) {
         alloc.release();
         return fail("capture did not return a peekable id");
     }
@@ -5059,7 +5897,8 @@ int test_restore_three_pages_and_prefetch(ninfer::DeviceContext& ctx, ninfer::Pa
     target.stream         = ctx.copy_stream;
     disk.restore_device(match->entry_id, target);
     try {
-        if (const int rc = wait_restore_bounded(disk, ctx, "restore of three pages hung"); rc != 0) {
+        if (const int rc = wait_restore_bounded(disk, ctx, "restore of three pages hung");
+            rc != 0) {
             disk.release(match->entry_id);
             dest.release();
             alloc.release();
@@ -5099,8 +5938,8 @@ int test_restore_three_pages_and_prefetch(ninfer::DeviceContext& ctx, ninfer::Pa
     target.text = &dest;
     disk.restore_device(match->entry_id, target);
     try {
-        if (const int rc =
-                wait_restore_bounded(disk, ctx, "prefetch-covered restore hung without RestoreRead");
+        if (const int rc = wait_restore_bounded(
+                disk, ctx, "prefetch-covered restore hung without RestoreRead");
             rc != 0) {
             disk.release(match->entry_id);
             dest.release();
@@ -5181,13 +6020,10 @@ int test_restore_completion_waits_for_final_scatter(ninfer::DeviceContext& ctx,
     std::thread waiter([&] {
         try {
             disk.wait_copies();
-        } catch (...) {
-            wait_error = std::current_exception();
-        }
+        } catch (...) { wait_error = std::current_exception(); }
         waiter_done.store(true, std::memory_order_release);
     });
-    if (!wait_pred([&] { return disk.test_scatter_record_entered(); },
-                   std::chrono::seconds(2))) {
+    if (!wait_pred([&] { return disk.test_scatter_record_entered(); }, std::chrono::seconds(2))) {
         disk.test_release_scatter_record_barrier();
         waiter.join();
         disk.cancel_restore();
@@ -5268,7 +6104,8 @@ int test_extend_preserves_disk_claim(ninfer::DeviceContext& ctx, ninfer::PagedKV
         alloc.release();
         return fail("claim-extend parent spill failed");
     }
-    const auto match_a = disk.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
+    const auto match_a =
+        disk.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
     if (!match_a) {
         alloc.release();
         return fail("claim-extend parent match failed");
@@ -5344,8 +6181,8 @@ int test_claimed_generation_not_extended(ninfer::DeviceContext& ctx, ninfer::Pag
         alloc.release();
         return fail("claimed disk page list changed under restore");
     }
-    const auto match_c =
-        disk.plan_match(text_prompt(extended), q36::detail::prefix_hash_chain(text_prompt(extended)));
+    const auto match_c = disk.plan_match(text_prompt(extended),
+                                         q36::detail::prefix_hash_chain(text_prompt(extended)));
     if (!match_c || match_c->entry_id == match_b->entry_id) {
         disk.release(match_b->entry_id);
         alloc.release();
@@ -5402,8 +6239,8 @@ int test_claimed_parent_branch_clones_partial_page(ninfer::DeviceContext& ctx,
         alloc.release();
         return fail("claimed-E63 parent spill failed");
     }
-    const auto match_p = disk.plan_match(text_prompt(parent_tokens),
-                                           q36::detail::prefix_hash_chain(text_prompt(parent_tokens)));
+    const auto match_p = disk.plan_match(
+        text_prompt(parent_tokens), q36::detail::prefix_hash_chain(text_prompt(parent_tokens)));
     if (!match_p || match_p->reuse_base != 63) {
         alloc.release();
         return fail("claimed-E63 parent did not match at frontier 63");
@@ -5434,7 +6271,7 @@ int test_claimed_parent_branch_clones_partial_page(ninfer::DeviceContext& ctx,
         return fail("claimed-E63 child spill failed");
     }
     const auto match_c = disk.plan_match(text_prompt(child_tokens),
-                                           q36::detail::prefix_hash_chain(text_prompt(child_tokens)));
+                                         q36::detail::prefix_hash_chain(text_prompt(child_tokens)));
     if (!match_c || match_c->entry_id == match_p->entry_id) {
         disk.release(match_p->entry_id);
         alloc.release();
@@ -5505,103 +6342,97 @@ int test_claimed_parent_branch_clones_partial_page(ninfer::DeviceContext& ctx,
     return 0;
 }
 
-int test_consume_failure_keeps_ram_note(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
-    TmpDir dir("consume-note");
-    q36::detail::KVRamCache ram(16ULL << 20);
-    auto alloc = pool.reserve(2);
-    alloc.materialize_pages(1, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
-    q36::detail::KVDiskCache disk(std::move(cfg));
-    const auto ram_id = capture_tokens(ram, pool, alloc, ctx, {5, 5, 5, 5});
-    disk.note_ram_resident(ram_id, 0);
-    if (!disk.emergency_spill_ram(ram_id)) {
+// A disk-hit claim of an entry whose idle Extend is in flight returns at once, while the
+// Extend's page write, its commit's object sync, or its commit after the meta.bin rename is
+// still held: the scheduler never waits for spill I/O. The claim makes the Extend abandon
+// (before the rename, or by rolling it back); the claimed generation stays in memory and on disk.
+int test_claim_returns_during_in_flight_idle_extend(ninfer::DeviceContext& ctx,
+                                                    ninfer::PagedKVPool& pool) {
+    using Window = q36::detail::DiskUnlockedIo;
+    for (const Window window :
+         {Window::PayloadWrite, Window::CommitSync, Window::CommitMetaRenamed}) {
+        const bool commit = window != Window::PayloadWrite;
+        TmpDir dir(window == Window::PayloadWrite ? "claim-idle-write"
+                   : window == Window::CommitSync ? "claim-idle-sync"
+                                                  : "claim-idle-renamed");
+        q36::detail::KVRamCache ram(64ULL << 20);
+        auto alloc = pool.reserve(4);
+        alloc.materialize_pages(3, ctx.stream);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               64ULL << 20, 4096);
+        std::vector<ninfer::TokenId> aligned(64, 4);
+        std::uint64_t entry_b    = 0;
+        std::uint32_t frontier_b = 0;
+        {
+            q36::detail::KVDiskCache disk(cfg);
+            const auto ram_b = capture_tokens(ram, pool, alloc, ctx, aligned);
+            disk.note_ram_resident(ram_b, 0);
+            if (!disk.emergency_spill_ram(ram_b)) {
+                alloc.release();
+                return fail("claim-idle spill of B failed");
+            }
+            const auto match_b = disk.plan_match(
+                text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
+            if (!match_b) {
+                alloc.release();
+                return fail("claim-idle match of B failed");
+            }
+            entry_b                               = match_b->entry_id;
+            frontier_b                            = disk.test_load_meta(entry_b).execution_frontier;
+            std::vector<ninfer::TokenId> extended = aligned;
+            extended.push_back(0);
+            extended.resize(128, 5);
+            const auto ram_d = capture_tokens(ram, pool, alloc, ctx, extended);
+            ram.set_disk_entry_id(ram_d, entry_b);
+            disk.note_ram_resident(ram_d, entry_b);
+            bool claimed = false;
+            {
+                UnlockedIoHold hold(disk, window);
+                disk.request_idle_spill();
+                if (!hold.entered()) {
+                    hold.release();
+                    alloc.release();
+                    return fail("claim-idle never entered the held Extend I/O");
+                }
+                std::atomic<bool> returned{false};
+                std::thread claimer([&] {
+                    claimed = disk.claim(entry_b);
+                    returned.store(true);
+                });
+                const bool returned_while_held =
+                    wait_pred([&] { return returned.load(); }, std::chrono::seconds(10));
+                hold.release();
+                claimer.join();
+                if (!returned_while_held) {
+                    if (claimed) { disk.release(entry_b); }
+                    alloc.release();
+                    return fail(commit ? "claim waited for the idle Extend's commit fsync"
+                                       : "claim waited for the idle Extend's payload write");
+                }
+            }
+            if (!claimed) {
+                alloc.release();
+                return fail("claim-idle claim of B failed");
+            }
+            // The abandoned Extend drains (and rolls a renamed meta.bin back) while B is claimed.
+            disk.wait_idle_and_fsync();
+            disk.prefetch_window(entry_b, 1, 0);
+            if (disk.test_load_meta(entry_b).execution_frontier != frontier_b) {
+                disk.release(entry_b);
+                alloc.release();
+                return fail("in-flight idle extend mutated a claimed generation");
+            }
+            disk.release(entry_b);
+        }
+        q36::detail::KVDiskCache reopened(cfg);
+        const auto match = reopened.plan_match(
+            text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
+        if (!match || match->entry_id != entry_b || match->reuse_base != frontier_b) {
+            alloc.release();
+            return fail("reopen after a claim-abandoned extend lost the claimed generation");
+        }
         alloc.release();
-        return fail("consume-note spill failed");
     }
-    ram.claim(ram_id);
-    const auto restores_before = ram.snapshot().restores;
-    ram.test_fail_next_copy_sync();
-    bool threw = false;
-    try {
-        ram.consume(ram_id);
-    } catch (const std::runtime_error&) { threw = true; }
-    if (!threw) {
-        alloc.release();
-        return fail("consume-note consume did not throw");
-    }
-    if (!ram.is_claimed(ram_id)) {
-        alloc.release();
-        return fail("consume-note dropped the RAM record before commit");
-    }
-    if (!disk.test_has_ram_note(ram_id)) {
-        alloc.release();
-        return fail("consume-note forgot the disk note before RAM consume committed");
-    }
-    if (ram.snapshot().restores != restores_before) {
-        ram.release(ram_id);
-        alloc.release();
-        return fail("consume-note counted a restore before commit");
-    }
-    ram.release(ram_id);
-    alloc.release();
-    return 0;
-}
-
-int test_claim_cancels_in_flight_idle_extend(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
-    TmpDir dir("claim-idle");
-    q36::detail::KVRamCache ram(64ULL << 20);
-    auto alloc = pool.reserve(4);
-    alloc.materialize_pages(3, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
-    q36::detail::KVDiskCache disk(std::move(cfg));
-    std::vector<ninfer::TokenId> aligned(64, 4);
-    const auto ram_b = capture_tokens(ram, pool, alloc, ctx, aligned);
-    disk.note_ram_resident(ram_b, 0);
-    if (!disk.emergency_spill_ram(ram_b)) {
-        alloc.release();
-        return fail("claim-idle spill of B failed");
-    }
-    const auto match_b =
-        disk.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
-    if (!match_b) {
-        alloc.release();
-        return fail("claim-idle match of B failed");
-    }
-    const auto frontier_b = disk.test_load_meta(match_b->entry_id).execution_frontier;
-    std::vector<ninfer::TokenId> extended = aligned;
-    extended.push_back(0);
-    extended.resize(128, 5);
-    const auto ram_d = capture_tokens(ram, pool, alloc, ctx, extended);
-    ram.set_disk_entry_id(ram_d, match_b->entry_id);
-    disk.note_ram_resident(ram_d, match_b->entry_id);
-    disk.test_set_payload_io_stall_ms(250);
-    disk.request_idle_spill();
-    const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!disk.test_payload_io_entered() &&
-           std::chrono::steady_clock::now() < entered_deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    if (!disk.test_payload_io_entered()) {
-        disk.test_set_payload_io_stall_ms(0);
-        alloc.release();
-        return fail("claim-idle never entered payload I/O");
-    }
-    if (!disk.claim(match_b->entry_id)) {
-        disk.test_set_payload_io_stall_ms(0);
-        alloc.release();
-        return fail("claim-idle claim of B failed");
-    }
-    disk.test_set_payload_io_stall_ms(0);
-    disk.prefetch_window(match_b->entry_id, 1, 0);
-    if (disk.test_load_meta(match_b->entry_id).execution_frontier != frontier_b) {
-        disk.release(match_b->entry_id);
-        alloc.release();
-        return fail("in-flight idle extend mutated a claimed generation");
-    }
-    disk.release(match_b->entry_id);
-    alloc.release();
     return 0;
 }
 
@@ -5630,7 +6461,7 @@ int test_cancel_after_meta_rename_keeps_parent(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("rename-cancel match of B failed");
         }
-        entry_b = match_b->entry_id;
+        entry_b                               = match_b->entry_id;
         std::vector<ninfer::TokenId> extended = aligned;
         extended.push_back(0);
         extended.resize(128, 5);
@@ -5640,8 +6471,7 @@ int test_cancel_after_meta_rename_keeps_parent(ninfer::DeviceContext& ctx,
         disk.test_arm_stall_after_meta_rename();
         disk.request_idle_spill();
         const auto renamed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-        while (!disk.test_meta_renamed() &&
-               std::chrono::steady_clock::now() < renamed_deadline) {
+        while (!disk.test_meta_renamed() && std::chrono::steady_clock::now() < renamed_deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (!disk.test_meta_renamed()) {
@@ -5673,7 +6503,7 @@ int test_claim_missing_after_fifo_evict(ninfer::DeviceContext& ctx, ninfer::Page
     auto alloc = pool.reserve(4);
     alloc.materialize_pages(3, ctx.stream);
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           192 * 1024, 4096);
+                           std::size_t{192} * 1024, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
     std::vector<ninfer::TokenId> tokens_a(192, 1);
     std::vector<ninfer::TokenId> tokens_b(192, 2);
@@ -5731,8 +6561,8 @@ int test_stale_plan_claim_rejects_extended_generation(ninfer::DeviceContext& ctx
     std::vector<unsigned char> seed_b(256, 0xbb);
     hid_b.copy_from_host(seed_b.data(), seed_b.size());
     ninfer::Tensor hidden_b(hid_b.p, ninfer::DType::U8, {256});
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   64ULL << 20, 4096);
     cfg.hidden_bytes = 256;
     q36::detail::KVDiskCache disk(std::move(cfg));
     std::vector<ninfer::TokenId> aligned(64, 4);
@@ -5759,9 +6589,9 @@ int test_stale_plan_claim_rejects_extended_generation(ninfer::DeviceContext& ctx
         alloc.release();
         return fail("stale-plan match of F=64 failed");
     }
-    const auto planned_id   = planned->entry_id;
-    const auto planned_hash = planned->hash_f;
-    const auto planned_f    = planned->execution_frontier;
+    const auto planned_id                 = planned->entry_id;
+    const auto planned_hash               = planned->hash_f;
+    const auto planned_f                  = planned->execution_frontier;
     std::vector<ninfer::TokenId> extended = aligned;
     extended.push_back(0);
     extended.resize(128, 5);
@@ -5886,8 +6716,7 @@ int test_post_rename_failure_keeps_a_valid_generation(ninfer::DeviceContext& ctx
         disk.test_arm_fail_after_meta_rename();
         disk.request_idle_spill();
         const auto renamed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-        while (!disk.test_meta_renamed() &&
-               std::chrono::steady_clock::now() < renamed_deadline) {
+        while (!disk.test_meta_renamed() && std::chrono::steady_clock::now() < renamed_deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (!disk.test_meta_renamed()) {
@@ -5904,26 +6733,23 @@ int test_post_rename_failure_keeps_a_valid_generation(ninfer::DeviceContext& ctx
             alloc.release();
             return fail("post-rename fsync failure marked RAM durable");
         }
-        const auto live128 =
-            disk.plan_match(text_prompt(extended),
-                            q36::detail::prefix_hash_chain(text_prompt(extended)));
+        const auto live128 = disk.plan_match(text_prompt(extended),
+                                             q36::detail::prefix_hash_chain(text_prompt(extended)));
         if (!live128 || live128->reuse_base != 128) {
             alloc.release();
             return fail("post-rename fsync failure did not publish the new generation");
         }
         for (std::uint64_t id : pages_b) {
-            if (id != 0 && !packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, id)) {
+            if (id != 0 &&
+                !packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, id)) {
                 alloc.release();
                 return fail("post-rename failure deleted the previous generation's objects");
             }
         }
     }
     q36::detail::KVDiskCache reopened(cfg);
-    const auto hit64 =
-        reopened.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
-    const auto hit128 =
-        reopened.plan_match(text_prompt(extended),
-                            q36::detail::prefix_hash_chain(text_prompt(extended)));
+    const auto hit128 = reopened.plan_match(text_prompt(extended),
+                                            q36::detail::prefix_hash_chain(text_prompt(extended)));
     if (!hit128 || hit128->reuse_base != 128) {
         alloc.release();
         return fail("post-rename failure did not keep the new generation hittable");
@@ -5936,8 +6762,8 @@ int test_post_rename_failure_keeps_a_valid_generation(ninfer::DeviceContext& ctx
         }
     }
     if (const int rc = claim_and_restore_match(reopened, ctx, pool, *hit128, 2,
-                                                "post-rename claim of the kept generation failed",
-                                                "post-rename restore hung");
+                                               "post-rename claim of the kept generation failed",
+                                               "post-rename restore hung");
         rc != 0) {
         alloc.release();
         return rc;
@@ -5979,8 +6805,7 @@ int test_rollback_meta_failure_keeps_a_valid_generation(ninfer::DeviceContext& c
         disk.test_arm_fail_rollback_meta();
         disk.request_idle_spill();
         const auto renamed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-        while (!disk.test_meta_renamed() &&
-               std::chrono::steady_clock::now() < renamed_deadline) {
+        while (!disk.test_meta_renamed() && std::chrono::steady_clock::now() < renamed_deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (!disk.test_meta_renamed()) {
@@ -5992,11 +6817,8 @@ int test_rollback_meta_failure_keeps_a_valid_generation(ninfer::DeviceContext& c
         disk.wait_idle_and_fsync();
     }
     q36::detail::KVDiskCache reopened(cfg);
-    const auto hit64 =
-        reopened.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
-    const auto hit128 =
-        reopened.plan_match(text_prompt(extended),
-                            q36::detail::prefix_hash_chain(text_prompt(extended)));
+    const auto hit128 = reopened.plan_match(text_prompt(extended),
+                                            q36::detail::prefix_hash_chain(text_prompt(extended)));
     if (!hit128 || hit128->reuse_base != 128) {
         alloc.release();
         return fail("rollback meta failure did not keep a consistent generation hittable");
@@ -6009,8 +6831,8 @@ int test_rollback_meta_failure_keeps_a_valid_generation(ninfer::DeviceContext& c
         }
     }
     if (const int rc = claim_and_restore_match(reopened, ctx, pool, *hit128, 2,
-                                                "rollback-fail claim of the kept generation failed",
-                                                "rollback-fail restore hung");
+                                               "rollback-fail claim of the kept generation failed",
+                                               "rollback-fail restore hung");
         rc != 0) {
         alloc.release();
         return rc;
@@ -6059,8 +6881,8 @@ int test_stale_manifest_discovers_branch(ninfer::DeviceContext& ctx, ninfer::Pag
     }
     fs::copy_file(bak, man, fs::copy_options::overwrite_existing);
     q36::detail::KVDiskCache reopened(cfg);
-    const auto hit = reopened.plan_match(text_prompt(child),
-                                         q36::detail::prefix_hash_chain(text_prompt(child)));
+    const auto hit =
+        reopened.plan_match(text_prompt(child), q36::detail::prefix_hash_chain(text_prompt(child)));
     if (!hit || hit->reuse_base < 64) {
         alloc.release();
         return fail("stale MANIFEST hid the durable branch generation");
@@ -6072,8 +6894,8 @@ int test_stale_manifest_discovers_branch(ninfer::DeviceContext& ctx, ninfer::Pag
         return fail("stale MANIFEST hid the durable parent generation");
     }
     if (const int rc = claim_and_restore_match(reopened, ctx, pool, *hit, 2,
-                                                "stale-manifest claim of the branch failed",
-                                                "stale-manifest branch restore hung");
+                                               "stale-manifest claim of the branch failed",
+                                               "stale-manifest branch restore hung");
         rc != 0) {
         alloc.release();
         return rc;
@@ -6115,8 +6937,8 @@ int test_gc_skipped_shared_pages(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
             alloc.release();
             return fail("skip-share branch spill failed");
         }
-        const auto match_c = disk.plan_match(text_prompt(child),
-                                             q36::detail::prefix_hash_chain(text_prompt(child)));
+        const auto match_c =
+            disk.plan_match(text_prompt(child), q36::detail::prefix_hash_chain(text_prompt(child)));
         if (!match_c) {
             alloc.release();
             return fail("skip-share branch match failed");
@@ -6144,28 +6966,28 @@ int test_gc_skipped_shared_pages(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
             alloc.release();
             return fail("skip-share GC did not leave one skipped tree");
         }
-        if (shared_page == 0 || !packed_object_location(
-                                    dir.path, q36::detail::DiskObjectKind::Main, shared_page)) {
+        if (shared_page == 0 ||
+            !packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, shared_page)) {
             alloc.release();
             return fail("skip-share GC deleted a page still owned by the surviving tree");
         }
         skipped.wait_idle_and_fsync();
         if (!packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, shared_page)) {
             alloc.release();
-            return fail("compaction dropped a shared object retained only by a skipped tree");
+            return fail("retirement dropped a shared object retained only by a skipped tree");
         }
     }
     cfg.max_context = 4096;
     q36::detail::KVDiskCache reopened(cfg);
-    const auto hit = reopened.plan_match(text_prompt(child),
-                                         q36::detail::prefix_hash_chain(text_prompt(child)));
+    const auto hit =
+        reopened.plan_match(text_prompt(child), q36::detail::prefix_hash_chain(text_prompt(child)));
     if (!hit) {
         alloc.release();
         return fail("GC of one skipped tree corrupted the shared-page survivor");
     }
     if (const int rc = claim_and_restore_match(reopened, ctx, pool, *hit, 2,
-                                                "skip-share claim of the survivor failed",
-                                                "skip-share survivor restore hung");
+                                               "skip-share claim of the survivor failed",
+                                               "skip-share survivor restore hung");
         rc != 0) {
         alloc.release();
         return rc;
@@ -6191,8 +7013,8 @@ int test_truncated_page_payload_is_skipped(ninfer::DeviceContext& ctx, ninfer::P
             alloc.release();
             return fail("trunc-page spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("trunc-page match failed");
@@ -6211,7 +7033,8 @@ int test_truncated_page_payload_is_skipped(ninfer::DeviceContext& ctx, ninfer::P
     }
     fs::resize_file(page->path, page->offset + q36::detail::kDiskPageHeaderBytes);
     q36::detail::KVDiskCache reopened(cfg);
-    if (reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+    if (reopened.plan_match(text_prompt(tokens),
+                            q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
         alloc.release();
         return fail("header-only truncated page remained hittable");
     }
@@ -6245,8 +7068,8 @@ int test_truncated_state_payload_is_skipped(ninfer::DeviceContext& ctx, ninfer::
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
     cfg.hidden_bytes = 4096;
     std::uint64_t hidden_id = 0;
     {
@@ -6294,15 +7117,18 @@ int test_truncated_state_payload_is_skipped(ninfer::DeviceContext& ctx, ninfer::
         alloc.release();
         return fail("aligned state restore did not enter O_DIRECT route");
     }
+
     struct DirectStateBarrierGuard {
         q36::detail::KVDiskCache& disk;
         bool active = true;
+
         ~DirectStateBarrierGuard() {
             if (active) { disk.test_release_direct_state_read_barrier(); }
         }
     } barrier_guard{reopened};
-    const auto hidden_loc = packed_object_location(dir.path, q36::detail::DiskObjectKind::State,
-                                                   hidden_id);
+
+    const auto hidden_loc =
+        packed_object_location(dir.path, q36::detail::DiskObjectKind::State, hidden_id);
     if (!hidden_loc) {
         reopened.test_release_direct_state_read_barrier();
         reopened.cancel_restore();
@@ -6311,11 +7137,10 @@ int test_truncated_state_payload_is_skipped(ninfer::DeviceContext& ctx, ninfer::
         alloc.release();
         return fail("trunc-state could not locate packed state");
     }
-    fs::resize_file(hidden_loc->path,
-                    hidden_loc->offset + q36::detail::kDiskStatePayloadOffset);
+    fs::resize_file(hidden_loc->path, hidden_loc->offset + q36::detail::kDiskStatePayloadOffset);
     reopened.test_release_direct_state_read_barrier();
     barrier_guard.active = false;
-    bool threw = false;
+    bool threw           = false;
     try {
         reopened.wait_copies();
     } catch (const std::runtime_error&) { threw = true; }
@@ -6340,20 +7165,20 @@ int test_live_state_gap_crc_is_checked(ninfer::DeviceContext& ctx, ninfer::Paged
     hid.copy_from_host(seed.data(), seed.size());
     ninfer::Tensor hidden(hid.p, ninfer::DType::U8, {4096});
     const auto prompt = text_prompt({12, 13, 14, 15});
-    auto retained = prompt;
+    auto retained     = prompt;
     retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity;
-    auto source = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
+    auto source        = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
     source.tail_hidden = &hidden;
-    auto ram_id = capture_or_evict(ram, source);
+    auto ram_id        = capture_or_evict(ram, source);
     if (!ram_id) {
         alloc.release();
         return fail("state-gap-crc capture failed");
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
     cfg.hidden_bytes = 4096;
     q36::detail::KVDiskCache disk(cfg);
     disk.note_ram_resident(*ram_id, 0);
@@ -6388,18 +7213,16 @@ int test_live_state_gap_crc_is_checked(ninfer::DeviceContext& ctx, ninfer::Paged
     ninfer::DeviceBuffer hid_out(4096);
     ninfer::Tensor hidden_out(hid_out.p, ninfer::DType::U8, {4096});
     q36::detail::DiskRestoreTarget target;
-    target.text = &dest;
-    target.text_pool = &pool;
+    target.text           = &dest;
+    target.text_pool      = &pool;
     target.text_dst_pages = 1;
-    target.tail_hidden = &hidden_out;
-    target.stream = ctx.copy_stream;
+    target.tail_hidden    = &hidden_out;
+    target.stream         = ctx.copy_stream;
     disk.restore_device(match->entry_id, target);
     bool threw = false;
     try {
         (void)wait_restore_bounded(disk, ctx, "state-gap-crc restore hung");
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
+    } catch (const std::runtime_error&) { threw = true; }
     disk.cancel_restore();
     disk.release(match->entry_id);
     dest.release();
@@ -6454,14 +7277,14 @@ int test_empty_codec_state_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedK
         }
     }
     std::vector<std::uint8_t> hdr(q36::detail::kDiskCodecHeaderBytes, 0);
-    hdr[0] = 0;
-    hdr[1] = static_cast<std::uint8_t>(q36::detail::DiskStateKind::TailHidden);
+    hdr[0]                  = 0;
+    hdr[1]                  = static_cast<std::uint8_t>(q36::detail::DiskStateKind::TailHidden);
     const std::uint64_t unc = 256;
     const std::uint64_t cmp = 0;
     std::memcpy(hdr.data() + 4, &unc, 8);
     std::memcpy(hdr.data() + 12, &cmp, 8);
-    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id,
-                             hdr.data(), hdr.size())) {
+    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id, hdr.data(),
+                             hdr.size())) {
         alloc.release();
         return fail("empty-codec could not patch packed state");
     }
@@ -6484,7 +7307,8 @@ int test_empty_codec_state_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedK
     return 0;
 }
 
-int test_wrapped_compressed_bytes_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_wrapped_compressed_bytes_is_skipped(ninfer::DeviceContext& ctx,
+                                             ninfer::PagedKVPool& pool) {
     TmpDir dir("wrap-cmp");
     q36::detail::KVRamCache ram(16ULL << 20);
     auto alloc = pool.reserve(2);
@@ -6528,14 +7352,14 @@ int test_wrapped_compressed_bytes_is_skipped(ninfer::DeviceContext& ctx, ninfer:
         }
     }
     std::vector<std::uint8_t> hdr(q36::detail::kDiskCodecHeaderBytes, 0);
-    hdr[0] = 1;
-    hdr[1] = static_cast<std::uint8_t>(q36::detail::DiskStateKind::TailHidden);
+    hdr[0]                  = 1;
+    hdr[1]                  = static_cast<std::uint8_t>(q36::detail::DiskStateKind::TailHidden);
     const std::uint64_t unc = 256;
     const std::uint64_t cmp = std::numeric_limits<std::uint64_t>::max();
     std::memcpy(hdr.data() + 4, &unc, 8);
     std::memcpy(hdr.data() + 12, &cmp, 8);
-    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id,
-                             hdr.data(), hdr.size())) {
+    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id, hdr.data(),
+                             hdr.size())) {
         alloc.release();
         return fail("wrap-cmp could not patch packed state");
     }
@@ -6575,8 +7399,8 @@ int test_short_page_id_vector_is_skipped(ninfer::DeviceContext& ctx, ninfer::Pag
             alloc.release();
             return fail("short-pages spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("short-pages match failed");
@@ -6597,7 +7421,7 @@ int test_short_page_id_vector_is_skipped(ninfer::DeviceContext& ctx, ninfer::Pag
         return fail("short-pages meta.bin is truncated");
     }
     const std::size_t counts = bytes.size() - 16;
-    std::uint32_t zero        = 0;
+    std::uint32_t zero       = 0;
     std::memcpy(bytes.data() + counts, &zero, 4);
     std::memcpy(bytes.data() + counts + 4, &zero, 4);
     {
@@ -6626,7 +7450,7 @@ int test_short_page_id_vector_is_skipped(ninfer::DeviceContext& ctx, ninfer::Pag
 }
 
 int test_corrupt_unselected_checkpoint_is_omitted(ninfer::DeviceContext& ctx,
-                                                   ninfer::PagedKVPool& pool) {
+                                                  ninfer::PagedKVPool& pool) {
     TmpDir dir("omit-head");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -6643,20 +7467,20 @@ int test_corrupt_unselected_checkpoint_is_omitted(ninfer::DeviceContext& ctx,
     source.tail_hidden = &hidden;
     std::vector<unsigned char> hidden_host(64, 0x11);
     q36::detail::RamLadderHead rollback;
-    rollback.frontier     = 3;
-    rollback.hash         = q36::detail::prefix_hash_at(retained.token_ids, identity, 3);
-    rollback.kind         = q36::detail::ContextCheckpointKind::TurnRollback;
-    rollback.hidden       = hidden_host.data();
-    rollback.hidden_bytes = 64;
+    rollback.frontier             = 3;
+    rollback.hash                 = q36::detail::prefix_hash_at(retained.token_ids, identity, 3);
+    rollback.kind                 = q36::detail::ContextCheckpointKind::TurnRollback;
+    rollback.hidden               = hidden_host.data();
+    rollback.hidden_bytes         = 64;
     q36::detail::RamLadderHead l1 = rollback;
     l1.frontier                   = 6;
-    l1.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 6);
-    l1.kind = q36::detail::ContextCheckpointKind::Ladder;
+    l1.hash                       = q36::detail::prefix_hash_at(retained.token_ids, identity, 6);
+    l1.kind                       = q36::detail::ContextCheckpointKind::Ladder;
     q36::detail::RamLadderHead l2 = l1;
     l2.frontier                   = 5;
-    l2.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
-    source.ladder_heads = {rollback, l1, l2};
-    auto id             = capture_or_evict(ram, source);
+    l2.hash                       = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
+    source.ladder_heads           = {rollback, l1, l2};
+    auto id                       = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("omit-head capture failed");
@@ -6701,13 +7525,9 @@ int test_corrupt_unselected_checkpoint_is_omitted(ninfer::DeviceContext& ctx,
         alloc.release();
         return fail("omit-head load_host missed the live entry");
     }
-    if (disk.populate_checkpoint_images(*host)) {
+    if (decode_checkpoint_images(disk, *host, {.hidden = 64})) {
         alloc.release();
         return fail("corrupt checkpoint populate succeeded");
-    }
-    if (!host->ladder_images.empty()) {
-        alloc.release();
-        return fail("failed populate still published checkpoint images");
     }
     alloc.release();
     return 0;
@@ -6737,18 +7557,18 @@ int test_corrupt_checkpoint_fails_restore(ninfer::DeviceContext& ctx, ninfer::Pa
     rollback.hidden_bytes = 64;
     q36::detail::RamLadderHead ladder = rollback;
     ladder.frontier                   = 5;
-    ladder.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
-    ladder.kind = q36::detail::ContextCheckpointKind::Ladder;
+    ladder.hash         = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
+    ladder.kind         = q36::detail::ContextCheckpointKind::Ladder;
     source.ladder_heads = {rollback, ladder};
-    auto id = capture_or_evict(ram, source);
+    auto id             = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("ckpt-pread capture failed");
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
     cfg.hidden_bytes = 64;
     q36::detail::KVDiskCache disk(std::move(cfg));
     disk.note_ram_resident(*id, 0);
@@ -6761,9 +7581,9 @@ int test_corrupt_checkpoint_fails_restore(ninfer::DeviceContext& ctx, ninfer::Pa
         alloc.release();
         return fail("ckpt-pread match failed");
     }
-    const auto meta      = disk.test_load_meta(match->entry_id);
-    const auto hidden_id = meta.ladders[0].hidden_id != 0 ? meta.ladders[0].hidden_id
-                                                           : meta.rollback.hidden_id;
+    const auto meta = disk.test_load_meta(match->entry_id);
+    const auto hidden_id =
+        meta.ladders[0].hidden_id != 0 ? meta.ladders[0].hidden_id : meta.rollback.hidden_id;
     if (hidden_id == 0) {
         alloc.release();
         return fail("ckpt-pread stored no checkpoint hidden");
@@ -6783,15 +7603,34 @@ int test_corrupt_checkpoint_fails_restore(ninfer::DeviceContext& ctx, ninfer::Pa
     target.text_dst_pages = 1;
     target.tail_hidden    = &hidden_out;
     target.stream         = ctx.copy_stream;
+    // The restore decodes only the checkpoint heads its caller hands in; hand in every saved
+    // head, as a restore whose base retains them all does, so the corrupt one is read.
+    const auto host = disk.load_host(match->entry_id);
+    if (!host || host->ladders.empty()) {
+        disk.release(match->entry_id);
+        dest.release();
+        alloc.release();
+        return fail("ckpt-pread load_host advertised no checkpoint heads");
+    }
+    std::vector<ninfer::PinnedHostBuffer> head_hidden;
+    head_hidden.reserve(host->ladders.size());
+    for (const auto& saved : host->ladders) {
+        head_hidden.emplace_back(64, q36::detail::kDiskPageIoAlignment);
+        target.checkpoint_images.push_back(q36::detail::DiskCheckpointImageTarget{
+            .frontier     = saved.frontier,
+            .hash         = saved.hash,
+            .kind         = saved.kind,
+            .hidden       = head_hidden.back().data(),
+            .hidden_bytes = 64,
+        });
+    }
     const auto drops_before = disk.snapshot().drops;
     disk.restore_device(match->entry_id, target);
     bool threw = false;
     try {
         disk.wait_copies();
-    } catch (const ninfer::runtime::CacheRestoreFailure&) {
-        threw = true;
-    }
-    if (!threw) {
+    } catch (const ninfer::runtime::CacheRestoreFailure&) { threw = true; }
+    if (!threw || disk.take_restore_checkpoints()) {
         disk.cancel_restore();
         disk.release(match->entry_id);
         dest.release();
@@ -6841,8 +7680,8 @@ int test_missing_ledger_skips_entry(ninfer::DeviceContext& ctx, ninfer::PagedKVP
             alloc.release();
             return fail("miss-ledger spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("miss-ledger match failed");
@@ -6853,8 +7692,8 @@ int test_missing_ledger_skips_entry(ninfer::DeviceContext& ctx, ninfer::PagedKVP
             return fail("miss-ledger stored no ledger object");
         }
     }
-    const auto ledger = packed_object_location(dir.path, q36::detail::DiskObjectKind::Ledger,
-                                               ledger_id);
+    const auto ledger =
+        packed_object_location(dir.path, q36::detail::DiskObjectKind::Ledger, ledger_id);
     if (!ledger) {
         alloc.release();
         return fail("miss-ledger could not locate packed ledger");
@@ -6897,8 +7736,8 @@ int test_manifest_duplicate_ids_rebuild(ninfer::DeviceContext& ctx, ninfer::Page
             alloc.release();
             return fail("dup-manifest spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("dup-manifest match failed");
@@ -6914,12 +7753,9 @@ int test_manifest_duplicate_ids_rebuild(ninfer::DeviceContext& ctx, ninfer::Page
             man.push_back(static_cast<std::uint8_t>(v >> 24));
         };
         auto u64 = [&](std::uint64_t v) {
-            for (int s = 0; s < 64; s += 8) {
-                man.push_back(static_cast<std::uint8_t>(v >> s));
-            }
+            for (int s = 0; s < 64; s += 8) { man.push_back(static_cast<std::uint8_t>(v >> s)); }
         };
-        man.insert(man.end(), q36::detail::kDiskManifestMagic,
-                   q36::detail::kDiskManifestMagic + 8);
+        man.insert(man.end(), q36::detail::kDiskManifestMagic, q36::detail::kDiskManifestMagic + 8);
         u32(q36::detail::kDiskFormatVersion);
         u32(2);
         u64(entry_id);
@@ -6930,8 +7766,8 @@ int test_manifest_duplicate_ids_rebuild(ninfer::DeviceContext& ctx, ninfer::Page
     }
     try {
         q36::detail::KVDiskCache reopened(cfg);
-        const auto match =
-            reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = reopened.plan_match(text_prompt(tokens),
+                                               q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match || match->entry_id != entry_id) {
             alloc.release();
             return fail("duplicate MANIFEST hid the durable generation");
@@ -6966,8 +7802,8 @@ int test_meta_entry_id_mismatch_is_skipped(ninfer::DeviceContext& ctx, ninfer::P
             alloc.release();
             return fail("id-mismatch spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("id-mismatch match failed");
@@ -6979,8 +7815,8 @@ int test_meta_entry_id_mismatch_is_skipped(ninfer::DeviceContext& ctx, ninfer::P
     fs::copy(src, dst, fs::copy_options::recursive);
     try {
         q36::detail::KVDiskCache reopened(cfg);
-        const auto match =
-            reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = reopened.plan_match(text_prompt(tokens),
+                                               q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match || match->entry_id != entry_id) {
             alloc.release();
             return fail("directory/meta id mismatch hid the matching generation");
@@ -7025,7 +7861,7 @@ int test_refresh_clears_absent_rollback(ninfer::DeviceContext& ctx, ninfer::Page
     rollback.hidden       = hidden_host.data();
     rollback.hidden_bytes = 64;
     source.ladder_heads   = {rollback};
-    auto id = capture_or_evict(ram, source);
+    auto id               = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("refresh-rollback capture failed");
@@ -7081,27 +7917,22 @@ int test_plan_match_does_not_wait_on_payload_io(ninfer::DeviceContext& ctx,
     std::vector<ninfer::TokenId> tokens(64, 6);
     const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
     disk.note_ram_resident(ram_id, 0);
-    disk.test_set_payload_io_stall_ms(250);
+    UnlockedIoHold write(disk, q36::detail::DiskUnlockedIo::PayloadWrite);
     std::atomic<bool> spilled{false};
     std::thread spiller([&] { spilled.store(disk.emergency_spill_ram(ram_id)); });
-    const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!disk.test_payload_io_entered() &&
-           std::chrono::steady_clock::now() < entered_deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    if (!disk.test_payload_io_entered()) {
-        disk.test_set_payload_io_stall_ms(0);
+    if (!write.entered()) {
+        write.release();
         spiller.join();
         alloc.release();
-        return fail("payload I/O stall was not reached");
+        return fail("payload I/O hold was not reached");
     }
-    const auto t0      = std::chrono::steady_clock::now();
+    write.arm();
     const auto unrelated = text_prompt({1, 2, 3, 4});
     (void)disk.plan_match(unrelated, q36::detail::prefix_hash_chain(unrelated));
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-    disk.test_set_payload_io_stall_ms(0);
+    const bool prompt = write.disarm();
+    write.release();
     spiller.join();
-    if (elapsed > std::chrono::milliseconds(100)) {
+    if (!prompt) {
         alloc.release();
         return fail("plan_match waited on SSD payload I/O");
     }
@@ -7144,8 +7975,8 @@ int test_populate_does_not_hold_mutex_across_pread(ninfer::DeviceContext& ctx,
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
     cfg.hidden_bytes = 4096;
     q36::detail::KVDiskCache disk(std::move(cfg));
     disk.note_ram_resident(*id, 0);
@@ -7163,26 +7994,21 @@ int test_populate_does_not_hold_mutex_across_pread(ninfer::DeviceContext& ctx,
         alloc.release();
         return fail("populate-mutex load_host missed the live entry");
     }
-    disk.test_set_payload_io_stall_ms(250);
-    std::thread populator([&] { (void)disk.populate_checkpoint_images(*host); });
-    const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!disk.test_payload_io_entered() &&
-           std::chrono::steady_clock::now() < entered_deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    if (!disk.test_payload_io_entered()) {
-        disk.test_set_payload_io_stall_ms(0);
+    UnlockedIoHold read(disk, q36::detail::DiskUnlockedIo::PayloadRead);
+    std::thread populator([&] { (void)decode_checkpoint_images(disk, *host, {.hidden = 4096}); });
+    if (!read.entered()) {
+        read.release();
         populator.join();
         alloc.release();
-        return fail("populate I/O stall was not reached");
+        return fail("populate I/O hold was not reached");
     }
-    const auto t0        = std::chrono::steady_clock::now();
+    read.arm();
     const auto unrelated = text_prompt({9, 9, 9, 9});
     (void)disk.plan_match(unrelated, q36::detail::prefix_hash_chain(unrelated));
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-    disk.test_set_payload_io_stall_ms(0);
+    const bool returned = read.disarm();
+    read.release();
     populator.join();
-    if (elapsed > std::chrono::milliseconds(100)) {
+    if (!returned) {
         alloc.release();
         return fail("plan_match waited on populate_checkpoint_images pread");
     }
@@ -7190,67 +8016,565 @@ int test_populate_does_not_hold_mutex_across_pread(ninfer::DeviceContext& ctx,
     return 0;
 }
 
-int test_idle_pin_aborts_for_ram_claim(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
-    TmpDir dir("idle-pin");
-    q36::detail::KVRamCache ram(16ULL << 20);
-    auto alloc = pool.reserve(2);
-    alloc.materialize_pages(1, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
-    q36::detail::KVDiskCache disk(std::move(cfg));
-    const auto ram_id = capture_tokens(ram, pool, alloc, ctx, {8, 8, 8, 8});
-    disk.note_ram_resident(ram_id, 0);
-    for (int i = 0; i < 40; ++i) {
-        disk.request_idle_spill();
-        std::this_thread::sleep_for(std::chrono::microseconds(50 * ((i % 5) + 1)));
-        disk.begin_ram_idle_exclusion(ram_id);
-        if (!disk.ram_is_durable(ram_id)) {
-            ram.claim(ram_id);
-            ram.release(ram_id);
-            disk.end_ram_idle_exclusion(ram_id);
-            if (!ram.peek_oldest_unpinned() || *ram.peek_oldest_unpinned() != ram_id) {
-                alloc.release();
-                return fail("idle pin-before-spill left a leftover I/O pin");
+// Releases a held spill encode on scope exit, and from a watchdog if a call under test
+// blocks on the held spill instead of returning, so a regression fails instead of hanging.
+struct EncodeHold {
+    q36::detail::KVDiskCache& disk;
+    std::atomic<bool> done{false};
+    std::atomic<bool> fired{false};
+    std::jthread watchdog;
+
+    explicit EncodeHold(q36::detail::KVDiskCache& cache) : disk(cache) {
+        disk.test_hold_spill_encode(true);
+    }
+
+    void arm() {
+        watchdog = std::jthread([this] {
+            if (!wait_pred([&] { return done.load(); }, std::chrono::seconds(10))) {
+                fired.store(true);
+                disk.test_hold_spill_encode(false);
             }
-        } else {
-            disk.end_ram_idle_exclusion(ram_id);
+        });
+    }
+
+    // True when every armed call returned while the encode was still held.
+    bool disarm() {
+        done.store(true);
+        if (watchdog.joinable()) { watchdog.join(); }
+        return !fired.load();
+    }
+
+    ~EncodeHold() {
+        done.store(true);
+        disk.test_hold_spill_encode(false);
+    }
+};
+
+// The measured stall: a RAM hit on an entry whose idle spill is in flight froze decoding for
+// the whole spill. A restore only reads the entry: claim and consume return while the spill
+// is held mid-encode, the spill keeps reading the I/O-pinned bytes and commits them, and the
+// consumed block is freed by the spill's last unpin.
+int test_ram_restore_does_not_wait_for_spill(ninfer::DeviceContext& ctx,
+                                             ninfer::PagedKVPool& pool) {
+    TmpDir dir("restore-during-spill");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096, ninfer::KvDiskCompress::Zstd);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    const std::vector<ninfer::TokenId> tokens(64, 57);
+    const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
+    disk.note_ram_resident(ram_id, 0);
+    const auto entry_bytes = ram.snapshot().used_bytes;
+    int failures           = 0;
+    {
+        EncodeHold hold(disk);
+        disk.request_idle_spill();
+        if (!wait_pred([&] { return disk.test_spill_encode_entered(); },
+                       std::chrono::seconds(10)) ||
+            ram.test_io_pins(ram_id) != 1) {
+            alloc.release();
+            return fail("restore-during-spill: idle spill never pinned and reached its encode");
+        }
+        hold.arm();
+        ram.claim(ram_id);
+        ram.consume(ram_id);
+        disk.forget_ram_resident(ram_id);
+        if (!hold.disarm()) {
+            failures += fail("RAM claim/consume waited for the entry's in-flight spill");
+        }
+        const auto consumed = ram.snapshot();
+        if (consumed.entry_count != 0 || consumed.used_bytes != entry_bytes ||
+            ram.test_io_pins(ram_id) != 1) {
+            failures +=
+                fail("consumed entry left the index too late or lost its spill-pinned block");
+        }
+    }
+    const auto prompt = text_prompt(tokens);
+    if (!wait_pred(
+            [&] {
+                return ram.snapshot().used_bytes == 0 &&
+                       disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt)).has_value();
+            },
+            std::chrono::seconds(10))) {
+        failures += fail("spill of the consumed entry did not commit and free its block");
+    }
+    if (ram.retired_pending()) { failures += fail("consumed block remained retired"); }
+    alloc.release();
+    return failures;
+}
+
+// Rolling a capture back never waits for its spill: abandon + discard return while the
+// worker is held mid-encode, the encode stops at its cancellation point, nothing commits,
+// and the block is freed when the abandoned prepare unpins it.
+int test_abandoned_capture_cancels_spill_without_waiting(ninfer::DeviceContext& ctx,
+                                                         ninfer::PagedKVPool& pool) {
+    TmpDir dir("abandon-spill");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096, ninfer::KvDiskCompress::Zstd);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    const std::vector<ninfer::TokenId> tokens(64, 61);
+    const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
+    disk.note_ram_resident(ram_id, 0);
+    int failures = 0;
+    {
+        EncodeHold hold(disk);
+        disk.request_idle_spill();
+        if (!wait_pred([&] { return disk.test_spill_encode_entered(); },
+                       std::chrono::seconds(10))) {
+            alloc.release();
+            return fail("abandon-spill: idle spill never reached its encode");
+        }
+        hold.arm();
+        disk.abandon_ram_spill(ram_id);
+        ram.discard(ram_id);
+        if (!hold.disarm()) { failures += fail("capture rollback waited for its in-flight spill"); }
+        if (ram.snapshot().entry_count != 0 || disk.test_has_ram_note(ram_id)) {
+            failures += fail("rolled-back capture stayed indexed or kept its disk note");
+        }
+        // Still held: only the cancellation lets the prepare finish and unpin.
+        if (!wait_pred([&] { return ram.snapshot().used_bytes == 0; }, std::chrono::seconds(10))) {
+            failures += fail("abandoned prepare did not stop at its encode cancellation point");
+        }
+    }
+    disk.wait_idle_and_fsync();
+    const auto prompt = text_prompt(tokens);
+    if (disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {
+        failures += fail("abandoned capture was committed to disk");
+    }
+    alloc.release();
+    return failures;
+}
+
+// A disk claim during the unlocked encode of an idle Extend sees no installed spill to
+// cancel. The prepare re-validates after relocking and abandons the Extend without marking
+// the RAM entry failed, so the retry branches from the claimed parent instead of rewriting it.
+int test_claim_during_encode_aborts_idle_extend(ninfer::DeviceContext& ctx,
+                                                ninfer::PagedKVPool& pool) {
+    TmpDir dir("claim-encode");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096, ninfer::KvDiskCompress::Zstd);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    std::vector<ninfer::TokenId> aligned(64, 4);
+    const auto ram_b = capture_tokens(ram, pool, alloc, ctx, aligned);
+    disk.note_ram_resident(ram_b, 0);
+    const auto prompt_b = text_prompt(aligned);
+    const auto match_b  = disk.emergency_spill_ram(ram_b)
+                              ? disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b))
+                              : std::nullopt;
+    if (!match_b) {
+        alloc.release();
+        return fail("claim-encode fixture spill of B failed");
+    }
+    const auto entry_b                    = match_b->entry_id;
+    const auto generation_b               = disk.test_committed_generation(entry_b);
+    const auto frontier_b                 = disk.test_load_meta(entry_b).execution_frontier;
+    std::vector<ninfer::TokenId> extended = aligned;
+    extended.push_back(0);
+    extended.resize(128, 5);
+    const auto ram_d = capture_tokens(ram, pool, alloc, ctx, extended);
+    ram.set_disk_entry_id(ram_d, entry_b);
+    disk.note_ram_resident(ram_d, entry_b);
+    const auto drops = disk.snapshot().drops;
+    int failures     = 0;
+    {
+        EncodeHold hold(disk);
+        disk.request_idle_spill();
+        if (!wait_pred([&] { return disk.test_spill_encode_entered(); },
+                       std::chrono::seconds(10)) ||
+            disk.test_disk_io_pins(entry_b) == 0) {
+            alloc.release();
+            return fail("claim-encode: idle Extend never pinned B and reached its encode");
+        }
+        hold.arm();
+        const bool claimed = disk.claim(entry_b);
+        if (!hold.disarm()) { failures += fail("disk claim waited for a preparing spill"); }
+        if (!claimed) {
+            alloc.release();
+            return failures + fail("claim-encode claim of B failed");
+        }
+    }
+    if (!wait_pred([&] { return disk.ram_is_durable(ram_d); }, std::chrono::seconds(10))) {
+        failures += fail("abandoned Extend was not retried as a branch of the claimed parent");
+    }
+    if (disk.test_committed_generation(entry_b) != generation_b ||
+        disk.test_load_meta(entry_b).execution_frontier != frontier_b) {
+        failures += fail("idle spill rewrote a parent claimed during its encode");
+    }
+    if (disk.snapshot().drops != drops) {
+        failures += fail("re-validated Extend was counted as a failed spill");
+    }
+    disk.release(entry_b);
+    alloc.release();
+    return failures;
+}
+
+// One scheduler admission round against a committed disk entry: plan, claim and release.
+bool disk_admission_round(q36::detail::KVDiskCache& disk,
+                          const std::vector<ninfer::TokenId>& tokens,
+                          std::uint64_t expected_entry) {
+    const auto prompt = text_prompt(tokens);
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match || match->entry_id != expected_entry || !disk.claim(match->entry_id)) {
+        return false;
+    }
+    disk.release(match->entry_id);
+    return true;
+}
+
+std::uint64_t planned_entry(q36::detail::KVDiskCache& disk,
+                            const std::vector<ninfer::TokenId>& tokens) {
+    const auto prompt = text_prompt(tokens);
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    return match ? match->entry_id : 0;
+}
+
+// The spill's record CRC32C work runs with the index mutex released: the raw state encode
+// that seals each state record, and the page-batch header/CRC build. A scheduler admission
+// round completes while either window is held, and the held spill still commits.
+int test_spill_crc_runs_without_index_mutex(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    TmpDir dir("spill-crc-unlocked");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    const std::vector<ninfer::TokenId> resident(64, 81);
+    const auto resident_ram = capture_tokens(ram, pool, alloc, ctx, resident);
+    disk.note_ram_resident(resident_ram, 0);
+    if (!disk.emergency_spill_ram(resident_ram)) {
+        alloc.release();
+        return fail("spill-crc-unlocked resident spill failed");
+    }
+    const std::uint64_t resident_entry = planned_entry(disk, resident);
+    int failures                       = 0;
+    {
+        const std::vector<ninfer::TokenId> tokens(64, 82);
+        const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
+        disk.note_ram_resident(ram_id, 0);
+        EncodeHold hold(disk);
+        disk.request_idle_spill();
+        if (!wait_pred([&] { return disk.test_spill_encode_entered(); },
+                       std::chrono::seconds(10))) {
+            alloc.release();
+            return fail("spill-crc-unlocked raw spill never reached its encode");
+        }
+        hold.arm();
+        std::optional<q36::detail::KvDiskSnapshot> preparing;
+        const bool sampled = wait_pred(
+            [&] {
+                if (!preparing) { preparing = disk.try_snapshot(); }
+                return preparing.has_value();
+            },
+            std::chrono::seconds(2));
+        // Encoding precedes publication of the session; preparation is active without a session
+        // age.
+        const bool visible  = sampled && preparing && preparing->spill_active &&
+                              preparing->spill_elapsed_seconds == 0.0 && preparing->captures == 1;
+        const bool admitted = disk_admission_round(disk, resident, resident_entry);
+        if (!hold.disarm() || !admitted || !visible) {
+            failures += fail("held spill blocked admission or hid its active snapshot");
+        }
+        disk.test_hold_spill_encode(false);
+        if (!wait_pred([&] { return disk.ram_is_durable(ram_id); }, std::chrono::seconds(10))) {
+            failures += fail("raw spill held at its encode did not commit");
+        }
+    }
+    {
+        const std::vector<ninfer::TokenId> tokens(64, 83);
+        const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
+        disk.note_ram_resident(ram_id, 0);
+        UnlockedIoHold hold(disk, q36::detail::DiskUnlockedIo::PageBatchCrc);
+        disk.request_idle_spill();
+        if (!hold.entered()) {
+            alloc.release();
+            return fail("spill-crc-unlocked spill never reached its page-batch CRC build");
+        }
+        hold.arm();
+        std::optional<q36::detail::KvDiskSnapshot> active;
+        const bool sampled = wait_pred(
+            [&] {
+                if (!active) { active = disk.try_snapshot(); }
+                return active.has_value();
+            },
+            std::chrono::seconds(2));
+        const bool visible  = sampled && active && active->spill_active &&
+                              active->spill_elapsed_seconds > 0.0 && active->captures == 2;
+        const bool admitted = disk_admission_round(disk, resident, resident_entry);
+        if (!hold.disarm() || !admitted || !visible) {
+            failures += fail("installed spill blocked admission or hid its active snapshot");
+        }
+        hold.release();
+        if (!wait_pred(
+                [&] { return disk.ram_is_durable(ram_id) && planned_entry(disk, tokens) != 0; },
+                std::chrono::seconds(10))) {
+            failures += fail("spill held at its page-batch CRC build did not commit");
+        }
+    }
+    disk.wait_idle_and_fsync();
+    const auto idle = disk.snapshot();
+    if (idle.spill_active || idle.pending_jobs != 0 || idle.spill_elapsed_seconds != 0.0 ||
+        idle.captures != 3 || idle.save_seconds <= 0.0) {
+        failures +=
+            fail("completed spills retained active work or lost completed lifetime counters");
+    }
+    alloc.release();
+    return failures;
+}
+
+// Capacity eviction is two-phase: the FIFO victim leaves planning under the mutex, its
+// tombstone is written and fsynced with the mutex released, and only then does it drop its
+// references. Admission of an unrelated entry completes while the tombstone write is held,
+// and the eviction is durable across a reopen.
+int test_capacity_eviction_tombstone_runs_without_index_mutex(ninfer::DeviceContext& ctx,
+                                                              ninfer::PagedKVPool& pool) {
+    TmpDir dir("evict-tombstone-unlocked");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    const std::vector<ninfer::TokenId> victim(64, 91);
+    const std::vector<ninfer::TokenId> survivor(64, 92);
+    const std::vector<ninfer::TokenId> incoming(64, 93);
+    std::size_t used = 0;
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        for (const auto* tokens : {&victim, &survivor}) {
+            const auto ram_id = capture_tokens(ram, pool, alloc, ctx, *tokens);
+            disk.note_ram_resident(ram_id, 0);
+            if (!disk.emergency_spill_ram(ram_id)) {
+                alloc.release();
+                return fail("evict-tombstone-unlocked fixture spill failed");
+            }
+        }
+        disk.wait_idle_and_fsync();
+        used = disk.snapshot().used_bytes;
+    }
+    cfg.capacity_bytes         = used;
+    int failures               = 0;
+    std::uint64_t victim_entry = 0;
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        victim_entry                       = planned_entry(disk, victim);
+        const std::uint64_t survivor_entry = planned_entry(disk, survivor);
+        const auto ram_id                  = capture_tokens(ram, pool, alloc, ctx, incoming);
+        disk.note_ram_resident(ram_id, 0);
+        {
+            UnlockedIoHold hold(disk, q36::detail::DiskUnlockedIo::EvictionTombstones);
+            disk.request_idle_spill();
+            if (!hold.entered()) {
+                alloc.release();
+                return fail("evict-tombstone-unlocked spill never reached capacity eviction");
+            }
+            hold.arm();
+            const bool admitted = disk_admission_round(disk, survivor, survivor_entry);
+            const bool victim_hidden =
+                planned_entry(disk, victim) == 0 && !disk.claim(victim_entry);
+            if (!hold.disarm() || !admitted) {
+                failures += fail("admission waited for a capacity-eviction tombstone write");
+            }
+            if (!victim_hidden) {
+                failures +=
+                    fail("eviction victim stayed plannable while its tombstone was written");
+            }
+            if (!disk.test_entry_in_index(victim_entry)) {
+                failures +=
+                    fail("eviction victim dropped its references before a durable tombstone");
+            }
+        }
+        if (!wait_pred([&] { return disk.ram_is_durable(ram_id); }, std::chrono::seconds(10))) {
+            failures += fail("spill did not commit after its capacity eviction");
+        }
+        disk.wait_idle_and_fsync();
+        if (disk.test_entry_in_index(victim_entry)) {
+            failures += fail("tombstoned eviction victim stayed indexed");
+        }
+    }
+    q36::detail::KVDiskCache reopened(cfg);
+    if (planned_entry(reopened, victim) != 0 || planned_entry(reopened, survivor) == 0 ||
+        planned_entry(reopened, incoming) == 0) {
+        failures += fail("unlocked capacity eviction exposed the wrong restart generation");
+    }
+    alloc.release();
+    return failures;
+}
+
+// A capacity round whose victims did not all become durably tombstoned: the failed victim
+// keeps its references, returns to service without a tombstone, and the next FIFO candidate
+// is evicted instead. Optionally the failed victim is quarantined while its tombstone write
+// is in flight; it then stays out of planning and the worker evicts it afterwards.
+int test_capacity_eviction_tombstone_failure(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool,
+                                             bool quarantine) {
+    TmpDir dir(quarantine ? "evict-fail-quarantine" : "evict-fail-partial");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    const std::vector<ninfer::TokenId> failing(64, 111);
+    const std::vector<ninfer::TokenId> evicted(64, 112);
+    const std::vector<ninfer::TokenId> fallback(64, 113);
+    // Larger than one resident and at most two: the first round takes two victims.
+    const std::vector<ninfer::TokenId> incoming(128, 114);
+    std::size_t used = 0;
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        for (const auto* tokens : {&failing, &evicted, &fallback}) {
+            const auto ram_id = capture_tokens(ram, pool, alloc, ctx, *tokens);
+            disk.note_ram_resident(ram_id, 0);
+            if (!disk.emergency_spill_ram(ram_id)) {
+                alloc.release();
+                return fail("evict-fail fixture spill failed");
+            }
+        }
+        disk.wait_idle_and_fsync();
+        used = disk.snapshot().used_bytes;
+    }
+    cfg.capacity_bytes          = used;
+    int failures                = 0;
+    std::uint64_t failing_entry = 0;
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        failing_entry     = planned_entry(disk, failing);
+        const auto ram_id = capture_tokens(ram, pool, alloc, ctx, incoming);
+        disk.note_ram_resident(ram_id, 0);
+        disk.test_arm_fail_tombstone();
+        {
+            UnlockedIoHold hold(disk, q36::detail::DiskUnlockedIo::EvictionTombstones);
+            disk.request_idle_spill();
+            if (!hold.entered()) {
+                alloc.release();
+                return fail("evict-fail spill never reached capacity eviction");
+            }
+            if (quarantine) { disk.invalidate_entry(failing_entry); }
+        }
+        if (!wait_pred([&] { return disk.ram_is_durable(ram_id); }, std::chrono::seconds(10))) {
+            failures += fail("evict-fail spill did not commit after skipping the failed victim");
+        }
+        disk.wait_idle_and_fsync();
+        if (quarantine) {
+            if (planned_entry(disk, failing) != 0 || disk.claim(failing_entry) ||
+                !wait_pred([&] { return !disk.test_entry_in_index(failing_entry); },
+                           std::chrono::seconds(10))) {
+                failures += fail("quarantine during a failed eviction did not keep the entry out");
+            }
+        } else if (planned_entry(disk, failing) != failing_entry) {
+            failures += fail("victim without a durable tombstone did not return to service");
+        }
+        if (planned_entry(disk, evicted) != 0 || planned_entry(disk, fallback) != 0) {
+            failures += fail("capacity eviction did not move past the failed victim");
+        }
+    }
+    q36::detail::KVDiskCache reopened(cfg);
+    if ((planned_entry(reopened, failing) != 0) != !quarantine ||
+        planned_entry(reopened, evicted) != 0 || planned_entry(reopened, fallback) != 0 ||
+        planned_entry(reopened, incoming) == 0) {
+        failures += fail("failed eviction round exposed the wrong restart generation");
+    }
+    alloc.release();
+    return failures;
+}
+
+// invalidate_entry never throws or waits for a spill that pins the entry: the quarantine is
+// immediate, the spill built on it abandons, and the disk worker evicts the entry once its
+// pins drop. The quarantine survives a reopen.
+int test_invalidate_during_spill_defers_eviction(ninfer::DeviceContext& ctx,
+                                                 ninfer::PagedKVPool& pool) {
+    TmpDir dir("invalidate-spill");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096, ninfer::KvDiskCompress::Zstd);
+    std::vector<ninfer::TokenId> aligned(64, 6);
+    const auto prompt_b                   = text_prompt(aligned);
+    std::vector<ninfer::TokenId> extended = aligned;
+    extended.push_back(0);
+    extended.resize(128, 7);
+    const auto prompt_d   = text_prompt(extended);
+    std::uint64_t entry_b = 0;
+    int failures          = 0;
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        const auto ram_b = capture_tokens(ram, pool, alloc, ctx, aligned);
+        disk.note_ram_resident(ram_b, 0);
+        const auto match_b =
+            disk.emergency_spill_ram(ram_b)
+                ? disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b))
+                : std::nullopt;
+        if (!match_b) {
+            alloc.release();
+            return fail("invalidate-spill fixture spill of B failed");
+        }
+        entry_b          = match_b->entry_id;
+        const auto ram_d = capture_tokens(ram, pool, alloc, ctx, extended);
+        ram.set_disk_entry_id(ram_d, entry_b);
+        disk.note_ram_resident(ram_d, entry_b);
+        {
+            EncodeHold hold(disk);
+            disk.request_idle_spill();
+            if (!wait_pred([&] { return disk.test_spill_encode_entered(); },
+                           std::chrono::seconds(10)) ||
+                disk.test_disk_io_pins(entry_b) == 0) {
+                alloc.release();
+                return fail("invalidate-spill: idle Extend never pinned B and reached its encode");
+            }
+            hold.arm();
+            bool threw = false;
+            try {
+                disk.invalidate_entry(entry_b);
+            } catch (const std::exception&) { threw = true; }
+            if (!hold.disarm() || threw) {
+                failures += fail("invalidation of a spill-pinned entry threw or waited");
+            }
+            const auto replanned =
+                disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+            if (disk.claim(entry_b) || (replanned && replanned->entry_id == entry_b) ||
+                !disk.test_entry_in_index(entry_b)) {
+                failures +=
+                    fail("pinned invalid entry stayed selectable or was evicted under its pin");
+            }
+        }
+        if (!wait_pred(
+                [&] {
+                    return !disk.test_entry_in_index(entry_b) &&
+                           disk.test_pending_invalidations() == 0;
+                },
+                std::chrono::seconds(10))) {
+            failures += fail("disk worker did not evict the invalid entry after its pin dropped");
+        }
+        if (!wait_pred([&] { return disk.ram_is_durable(ram_d); }, std::chrono::seconds(10))) {
+            failures += fail("spill of the extension was not retried without its invalid parent");
+        }
+        const auto match_d = disk.plan_match(prompt_d, q36::detail::prefix_hash_chain(prompt_d));
+        if (!match_d || match_d->entry_id == entry_b) {
+            failures += fail("abandoned Extend republished the invalid entry");
+        }
+        disk.wait_idle_and_fsync();
+    }
+    {
+        q36::detail::KVDiskCache reopened(cfg);
+        if (reopened.test_entry_in_index(entry_b) || reopened.claim(entry_b)) {
+            failures += fail("invalidated entry resurrected on reopen");
         }
     }
     alloc.release();
-    return 0;
+    return failures;
 }
 
-int test_ram_idle_exclusion_covers_claim(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
-    TmpDir dir("idle-excl");
-    q36::detail::KVRamCache ram(16ULL << 20);
-    auto alloc = pool.reserve(2);
-    alloc.materialize_pages(1, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
-    q36::detail::KVDiskCache disk(std::move(cfg));
-    const auto ram_id = capture_tokens(ram, pool, alloc, ctx, {8, 8, 8, 8});
-    disk.note_ram_resident(ram_id, 0);
-    disk.begin_ram_idle_exclusion(ram_id);
-    disk.request_idle_spill();
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    if (ram.test_io_pins(ram_id) != 0) {
-        disk.end_ram_idle_exclusion(ram_id);
-        alloc.release();
-        return fail("idle spill pinned RAM while exclusion was held");
-    }
-    ram.claim(ram_id);
-    disk.end_ram_idle_exclusion(ram_id);
-    if (disk.ram_is_durable(ram_id)) {
-        ram.release(ram_id);
-        alloc.release();
-        return fail("idle spill committed during claim exclusion");
-    }
-    ram.release(ram_id);
-    alloc.release();
-    return 0;
-}
-
-int test_discard_keeps_note_until_evict(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+// Rolling back a capture that a spill already pinned retires it at once; its block stays
+// allocated until the spill's unpin.
+int test_discard_while_spill_pinned_defers_free(ninfer::DeviceContext& ctx,
+                                                ninfer::PagedKVPool& pool) {
     TmpDir dir("discard-note");
     q36::detail::KVRamCache ram(16ULL << 20);
     auto alloc = pool.reserve(2);
@@ -7260,38 +8584,30 @@ int test_discard_keeps_note_until_evict(ninfer::DeviceContext& ctx, ninfer::Page
     q36::detail::KVDiskCache disk(std::move(cfg));
     const auto ram_id = capture_tokens(ram, pool, alloc, ctx, {4, 4, 4, 4});
     disk.note_ram_resident(ram_id, 0);
+    const auto entry_bytes = ram.snapshot().used_bytes;
     ram.pin_for_io(ram_id);
-    disk.begin_ram_idle_exclusion(ram_id);
     if (ram.evict_one_unpinned(ram_id)) {
-        disk.end_ram_idle_exclusion(ram_id);
-        alloc.release();
-        return fail("evict succeeded while an I/O pin was held");
-    }
-    if (!disk.test_has_ram_note(ram_id)) {
         ram.unpin_for_io(ram_id);
-        disk.end_ram_idle_exclusion(ram_id);
         alloc.release();
-        return fail("RAM note was erased before a failed evict");
+        return fail("reclaim eviction succeeded while an I/O pin was held");
     }
-    disk.end_ram_idle_exclusion(ram_id);
+    disk.abandon_ram_spill(ram_id);
+    ram.discard(ram_id);
+    int failures = 0;
+    if (disk.test_has_ram_note(ram_id) || ram.snapshot().entry_count != 0 ||
+        ram.snapshot().used_bytes != entry_bytes || ram.test_io_pins(ram_id) != 1) {
+        failures += fail("discard of a pinned capture did not retire it with its block intact");
+    }
     ram.unpin_for_io(ram_id);
-    disk.begin_ram_idle_exclusion(ram_id);
-    if (!ram.evict_one_unpinned(ram_id)) {
-        disk.end_ram_idle_exclusion(ram_id);
-        alloc.release();
-        return fail("evict failed after the I/O pin was dropped");
-    }
-    disk.forget_ram_resident(ram_id);
-    disk.end_ram_idle_exclusion(ram_id);
-    if (disk.test_has_ram_note(ram_id)) {
-        alloc.release();
-        return fail("RAM note survived a successful evict");
+    if (ram.snapshot().used_bytes != 0 || ram.retired_pending()) {
+        failures += fail("the spill's unpin did not free the discarded block");
     }
     alloc.release();
-    return 0;
+    return failures;
 }
 
-int test_checkpoint_images_survive_host_load(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_checkpoint_images_survive_host_load(ninfer::DeviceContext& ctx,
+                                             ninfer::PagedKVPool& pool) {
     TmpDir dir("images");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -7315,8 +8631,8 @@ int test_checkpoint_images_survive_host_load(ninfer::DeviceContext& ctx, ninfer:
     rollback.hidden_bytes = 4096;
     q36::detail::RamLadderHead ladder = rollback;
     ladder.frontier                   = 6;
-    ladder.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 6);
-    ladder.kind = q36::detail::ContextCheckpointKind::Ladder;
+    ladder.hash         = q36::detail::prefix_hash_at(retained.token_ids, identity, 6);
+    ladder.kind         = q36::detail::ContextCheckpointKind::Ladder;
     source.ladder_heads = {rollback, ladder};
     auto id             = capture_or_evict(ram, source);
     if (!id) {
@@ -7344,10 +8660,8 @@ int test_checkpoint_images_survive_host_load(ninfer::DeviceContext& ctx, ninfer:
         return fail("checkpoint-image load_host missed the live entry");
     }
     disk.test_arm_direct_state_read_barrier();
-    std::atomic<bool> populate_ok{false};
-    std::thread populate([&] {
-        populate_ok.store(disk.populate_checkpoint_images(*host), std::memory_order_release);
-    });
+    std::optional<std::vector<DecodedCheckpointImage>> images;
+    std::thread populate([&] { images = decode_checkpoint_images(disk, *host, {.hidden = 4096}); });
     if (!wait_pred([&] { return disk.test_direct_state_read_entered(); },
                    std::chrono::seconds(2))) {
         disk.test_release_direct_state_read_barrier();
@@ -7357,26 +8671,15 @@ int test_checkpoint_images_survive_host_load(ninfer::DeviceContext& ctx, ninfer:
     }
     disk.test_release_direct_state_read_barrier();
     populate.join();
-    if (!populate_ok.load(std::memory_order_acquire) || host->ladders.size() != 2 ||
-        host->ladder_images.size() != 2) {
+    if (!images || host->ladders.size() != 2 || images->size() != 2) {
         alloc.release();
         return fail("populate_checkpoint_images did not restore rollback and ladder payloads");
     }
-    if (host->ladder_images[0].hidden == nullptr || host->ladder_images[1].hidden == nullptr) {
-        alloc.release();
-        return fail("checkpoint images lost hidden payloads");
-    }
-    if (host->ladder_images[0].hidden->size() != hidden_host.size() ||
-        std::memcmp(host->ladder_images[0].hidden->data(), hidden_host.data(),
-                    hidden_host.size()) != 0) {
-        alloc.release();
-        return fail("checkpoint final pinned owner contains the wrong hidden payload");
-    }
-    if (reinterpret_cast<std::uintptr_t>(host->ladder_images[0].hidden->data()) %
-            q36::detail::kDiskPageIoAlignment !=
-        0) {
-        alloc.release();
-        return fail("checkpoint final pinned owner is not direct-I/O aligned");
+    for (const DecodedCheckpointImage& image : *images) {
+        if (std::memcmp(image.hidden->data(), hidden_host.data(), hidden_host.size()) != 0) {
+            alloc.release();
+            return fail("checkpoint image contains the wrong hidden payload");
+        }
     }
     alloc.release();
     return 0;
@@ -7514,9 +8817,8 @@ int test_wait_idle_with_live_prefetch(ninfer::DeviceContext& ctx, ninfer::PagedK
         alloc.release();
         return fail("prefetch-idle spill failed");
     }
-    const auto match =
-        disk.plan_match(text_prompt({2, 2, 2, 2}),
-                        q36::detail::prefix_hash_chain(text_prompt({2, 2, 2, 2})));
+    const auto match = disk.plan_match(text_prompt({2, 2, 2, 2}),
+                                       q36::detail::prefix_hash_chain(text_prompt({2, 2, 2, 2})));
     if (!match) {
         alloc.release();
         return fail("prefetch-idle match failed");
@@ -7561,7 +8863,7 @@ int test_cancel_idle_spill_unpins_peek_victim(ninfer::DeviceContext& ctx,
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (std::chrono::steady_clock::now() < deadline) {
         disk.cancel_idle_spill();
-        peek = ram.peek_oldest_unpinned();
+        peek = oldest_unpinned(ram);
         if (peek && *peek == d_id) { break; }
         disk.request_idle_spill();
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -7597,7 +8899,7 @@ int test_ticket_write_fail_unpins(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
         alloc.release();
         return fail("ticket-write failure dropped a published SSD generation");
     }
-    if (!ram.peek_oldest_unpinned() || *ram.peek_oldest_unpinned() != ram_id) {
+    if (oldest_unpinned(ram) != std::optional<std::uint64_t>(ram_id)) {
         alloc.release();
         return fail("ticket-write failure left a leftover I/O pin");
     }
@@ -7618,15 +8920,15 @@ int test_ticket_write_fail_unpins(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
 int test_zero_kv_gdn_restore_and_cancel(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("gdn0");
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 16,
-                      .conv_channels  = 64,
-                      .conv_width     = 2,
-                      .value_heads    = 1,
-                      .value_head_dim = 8,
-                      .key_head_dim   = 8,
-                      .slot_count     = 4,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 16,
+                                                               .conv_channels  = 64,
+                                                               .conv_width     = 2,
+                                                               .value_heads    = 1,
+                                                               .value_head_dim = 8,
+                                                               .key_head_dim   = 8,
+                                                               .slot_count     = 4,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     std::vector<unsigned char> conv(gdn.conv_host_image_bytes(), 0x5a);
@@ -7647,19 +8949,19 @@ int test_zero_kv_gdn_restore_and_cancel(ninfer::DeviceContext& ctx, ninfer::Page
     auto retained = prompt;
     retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity;
-    auto source            = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
-    source.gdn             = &gdn;
+    auto source             = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
+    source.gdn              = &gdn;
     source.gdn_current_slot = 0;
-    source.tail_hidden     = &hidden;
-    auto id                = capture_or_evict(ram, source);
+    source.tail_hidden      = &hidden;
+    auto id                 = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("gdn capture failed");
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096, ninfer::KvDiskCompress::Off, &gdn, nullptr);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096, ninfer::KvDiskCompress::Off, &gdn, nullptr);
     cfg.hidden_bytes = 64;
     q36::detail::KVDiskCache disk(std::move(cfg));
     disk.note_ram_resident(*id, 0);
@@ -7683,13 +8985,13 @@ int test_zero_kv_gdn_restore_and_cancel(ninfer::DeviceContext& ctx, ninfer::Page
     ninfer::unpack_paged_kv_logical_page_from_host(dest, pool, poison.data(), 0, ctx.stream);
     ctx.synchronize_all();
     q36::detail::DiskRestoreTarget target;
-    target.text               = &dest;
-    target.text_pool          = &pool;
-    target.text_dst_pages     = 0;
-    target.gdn                = &gdn;
-    target.gdn_current_slot   = 1;
-    target.tail_hidden        = &hidden_out;
-    target.stream             = ctx.copy_stream;
+    target.text             = &dest;
+    target.text_pool        = &pool;
+    target.text_dst_pages   = 0;
+    target.gdn              = &gdn;
+    target.gdn_current_slot = 1;
+    target.tail_hidden      = &hidden_out;
+    target.stream           = ctx.copy_stream;
     disk.restore_device(match->entry_id, target);
     try {
         if (const int rc = wait_restore_bounded(disk, ctx, "zero-KV GDN restore hung"); rc != 0) {
@@ -7792,15 +9094,15 @@ int test_zero_kv_gdn_restore_and_cancel(ninfer::DeviceContext& ctx, ninfer::Page
 int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("skip-cur");
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 2,
-                      .conv_channels  = 4,
-                      .conv_width     = 2,
-                      .value_heads    = 1,
-                      .value_head_dim = 4,
-                      .key_head_dim   = 2,
-                      .slot_count     = 4,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 2,
+                                                               .conv_channels  = 4,
+                                                               .conv_width     = 2,
+                                                               .value_heads    = 1,
+                                                               .value_head_dim = 4,
+                                                               .key_head_dim   = 2,
+                                                               .slot_count     = 4,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     std::vector<unsigned char> frontier_conv(gdn.conv_host_image_bytes(), 0xa1);
@@ -7816,16 +9118,18 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
     auto retained = prompt;
     retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity;
-    auto source                   = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
-    source.gdn                    = &gdn;
-    source.gdn_current_slot      = 0;
-    source.gdn_checkpoint_slot  = 1;
-    source.rewrite_valid       = true;
-    source.rewrite_kind         = q36::RewriteCheckpointKind::TurnClosure;
-    source.rewrite_frontier     = 2;
-    source.hash_c_valid        = true;
-    source.hash_c               = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
-    auto id = capture_or_evict(ram, source);
+    auto source             = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
+    source.gdn              = &gdn;
+    source.gdn_current_slot = 0;
+    const auto source_rewrite =
+        ninfer::test::RewriteStateHostImage::packed(gdn, 1, nullptr, 0, ctx.stream);
+    source.rewrite_state    = source_rewrite.source();
+    source.rewrite_valid    = true;
+    source.rewrite_kind     = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier = 2;
+    source.hash_c_valid     = true;
+    source.hash_c           = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
+    auto id                 = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("skip-current capture failed");
@@ -7846,26 +9150,30 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
         return fail("skip-current match failed");
     }
     auto restore_one = [&](const q36::detail::DiskMatch& restore_match,
-                            ninfer::PrefixReusePath reuse, std::uint32_t reuse_base,
-                            std::int32_t current_slot, std::int32_t checkpoint_slot,
-                            const char* hung) -> int {
+                           ninfer::PrefixReusePath reuse, std::uint32_t reuse_base,
+                           std::int32_t current_slot, std::int32_t checkpoint_slot,
+                           const char* hung, bool keep_rewrite = true) -> int {
         if (!disk.claim(restore_match.entry_id, restore_match.hash_f,
-                         restore_match.execution_frontier, reuse_base,
-                         reuse)) {
+                        restore_match.execution_frontier, reuse_base, reuse)) {
             return fail("skip-current claim failed");
         }
         auto dest = pool.reserve(2);
         dest.materialize_pages(1, ctx.stream);
         q36::detail::DiskRestoreTarget target;
-        target.text                = &dest;
-        target.text_pool           = &pool;
-        target.text_dst_pages     = 1;
-        target.gdn                 = &gdn;
-        target.gdn_current_slot   = current_slot;
-        target.gdn_checkpoint_slot = checkpoint_slot;
-        target.reuse               = reuse;
-        target.reuse_base         = reuse_base;
-        target.stream              = ctx.copy_stream;
+        target.text             = &dest;
+        target.text_pool        = &pool;
+        target.text_dst_pages   = 1;
+        target.gdn              = &gdn;
+        target.gdn_current_slot = current_slot;
+        // Seed the host rewrite image from the checkpoint slot so an untouched image leaves the
+        // device-side comparison unchanged.
+        auto target_rewrite  = ninfer::test::RewriteStateHostImage::packed(gdn, checkpoint_slot,
+                                                                           nullptr, 0, ctx.stream);
+        target.rewrite_state = target_rewrite.target();
+        target.reuse         = reuse;
+        target.reuse_base    = reuse_base;
+        target.keep_rewrite_checkpoint = keep_rewrite;
+        target.stream                  = ctx.copy_stream;
         disk.restore_device(restore_match.entry_id, target);
         try {
             if (const int rc = wait_restore_bounded(disk, ctx, hung); rc != 0) {
@@ -7879,6 +9187,7 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
             std::cerr << hung << " threw: " << e.what() << '\n';
             return 1;
         }
+        target_rewrite.unpack(gdn, checkpoint_slot, nullptr, 0, ctx.stream);
         disk.cancel_restore();
         disk.release(restore_match.entry_id);
         dest.release();
@@ -7889,7 +9198,7 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
     gdn.zero_slot(3, ctx.stream);
     ctx.synchronize_all();
     if (const int rc = restore_one(*match, ninfer::PrefixReusePath::AppendAtFrontier, 4, 2, 3,
-                                      "append restore hung");
+                                   "append restore hung");
         rc != 0) {
         alloc.release();
         return rc;
@@ -7910,13 +9219,39 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
         return fail("append restore did not unpack rewrite GDN");
     }
 
+    // A request that drops the rewrite checkpoint never reads the entry's rewrite set.
+    std::vector<unsigned char> unread_conv(frontier_conv.size(), 0xce);
+    std::vector<unsigned char> unread_rec(frontier_rec.size(), 0xcf);
+    gdn.zero_slot(2, ctx.stream);
+    gdn.unpack_slot_from_host(3, unread_conv.data(), unread_rec.data(), ctx.stream);
+    ctx.synchronize_all();
+    if (const int rc = restore_one(*match, ninfer::PrefixReusePath::AppendAtFrontier, 4, 2, 3,
+                                   "drop restore hung", false);
+        rc != 0) {
+        alloc.release();
+        return rc;
+    }
+    ctx.synchronize_all();
+    gdn.pack_slot_to_host(2, conv_got.data(), rec_got.data(), ctx.stream);
+    ctx.synchronize_all();
+    if (conv_got != frontier_conv || rec_got != frontier_rec) {
+        alloc.release();
+        return fail("drop restore skipped required frontier GDN");
+    }
+    gdn.pack_slot_to_host(3, conv_got.data(), rec_got.data(), ctx.stream);
+    ctx.synchronize_all();
+    if (conv_got != unread_conv || rec_got != unread_rec) {
+        alloc.release();
+        return fail("drop restore unpacked the dropped rewrite GDN");
+    }
+
     std::vector<unsigned char> poison_conv(frontier_conv.size(), 0xcc);
     std::vector<unsigned char> poison_rec(frontier_rec.size(), 0xcd);
     gdn.unpack_slot_from_host(2, poison_conv.data(), poison_rec.data(), ctx.stream);
     gdn.zero_slot(3, ctx.stream);
     ctx.synchronize_all();
     if (const int rc = restore_one(*match, ninfer::PrefixReusePath::RestoreTurnCheckpoint, 2, 2, 3,
-                                      "rewrite restore hung");
+                                   "rewrite restore hung");
         rc != 0) {
         alloc.release();
         return rc;
@@ -7936,31 +9271,31 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
     }
 
     auto response_capture_prompt = text_prompt({6, 6, 6, 6});
-    auto response_retained = response_capture_prompt;
+    auto response_retained       = response_capture_prompt;
     response_retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity response_identity;
-    auto response_source = make_source(response_retained, response_identity, alloc, pool,
-                                       ctx.copy_stream, 4);
-    response_source.gdn = &gdn;
+    auto response_source =
+        make_source(response_retained, response_identity, alloc, pool, ctx.copy_stream, 4);
+    response_source.gdn              = &gdn;
     response_source.gdn_current_slot = 0;
-    response_source.gdn_checkpoint_slot = 1;
-    response_source.rewrite_valid = true;
-    response_source.rewrite_kind = q36::RewriteCheckpointKind::ResponseReplay;
+    response_source.rewrite_state    = source_rewrite.source();
+    response_source.rewrite_valid    = true;
+    response_source.rewrite_kind     = q36::RewriteCheckpointKind::ResponseReplay;
     response_source.rewrite_frontier = 2;
-    response_source.hash_c_valid = true;
+    response_source.hash_c_valid     = true;
     response_source.hash_c =
         q36::detail::prefix_hash_at(response_retained.token_ids, response_identity, 2);
     q36::detail::RamLadderHead response_ladder;
     response_ladder.frontier = 1;
     response_ladder.hash =
         q36::detail::prefix_hash_at(response_retained.token_ids, response_identity, 1);
-    response_ladder.kind = q36::detail::ContextCheckpointKind::Ladder;
-    response_ladder.conv = frontier_conv.data();
-    response_ladder.conv_bytes = frontier_conv.size();
-    response_ladder.recurrent = frontier_rec.data();
+    response_ladder.kind            = q36::detail::ContextCheckpointKind::Ladder;
+    response_ladder.conv            = frontier_conv.data();
+    response_ladder.conv_bytes      = frontier_conv.size();
+    response_ladder.recurrent       = frontier_rec.data();
     response_ladder.recurrent_bytes = frontier_rec.size();
-    response_source.ladder_heads = {response_ladder};
-    const auto response_ram = capture_or_evict(ram, response_source);
+    response_source.ladder_heads    = {response_ladder};
+    const auto response_ram         = capture_or_evict(ram, response_source);
     if (!response_ram) {
         alloc.release();
         return fail("response-checkpoint capture failed");
@@ -7983,9 +9318,9 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
     gdn.unpack_slot_from_host(2, poison_conv.data(), poison_rec.data(), ctx.stream);
     gdn.zero_slot(3, ctx.stream);
     ctx.synchronize_all();
-    if (const int rc = restore_one(*response_match,
-                                   ninfer::PrefixReusePath::RestoreResponseCheckpoint, 2, 2, 3,
-                                   "response-checkpoint restore hung");
+    if (const int rc =
+            restore_one(*response_match, ninfer::PrefixReusePath::RestoreResponseCheckpoint, 2, 2,
+                        3, "response-checkpoint restore hung");
         rc != 0) {
         alloc.release();
         return rc;
@@ -8010,15 +9345,15 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
 int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("pin-state");
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 2,
-                      .conv_channels  = 4,
-                      .conv_width     = 2,
-                      .value_heads    = 1,
-                      .value_head_dim = 4,
-                      .key_head_dim   = 2,
-                      .slot_count     = 4,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 2,
+                                                               .conv_channels  = 4,
+                                                               .conv_width     = 2,
+                                                               .value_heads    = 1,
+                                                               .value_head_dim = 4,
+                                                               .key_head_dim   = 2,
+                                                               .slot_count     = 4,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     ninfer::LayoutBuilder cyclic_builder;
@@ -8029,8 +9364,8 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
     const auto rewrite_cyclic_layout =
         ninfer::plan_cyclic_kv_cache(rewrite_cyclic_builder, 2, 32, 2, 8, 3);
     ninfer::DeviceArena rewrite_cyclic_arena(rewrite_cyclic_builder.finish(256));
-    ninfer::CyclicKVCache rewrite_cyclic({rewrite_cyclic_arena.base(), rewrite_cyclic_arena.capacity()},
-                                        rewrite_cyclic_layout);
+    ninfer::CyclicKVCache rewrite_cyclic(
+        {rewrite_cyclic_arena.base(), rewrite_cyclic_arena.capacity()}, rewrite_cyclic_layout);
     std::vector<unsigned char> frontier_conv(gdn.conv_host_image_bytes(), 0xa1);
     std::vector<unsigned char> frontier_rec(gdn.recurrent_host_image_bytes(), 0xa2);
     std::vector<unsigned char> rewrite_conv(gdn.conv_host_image_bytes(), 0xb1);
@@ -8054,20 +9389,21 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
     auto retained = prompt;
     retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity;
-    auto source                       = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
-    source.gdn                        = &gdn;
-    source.gdn_current_slot         = 0;
-    source.gdn_checkpoint_slot       = 1;
-    source.tail_hidden                = &hidden;
+    auto source             = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
+    source.gdn              = &gdn;
+    source.gdn_current_slot = 0;
+    const auto source_rewrite =
+        ninfer::test::RewriteStateHostImage::packed(gdn, 1, &rewrite_cyclic, 0, ctx.stream);
+    source.rewrite_state             = source_rewrite.source();
+    source.tail_hidden               = &hidden;
     source.rewrite_checkpoint_hidden = &hidden_rw;
     source.rewrite_valid             = true;
-    source.rewrite_kind               = q36::RewriteCheckpointKind::TurnClosure;
-    source.rewrite_frontier            = 2;
+    source.rewrite_kind              = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier          = 2;
     source.hash_c_valid              = true;
-    source.hash_c                     = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
-    source.dflash_local               = &cyclic;
-    source.dflash_lane                = 0;
-    source.dflash_checkpoint            = &rewrite_cyclic;
+    source.hash_c                    = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
+    source.dflash_local              = &cyclic;
+    source.dflash_lane               = 0;
     ctx.synchronize_all();
     auto id = capture_or_evict(ram, source);
     if (!id) {
@@ -8076,8 +9412,8 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::DFlash,
-                           32ULL << 20, 4096, ninfer::KvDiskCompress::Off, &gdn, &cyclic);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::DFlash,
+                                   32ULL << 20, 4096, ninfer::KvDiskCompress::Off, &gdn, &cyclic);
     cfg.hidden_bytes = 4096;
     q36::detail::KVDiskCache disk(std::move(cfg));
     disk.note_ram_resident(*id, 0);
@@ -8091,7 +9427,7 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
         return fail("pin-state match failed");
     }
     if (!disk.claim(match->entry_id, match->hash_f, match->execution_frontier, 4,
-                     ninfer::PrefixReusePath::AppendAtFrontier)) {
+                    ninfer::PrefixReusePath::AppendAtFrontier)) {
         alloc.release();
         return fail("pin-state claim failed");
     }
@@ -8110,20 +9446,20 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
     rewrite_cyclic.copy_lane_from_host(cyclic_zero.data(), 0, ctx.stream);
     ctx.synchronize_all();
     q36::detail::DiskRestoreTarget target;
-    target.text                       = &dest;
-    target.text_pool                  = &pool;
-    target.text_dst_pages            = 1;
-    target.gdn                        = &gdn;
-    target.gdn_current_slot          = 2;
-    target.gdn_checkpoint_slot      = 3;
-    target.tail_hidden                = &hidden_out;
+    target.text             = &dest;
+    target.text_pool        = &pool;
+    target.text_dst_pages   = 1;
+    target.gdn              = &gdn;
+    target.gdn_current_slot = 2;
+    auto target_rewrite     = ninfer::test::RewriteStateHostImage::sized(gdn, &rewrite_cyclic);
+    target.rewrite_state    = target_rewrite.target();
+    target.tail_hidden      = &hidden_out;
     target.rewrite_checkpoint_hidden = &hidden_out_rw;
-    target.dflash_local               = &cyclic;
-    target.dflash_checkpoint           = &rewrite_cyclic;
-    target.dflash_lane                = 0;
-    target.reuse                      = ninfer::PrefixReusePath::AppendAtFrontier;
+    target.dflash_local              = &cyclic;
+    target.dflash_lane               = 0;
+    target.reuse                     = ninfer::PrefixReusePath::AppendAtFrontier;
     target.reuse_base                = 4;
-    target.stream                     = ctx.copy_stream;
+    target.stream                    = ctx.copy_stream;
     disk.restore_device(match->entry_id, target);
     try {
         if (const int rc = wait_restore_bounded(disk, ctx, "pin-state restore hung"); rc != 0) {
@@ -8140,6 +9476,7 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
         return 1;
     }
     ctx.synchronize_all();
+    target_rewrite.unpack(gdn, 3, &rewrite_cyclic, 0, ctx.stream);
     std::vector<unsigned char> conv_got(frontier_conv.size());
     std::vector<unsigned char> rec_got(frontier_rec.size());
     gdn.pack_slot_to_host(2, conv_got.data(), rec_got.data(), ctx.stream);
@@ -8218,9 +9555,8 @@ int test_c1_order_disk_b_ram_c(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& 
         alloc.release();
         return fail("C=1 API spill of B failed");
     }
-    const auto match_b =
-        disk.plan_match(text_prompt({7, 7, 7, 7}),
-                        q36::detail::prefix_hash_chain(text_prompt({7, 7, 7, 7})));
+    const auto match_b = disk.plan_match(text_prompt({7, 7, 7, 7}),
+                                         q36::detail::prefix_hash_chain(text_prompt({7, 7, 7, 7})));
     if (!match_b) {
         alloc.release();
         return fail("C=1 API disk B match failed");
@@ -8242,7 +9578,7 @@ int test_c1_order_disk_b_ram_c(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& 
         return fail("C=1 API emergency spill of C failed");
     }
     disk.cancel_idle_spill();
-    const auto peek = ram.peek_oldest_unpinned();
+    const auto peek = oldest_unpinned(ram);
     if (!peek) {
         disk.release(match_b->entry_id);
         alloc.release();
@@ -8308,20 +9644,20 @@ int test_recapture_keeps_ladders(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
     source.tail_hidden = &hidden;
     std::vector<unsigned char> hidden_host(64, 0x11);
     q36::detail::RamLadderHead rollback;
-    rollback.frontier     = 3;
-    rollback.hash         = q36::detail::prefix_hash_at(retained.token_ids, identity, 3);
-    rollback.kind         = q36::detail::ContextCheckpointKind::TurnRollback;
-    rollback.hidden       = hidden_host.data();
-    rollback.hidden_bytes = 64;
+    rollback.frontier             = 3;
+    rollback.hash                 = q36::detail::prefix_hash_at(retained.token_ids, identity, 3);
+    rollback.kind                 = q36::detail::ContextCheckpointKind::TurnRollback;
+    rollback.hidden               = hidden_host.data();
+    rollback.hidden_bytes         = 64;
     q36::detail::RamLadderHead l1 = rollback;
     l1.frontier                   = 6;
-    l1.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 6);
-    l1.kind = q36::detail::ContextCheckpointKind::Ladder;
+    l1.hash                       = q36::detail::prefix_hash_at(retained.token_ids, identity, 6);
+    l1.kind                       = q36::detail::ContextCheckpointKind::Ladder;
     q36::detail::RamLadderHead l2 = l1;
     l2.frontier                   = 5;
-    l2.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
-    source.ladder_heads = {rollback, l1, l2};
-    auto id             = capture_or_evict(ram, source);
+    l2.hash                       = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
+    source.ladder_heads           = {rollback, l1, l2};
+    auto id                       = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("recapture-ladder capture failed");
@@ -8346,19 +9682,20 @@ int test_recapture_keeps_ladders(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
         alloc.release();
         return fail("recapture-ladder load_host missed the live entry");
     }
-    if (!disk.populate_checkpoint_images(*host)) {
+    const auto images = decode_checkpoint_images(disk, *host, {.hidden = 64});
+    if (!images) {
         alloc.release();
         return fail("recapture-ladder populate failed");
     }
     ram.claim(*id);
     ram.consume(*id);
-    if (host->ladder_images.size() != 3) {
+    if (images->size() != 3) {
         alloc.release();
         return fail("recapture-ladder populate did not return rollback + two ladders");
     }
     std::vector<q36::detail::RamLadderHead> recap_heads;
-    recap_heads.reserve(host->ladder_images.size());
-    for (const auto& image : host->ladder_images) {
+    recap_heads.reserve(images->size());
+    for (const auto& image : *images) {
         q36::detail::RamLadderHead head;
         head.frontier        = image.frontier;
         head.hash            = image.hash;
@@ -8373,9 +9710,9 @@ int test_recapture_keeps_ladders(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
         head.dflash_bytes    = image.dflash ? image.dflash->size() : 0;
         recap_heads.push_back(head);
     }
-    source.ladder_heads = recap_heads;
-    source.disk_entry_id           = match->entry_id;
-    auto recaptured                = capture_or_evict(ram, source);
+    source.ladder_heads  = recap_heads;
+    source.disk_entry_id = match->entry_id;
+    auto recaptured      = capture_or_evict(ram, source);
     if (!recaptured) {
         alloc.release();
         return fail("recapture with ladder images failed");
@@ -8433,8 +9770,8 @@ int test_mixed_zstd_and_raw_hidden(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
             return fail("mixed-codec RAM capture of A did not store 0xaa hidden");
         }
     }
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096, ninfer::KvDiskCompress::Zstd);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096, ninfer::KvDiskCompress::Zstd);
     cfg.hidden_bytes = 256;
     q36::detail::KVDiskCache disk(std::move(cfg));
     disk.note_ram_resident(*id_a, 0);
@@ -8527,6 +9864,9 @@ int test_dflash_open_skips_missing_cyclic(ninfer::DeviceContext& ctx, ninfer::Pa
     const auto cyclic_layout = ninfer::plan_cyclic_kv_cache(cyclic_builder, 2, 32, 2, 8, 3);
     ninfer::DeviceArena cyclic_arena(cyclic_builder.finish(256));
     ninfer::CyclicKVCache cyclic({cyclic_arena.base(), cyclic_arena.capacity()}, cyclic_layout);
+    std::vector<unsigned char> cyclic_state(cyclic.lane_host_bytes(), 0x5a);
+    cyclic.copy_lane_from_host(cyclic_state.data(), 0, ctx.stream);
+    ctx.synchronize_all();
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
     alloc.materialize_pages(1, ctx.stream);
@@ -8546,7 +9886,7 @@ int test_dflash_open_skips_missing_cyclic(ninfer::DeviceContext& ctx, ninfer::Pa
     ram.wait_pending_copies();
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::DFlash,
                            32ULL << 20, 4096, ninfer::KvDiskCompress::Off, nullptr, &cyclic);
-    std::uint64_t entry = 0;
+    std::uint64_t entry     = 0;
     std::uint64_t cyclic_id = 0;
     {
         q36::detail::KVDiskCache disk(cfg);
@@ -8616,13 +9956,14 @@ int test_mtp_refresh_grows_valid_tail(ninfer::DeviceContext& ctx) {
     int failures = 0;
     enum class TailChange { GrowValidity, Resample, Unchanged };
     for (const std::uint32_t frontier : {64U, 65U}) {
-        for (const TailChange change : {TailChange::GrowValidity, TailChange::Resample,
-                                        TailChange::Unchanged}) {
+        for (const TailChange change :
+             {TailChange::GrowValidity, TailChange::Resample, TailChange::Unchanged}) {
             failures += [&]() -> int {
                 auto plan = plan_paged_cache(8, 8, 2, {{ninfer::DType::I8, 64, 2}});
                 ninfer::DeviceArena text_arena(plan.bytes), backend_arena(plan.bytes);
                 ninfer::PagedKVPool text({text_arena.base(), text_arena.capacity()}, plan.layout);
-                ninfer::PagedKVPool backend({backend_arena.base(), backend_arena.capacity()}, plan.layout);
+                ninfer::PagedKVPool backend({backend_arena.base(), backend_arena.capacity()},
+                                            plan.layout);
                 auto text_alloc = text.reserve(2), backend_alloc = backend.reserve(2);
                 text_alloc.materialize_pages(2, ctx.stream);
                 backend_alloc.materialize_pages(2, ctx.stream);
@@ -8630,16 +9971,17 @@ int test_mtp_refresh_grows_valid_tail(ninfer::DeviceContext& ctx) {
                 fill_logical_pages(backend, backend_alloc, 2);
                 TmpDir dir("mtp-refresh-tail");
                 q36::detail::KVRamCache ram(64ULL << 20);
-                auto prompt = text_prompt(std::vector<ninfer::TokenId>(frontier, 42));
+                auto prompt   = text_prompt(std::vector<ninfer::TokenId>(frontier, 42));
                 auto retained = prompt;
                 retained.token_ids.push_back(0);
                 q36::detail::ResidentPrefixIdentity identity;
-                auto source = make_source(retained, identity, text_alloc, text, ctx.copy_stream, frontier);
+                auto source =
+                    make_source(retained, identity, text_alloc, text, ctx.copy_stream, frontier);
                 source.mtp_kv_valid = change == TailChange::GrowValidity ? frontier - 1 : frontier;
-                source.backend = &backend_alloc;
+                source.backend      = &backend_alloc;
                 source.backend_pool = &backend;
-                auto cfg = disk_config(dir.path, ram, text, &backend, ninfer::SpeculativeBackend::Mtp,
-                                       64ULL << 20, 4096);
+                auto cfg = disk_config(dir.path, ram, text, &backend,
+                                       ninfer::SpeculativeBackend::Mtp, 64ULL << 20, 4096);
                 std::uint64_t ticket = 0;
                 std::vector<std::uint8_t> expected(ninfer::paged_kv_logical_page_bytes(backend));
                 const std::uint32_t tail_page = (frontier - 1) / 64;
@@ -8649,13 +9991,15 @@ int test_mtp_refresh_grows_valid_tail(ninfer::DeviceContext& ctx) {
                     if (!first) { return fail("MTP tail parent capture failed"); }
                     ram.wait_pending_copies();
                     disk.note_ram_resident(*first, 0);
-                    if (!disk.emergency_spill_ram(*first)) { return fail("MTP tail parent spill failed"); }
-                    ticket = ram.load_host(*first).disk_entry_id;
+                    if (!disk.emergency_spill_ram(*first)) {
+                        return fail("MTP tail parent spill failed");
+                    }
+                    ticket                  = ram.load_host(*first).disk_entry_id;
                     const auto parent_pages = disk.test_backend_page_ids(ticket);
                     // Only the tail page changes; earlier complete pages stay identical.
                     std::vector<std::uint8_t> tail(expected.size());
-                    ninfer::pack_paged_kv_logical_page_to_host(
-                        backend_alloc, backend, tail_page, tail.data(), ctx.stream);
+                    ninfer::pack_paged_kv_logical_page_to_host(backend_alloc, backend, tail_page,
+                                                               tail.data(), ctx.stream);
                     ctx.synchronize_all();
                     // One represented I8 value in the bridge token, first head.
                     if (change != TailChange::Unchanged) {
@@ -8665,16 +10009,18 @@ int test_mtp_refresh_grows_valid_tail(ninfer::DeviceContext& ctx) {
                     ninfer::unpack_paged_kv_logical_page_from_host(
                         backend_alloc, backend, tail.data(), tail_page, ctx.stream);
                     ctx.synchronize_all();
-                    ninfer::pack_paged_kv_logical_page_to_host(
-                        backend_alloc, backend, tail_page, expected.data(), ctx.stream);
+                    ninfer::pack_paged_kv_logical_page_to_host(backend_alloc, backend, tail_page,
+                                                               expected.data(), ctx.stream);
                     ctx.synchronize_all();
-                    source.mtp_kv_valid = frontier;
+                    source.mtp_kv_valid  = frontier;
                     source.disk_entry_id = ticket;
-                    auto second = capture_or_evict(ram, source);
+                    auto second          = capture_or_evict(ram, source);
                     if (!second) { return fail("MTP tail refreshed capture failed"); }
                     ram.wait_pending_copies();
                     disk.note_ram_resident(*second, ticket);
-                    if (!disk.emergency_spill_ram(*second)) { return fail("MTP tail Refresh failed"); }
+                    if (!disk.emergency_spill_ram(*second)) {
+                        return fail("MTP tail Refresh failed");
+                    }
                     if (change == TailChange::Unchanged &&
                         disk.test_backend_page_ids(ticket) != parent_pages) {
                         return fail("MTP unchanged Refresh rewrote proven backend pages");
@@ -8690,18 +10036,20 @@ int test_mtp_refresh_grows_valid_tail(ninfer::DeviceContext& ctx) {
                 text_out.materialize_pages(2, ctx.stream);
                 backend_out.materialize_pages(2, ctx.stream);
                 q36::detail::DiskRestoreTarget target;
-                target.text = &text_out;
-                target.text_pool = &text;
-                target.text_dst_pages = ninfer::pages_for_tokens(frontier);
-                target.backend = &backend_out;
-                target.backend_pool = &backend;
+                target.text              = &text_out;
+                target.text_pool         = &text;
+                target.text_dst_pages    = ninfer::pages_for_tokens(frontier);
+                target.backend           = &backend_out;
+                target.backend_pool      = &backend;
                 target.backend_dst_pages = ninfer::pages_for_tokens(frontier);
-                target.stream = ctx.copy_stream;
+                target.stream            = ctx.copy_stream;
                 reopened.restore_device(match->entry_id, target);
-                if (wait_restore_bounded(reopened, ctx, "MTP tail Refresh restore hung")) { return 1; }
+                if (wait_restore_bounded(reopened, ctx, "MTP tail Refresh restore hung")) {
+                    return 1;
+                }
                 std::vector<std::uint8_t> actual(expected.size());
-                ninfer::pack_paged_kv_logical_page_to_host(
-                    backend_out, backend, tail_page, actual.data(), ctx.stream);
+                ninfer::pack_paged_kv_logical_page_to_host(backend_out, backend, tail_page,
+                                                           actual.data(), ctx.stream);
                 ctx.synchronize_all();
                 reopened.cancel_restore();
                 reopened.release(match->entry_id);
@@ -8709,7 +10057,9 @@ int test_mtp_refresh_grows_valid_tail(ninfer::DeviceContext& ctx) {
                 backend_out.release();
                 text_alloc.release();
                 backend_alloc.release();
-                if (actual != expected) { return fail("MTP tail Refresh restored stale backend bytes"); }
+                if (actual != expected) {
+                    return fail("MTP tail Refresh restored stale backend bytes");
+                }
                 return 0;
             }();
         }
@@ -8778,8 +10128,7 @@ int test_mtp_backend_cow_and_dflash2(ninfer::DeviceContext& ctx) {
     auto retained129 = prompt129;
     retained129.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity129;
-    auto source129         = make_source(retained129, identity129, text_alloc, text, ctx.copy_stream,
-                                         129);
+    auto source129 = make_source(retained129, identity129, text_alloc, text, ctx.copy_stream, 129);
     source129.mtp_kv_valid = 128;
     source129.backend      = &backend_alloc;
     source129.backend_pool = &backend;
@@ -8822,8 +10171,8 @@ int test_mtp_backend_cow_and_dflash2(ninfer::DeviceContext& ctx) {
             text_alloc2.release();
             return fail("DFlash2 create spill failed");
         }
-        const auto match =
-            disk2.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
+        const auto match = disk2.plan_match(text_prompt(aligned),
+                                            q36::detail::prefix_hash_chain(text_prompt(aligned)));
         if (!match || !disk2.test_backend_page_ids(match->entry_id).empty()) {
             text_alloc2.release();
             return fail("DFlash2 stored backend pages");
@@ -8859,7 +10208,8 @@ int test_mtp_backend_cow_and_dflash2(ninfer::DeviceContext& ctx) {
             target.stream            = ctx.copy_stream;
             disk2.restore_device(live_match->entry_id, target);
             try {
-                if (const int rc = wait_restore_bounded(disk2, ctx, "DFlash2 restore hung"); rc != 0) {
+                if (const int rc = wait_restore_bounded(disk2, ctx, "DFlash2 restore hung");
+                    rc != 0) {
                     disk2.release(live_match->entry_id);
                     dest.release();
                     text_alloc2.release();
@@ -8952,9 +10302,7 @@ int test_fingerprint_and_location_file(ninfer::DeviceContext& ctx, ninfer::Paged
     q36::detail::KVRamCache ram(8ULL << 20);
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                            16ULL << 20, 4096);
-    {
-        q36::detail::KVDiskCache first(cfg);
-    }
+    { q36::detail::KVDiskCache first(cfg); }
     cfg.fingerprint.weights_id = "other-weights";
     bool threw                 = false;
     try {
@@ -8978,19 +10326,20 @@ int test_fingerprint_and_location_file(ninfer::DeviceContext& ctx, ninfer::Paged
         threw = std::string(e.what()).find("directory") != std::string::npos;
     }
     if (!threw) { return fail("file location did not fail construction"); }
-    try {
-        ninfer::validate_kv_disk_options(0, 1, "p");
-        return fail("disk without RAM did not throw");
-    } catch (const std::invalid_argument&) {}
-    try {
-        ninfer::validate_kv_disk_options(1, 0, "p");
-        return fail("location without capacity did not throw");
-    } catch (const std::invalid_argument&) {}
+    const auto rejects_disk_options = [](std::size_t ram_bytes, std::size_t disk_bytes) {
+        try {
+            ninfer::validate_kv_disk_options(ram_bytes, disk_bytes, "p");
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    if (!rejects_disk_options(0, 1)) { return fail("disk without RAM did not throw"); }
+    if (!rejects_disk_options(1, 0)) { return fail("location without capacity did not throw"); }
     (void)ctx;
     return 0;
 }
 
-int test_restore_second_entry_without_cancel(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_restore_second_entry_without_cancel(ninfer::DeviceContext& ctx,
+                                             ninfer::PagedKVPool& pool) {
     TmpDir dir("restore-b2");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -9015,10 +10364,10 @@ int test_restore_second_entry_without_cancel(ninfer::DeviceContext& ctx, ninfer:
         alloc.release();
         return fail("B2 spill of D failed");
     }
-    const auto match_b =
-        disk.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-    const auto match_d =
-        disk.plan_match(text_prompt(tokens_d), q36::detail::prefix_hash_chain(text_prompt(tokens_d)));
+    const auto match_b = disk.plan_match(text_prompt(tokens_b),
+                                         q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+    const auto match_d = disk.plan_match(text_prompt(tokens_d),
+                                         q36::detail::prefix_hash_chain(text_prompt(tokens_d)));
     if (!match_b || !match_d || match_b->entry_id == match_d->entry_id) {
         alloc.release();
         return fail("B2 did not produce two disk entries");
@@ -9118,10 +10467,10 @@ int test_cancel_restore_then_restore_other(ninfer::DeviceContext& ctx, ninfer::P
         alloc.release();
         return fail("cancel-h2d spill of D failed");
     }
-    const auto match_b =
-        disk.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-    const auto match_d =
-        disk.plan_match(text_prompt(tokens_d), q36::detail::prefix_hash_chain(text_prompt(tokens_d)));
+    const auto match_b = disk.plan_match(text_prompt(tokens_b),
+                                         q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+    const auto match_d = disk.plan_match(text_prompt(tokens_d),
+                                         q36::detail::prefix_hash_chain(text_prompt(tokens_d)));
     if (!match_b || !match_d || match_b->entry_id == match_d->entry_id) {
         alloc.release();
         return fail("cancel-h2d did not produce two disk entries");
@@ -9142,7 +10491,8 @@ int test_cancel_restore_then_restore_other(ninfer::DeviceContext& ctx, ninfer::P
     disk.claim(match_d->entry_id);
     disk.restore_device(match_d->entry_id, target);
     try {
-        if (const int rc = wait_restore_bounded(disk, ctx, "cancel-h2d restore of D hung"); rc != 0) {
+        if (const int rc = wait_restore_bounded(disk, ctx, "cancel-h2d restore of D hung");
+            rc != 0) {
             disk.release(match_d->entry_id);
             dest.release();
             alloc.release();
@@ -9175,7 +10525,7 @@ int test_cancel_restore_then_restore_other(ninfer::DeviceContext& ctx, ninfer::P
 }
 
 int test_impossible_spill_preserves_residents(ninfer::DeviceContext& ctx,
-                                               ninfer::PagedKVPool& pool) {
+                                              ninfer::PagedKVPool& pool) {
     for (int mode = 0; mode < 3; ++mode) {
         TmpDir dir("impossible-spill");
         q36::detail::KVRamCache ram(32ULL << 20);
@@ -9186,7 +10536,8 @@ int test_impossible_spill_preserves_residents(ninfer::DeviceContext& ctx,
         const auto ram_a = capture_tokens(ram, pool, alloc, ctx, a);
         const auto ram_b = capture_tokens(ram, pool, alloc, ctx, b);
         std::vector<unsigned char> expected(ninfer::paged_kv_logical_page_bytes(pool));
-        ninfer::pack_paged_kv_logical_page_to_host(alloc, pool, 0, expected.data(), ctx.copy_stream);
+        ninfer::pack_paged_kv_logical_page_to_host(alloc, pool, 0, expected.data(),
+                                                   ctx.copy_stream);
         ctx.synchronize_all();
         auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                                32ULL << 20, 4096);
@@ -9198,7 +10549,7 @@ int test_impossible_spill_preserves_residents(ninfer::DeviceContext& ctx,
             if (!disk.emergency_spill_ram(ram_a) || !disk.emergency_spill_ram(ram_b)) {
                 return fail("impossible-spill resident setup failed");
             }
-            disk_a = ram.disk_entry_id(ram_a);
+            disk_a             = ram.disk_entry_id(ram_a);
             cfg.capacity_bytes = disk.snapshot().used_bytes;
             disk.wait_idle_and_fsync();
         }
@@ -9207,7 +10558,7 @@ int test_impossible_spill_preserves_residents(ninfer::DeviceContext& ctx,
         const std::uint32_t pages = mode == 2 ? 2 : 3;
         alloc.materialize_pages(pages, ctx.stream);
         fill_logical_pages(pool, alloc, 61);
-        std::vector<ninfer::TokenId> incoming(pages * 64, 41);
+        std::vector<ninfer::TokenId> incoming(static_cast<std::size_t>(pages) * 64, 41);
         if (mode == 1) { std::copy(a.begin(), a.end(), incoming.begin()); }
         const auto ram_in = capture_tokens(ram, pool, alloc, ctx, incoming);
         {
@@ -9230,23 +10581,24 @@ int test_impossible_spill_preserves_residents(ninfer::DeviceContext& ctx,
         q36::detail::KVDiskCache reopened(cfg);
         for (const auto& tokens : {a, b}) {
             const auto prompt = text_prompt(tokens);
-            const auto match = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+            const auto match  = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
             if (!match || !reopened.claim(match->entry_id)) {
                 return fail("rejected disk spill lost a durable resident on reopen");
             }
             auto dest = pool.reserve(1);
             dest.materialize_pages(1, ctx.copy_stream);
             q36::detail::DiskRestoreTarget target;
-            target.text = &dest;
-            target.text_pool = &pool;
+            target.text           = &dest;
+            target.text_pool      = &pool;
             target.text_dst_pages = 1;
-            target.stream = ctx.copy_stream;
-            const auto ticket = reopened.restore_device(match->entry_id, target);
+            target.stream         = ctx.copy_stream;
+            const auto ticket     = reopened.restore_device(match->entry_id, target);
             if (wait_restore_bounded(reopened, ctx, "preserved disk resident restore hung")) {
                 return 1;
             }
             std::vector<unsigned char> actual(expected.size());
-            ninfer::pack_paged_kv_logical_page_to_host(dest, pool, 0, actual.data(), ctx.copy_stream);
+            ninfer::pack_paged_kv_logical_page_to_host(dest, pool, 0, actual.data(),
+                                                       ctx.copy_stream);
             ctx.synchronize_all();
             reopened.release_restore_ticket(ticket);
             reopened.consume(match->entry_id);
@@ -9272,15 +10624,15 @@ int test_refresh_does_not_exceed_capacity(ninfer::DeviceContext& ctx, ninfer::Pa
     hid.copy_from_host(seed.data(), seed.size());
     ninfer::Tensor hidden(hid.p, ninfer::DType::U8, {256});
     source.tail_hidden = &hidden;
-    auto id = capture_or_evict(ram, source);
+    auto id            = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("refresh-cap first capture failed");
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   64ULL << 20, 4096);
     std::size_t used = 0;
     std::uint64_t entry = 0;
     {
@@ -9296,7 +10648,7 @@ int test_refresh_does_not_exceed_capacity(ninfer::DeviceContext& ctx, ninfer::Pa
             return fail("refresh-cap first match failed");
         }
         entry = match->entry_id;
-        used = disk.snapshot().used_bytes;
+        used  = disk.snapshot().used_bytes;
         if (used == 0) {
             alloc.release();
             return fail("refresh-cap first spill billed no unique bytes");
@@ -9307,23 +10659,23 @@ int test_refresh_does_not_exceed_capacity(ninfer::DeviceContext& ctx, ninfer::Pa
     ram.claim(*id);
     ram.consume(*id);
     std::vector<unsigned char> hidden_host(256, 0x22);
-    auto source2 = make_source(retained, identity, alloc, pool, ctx.copy_stream, 64);
+    auto source2        = make_source(retained, identity, alloc, pool, ctx.copy_stream, 64);
     source2.tail_hidden = &hidden;
     q36::detail::RamLadderHead rollback;
-    rollback.frontier     = 3;
-    rollback.hash         = q36::detail::prefix_hash_at(retained.token_ids, identity, 3);
-    rollback.kind         = q36::detail::ContextCheckpointKind::TurnRollback;
-    rollback.hidden       = hidden_host.data();
-    rollback.hidden_bytes = 256;
+    rollback.frontier             = 3;
+    rollback.hash                 = q36::detail::prefix_hash_at(retained.token_ids, identity, 3);
+    rollback.kind                 = q36::detail::ContextCheckpointKind::TurnRollback;
+    rollback.hidden               = hidden_host.data();
+    rollback.hidden_bytes         = 256;
     q36::detail::RamLadderHead l1 = rollback;
     l1.frontier                   = 4;
-    l1.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
-    l1.kind = q36::detail::ContextCheckpointKind::Ladder;
+    l1.hash                       = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    l1.kind                       = q36::detail::ContextCheckpointKind::Ladder;
     q36::detail::RamLadderHead l2 = l1;
     l2.frontier                   = 5;
-    l2.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
-    source2.ladder_heads = {rollback, l1, l2};
-    auto id2 = capture_or_evict(ram, source2);
+    l2.hash                       = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
+    source2.ladder_heads          = {rollback, l1, l2};
+    auto id2                      = capture_or_evict(ram, source2);
     if (!id2) {
         alloc.release();
         return fail("refresh-cap ladder capture failed");
@@ -9343,7 +10695,7 @@ int test_refresh_does_not_exceed_capacity(ninfer::DeviceContext& ctx, ninfer::Pa
 }
 
 int test_claim_rejects_checkpoint_only_refresh(ninfer::DeviceContext& ctx,
-                                                 ninfer::PagedKVPool& pool) {
+                                               ninfer::PagedKVPool& pool) {
     TmpDir dir("claim-ckpt");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -9366,7 +10718,7 @@ int test_claim_rejects_checkpoint_only_refresh(ninfer::DeviceContext& ctx,
     rollback.hidden       = hidden_host.data();
     rollback.hidden_bytes = 64;
     source.ladder_heads   = {rollback};
-    auto id = capture_or_evict(ram, source);
+    auto id               = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("claim-ckpt capture failed");
@@ -9381,7 +10733,7 @@ int test_claim_rejects_checkpoint_only_refresh(ninfer::DeviceContext& ctx,
         alloc.release();
         return fail("claim-ckpt first spill failed");
     }
-    auto prompt3 = text_prompt({3, 3, 3});
+    auto prompt3       = text_prompt({3, 3, 3});
     const auto planned = disk.plan_match(prompt3, q36::detail::prefix_hash_chain(prompt3));
     if (!planned || planned->reuse_base != 3) {
         alloc.release();
@@ -9419,7 +10771,7 @@ int test_claim_rejects_checkpoint_only_refresh(ninfer::DeviceContext& ctx,
 }
 
 int test_claim_rejects_replaced_head_at_same_frontier(ninfer::DeviceContext& ctx,
-                                                    ninfer::PagedKVPool& pool) {
+                                                      ninfer::PagedKVPool& pool) {
     TmpDir dir("claim-kind");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -9441,8 +10793,8 @@ int test_claim_rejects_replaced_head_at_same_frontier(ninfer::DeviceContext& ctx
     ladder.kind         = q36::detail::ContextCheckpointKind::Ladder;
     ladder.hidden       = hidden_host.data();
     ladder.hidden_bytes = 64;
-    source.ladder_heads  = {ladder};
-    auto id = capture_or_evict(ram, source);
+    source.ladder_heads = {ladder};
+    auto id             = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("claim-kind capture failed");
@@ -9457,7 +10809,7 @@ int test_claim_rejects_replaced_head_at_same_frontier(ninfer::DeviceContext& ctx
         alloc.release();
         return fail("claim-kind first spill failed");
     }
-    auto prompt4 = text_prompt({3, 3, 3, 3});
+    auto prompt4       = text_prompt({3, 3, 3, 3});
     const auto planned = disk.plan_match(prompt4, q36::detail::prefix_hash_chain(prompt4));
     if (!planned || planned->reuse_base != 4 ||
         planned->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint) {
@@ -9470,12 +10822,11 @@ int test_claim_rejects_replaced_head_at_same_frontier(ninfer::DeviceContext& ctx
     ram.claim(*id);
     ram.consume(*id);
     q36::detail::RamLadderHead rollback = ladder;
-    rollback.kind                      = q36::detail::ContextCheckpointKind::TurnRollback;
-    auto source2                        = make_source(retained, identity, alloc, pool,
-                                 ctx.copy_stream, 8);
-    source2.tail_hidden                 = &hidden;
-    source2.ladder_heads              = {rollback};
-    auto id2 = capture_or_evict(ram, source2);
+    rollback.kind                       = q36::detail::ContextCheckpointKind::TurnRollback;
+    auto source2         = make_source(retained, identity, alloc, pool, ctx.copy_stream, 8);
+    source2.tail_hidden  = &hidden;
+    source2.ladder_heads = {rollback};
+    auto id2             = capture_or_evict(ram, source2);
     if (!id2) {
         alloc.release();
         return fail("claim-kind refresh capture failed");
@@ -9504,8 +10855,7 @@ int test_claim_rejects_replaced_head_at_same_frontier(ninfer::DeviceContext& ctx
     return 0;
 }
 
-int test_invalid_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx,
-                                              ninfer::PagedKVPool& pool) {
+int test_invalid_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("bad-kind");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -9528,7 +10878,7 @@ int test_invalid_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx,
     rollback.hidden       = hidden_host.data();
     rollback.hidden_bytes = 64;
     source.ladder_heads   = {rollback};
-    auto id = capture_or_evict(ram, source);
+    auto id               = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("bad-kind capture failed");
@@ -9554,7 +10904,7 @@ int test_invalid_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx,
         disk.wait_idle_and_fsync();
     }
     const auto meta_path = dir.path / "entries" / std::to_string(entry) / "meta.bin";
-    auto bytes            = [&] {
+    auto bytes           = [&] {
         std::ifstream in(meta_path, std::ios::binary);
         return std::vector<unsigned char>((std::istreambuf_iterator<char>(in)),
                                           std::istreambuf_iterator<char>());
@@ -9562,7 +10912,7 @@ int test_invalid_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx,
     bool patched = false;
     for (std::size_t i = 0; i + 8 <= bytes.size(); ++i) {
         std::uint32_t frontier = 0;
-        std::uint32_t kind    = 0;
+        std::uint32_t kind     = 0;
         std::memcpy(&frontier, bytes.data() + i, 4);
         std::memcpy(&kind, bytes.data() + i + 4, 4);
         if (frontier == 3 && kind == 1) {
@@ -9600,15 +10950,16 @@ int test_invalid_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx,
     return 0;
 }
 
-int test_refresh_does_not_evict_sibling(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_refresh_shares_pages_with_replacement_headroom(ninfer::DeviceContext& ctx,
+                                                        ninfer::PagedKVPool& pool) {
     TmpDir dir("refresh-sib");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
     alloc.materialize_pages(2, ctx.stream);
     std::vector<ninfer::TokenId> tokens_a(64, 4);
     std::vector<ninfer::TokenId> tokens_b(64, 7);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   64ULL << 20, 4096);
     std::size_t used = 0;
     std::uint64_t entry_a = 0;
     {
@@ -9619,13 +10970,13 @@ int test_refresh_does_not_evict_sibling(ninfer::DeviceContext& ctx, ninfer::Page
             alloc.release();
             return fail("refresh-sib spill of A failed");
         }
-        const auto match_a =
-            disk.plan_match(text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
+        const auto match_a = disk.plan_match(text_prompt(tokens_a),
+                                             q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
         if (!match_a) {
             alloc.release();
             return fail("refresh-sib match of A failed");
         }
-        entry_a = match_a->entry_id;
+        entry_a          = match_a->entry_id;
         const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
         disk.note_ram_resident(ram_b, 0);
         if (!disk.emergency_spill_ram(ram_b)) {
@@ -9635,7 +10986,8 @@ int test_refresh_does_not_evict_sibling(ninfer::DeviceContext& ctx, ninfer::Page
         used = disk.snapshot().used_bytes;
         disk.wait_idle_and_fsync();
     }
-    cfg.capacity_bytes = used;
+    // Keep room for the replacement ledger/identity while both old entries remain owned.
+    cfg.capacity_bytes = used + used / 2;
     q36::detail::KVDiskCache disk(cfg);
     const auto ram_a2 = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     ram.set_disk_entry_id(ram_a2, entry_a);
@@ -9644,22 +10996,22 @@ int test_refresh_does_not_evict_sibling(ninfer::DeviceContext& ctx, ninfer::Page
         alloc.release();
         return fail("refresh-sib refresh of A failed");
     }
-    const auto hit_b =
-        disk.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+    const auto hit_b = disk.plan_match(text_prompt(tokens_b),
+                                       q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
     if (!hit_b) {
         alloc.release();
-        return fail("refresh charged retained pages and evicted sibling B");
+        return fail("refresh with replacement headroom evicted sibling B");
     }
-    if (disk.snapshot().used_bytes > cfg.capacity_bytes) {
+    if (disk.snapshot().storage_bytes > cfg.capacity_bytes) {
         alloc.release();
-        return fail("refresh unique_bytes exceeded capacity");
+        return fail("refresh pack storage exceeded capacity");
     }
     alloc.release();
     return 0;
 }
 
 int test_raw_state_unequal_codec_bytes_is_skipped(ninfer::DeviceContext& ctx,
-                                                 ninfer::PagedKVPool& pool) {
+                                                  ninfer::PagedKVPool& pool) {
     TmpDir dir("raw-uneq");
     q36::detail::KVRamCache ram(16ULL << 20);
     auto alloc = pool.reserve(2);
@@ -9704,18 +11056,18 @@ int test_raw_state_unequal_codec_bytes_is_skipped(ninfer::DeviceContext& ctx,
         disk.wait_idle_and_fsync();
     }
     std::vector<std::uint8_t> blob(q36::detail::kDiskCodecHeaderBytes);
-    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id,
-                            blob.data(), blob.size())) {
+    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id, blob.data(),
+                            blob.size())) {
         alloc.release();
         return fail("raw-uneq state blob too small to patch");
     }
-    blob[0] = static_cast<std::uint8_t>(q36::detail::DiskCodec::Raw);
+    blob[0]                 = static_cast<std::uint8_t>(q36::detail::DiskCodec::Raw);
     const std::uint64_t unc = 256;
     const std::uint64_t cmp = 128;
     std::memcpy(blob.data() + 4, &unc, 8);
     std::memcpy(blob.data() + 12, &cmp, 8);
-    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id,
-                             blob.data(), blob.size())) {
+    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id, blob.data(),
+                             blob.size())) {
         alloc.release();
         return fail("raw-uneq could not patch packed state");
     }
@@ -9739,18 +11091,18 @@ int test_raw_state_unequal_codec_bytes_is_skipped(ninfer::DeviceContext& ctx,
 }
 
 int test_gdn_checkpoint_without_hidden_is_not_selected(ninfer::DeviceContext& ctx,
-                                                      ninfer::PagedKVPool& pool) {
+                                                       ninfer::PagedKVPool& pool) {
     TmpDir dir("gdn-nohid");
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 2,
-                      .conv_channels  = 4,
-                      .conv_width     = 2,
-                      .value_heads    = 1,
-                      .value_head_dim = 4,
-                      .key_head_dim   = 2,
-                      .slot_count     = 4,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 2,
+                                                               .conv_channels  = 4,
+                                                               .conv_width     = 2,
+                                                               .value_heads    = 1,
+                                                               .value_head_dim = 4,
+                                                               .key_head_dim   = 2,
+                                                               .slot_count     = 4,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     std::vector<unsigned char> conv(gdn.conv_host_image_bytes(), 0x41);
@@ -9780,15 +11132,15 @@ int test_gdn_checkpoint_without_hidden_is_not_selected(ninfer::DeviceContext& ct
     rollback.conv_bytes      = conv.size();
     rollback.recurrent_bytes = rec.size();
     source.ladder_heads      = {rollback};
-    auto id = capture_or_evict(ram, source);
+    auto id                  = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("gdn-nohid capture failed");
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096, ninfer::KvDiskCompress::Off, &gdn);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096, ninfer::KvDiskCompress::Off, &gdn);
     cfg.hidden_bytes = 64;
     q36::detail::KVDiskCache disk(std::move(cfg));
     disk.note_ram_resident(*id, 0);
@@ -9806,7 +11158,7 @@ int test_gdn_checkpoint_without_hidden_is_not_selected(ninfer::DeviceContext& ct
         alloc.release();
         return fail("gdn-nohid did not persist GDN-only rollback");
     }
-    auto prompt3 = text_prompt({3, 3, 3});
+    auto prompt3    = text_prompt({3, 3, 3});
     const auto ckpt = disk.plan_match(prompt3, q36::detail::prefix_hash_chain(prompt3));
     if (ckpt && ckpt->reuse_base == 3) {
         alloc.release();
@@ -9823,15 +11175,10 @@ int test_gdn_checkpoint_without_hidden_is_not_selected(ninfer::DeviceContext& ct
             return fail("gdn-nohid load_host advertised the incomplete rollback");
         }
     }
-    if (!disk.populate_checkpoint_images(*host)) {
+    if (!decode_checkpoint_images(disk, *host,
+                                  {.conv = conv.size(), .recurrent = rec.size(), .hidden = 64})) {
         alloc.release();
         return fail("gdn-nohid populate failed on a skipped incomplete rollback");
-    }
-    for (const auto& image : host->ladder_images) {
-        if (image.frontier == 3) {
-            alloc.release();
-            return fail("gdn-nohid populate installed a hidden-less rollback");
-        }
     }
     alloc.release();
     return 0;
@@ -9858,7 +11205,7 @@ int test_load_host_misses_evicted_entry(ninfer::DeviceContext& ctx, ninfer::Page
         return fail("load-evict spill of B failed");
     }
     const auto prompt_a = text_prompt({1, 1, 1, 1});
-    const auto match_a = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+    const auto match_a  = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
     if (!match_a) {
         alloc.release();
         return fail("load-evict match of A failed");
@@ -9886,15 +11233,15 @@ int test_load_host_misses_evicted_entry(ninfer::DeviceContext& ctx, ninfer::Page
 int test_wrong_gdn_decoded_size_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("gdn-size");
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 2,
-                      .conv_channels  = 4,
-                      .conv_width     = 2,
-                      .value_heads    = 1,
-                      .value_head_dim = 4,
-                      .key_head_dim   = 2,
-                      .slot_count     = 4,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 2,
+                                                               .conv_channels  = 4,
+                                                               .conv_width     = 2,
+                                                               .value_heads    = 1,
+                                                               .value_head_dim = 4,
+                                                               .key_head_dim   = 2,
+                                                               .slot_count     = 4,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     std::vector<unsigned char> conv(gdn.conv_host_image_bytes(), 0x61);
@@ -9910,7 +11257,7 @@ int test_wrong_gdn_decoded_size_is_skipped(ninfer::DeviceContext& ctx, ninfer::P
     auto source             = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
     source.gdn              = &gdn;
     source.gdn_current_slot = 0;
-    auto id = capture_or_evict(ram, source);
+    auto id                 = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("gdn-size capture failed");
@@ -9940,15 +11287,15 @@ int test_wrong_gdn_decoded_size_is_skipped(ninfer::DeviceContext& ctx, ninfer::P
         disk.wait_idle_and_fsync();
     }
     std::vector<std::uint8_t> blob(q36::detail::kDiskCodecHeaderBytes);
-    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State, gdn_id,
-                            blob.data(), blob.size())) {
+    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State, gdn_id, blob.data(),
+                            blob.size())) {
         alloc.release();
         return fail("gdn-size blob too small to patch");
     }
     const std::uint64_t unc = 1;
     std::memcpy(blob.data() + 4, &unc, 8);
-    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, gdn_id,
-                             blob.data(), blob.size())) {
+    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, gdn_id, blob.data(),
+                             blob.size())) {
         alloc.release();
         return fail("gdn-size could not patch packed state");
     }
@@ -9971,7 +11318,8 @@ int test_wrong_gdn_decoded_size_is_skipped(ninfer::DeviceContext& ctx, ninfer::P
     return 0;
 }
 
-int test_plan_match_does_not_wait_on_manifest(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_plan_match_does_not_wait_on_manifest(ninfer::DeviceContext& ctx,
+                                              ninfer::PagedKVPool& pool) {
     TmpDir dir("plan-manifest");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -9982,7 +11330,7 @@ int test_plan_match_does_not_wait_on_manifest(ninfer::DeviceContext& ctx, ninfer
     std::vector<ninfer::TokenId> tokens(64, 6);
     const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
     disk.note_ram_resident(ram_id, 0);
-    disk.test_set_manifest_io_stall_ms(250);
+    disk.test_hold_manifest_io(true);
     std::atomic<bool> spilled{false};
     std::thread spiller([&] { spilled.store(disk.emergency_spill_ram(ram_id)); });
     const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -9991,18 +11339,27 @@ int test_plan_match_does_not_wait_on_manifest(ninfer::DeviceContext& ctx, ninfer
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (!disk.test_manifest_io_entered()) {
-        disk.test_set_manifest_io_stall_ms(0);
+        disk.test_hold_manifest_io(false);
         spiller.join();
         alloc.release();
         return fail("manifest I/O stall was not reached");
     }
-    const auto t0        = std::chrono::steady_clock::now();
+    // A plan_match that waits on the held write is released by the watchdog and fails.
+    std::atomic<bool> planned{false};
+    std::atomic<bool> fired{false};
+    std::thread watchdog([&] {
+        if (!wait_pred([&] { return planned.load(); }, std::chrono::seconds(10))) {
+            fired.store(true);
+            disk.test_hold_manifest_io(false);
+        }
+    });
     const auto unrelated = text_prompt({1, 2, 3, 4});
     (void)disk.plan_match(unrelated, q36::detail::prefix_hash_chain(unrelated));
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-    disk.test_set_manifest_io_stall_ms(0);
+    planned.store(true);
+    watchdog.join();
+    disk.test_hold_manifest_io(false);
     spiller.join();
-    if (elapsed > std::chrono::milliseconds(100)) {
+    if (fired.load()) {
         alloc.release();
         return fail("plan_match waited on manifest fsync");
     }
@@ -10012,6 +11369,375 @@ int test_plan_match_does_not_wait_on_manifest(ninfer::DeviceContext& ctx, ninfer
     }
     alloc.release();
     return 0;
+}
+
+// An idle prepare that makes capacity releases the mutex for the eviction's
+// MANIFEST write. A cancellation in that window must stop the spill before it
+// installs; otherwise cancel_idle_spill waits for the whole idle image write.
+int test_idle_cancel_during_capacity_eviction(ninfer::DeviceContext& ctx,
+                                              ninfer::PagedKVPool& pool) {
+    TmpDir dir("idle-cancel-evict");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   64ULL << 20, 4096);
+    const auto first = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 21));
+    std::size_t used = 0;
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        disk.note_ram_resident(first, 0);
+        if (!disk.emergency_spill_ram(first)) {
+            alloc.release();
+            return fail("idle-cancel-evict first spill failed");
+        }
+        disk.wait_idle_and_fsync();
+        used = disk.snapshot().used_bytes;
+    }
+    cfg.capacity_bytes = used;
+    q36::detail::KVDiskCache disk(cfg);
+    const auto second = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 22));
+    disk.note_ram_resident(second, 0);
+    // The eviction's MANIFEST write is held until the cancellation has registered, so the
+    // cancellation always lands inside the window regardless of host scheduling.
+    disk.test_hold_manifest_io(true);
+    disk.request_idle_spill();
+    if (!wait_pred([&] { return disk.test_manifest_io_entered(); }, std::chrono::seconds(10))) {
+        disk.test_hold_manifest_io(false);
+        disk.cancel_idle_spill();
+        alloc.release();
+        return fail("idle-cancel-evict idle prepare did not reach capacity eviction");
+    }
+    bool registered = false;
+    bool prompt     = false;
+    bool durable    = false;
+    {
+        // Any payload write from here on stays held: a cancel that waits for a spill installed
+        // after the cancellation never returns while it is held.
+        UnlockedIoHold write(disk, q36::detail::DiskUnlockedIo::PayloadWrite);
+        const std::uint64_t epoch = disk.test_idle_cancel_epoch();
+        std::thread canceller([&] { disk.cancel_idle_spill(); });
+        registered = wait_pred([&] { return disk.test_idle_cancel_epoch() != epoch; },
+                               std::chrono::seconds(10));
+        write.arm();
+        disk.test_hold_manifest_io(false);
+        canceller.join();
+        prompt  = write.disarm();
+        durable = disk.ram_is_durable(second);
+    }
+    disk.wait_idle_and_fsync();
+    alloc.release();
+    if (!registered) {
+        return fail("idle-cancel-evict cancellation did not register during the MANIFEST write");
+    }
+    if (!prompt) { return fail("idle cancel waited for a spill installed after cancellation"); }
+    if (durable) { return fail("idle spill committed after cancellation"); }
+    return 0;
+}
+
+// Pinning an entry for a disk spill waits for that entry's own device copies,
+// not every pending RAM copy: an unrelated gated capture must not stall it.
+int test_spill_pin_waits_only_its_entry(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    TmpDir dir("spill-own-copy");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    fill_logical_pages(pool, alloc, 87);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    cudaStream_t side = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
+    int failures = 0;
+    {
+        ninfer::test::StreamCopyGate gate;
+        auto own_prompt = text_prompt(std::vector<ninfer::TokenId>(64, 24));
+        auto own        = own_prompt;
+        own.token_ids.push_back(0);
+        q36::detail::ResidentPrefixIdentity own_identity;
+        auto source         = make_source(own, own_identity, alloc, pool, ctx.copy_stream, 64);
+        const auto captured = ram.capture(source);
+        std::optional<std::uint64_t> own_id;
+        if (captured.status == q36::detail::RamCaptureStatus::Captured) {
+            own_id = captured.entry_id;
+        } else {
+            failures += fail("spill-own-copy capture failed");
+        }
+        gate.arm(ram);
+        auto unrelated_prompt = text_prompt(std::vector<ninfer::TokenId>(64, 23));
+        auto unrelated        = unrelated_prompt;
+        unrelated.token_ids.push_back(0);
+        q36::detail::ResidentPrefixIdentity unrelated_identity;
+        auto gated = make_source(unrelated, unrelated_identity, alloc, pool, side, 64);
+        if (ram.capture(gated).status != q36::detail::RamCaptureStatus::Captured) {
+            failures += fail("spill-own-copy gated capture failed");
+        }
+        if (failures == 0) {
+            disk.note_ram_resident(own_id.value(), 0);
+            std::atomic<bool> spilled{false};
+            // Reaching the payload write proves the pin passed its own copy; the unrelated
+            // capture stays gated until after the check, so a pin that waits on it never does.
+            UnlockedIoHold write(disk, q36::detail::DiskUnlockedIo::PayloadWrite);
+            std::thread spiller([&] { spilled.store(disk.emergency_spill_ram(own_id.value())); });
+            const bool prompt = write.entered();
+            write.release();
+            gate.release();
+            spiller.join();
+            if (!prompt) {
+                failures += fail("disk spill pin waited for an unrelated gated RAM copy");
+            } else if (!spilled.load()) {
+                failures += fail("spill-own-copy spill failed");
+            }
+        }
+        gate.release();
+    }
+    ctx.synchronize_all();
+    CUDA_CHECK(cudaStreamSynchronize(side));
+    CUDA_CHECK(cudaStreamDestroy(side));
+    disk.wait_idle_and_fsync();
+    alloc.release();
+    return failures;
+}
+
+// Compaction copies the whole live pack store. Lookups and admission on the
+// scheduler thread must not wait for that copy.
+
+
+// Reclaiming RAM for a capture while other lanes decode must not wait on a
+// disk write: a disk-durable entry is evicted first, and without one the
+// oldest entry is spilled on the disk worker and evicted once durable, never
+// dropped unsaved and never spilled synchronously.
+int test_ram_reclaim_never_blocks_on_disk(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    TmpDir dir("ram-reclaim");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    const auto older = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 27));
+    disk.note_ram_resident(older, 0);
+    const auto newer = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 28));
+    disk.note_ram_resident(newer, 0);
+    if (!disk.emergency_spill_ram(newer)) {
+        alloc.release();
+        return fail("ram-reclaim fixture spill failed");
+    }
+    disk.wait_idle_and_fsync();
+    const auto resident = [&](std::uint64_t id) {
+        const auto ids = ram.fifo_ids();
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    };
+    int failures        = 0;
+    auto result         = q36::detail::RamReclaim::NoVictim;
+    std::uint64_t drops = 0;
+    {
+        // Every disk write from here on stays held: a reclaim that waits on one never returns
+        // while it is held.
+        UnlockedIoHold write(disk, q36::detail::DiskUnlockedIo::PayloadWrite);
+        write.arm();
+        result = disk.reclaim_ram_entry(false);
+        if (result != q36::detail::RamReclaim::Evicted || resident(newer) || !resident(older)) {
+            failures += fail("non-blocking reclaim did not evict the disk-durable entry first");
+        }
+        drops  = disk.snapshot().drops;
+        result = disk.reclaim_ram_entry(false);
+        if (result == q36::detail::RamReclaim::Evicted || !resident(older)) {
+            failures += fail("non-blocking reclaim dropped the unsaved oldest entry");
+        }
+        if (!write.disarm()) {
+            failures += fail("non-blocking reclaim waited on disk I/O or spilled synchronously");
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (result != q36::detail::RamReclaim::Evicted &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        result = disk.reclaim_ram_entry(false);
+    }
+    if (result != q36::detail::RamReclaim::Evicted || resident(older)) {
+        failures += fail("non-blocking reclaim never evicted the spilled entry");
+    }
+    if (disk.snapshot().drops != drops) {
+        failures += fail("non-blocking reclaim dropped an unsaved RAM entry");
+    }
+    const auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 27));
+    if (!disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {
+        failures += fail("reclaimed RAM entry is not on disk");
+    }
+    alloc.release();
+    return failures;
+}
+
+// Under sustained load write-behind is still spilling the oldest entry when
+// RAM fills. That entry is I/O-pinned, so it is not an eviction candidate;
+// reclaim must finish its spill and evict it rather than drop a newer entry.
+int test_ram_reclaim_waits_for_inflight_spill(ninfer::DeviceContext& ctx,
+                                              ninfer::PagedKVPool& pool) {
+    TmpDir dir("ram-reclaim-inflight");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    const auto older = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 37));
+    disk.note_ram_resident(older, 0);
+    const auto newer = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 38));
+    disk.note_ram_resident(newer, 0);
+    const auto resident = [&](std::uint64_t id) {
+        const auto ids = ram.fifo_ids();
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    };
+    int failures     = 0;
+    const auto drops = disk.snapshot().drops;
+    auto result      = q36::detail::RamReclaim::NoVictim;
+    {
+        // The write-behind of the oldest entry stays in flight until the reclaim has returned.
+        UnlockedIoHold write(disk, q36::detail::DiskUnlockedIo::PayloadWrite);
+        disk.request_idle_spill();
+        if (!write.entered() || ram.test_io_pins(older) == 0) {
+            alloc.release();
+            return fail("ram-reclaim-inflight write-behind never started");
+        }
+        write.arm();
+        result = disk.reclaim_ram_entry(false);
+        if (result == q36::detail::RamReclaim::Evicted || !resident(newer)) {
+            failures += fail("reclaim dropped a newer entry while the oldest was spilling");
+        }
+        if (!write.disarm()) {
+            failures += fail("non-blocking reclaim waited for the in-flight spill");
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (result != q36::detail::RamReclaim::Evicted &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        result = disk.reclaim_ram_entry(false);
+    }
+    if (result != q36::detail::RamReclaim::Evicted || resident(older) || !resident(newer)) {
+        failures += fail("reclaim did not evict the spilled oldest entry");
+    }
+    if (disk.snapshot().drops != drops) {
+        failures += fail("reclaim dropped an unsaved RAM entry");
+    }
+    alloc.release();
+    return failures;
+}
+
+// An admission that captures several lanes rolls every capture back when it
+// defers. Its own earlier capture must not become a later capture's reclaim
+// target, or each retry recaptures it, targets it and rolls it back again.
+int test_ram_reclaim_skips_attempt_captures(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    TmpDir dir("ram-reclaim-attempt");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    const auto older = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 47));
+    disk.note_ram_resident(older, 0);
+    disk.test_arm_fail_prepare_spill();
+    if (disk.emergency_spill_ram(older)) {
+        alloc.release();
+        return fail("ram-reclaim-attempt fixture spill did not fail");
+    }
+    const auto attempt =
+        capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 48));
+    disk.note_ram_resident(attempt, 0);
+    // Every disk write from here on stays held: a reclaim that waits on one never returns
+    // while it is held.
+    UnlockedIoHold write(disk, q36::detail::DiskUnlockedIo::PayloadWrite);
+    write.arm();
+    const auto resident = [&](std::uint64_t id) {
+        const auto ids = ram.fifo_ids();
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    };
+    const std::array<std::uint64_t, 1> keep{attempt};
+    int failures     = 0;
+    const auto drops = disk.snapshot().drops;
+    const auto first = disk.reclaim_ram_entry(false, keep);
+    if (first != q36::detail::RamReclaim::Evicted || resident(older) || !resident(attempt) ||
+        disk.ram_reclaim_pending()) {
+        failures += fail("reclaim targeted this attempt's capture instead of dropping the "
+                         "unsavable older entry");
+    }
+    if (disk.snapshot().drops != drops + 1) {
+        failures += fail("dropping the unsavable older entry was not counted");
+    }
+    const auto second = disk.reclaim_ram_entry(false, keep);
+    if (second != q36::detail::RamReclaim::NoVictim || !resident(attempt) ||
+        disk.ram_reclaim_pending()) {
+        failures += fail("reclaim with only this attempt's capture left did not refuse");
+    }
+    if (!write.disarm()) {
+        failures += fail("reclaim excluding this attempt's capture waited on disk I/O");
+    }
+    write.release();
+    alloc.release();
+    return failures;
+}
+
+// restore_device waits for another entry's in-flight window reads. The
+// readiness probe lets admission keep decoding instead of taking that wait.
+int test_restore_setup_ready_tracks_window_reads(ninfer::DeviceContext& ctx,
+                                                 ninfer::PagedKVPool& pool) {
+    TmpDir dir("restore-ready");
+    q36::detail::KVRamCache ram(32ULL << 20);
+    auto alloc = pool.reserve(2);
+    alloc.materialize_pages(1, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           32ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+
+    struct BarrierGuard {
+        q36::detail::KVDiskCache& disk;
+
+        ~BarrierGuard() { disk.test_release_page_read_barrier(); }
+    } barrier{disk};
+
+    for (const auto& tokens : {std::vector<ninfer::TokenId>{12, 13, 14, 15},
+                               std::vector<ninfer::TokenId>{16, 17, 18, 19}}) {
+        const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
+        disk.note_ram_resident(ram_id, 0);
+        if (!disk.emergency_spill_ram(ram_id)) {
+            alloc.release();
+            return fail("restore-ready fixture spill failed");
+        }
+    }
+    const auto prompt_a = text_prompt({12, 13, 14, 15});
+    const auto prompt_b = text_prompt({16, 17, 18, 19});
+    const auto match_a  = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+    const auto match_b  = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+    if (!match_a || !match_b || !disk.claim(match_b->entry_id)) {
+        alloc.release();
+        return fail("restore-ready fixture could not claim the prefetched entry");
+    }
+    int failures = 0;
+    if (!disk.restore_setup_ready(match_a->entry_id)) {
+        failures += fail("restore setup reported busy with no window reads");
+    }
+    disk.test_arm_page_read_barrier();
+    disk.prefetch_window(match_b->entry_id, 1, 0);
+    if (!wait_pred([&] { return disk.test_page_read_entered(); }, std::chrono::seconds(2))) {
+        disk.test_release_page_read_barrier();
+        disk.release(match_b->entry_id);
+        alloc.release();
+        return fail("restore-ready prefetch did not enter its page read");
+    }
+    if (disk.restore_setup_ready(match_a->entry_id)) {
+        failures += fail("restore setup reported ready while another entry's read was in flight");
+    }
+    disk.test_release_page_read_barrier();
+    if (!wait_pred([&] { return disk.restore_setup_ready(match_a->entry_id); },
+                   std::chrono::seconds(2))) {
+        failures += fail("restore setup stayed busy after the window read finished");
+    }
+    disk.release(match_b->entry_id);
+    alloc.release();
+    return failures;
 }
 
 int test_disk_fifo_evict_clears_ram_durable(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
@@ -10034,7 +11760,7 @@ int test_disk_fifo_evict_clears_ram_durable(ninfer::DeviceContext& ctx, ninfer::
         return fail("spill did not mark RAM durable");
     }
     const auto prompt = text_prompt(tokens);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("durable-clear match failed");
@@ -10067,7 +11793,8 @@ int test_disk_fifo_evict_clears_ram_durable(ninfer::DeviceContext& ctx, ninfer::
     return 0;
 }
 
-int test_lock_does_not_wipe_tmp_before_flock(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_lock_does_not_wipe_tmp_before_flock(ninfer::DeviceContext& ctx,
+                                             ninfer::PagedKVPool& pool) {
     TmpDir dir("lock-tmp");
     fs::create_directories(dir.path / "tmp");
     const auto keep = dir.path / "tmp" / "keep-me";
@@ -10083,8 +11810,8 @@ int test_lock_does_not_wipe_tmp_before_flock(ninfer::DeviceContext& ctx, ninfer:
         return fail("could not take exclusive LOCK");
     }
     q36::detail::KVRamCache ram(8ULL << 20);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg   = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                             32ULL << 20, 4096);
     bool threw = false;
     try {
         q36::detail::KVDiskCache second(cfg);
@@ -10103,7 +11830,7 @@ int test_lock_does_not_wipe_tmp_before_flock(ninfer::DeviceContext& ctx, ninfer:
 std::vector<std::uint64_t> read_manifest_ids(const fs::path& path) {
     std::ifstream in(path, std::ios::binary);
     std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(in)),
-                                      std::istreambuf_iterator<char>());
+                                     std::istreambuf_iterator<char>());
     if (bytes.size() < 16) { return {}; }
     if (std::memcmp(bytes.data(), q36::detail::kDiskManifestMagic, 8) != 0) { return {}; }
     std::uint32_t count = 0;
@@ -10148,9 +11875,13 @@ int test_claim_does_not_hang_when_idle_spill_has_no_inflight(ninfer::DeviceConte
         disk.request_idle_spill();
         std::atomic<bool> done{false};
         std::thread claimer([&] {
+            // claim() reports an entry that is already claimed with std::logic_error. Either
+            // outcome is accepted: this test checks only that claim returns instead of waiting on
+            // an idle spill with no inflight payload.
             try {
                 if (disk.claim(match_b->entry_id)) { disk.release(match_b->entry_id); }
-            } catch (const std::logic_error&) {}
+            } catch (const std::logic_error&) { // NOLINT(bugprone-empty-catch): accepted outcome.
+            }
             done.store(true);
         });
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -10165,7 +11896,7 @@ int test_claim_does_not_hang_when_idle_spill_has_no_inflight(ninfer::DeviceConte
         claimer.join();
         std::atomic<bool> cancelled{false};
         std::thread canceler([&] {
-            disk.cancel_idle_of_ram(ram_d);
+            disk.cancel_idle_spill();
             cancelled.store(true);
         });
         const auto cancel_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -10175,7 +11906,7 @@ int test_claim_does_not_hang_when_idle_spill_has_no_inflight(ninfer::DeviceConte
         if (!cancelled.load()) {
             canceler.detach();
             alloc.release();
-            return fail("cancel_idle_of_ram hung with no inflight payload");
+            return fail("cancel_idle_spill hung with no inflight payload");
         }
         canceler.join();
     }
@@ -10205,8 +11936,8 @@ int test_fifo_evict_rewrites_manifest(ninfer::DeviceContext& ctx, ninfer::PagedK
         alloc.release();
         return fail("evict-man spill B failed");
     }
-    const auto match_a =
-        disk.plan_match(text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
+    const auto match_a = disk.plan_match(text_prompt(tokens_a),
+                                         q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
     if (!match_a) {
         alloc.release();
         return fail("evict-man match A failed");
@@ -10230,84 +11961,89 @@ int test_fifo_evict_rewrites_manifest(ninfer::DeviceContext& ctx, ninfer::PagedK
 }
 
 int test_smaller_capacity_open_persists_eviction(ninfer::DeviceContext& ctx,
-                                                  ninfer::PagedKVPool& pool) {
-    TmpDir dir("small-cap");
-    q36::detail::KVRamCache ram(64ULL << 20);
-    auto alloc = pool.reserve(4);
-    alloc.materialize_pages(3, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
-    std::vector<ninfer::TokenId> tokens_a(192, 1);
-    std::vector<ninfer::TokenId> tokens_b(192, 2);
-    std::uint64_t id_a = 0;
-    std::uint64_t id_b = 0;
-    {
-        q36::detail::KVDiskCache disk(cfg);
-        const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
-        disk.note_ram_resident(ram_a, 0);
-        if (!disk.emergency_spill_ram(ram_a)) {
-            alloc.release();
-            return fail("small-cap spill A failed");
+                                                 ninfer::PagedKVPool& pool) {
+    for (bool short_context : {false, true}) {
+        TmpDir dir("small-cap");
+        q36::detail::KVRamCache ram(64ULL << 20);
+        auto alloc = pool.reserve(4);
+        alloc.materialize_pages(3, ctx.stream);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               64ULL << 20, 4096);
+        std::vector<ninfer::TokenId> tokens_a(192, 1);
+        std::vector<ninfer::TokenId> tokens_b(192, 2);
+        std::uint64_t id_a = 0;
+        std::uint64_t id_b = 0;
+        {
+            q36::detail::KVDiskCache disk(cfg);
+            const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
+            disk.note_ram_resident(ram_a, 0);
+            if (!disk.emergency_spill_ram(ram_a)) {
+                alloc.release();
+                return fail("small-cap spill A failed");
+            }
+            const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
+            disk.note_ram_resident(ram_b, 0);
+            if (!disk.emergency_spill_ram(ram_b)) {
+                alloc.release();
+                return fail("small-cap spill B failed");
+            }
+            const auto match_a = disk.plan_match(
+                text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
+            const auto match_b = disk.plan_match(
+                text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+            if (!match_a || !match_b) {
+                alloc.release();
+                return fail("small-cap match failed");
+            }
+            id_a = match_a->entry_id;
+            id_b = match_b->entry_id;
+            disk.wait_idle_and_fsync();
         }
-        const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
-        disk.note_ram_resident(ram_b, 0);
-        if (!disk.emergency_spill_ram(ram_b)) {
-            alloc.release();
-            return fail("small-cap spill B failed");
+        auto used = 0ULL;
+        {
+            q36::detail::KVDiskCache measure(cfg);
+            used = measure.snapshot().used_bytes;
         }
-        const auto match_a =
-            disk.plan_match(text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
-        const auto match_b =
-            disk.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-        if (!match_a || !match_b) {
+        if (used == 0) {
             alloc.release();
-            return fail("small-cap match failed");
+            return fail("small-cap could not measure used bytes");
         }
-        id_a = match_a->entry_id;
-        id_b = match_b->entry_id;
-        disk.wait_idle_and_fsync();
-    }
-    auto used = 0ULL;
-    {
-        q36::detail::KVDiskCache measure(cfg);
-        used = measure.snapshot().used_bytes;
-    }
-    if (used == 0) {
+        cfg.capacity_bytes = used > 1 ? used - 1 : 1;
+        cfg.max_context    = short_context ? 16 : 4096;
+        {
+            q36::detail::KVDiskCache small(cfg);
+            const auto ids      = read_manifest_ids(dir.path / "MANIFEST");
+            const bool a_listed = std::find(ids.begin(), ids.end(), id_a) != ids.end();
+            const bool b_listed = std::find(ids.begin(), ids.end(), id_b) != ids.end();
+            if (a_listed && b_listed) {
+                alloc.release();
+                return fail("smaller-capacity open did not persist FIFO eviction to MANIFEST");
+            }
+            if (small.snapshot().storage_bytes > cfg.capacity_bytes ||
+                pack_file_bytes(dir.path) != small.snapshot().storage_bytes) {
+                alloc.release();
+                return fail("smaller-capacity open exceeded physical pack capacity");
+            }
+        }
+        cfg.capacity_bytes = 64ULL << 20;
+        cfg.max_context    = 4096;
+        q36::detail::KVDiskCache reopened(cfg);
+        const auto hit_a = reopened.plan_match(
+            text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
+        const auto hit_b = reopened.plan_match(
+            text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+        const int hits = (hit_a ? 1 : 0) + (hit_b ? 1 : 0);
+        if (hits > 1) {
+            alloc.release();
+            return fail("smaller-capacity eviction did not remain after reopen at full capacity");
+        }
         alloc.release();
-        return fail("small-cap could not measure used bytes");
     }
-    cfg.capacity_bytes = used > 1 ? used - 1 : 1;
-    {
-        q36::detail::KVDiskCache small(cfg);
-        const auto ids = read_manifest_ids(dir.path / "MANIFEST");
-        const bool a_listed = std::find(ids.begin(), ids.end(), id_a) != ids.end();
-        const bool b_listed = std::find(ids.begin(), ids.end(), id_b) != ids.end();
-        if (a_listed && b_listed) {
-            alloc.release();
-            return fail("smaller-capacity open did not persist FIFO eviction to MANIFEST");
-        }
-        if (small.snapshot().used_bytes > cfg.capacity_bytes) {
-            alloc.release();
-            return fail("smaller-capacity open exceeded unique-byte capacity");
-        }
-    }
-    cfg.capacity_bytes = 64ULL << 20;
-    q36::detail::KVDiskCache reopened(cfg);
-    const auto hit_a =
-        reopened.plan_match(text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
-    const auto hit_b =
-        reopened.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-    const int hits = (hit_a ? 1 : 0) + (hit_b ? 1 : 0);
-    if (hits != 1) {
-        alloc.release();
-        return fail("smaller-capacity eviction did not remain after reopen at full capacity");
-    }
-    alloc.release();
     return 0;
 }
 
 int test_misplaced_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx,
-                                               ninfer::PagedKVPool& pool) {
+                                              ninfer::PagedKVPool& pool) {
     TmpDir dir("slot-kind");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -10330,7 +12066,7 @@ int test_misplaced_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx,
     rollback.hidden       = hidden_host.data();
     rollback.hidden_bytes = 64;
     source.ladder_heads   = {rollback};
-    auto id = capture_or_evict(ram, source);
+    auto id               = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("slot-kind capture failed");
@@ -10356,15 +12092,15 @@ int test_misplaced_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx,
         disk.wait_idle_and_fsync();
     }
     const auto meta_path = dir.path / "entries" / std::to_string(entry) / "meta.bin";
-    auto bytes            = [&] {
+    auto bytes           = [&] {
         std::ifstream in(meta_path, std::ios::binary);
         return std::vector<unsigned char>((std::istreambuf_iterator<char>(in)),
                                           std::istreambuf_iterator<char>());
     }();
     constexpr std::size_t kRollbackFrontierOffset = 148;
-    bool patched = bytes.size() >= kRollbackFrontierOffset + 8;
-    std::uint32_t frontier = 0;
-    std::uint32_t kind     = 0;
+    bool patched                                  = bytes.size() >= kRollbackFrontierOffset + 8;
+    std::uint32_t frontier                        = 0;
+    std::uint32_t kind                            = 0;
     if (patched) {
         std::memcpy(&frontier, bytes.data() + kRollbackFrontierOffset, 4);
         std::memcpy(&kind, bytes.data() + kRollbackFrontierOffset + 4, 4);
@@ -10403,7 +12139,7 @@ int test_misplaced_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx,
 }
 
 int test_missing_current_hidden_is_not_advertised(ninfer::DeviceContext& ctx,
-                                                   ninfer::PagedKVPool& pool) {
+                                                  ninfer::PagedKVPool& pool) {
     TmpDir dir("hidden-adv");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -10480,7 +12216,7 @@ bool disk_tree_has_regular_files(const fs::path& root) {
 }
 
 int test_cancel_create_after_rename_does_not_leak(ninfer::DeviceContext& ctx,
-                                                    ninfer::PagedKVPool& pool) {
+                                                  ninfer::PagedKVPool& pool) {
     TmpDir dir("create-cancel");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -10495,8 +12231,7 @@ int test_cancel_create_after_rename_does_not_leak(ninfer::DeviceContext& ctx,
         disk.test_arm_stall_after_meta_rename();
         disk.request_idle_spill();
         const auto renamed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-        while (!disk.test_meta_renamed() &&
-               std::chrono::steady_clock::now() < renamed_deadline) {
+        while (!disk.test_meta_renamed() && std::chrono::steady_clock::now() < renamed_deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (!disk.test_meta_renamed()) {
@@ -10510,7 +12245,8 @@ int test_cancel_create_after_rename_does_not_leak(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("cancelled Create left billed unique bytes");
         }
-        if (disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+        if (disk.plan_match(text_prompt(tokens),
+                            q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
             alloc.release();
             return fail("cancelled Create remained hittable");
         }
@@ -10524,7 +12260,8 @@ int test_cancel_create_after_rename_does_not_leak(ninfer::DeviceContext& ctx,
         }
     }
     q36::detail::KVDiskCache reopened(cfg);
-    if (reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+    if (reopened.plan_match(text_prompt(tokens),
+                            q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
         alloc.release();
         return fail("reopen resurrected a cancelled Create generation");
     }
@@ -10537,7 +12274,7 @@ int test_cancel_create_after_rename_does_not_leak(ninfer::DeviceContext& ctx,
 }
 
 int test_cancel_branch_after_rename_drops_shared_refs(ninfer::DeviceContext& ctx,
-                                                       ninfer::PagedKVPool& pool) {
+                                                      ninfer::PagedKVPool& pool) {
     TmpDir dir("branch-cancel");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -10548,9 +12285,9 @@ int test_cancel_branch_after_rename_drops_shared_refs(ninfer::DeviceContext& ctx
     std::vector<ninfer::TokenId> child(parent.begin(), parent.begin() + 64);
     child.push_back(99);
     child.resize(70, 11);
-    std::uint64_t parent_id = 0;
-    std::uint64_t parent_page = 0;
-    std::uint64_t parent_refs = 0;
+    std::uint64_t parent_id       = 0;
+    std::uint64_t parent_page     = 0;
+    std::uint64_t parent_refs     = 0;
     std::size_t used_after_parent = 0;
     {
         q36::detail::KVDiskCache disk(cfg);
@@ -10560,29 +12297,28 @@ int test_cancel_branch_after_rename_drops_shared_refs(ninfer::DeviceContext& ctx
             alloc.release();
             return fail("branch-cancel parent spill failed");
         }
-        const auto match_p =
-            disk.plan_match(text_prompt(parent), q36::detail::prefix_hash_chain(text_prompt(parent)));
+        const auto match_p = disk.plan_match(text_prompt(parent),
+                                             q36::detail::prefix_hash_chain(text_prompt(parent)));
         if (!match_p) {
             alloc.release();
             return fail("branch-cancel parent match failed");
         }
-        parent_id         = match_p->entry_id;
-        const auto pages  = disk.test_main_page_ids(parent_id);
+        parent_id        = match_p->entry_id;
+        const auto pages = disk.test_main_page_ids(parent_id);
         if (pages.empty()) {
             alloc.release();
             return fail("branch-cancel parent has no pages");
         }
-        parent_page        = pages.front();
-        parent_refs         = disk.test_object_refcount(parent_page);
-        used_after_parent  = disk.snapshot().used_bytes;
-        const auto ram_c = capture_tokens(ram, pool, alloc, ctx, child);
+        parent_page       = pages.front();
+        parent_refs       = disk.test_object_refcount(parent_page);
+        used_after_parent = disk.snapshot().used_bytes;
+        const auto ram_c  = capture_tokens(ram, pool, alloc, ctx, child);
         ram.set_disk_entry_id(ram_c, parent_id);
         disk.note_ram_resident(ram_c, parent_id);
         disk.test_arm_stall_after_meta_rename();
         disk.request_idle_spill();
         const auto renamed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-        while (!disk.test_meta_renamed() &&
-               std::chrono::steady_clock::now() < renamed_deadline) {
+        while (!disk.test_meta_renamed() && std::chrono::steady_clock::now() < renamed_deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (!disk.test_meta_renamed()) {
@@ -10604,16 +12340,18 @@ int test_cancel_branch_after_rename_drops_shared_refs(ninfer::DeviceContext& ctx
             alloc.release();
             return fail("cancelled Branch changed unique-byte billing");
         }
-        if (disk.plan_match(text_prompt(child), q36::detail::prefix_hash_chain(text_prompt(child))) &&
+        if (disk.plan_match(text_prompt(child),
+                            q36::detail::prefix_hash_chain(text_prompt(child))) &&
             disk.plan_match(text_prompt(child), q36::detail::prefix_hash_chain(text_prompt(child)))
-                    ->reuse_base >= 70) {
+                    .value()
+                    .reuse_base >= 70) {
             alloc.release();
             return fail("cancelled Branch remained hittable at the child frontier");
         }
     }
     q36::detail::KVDiskCache reopened(cfg);
-    const auto hit_p =
-        reopened.plan_match(text_prompt(parent), q36::detail::prefix_hash_chain(text_prompt(parent)));
+    const auto hit_p = reopened.plan_match(text_prompt(parent),
+                                           q36::detail::prefix_hash_chain(text_prompt(parent)));
     if (!hit_p || hit_p->entry_id != parent_id) {
         alloc.release();
         return fail("reopen lost the parent after cancelled Branch");
@@ -10629,18 +12367,18 @@ int test_cancel_branch_after_rename_drops_shared_refs(ninfer::DeviceContext& ctx
 }
 
 int test_incomplete_rollback_does_not_poison_ladder_restore(ninfer::DeviceContext& ctx,
-                                                          ninfer::PagedKVPool& pool) {
+                                                            ninfer::PagedKVPool& pool) {
     TmpDir dir("poison-rb");
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 2,
-                      .conv_channels  = 4,
-                      .conv_width     = 2,
-                      .value_heads    = 1,
-                      .value_head_dim = 4,
-                      .key_head_dim   = 2,
-                      .slot_count     = 4,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 2,
+                                                               .conv_channels  = 4,
+                                                               .conv_width     = 2,
+                                                               .value_heads    = 1,
+                                                               .value_head_dim = 4,
+                                                               .key_head_dim   = 2,
+                                                               .slot_count     = 4,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     std::vector<unsigned char> conv(gdn.conv_host_image_bytes(), 0x41);
@@ -10671,19 +12409,19 @@ int test_incomplete_rollback_does_not_poison_ladder_restore(ninfer::DeviceContex
     rollback.conv_bytes      = conv.size();
     rollback.recurrent_bytes = rec.size();
     q36::detail::RamLadderHead ladder = rollback;
-    ladder.kind         = q36::detail::ContextCheckpointKind::Ladder;
-    ladder.hidden       = hidden_host.data();
-    ladder.hidden_bytes = 64;
-    source.ladder_heads = {rollback, ladder};
-    auto id = capture_or_evict(ram, source);
+    ladder.kind                       = q36::detail::ContextCheckpointKind::Ladder;
+    ladder.hidden                     = hidden_host.data();
+    ladder.hidden_bytes               = 64;
+    source.ladder_heads               = {rollback, ladder};
+    auto id                           = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("poison-rb capture failed");
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096, ninfer::KvDiskCompress::Off, &gdn);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096, ninfer::KvDiskCompress::Off, &gdn);
     cfg.hidden_bytes = 64;
     q36::detail::KVDiskCache disk(std::move(cfg));
     disk.note_ram_resident(*id, 0);
@@ -10691,7 +12429,7 @@ int test_incomplete_rollback_does_not_poison_ladder_restore(ninfer::DeviceContex
         alloc.release();
         return fail("poison-rb spill failed");
     }
-    auto prompt3 = text_prompt({3, 3, 3});
+    auto prompt3     = text_prompt({3, 3, 3});
     const auto match = disk.plan_match(prompt3, q36::detail::prefix_hash_chain(prompt3));
     if (!match || match->reuse_base != 3 ||
         match->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint) {
@@ -10705,7 +12443,7 @@ int test_incomplete_rollback_does_not_poison_ladder_restore(ninfer::DeviceContex
         return fail("poison-rb did not persist incomplete rollback plus complete Ladder");
     }
     if (!disk.claim(match->entry_id, match->hash_f, match->execution_frontier, match->reuse_base,
-                     match->reuse)) {
+                    match->reuse)) {
         alloc.release();
         return fail("poison-rb claim of the Ladder failed");
     }
@@ -10773,7 +12511,7 @@ int test_shutdown_retries_failed_ram_spill(ninfer::DeviceContext& ctx, ninfer::P
 }
 
 int test_failed_entry_unlink_does_not_resurrect(ninfer::DeviceContext& ctx,
-                                                 ninfer::PagedKVPool& pool) {
+                                                ninfer::PagedKVPool& pool) {
     TmpDir dir("unlink-res");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -10794,8 +12532,8 @@ int test_failed_entry_unlink_does_not_resurrect(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("unlink-res parent spill failed");
         }
-        const auto parent_match =
-            disk.plan_match(text_prompt(parent), q36::detail::prefix_hash_chain(text_prompt(parent)));
+        const auto parent_match = disk.plan_match(
+            text_prompt(parent), q36::detail::prefix_hash_chain(text_prompt(parent)));
         if (!parent_match) {
             alloc.release();
             return fail("unlink-res parent match failed");
@@ -10835,8 +12573,8 @@ int test_failed_entry_unlink_does_not_resurrect(ninfer::DeviceContext& ctx,
         alloc.release();
         return fail("unlink-res lost the parent generation");
     }
-    const auto child_hit = reopened.plan_match(
-        text_prompt(child), q36::detail::prefix_hash_chain(text_prompt(child)));
+    const auto child_hit =
+        reopened.plan_match(text_prompt(child), q36::detail::prefix_hash_chain(text_prompt(child)));
     if (child_hit && child_hit->entry_id == child_id && child_hit->reuse_base >= 70) {
         alloc.release();
         return fail("failed entry-dir unlink resurrected the evicted child");
@@ -10846,18 +12584,18 @@ int test_failed_entry_unlink_does_not_resurrect(ninfer::DeviceContext& ctx,
 }
 
 int test_oversized_state_object_does_not_abort_restore(ninfer::DeviceContext& ctx,
-                                                      ninfer::PagedKVPool& pool) {
+                                                       ninfer::PagedKVPool& pool) {
     TmpDir dir("huge-state");
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 2,
-                      .conv_channels  = 4,
-                      .conv_width     = 2,
-                      .value_heads    = 1,
-                      .value_head_dim = 4,
-                      .key_head_dim   = 2,
-                      .slot_count     = 4,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 2,
+                                                               .conv_channels  = 4,
+                                                               .conv_width     = 2,
+                                                               .value_heads    = 1,
+                                                               .value_head_dim = 4,
+                                                               .key_head_dim   = 2,
+                                                               .slot_count     = 4,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     std::vector<unsigned char> conv(gdn.conv_host_image_bytes(), 0x41);
@@ -10874,7 +12612,7 @@ int test_oversized_state_object_does_not_abort_restore(ninfer::DeviceContext& ct
     auto source             = make_source(retained, identity, alloc, pool, ctx.copy_stream, 8);
     source.gdn              = &gdn;
     source.gdn_current_slot = 0;
-    auto id = capture_or_evict(ram, source);
+    auto id                 = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("huge-state capture failed");
@@ -10899,8 +12637,8 @@ int test_oversized_state_object_does_not_abort_restore(ninfer::DeviceContext& ct
         alloc.release();
         return fail("huge-state did not persist current GDN");
     }
-    const auto gdn_loc = packed_object_location(dir.path, q36::detail::DiskObjectKind::State,
-                                                meta.current_gdn_id);
+    const auto gdn_loc =
+        packed_object_location(dir.path, q36::detail::DiskObjectKind::State, meta.current_gdn_id);
     const int fd = gdn_loc ? ::open(gdn_loc->path.c_str(), O_RDWR) : -1;
     if (fd < 0) {
         alloc.release();
@@ -10960,36 +12698,32 @@ int test_cancel_create_fsync_does_not_hold_mutex(ninfer::DeviceContext& ctx,
     const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
     disk.note_ram_resident(ram_id, 0);
     disk.test_arm_stall_after_meta_rename();
-    disk.test_set_fsync_stall_ms(250);
     disk.request_idle_spill();
-    const auto renamed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-    while (!disk.test_meta_renamed() && std::chrono::steady_clock::now() < renamed_deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    if (!disk.test_meta_renamed()) {
-        disk.test_set_fsync_stall_ms(0);
+    if (!wait_pred([&] { return disk.test_meta_renamed(); }, std::chrono::seconds(10))) {
         disk.cancel_idle_spill();
         alloc.release();
         return fail("cancel-fsync never reached meta rename");
     }
-    disk.cancel_idle_spill();
-    const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-    while (!disk.test_fsync_entered() && std::chrono::steady_clock::now() < entered_deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    bool entered = false;
+    bool prompt  = false;
+    {
+        UnlockedIoHold fsync(disk, q36::detail::DiskUnlockedIo::StoreDirFsync);
+        std::jthread canceller([&] { disk.cancel_idle_spill(); });
+        entered = fsync.entered();
+        if (entered) {
+            fsync.arm();
+            const auto unrelated = text_prompt({1, 2, 3, 4});
+            (void)disk.plan_match(unrelated, q36::detail::prefix_hash_chain(unrelated));
+            prompt = fsync.disarm();
+        }
+        fsync.release();
     }
-    if (!disk.test_fsync_entered()) {
-        disk.test_set_fsync_stall_ms(0);
-        disk.wait_idle_and_fsync();
+    disk.wait_idle_and_fsync();
+    if (!entered) {
         alloc.release();
         return fail("cancel-fsync never reached directory fsync");
     }
-    const auto t0        = std::chrono::steady_clock::now();
-    const auto unrelated = text_prompt({1, 2, 3, 4});
-    (void)disk.plan_match(unrelated, q36::detail::prefix_hash_chain(unrelated));
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-    disk.test_set_fsync_stall_ms(0);
-    disk.wait_idle_and_fsync();
-    if (elapsed > std::chrono::milliseconds(100)) {
+    if (!prompt) {
         alloc.release();
         return fail("plan_match waited on cancelled-Create directory fsync");
     }
@@ -10998,14 +12732,14 @@ int test_cancel_create_fsync_does_not_hold_mutex(ninfer::DeviceContext& ctx,
 }
 
 int test_refresh_does_not_evict_self_before_commit(ninfer::DeviceContext& ctx,
-                                                    ninfer::PagedKVPool& pool) {
+                                                   ninfer::PagedKVPool& pool) {
     TmpDir dir("refresh-self");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
     alloc.materialize_pages(1, ctx.stream);
     std::vector<ninfer::TokenId> tokens{4, 5, 6, 7};
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   64ULL << 20, 4096);
     std::size_t used = 0;
     std::uint64_t entry_id = 0;
     {
@@ -11016,8 +12750,8 @@ int test_refresh_does_not_evict_self_before_commit(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("refresh-self first spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("refresh-self first match failed");
@@ -11036,7 +12770,7 @@ int test_refresh_does_not_evict_self_before_commit(ninfer::DeviceContext& ctx,
     q36::detail::ResidentPrefixIdentity identity;
     auto source        = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
     source.tail_hidden = &hidden;
-    auto ram_id       = capture_or_evict(ram, source);
+    auto ram_id        = capture_or_evict(ram, source);
     if (!ram_id) {
         alloc.release();
         return fail("refresh-self hidden capture failed");
@@ -11063,9 +12797,9 @@ int test_refresh_does_not_evict_self_before_commit(ninfer::DeviceContext& ctx,
 }
 
 int test_oversized_host_files_are_skipped_on_open(ninfer::DeviceContext& ctx,
-                                                   ninfer::PagedKVPool& pool) {
-    auto spill_one = [&](const fs::path& location, std::uint64_t& ledger_id, std::uint64_t& identity_id,
-                          std::uint64_t& entry_id) -> int {
+                                                  ninfer::PagedKVPool& pool) {
+    auto spill_one = [&](const fs::path& location, std::uint64_t& ledger_id,
+                         std::uint64_t& identity_id, std::uint64_t& entry_id) -> int {
         q36::detail::KVRamCache ram(16ULL << 20);
         auto alloc = pool.reserve(2);
         alloc.materialize_pages(1, ctx.stream);
@@ -11080,16 +12814,16 @@ int test_oversized_host_files_are_skipped_on_open(ninfer::DeviceContext& ctx,
                 alloc.release();
                 return fail("huge-host spill failed");
             }
-            const auto match =
-                disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+            const auto match = disk.plan_match(text_prompt(tokens),
+                                               q36::detail::prefix_hash_chain(text_prompt(tokens)));
             if (!match) {
                 alloc.release();
                 return fail("huge-host match failed");
             }
-            entry_id    = match->entry_id;
+            entry_id        = match->entry_id;
             const auto meta = disk.test_load_meta(entry_id);
-            ledger_id    = meta.ledger_id;
-            identity_id  = meta.identity_id;
+            ledger_id       = meta.ledger_id;
+            identity_id     = meta.identity_id;
         }
         alloc.release();
         return 0;
@@ -11101,8 +12835,8 @@ int test_oversized_host_files_are_skipped_on_open(ninfer::DeviceContext& ctx,
         if (const int rc = spill_one(dir.path, ledger_id, identity_id, entry_id); rc != 0) {
             return rc;
         }
-        const auto ledger = packed_object_location(dir.path, q36::detail::DiskObjectKind::Ledger,
-                                                   ledger_id);
+        const auto ledger =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::Ledger, ledger_id);
         const int fd = ledger ? ::open(ledger->path.c_str(), O_RDWR) : -1;
         if (fd < 0) { return fail("huge-host could not open the ledger"); }
         const int truncated = ::ftruncate(fd, static_cast<off_t>(1ULL << 40));
@@ -11113,8 +12847,8 @@ int test_oversized_host_files_are_skipped_on_open(ninfer::DeviceContext& ctx,
                                32ULL << 20, 4096);
         try {
             q36::detail::KVDiskCache reopened(cfg);
-        if (!reopened.plan_match(text_prompt({2, 3, 4, 5}),
-                                 q36::detail::prefix_hash_chain(text_prompt({2, 3, 4, 5})))) {
+            if (!reopened.plan_match(text_prompt({2, 3, 4, 5}),
+                                     q36::detail::prefix_hash_chain(text_prompt({2, 3, 4, 5})))) {
                 return fail("oversized pack tail invalidated its bounded ledger extent");
             }
         } catch (const std::exception& e) {
@@ -11129,9 +12863,8 @@ int test_oversized_host_files_are_skipped_on_open(ninfer::DeviceContext& ctx,
             return rc;
         }
         if (identity_id == 0) { return fail("huge-ident stored no identity"); }
-        const auto identity = packed_object_location(dir.path,
-                                                     q36::detail::DiskObjectKind::Identity,
-                                                     identity_id);
+        const auto identity =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::Identity, identity_id);
         const int fd = identity ? ::open(identity->path.c_str(), O_RDWR) : -1;
         if (fd < 0) { return fail("huge-host could not open identity"); }
         const int truncated = ::ftruncate(fd, static_cast<off_t>(1ULL << 40));
@@ -11160,7 +12893,7 @@ int test_oversized_host_files_are_skipped_on_open(ninfer::DeviceContext& ctx,
         std::vector<std::uint8_t> man(16 + 4, 0);
         std::memcpy(man.data(), q36::detail::kDiskManifestMagic, 8);
         const std::uint32_t version = q36::detail::kDiskFormatVersion;
-        const std::uint32_t n      = 0xffffffffu;
+        const std::uint32_t n       = 0xffffffffu;
         std::memcpy(man.data() + 8, &version, 4);
         std::memcpy(man.data() + 12, &n, 4);
         {
@@ -11219,7 +12952,7 @@ int test_oversized_host_files_are_skipped_on_open(ninfer::DeviceContext& ctx,
 }
 
 int test_tombstone_survives_failed_entries_unlink(ninfer::DeviceContext& ctx,
-                                                    ninfer::PagedKVPool& pool) {
+                                                  ninfer::PagedKVPool& pool) {
     TmpDir dir("tombstone");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -11236,8 +12969,8 @@ int test_tombstone_survives_failed_entries_unlink(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("tombstone spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("tombstone match failed");
@@ -11255,7 +12988,8 @@ int test_tombstone_survives_failed_entries_unlink(ninfer::DeviceContext& ctx,
         disk.wait_idle_and_fsync();
     }
     q36::detail::KVDiskCache reopened(cfg);
-    if (reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+    if (reopened.plan_match(text_prompt(tokens),
+                            q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
         alloc.release();
         return fail("failed entries/ unlink resurrected a tombstoned generation");
     }
@@ -11264,7 +12998,7 @@ int test_tombstone_survives_failed_entries_unlink(ninfer::DeviceContext& ctx,
 }
 
 int test_text_kv_valid_cannot_hide_short_pages(ninfer::DeviceContext& ctx,
-                                                 ninfer::PagedKVPool& pool) {
+                                               ninfer::PagedKVPool& pool) {
     TmpDir dir("kv-valid");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(4);
@@ -11282,13 +13016,13 @@ int test_text_kv_valid_cannot_hide_short_pages(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("kv-valid spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match || match->reuse_base != 128) {
             alloc.release();
             return fail("kv-valid match failed");
         }
-        entry_id = match->entry_id;
+        entry_id   = match->entry_id;
         page_bytes = disk.test_main_page_ids(entry_id).size() * 8;
         if (page_bytes < 16) {
             alloc.release();
@@ -11304,7 +13038,7 @@ int test_text_kv_valid_cannot_hide_short_pages(ninfer::DeviceContext& ctx,
         alloc.release();
         return fail("kv-valid meta.bin is truncated");
     }
-    const std::uint32_t one = 1;
+    const std::uint32_t one  = 1;
     const std::uint32_t zero = 0;
     std::memcpy(bytes.data() + 32, &one, 4);
     const std::size_t counts = bytes.size() - page_bytes - 8;
@@ -11317,7 +13051,8 @@ int test_text_kv_valid_cannot_hide_short_pages(ninfer::DeviceContext& ctx,
                   static_cast<std::streamsize>(bytes.size()));
     }
     q36::detail::KVDiskCache reopened(cfg);
-    if (reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+    if (reopened.plan_match(text_prompt(tokens),
+                            q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
         alloc.release();
         return fail("short page vector hidden by text_kv_valid remained hittable");
     }
@@ -11326,7 +13061,7 @@ int test_text_kv_valid_cannot_hide_short_pages(ninfer::DeviceContext& ctx,
 }
 
 int test_tombstone_does_not_poison_reused_ids(ninfer::DeviceContext& ctx,
-                                                ninfer::PagedKVPool& pool) {
+                                              ninfer::PagedKVPool& pool) {
     TmpDir dir("tomb-reuse");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -11366,8 +13101,8 @@ int test_tombstone_does_not_poison_reused_ids(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("tomb-reuse second spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(second), q36::detail::prefix_hash_chain(text_prompt(second)));
+        const auto match = disk.plan_match(text_prompt(second),
+                                           q36::detail::prefix_hash_chain(text_prompt(second)));
         if (!match) {
             alloc.release();
             return fail("tomb-reuse second match failed");
@@ -11379,12 +13114,13 @@ int test_tombstone_does_not_poison_reused_ids(ninfer::DeviceContext& ctx,
         }
     }
     q36::detail::KVDiskCache reopened(cfg);
-    if (reopened.plan_match(text_prompt(first), q36::detail::prefix_hash_chain(text_prompt(first)))) {
+    if (reopened.plan_match(text_prompt(first),
+                            q36::detail::prefix_hash_chain(text_prompt(first)))) {
         alloc.release();
         return fail("tombstoned first generation was resurrected");
     }
     if (!reopened.plan_match(text_prompt(second),
-                              q36::detail::prefix_hash_chain(text_prompt(second)))) {
+                             q36::detail::prefix_hash_chain(text_prompt(second)))) {
         alloc.release();
         return fail("new generation after a leftover tombstone was not hittable");
     }
@@ -11420,7 +13156,8 @@ int test_listed_tombstone_is_not_loaded(ninfer::DeviceContext& ctx, ninfer::Page
     }
     fs::copy_file(bak, man, fs::copy_options::overwrite_existing);
     q36::detail::KVDiskCache reopened(cfg);
-    if (reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+    if (reopened.plan_match(text_prompt(tokens),
+                            q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
         alloc.release();
         return fail("stale MANIFEST resurrected a tombstoned generation");
     }
@@ -11446,8 +13183,8 @@ int test_tombstone_write_failure_does_not_unlink(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("tomb-fail spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("tomb-fail match failed");
@@ -11464,7 +13201,8 @@ int test_tombstone_write_failure_does_not_unlink(ninfer::DeviceContext& ctx,
         }
     }
     q36::detail::KVDiskCache reopened(cfg);
-    if (!reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+    if (!reopened.plan_match(text_prompt(tokens),
+                             q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
         alloc.release();
         return fail("generation unlinked without a durable tombstone was lost");
     }
@@ -11473,7 +13211,7 @@ int test_tombstone_write_failure_does_not_unlink(ninfer::DeviceContext& ctx,
 }
 
 int test_rollback_after_rename_keeps_previous(ninfer::DeviceContext& ctx,
-                                               ninfer::PagedKVPool& pool) {
+                                              ninfer::PagedKVPool& pool) {
     TmpDir dir("rollback-rename");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -11505,8 +13243,7 @@ int test_rollback_after_rename_keeps_previous(ninfer::DeviceContext& ctx,
         disk.test_arm_fail_after_rollback_rename();
         disk.request_idle_spill();
         const auto renamed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-        while (!disk.test_meta_renamed() &&
-               std::chrono::steady_clock::now() < renamed_deadline) {
+        while (!disk.test_meta_renamed() && std::chrono::steady_clock::now() < renamed_deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (!disk.test_meta_renamed()) {
@@ -11516,9 +13253,8 @@ int test_rollback_after_rename_keeps_previous(ninfer::DeviceContext& ctx,
         }
         disk.cancel_idle_spill();
         disk.wait_idle_and_fsync();
-        const auto live128 =
-            disk.plan_match(text_prompt(extended),
-                            q36::detail::prefix_hash_chain(text_prompt(extended)));
+        const auto live128 = disk.plan_match(text_prompt(extended),
+                                             q36::detail::prefix_hash_chain(text_prompt(extended)));
         if (live128 && live128->reuse_base == 128) {
             alloc.release();
             return fail("post-rollback-rename failure published the new generation in memory");
@@ -11538,11 +13274,10 @@ int test_rollback_after_rename_keeps_previous(ninfer::DeviceContext& ctx,
         }
     }
     q36::detail::KVDiskCache reopened(cfg);
-    const auto hit64 =
-        reopened.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
-    const auto hit128 =
-        reopened.plan_match(text_prompt(extended),
-                            q36::detail::prefix_hash_chain(text_prompt(extended)));
+    const auto hit64  = reopened.plan_match(text_prompt(aligned),
+                                            q36::detail::prefix_hash_chain(text_prompt(aligned)));
+    const auto hit128 = reopened.plan_match(text_prompt(extended),
+                                            q36::detail::prefix_hash_chain(text_prompt(extended)));
     if (!hit64 || hit64->reuse_base != 64) {
         alloc.release();
         return fail("rollback after rename did not keep the previous generation");
@@ -11577,8 +13312,8 @@ int test_wrong_hidden_size_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedK
     }
     ctx.synchronize_all();
     ram.wait_pending_copies();
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
     cfg.hidden_bytes = 64;
     std::uint64_t hidden_id = 0;
     {
@@ -11600,16 +13335,18 @@ int test_wrong_hidden_size_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedK
         }
     }
     std::vector<std::uint8_t> hdr(q36::detail::kDiskCodecHeaderBytes);
-    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id,
-                            hdr.data(), hdr.size())) {
+    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id, hdr.data(),
+                            hdr.size())) {
         alloc.release();
         return fail("hidden-sz state object is truncated");
     }
     const std::uint64_t wrong = 8;
     std::memcpy(hdr.data() + 4, &wrong, 8);
     std::memcpy(hdr.data() + 12, &wrong, 8);
-    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id,
-                             hdr.data(), hdr.size())) { return fail("hidden-sz could not patch pack"); }
+    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, hidden_id, hdr.data(),
+                             hdr.size())) {
+        return fail("hidden-sz could not patch pack");
+    }
     try {
         q36::detail::KVDiskCache reopened(cfg);
         if (reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {
@@ -11643,8 +13380,8 @@ int test_huge_identity_token_count_is_skipped(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("ident-cnt spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("ident-cnt match failed");
@@ -11662,12 +13399,13 @@ int test_huge_identity_token_count_is_skipped(ninfer::DeviceContext& ctx,
     std::memcpy(identity_hdr.data() + 4, &item_count, 4);
     if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::Identity, identity_id,
                              identity_hdr.data(), identity_hdr.size())) {
-        alloc.release(); return fail("ident-cnt could not patch pack");
+        alloc.release();
+        return fail("ident-cnt could not patch pack");
     }
     try {
         q36::detail::KVDiskCache reopened(cfg);
         if (reopened.plan_match(text_prompt(tokens),
-                                 q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+                                q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
             alloc.release();
             return fail("huge identity token count remained hittable");
         }
@@ -11683,15 +13421,15 @@ int test_huge_identity_token_count_is_skipped(ninfer::DeviceContext& ctx,
 int test_huge_compressed_size_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("huge-cmp");
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 2,
-                      .conv_channels  = 4,
-                      .conv_width     = 2,
-                      .value_heads    = 1,
-                      .value_head_dim = 4,
-                      .key_head_dim   = 2,
-                      .slot_count     = 4,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 2,
+                                                               .conv_channels  = 4,
+                                                               .conv_width     = 2,
+                                                               .value_heads    = 1,
+                                                               .value_head_dim = 4,
+                                                               .key_head_dim   = 2,
+                                                               .slot_count     = 4,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     std::vector<unsigned char> conv(gdn.conv_host_image_bytes(), 0x41);
@@ -11708,7 +13446,7 @@ int test_huge_compressed_size_is_skipped(ninfer::DeviceContext& ctx, ninfer::Pag
     auto source             = make_source(retained, identity, alloc, pool, ctx.copy_stream, 8);
     source.gdn              = &gdn;
     source.gdn_current_slot = 0;
-    auto id = capture_or_evict(ram, source);
+    auto id                 = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("huge-cmp capture failed");
@@ -11737,15 +13475,17 @@ int test_huge_compressed_size_is_skipped(ninfer::DeviceContext& ctx, ninfer::Pag
         }
     }
     std::vector<std::uint8_t> hdr(q36::detail::kDiskCodecHeaderBytes);
-    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State, gdn_id,
-                            hdr.data(), hdr.size())) {
+    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::State, gdn_id, hdr.data(),
+                            hdr.size())) {
         alloc.release();
         return fail("huge-cmp state object is truncated");
     }
     const std::uint64_t huge_cmp = (64ULL << 20) + 1;
     std::memcpy(hdr.data() + 12, &huge_cmp, 8);
-    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, gdn_id,
-                             hdr.data(), hdr.size())) { return fail("huge-cmp could not patch pack"); }
+    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::State, gdn_id, hdr.data(),
+                             hdr.size())) {
+        return fail("huge-cmp could not patch pack");
+    }
     try {
         q36::detail::KVDiskCache reopened(cfg);
         if (reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {
@@ -11839,7 +13579,7 @@ int test_tombstone_survives_until_manifest_persist(ninfer::DeviceContext& ctx,
 }
 
 int test_capped_extra_object_ids_are_not_reused(ninfer::DeviceContext& ctx,
-                                                 ninfer::PagedKVPool& pool) {
+                                                ninfer::PagedKVPool& pool) {
     TmpDir dir("obj-hw");
     q36::detail::KVRamCache ram(16ULL << 20);
     auto alloc = pool.reserve(2);
@@ -11874,7 +13614,8 @@ int test_capped_extra_object_ids_are_not_reused(ninfer::DeviceContext& ctx,
     cfg.max_index_entries = 1;
     {
         q36::detail::KVDiskCache disk(cfg);
-        const auto ram_id = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>{9, 8, 7, 6});
+        const auto ram_id =
+            capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>{9, 8, 7, 6});
         disk.note_ram_resident(ram_id, 0);
         if (!disk.emergency_spill_ram(ram_id)) {
             alloc.release();
@@ -11884,8 +13625,8 @@ int test_capped_extra_object_ids_are_not_reused(ninfer::DeviceContext& ctx,
     cfg.max_index_entries = 4096;
     {
         q36::detail::KVDiskCache disk(cfg);
-        const auto match = disk.plan_match(text_prompt({9, 8, 7, 6}),
-                                           q36::detail::prefix_hash_chain(text_prompt({9, 8, 7, 6})));
+        const auto match = disk.plan_match(
+            text_prompt({9, 8, 7, 6}), q36::detail::prefix_hash_chain(text_prompt({9, 8, 7, 6})));
         if (!match) {
             alloc.release();
             return fail("capped high-water spill did not reopen");
@@ -11909,8 +13650,8 @@ int test_failed_object_write_does_not_leak(ninfer::DeviceContext& ctx, ninfer::P
     q36::detail::KVRamCache ram(16ULL << 20);
     auto alloc = pool.reserve(2);
     alloc.materialize_pages(1, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           32ULL << 20, 4096);
+    auto cfg        = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                  32ULL << 20, 4096);
     auto count_main = [&] {
         std::size_t n = 0;
         std::error_code ec;
@@ -11920,7 +13661,8 @@ int test_failed_object_write_does_not_leak(ninfer::DeviceContext& ctx, ninfer::P
         return n;
     };
     q36::detail::KVDiskCache disk(cfg);
-    const auto ram_id = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>{2, 3, 4, 5});
+    const auto ram_id =
+        capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>{2, 3, 4, 5});
     disk.note_ram_resident(ram_id, 0);
     disk.test_arm_fail_object_write();
     const bool spilled = disk.emergency_spill_ram(ram_id);
@@ -11945,7 +13687,7 @@ int test_kind_conflict_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
                            32ULL << 20, 4096);
     std::vector<ninfer::TokenId> tokens{2, 3, 4, 5};
     std::uint64_t entry_id = 0;
-    std::uint64_t page_id   = 0;
+    std::uint64_t page_id  = 0;
     {
         q36::detail::KVDiskCache disk(cfg);
         const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
@@ -11954,13 +13696,13 @@ int test_kind_conflict_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
             alloc.release();
             return fail("kind-col spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("kind-col match failed");
         }
-        entry_id = match->entry_id;
+        entry_id         = match->entry_id;
         const auto pages = disk.test_main_page_ids(entry_id);
         if (pages.empty()) {
             alloc.release();
@@ -11969,8 +13711,8 @@ int test_kind_conflict_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
         page_id = pages.front();
     }
     std::vector<std::uint8_t> blob(q36::detail::kDiskCodecHeaderBytes + 8, 0);
-    blob[0] = 0;
-    blob[1] = static_cast<std::uint8_t>(q36::detail::DiskStateKind::TailHidden);
+    blob[0]                   = 0;
+    blob[1]                   = static_cast<std::uint8_t>(q36::detail::DiskStateKind::TailHidden);
     const std::uint64_t eight = 8;
     std::memcpy(blob.data() + 4, &eight, 8);
     std::memcpy(blob.data() + 12, &eight, 8);
@@ -11985,7 +13727,7 @@ int test_kind_conflict_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
     std::vector<std::uint8_t> meta((std::istreambuf_iterator<char>(in)),
                                    std::istreambuf_iterator<char>());
     in.close();
-    // encode_meta: magic 8, version 6, then packed scalars through identity_id at
+    // encode_meta: magic 8, version u32, then packed scalars through identity_id at
     // byte 100, current_gdn_id at 108, current_hidden_id at 116.
     constexpr std::size_t kCurrentHiddenIdOff = 116;
     if (meta.size() < kCurrentHiddenIdOff + 8) {
@@ -12001,7 +13743,7 @@ int test_kind_conflict_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
     try {
         q36::detail::KVDiskCache reopened(cfg);
         if (reopened.plan_match(text_prompt(tokens),
-                                 q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+                                q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
             alloc.release();
             return fail("conflicting object-kind namespaces remained hittable");
         }
@@ -12031,8 +13773,8 @@ int test_short_text_kv_valid_is_skipped(ninfer::DeviceContext& ctx, ninfer::Page
             alloc.release();
             return fail("kv-short spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match || match->reuse_base != 128) {
             alloc.release();
             return fail("kv-short match failed");
@@ -12056,7 +13798,8 @@ int test_short_text_kv_valid_is_skipped(ninfer::DeviceContext& ctx, ninfer::Page
                   static_cast<std::streamsize>(bytes.size()));
     }
     q36::detail::KVDiskCache reopened(cfg);
-    if (reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+    if (reopened.plan_match(text_prompt(tokens),
+                            q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
         alloc.release();
         return fail("text_kv_valid shorter than execution_frontier remained hittable");
     }
@@ -12074,7 +13817,7 @@ int test_skipped_corrupt_ids_do_not_poison_valid_entry(ninfer::DeviceContext& ct
                            64ULL << 20, 4096);
     std::vector<ninfer::TokenId> long_chat(80, 1);
     std::vector<ninfer::TokenId> short_chat{9, 8, 7, 6};
-    std::uint64_t long_id = 0;
+    std::uint64_t long_id    = 0;
     std::uint64_t short_page = 0;
     {
         q36::detail::KVDiskCache disk(cfg);
@@ -12084,22 +13827,21 @@ int test_skipped_corrupt_ids_do_not_poison_valid_entry(ninfer::DeviceContext& ct
             alloc.release();
             return fail("skip-poison long spill failed");
         }
-        const auto long_match =
-            disk.plan_match(text_prompt(long_chat), q36::detail::prefix_hash_chain(text_prompt(long_chat)));
+        const auto long_match = disk.plan_match(
+            text_prompt(long_chat), q36::detail::prefix_hash_chain(text_prompt(long_chat)));
         if (!long_match) {
             alloc.release();
             return fail("skip-poison long match failed");
         }
-        long_id = long_match->entry_id;
+        long_id              = long_match->entry_id;
         const auto ram_short = capture_tokens(ram, pool, alloc, ctx, short_chat);
         disk.note_ram_resident(ram_short, 0);
         if (!disk.emergency_spill_ram(ram_short)) {
             alloc.release();
             return fail("skip-poison short spill failed");
         }
-        const auto short_match =
-            disk.plan_match(text_prompt(short_chat),
-                            q36::detail::prefix_hash_chain(text_prompt(short_chat)));
+        const auto short_match = disk.plan_match(
+            text_prompt(short_chat), q36::detail::prefix_hash_chain(text_prompt(short_chat)));
         if (!short_match) {
             alloc.release();
             return fail("skip-poison short match failed");
@@ -12130,7 +13872,7 @@ int test_skipped_corrupt_ids_do_not_poison_valid_entry(ninfer::DeviceContext& ct
     cfg.max_context = 16;
     q36::detail::KVDiskCache reopened(cfg);
     if (!reopened.plan_match(text_prompt(short_chat),
-                              q36::detail::prefix_hash_chain(text_prompt(short_chat)))) {
+                             q36::detail::prefix_hash_chain(text_prompt(short_chat)))) {
         alloc.release();
         return fail("valid entry was poisoned by a skipped too-long tree");
     }
@@ -12138,7 +13880,7 @@ int test_skipped_corrupt_ids_do_not_poison_valid_entry(ninfer::DeviceContext& ct
     return 0;
 }
 
-int test_failed_object_unlink_keeps_tombstone(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_eviction_reclaims_pack_extent(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("unlink-obj");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -12147,7 +13889,7 @@ int test_failed_object_unlink_keeps_tombstone(ninfer::DeviceContext& ctx, ninfer
                            32ULL << 20, 4096);
     std::vector<ninfer::TokenId> tokens{2, 3, 4, 5};
     std::uint64_t entry_id = 0;
-    std::uint64_t page_id = 0;
+    std::uint64_t page_id  = 0;
     {
         q36::detail::KVDiskCache disk(cfg);
         const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
@@ -12156,13 +13898,13 @@ int test_failed_object_unlink_keeps_tombstone(ninfer::DeviceContext& ctx, ninfer
             alloc.release();
             return fail("unlink-obj spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("unlink-obj match failed");
         }
-        entry_id = match->entry_id;
+        entry_id         = match->entry_id;
         const auto pages = disk.test_main_page_ids(entry_id);
         if (pages.empty()) {
             alloc.release();
@@ -12173,21 +13915,22 @@ int test_failed_object_unlink_keeps_tombstone(ninfer::DeviceContext& ctx, ninfer
             alloc.release();
             return fail("unlink-obj evict failed");
         }
-        const auto location = packed_object_location(dir.path, q36::detail::DiskObjectKind::Main,
-                                                     page_id);
-        if (!location || !fs::exists(location->path)) {
+        const auto location =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page_id);
+        if (location) {
             alloc.release();
-            return fail("packed eviction deleted a retained pack extent");
+            return fail("packed eviction retained a retired object mapping");
         }
     }
     if (fs::exists(dir.path / "tombstones" / std::to_string(entry_id))) {
         alloc.release();
         return fail("packed eviction left a completed tombstone");
     }
-    const auto location = packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page_id);
-    if (!location || !fs::exists(location->path)) {
+    const auto location =
+        packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page_id);
+    if (location) {
         alloc.release();
-        return fail("packed eviction reclaimed its extent before compaction");
+        return fail("packed eviction retained a dead extent mapping");
     }
     alloc.release();
     return 0;
@@ -12211,8 +13954,8 @@ int test_ledger_frontier_must_be_execution_plus_one(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("ledger-f spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("ledger-f match failed");
@@ -12226,7 +13969,7 @@ int test_ledger_frontier_must_be_execution_plus_one(ninfer::DeviceContext& ctx,
     const auto meta_path = dir.path / "entries" / std::to_string(entry_id) / "meta.bin";
     std::ifstream in(meta_path, std::ios::binary);
     std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
-                                   std::istreambuf_iterator<char>());
+                                    std::istreambuf_iterator<char>());
     in.close();
     if (bytes.size() < 28) {
         alloc.release();
@@ -12240,7 +13983,8 @@ int test_ledger_frontier_must_be_execution_plus_one(ninfer::DeviceContext& ctx,
                   static_cast<std::streamsize>(bytes.size()));
     }
     q36::detail::KVDiskCache reopened(cfg);
-    if (reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+    if (reopened.plan_match(text_prompt(tokens),
+                            q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
         alloc.release();
         return fail("ledger_frontier == execution_frontier remained hittable");
     }
@@ -12260,6 +14004,8 @@ int test_mtp_frontier_beyond_valid_backend_is_not_reused(ninfer::DeviceContext& 
     auto backend_alloc = backend.reserve(4);
     text_alloc.materialize_pages(3, ctx.stream);
     backend_alloc.materialize_pages(1, ctx.stream);
+    fill_logical_pages(text, text_alloc, 67);
+    fill_logical_pages(backend, backend_alloc, 91);
     TmpDir dir("mtp-short");
     q36::detail::KVRamCache ram(64ULL << 20);
     std::vector<ninfer::TokenId> t129(129, 42);
@@ -12281,7 +14027,8 @@ int test_mtp_frontier_beyond_valid_backend_is_not_reused(ninfer::DeviceContext& 
     ram.wait_pending_copies();
     auto cfg = disk_config(dir.path, ram, text, &backend, ninfer::SpeculativeBackend::Mtp,
                            64ULL << 20, 4096);
-    const q36::detail::ReuseBackendPolicy policy{ninfer::SpeculativeBackend::Mtp, true, false, false};
+    const q36::detail::ReuseBackendPolicy policy{ninfer::SpeculativeBackend::Mtp, true, false,
+                                                 false};
     {
         q36::detail::KVDiskCache disk(std::move(cfg));
         disk.note_ram_resident(*id, 0);
@@ -12316,7 +14063,7 @@ int test_mtp_frontier_beyond_valid_backend_is_not_reused(ninfer::DeviceContext& 
 }
 
 int test_fingerprint_state_over_64mib_is_accepted(ninfer::DeviceContext& ctx,
-                                                    ninfer::PagedKVPool& pool) {
+                                                  ninfer::PagedKVPool& pool) {
     TmpDir dir("big-state");
     constexpr std::uint64_t hidden_bytes = 65ULL << 20;
     q36::detail::KVRamCache ram(192ULL << 20);
@@ -12327,13 +14074,12 @@ int test_fingerprint_state_over_64mib_is_accepted(ninfer::DeviceContext& ctx,
     hidden_storage.fill(0x6d);
     ninfer::Tensor hidden(hidden_storage.p, ninfer::DType::U8,
                           {static_cast<std::int64_t>(hidden_bytes)});
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           512ULL << 20, 4096);
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   512ULL << 20, 4096);
     cfg.hidden_bytes = hidden_bytes;
     const std::vector<ninfer::TokenId> tokens_a(64, 73);
     const std::vector<ninfer::TokenId> tokens_b(64, 89);
     std::uint64_t entry_b = 0;
-    std::uint64_t old_generation = 0;
     {
         q36::detail::KVDiskCache disk(cfg);
         const auto ram_a = capture_tokens_hidden(ram, pool, alloc, ctx, tokens_a, hidden);
@@ -12349,7 +14095,7 @@ int test_fingerprint_state_over_64mib_is_accepted(ninfer::DeviceContext& ctx,
             return fail("big-state spill B failed");
         }
         const auto match_b = disk.plan_match(text_prompt(tokens_b),
-                                              q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+                                             q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
         if (!match_b) {
             alloc.release();
             return fail("big-state match B failed");
@@ -12357,36 +14103,15 @@ int test_fingerprint_state_over_64mib_is_accepted(ninfer::DeviceContext& ctx,
         entry_b = match_b->entry_id;
         if (!disk.test_fifo_evict_one()) {
             alloc.release();
-            return fail("big-state could not evict A before compaction");
-        }
-    }
-    {
-        const auto packset = read_bytes(dir.path / "PACKSET");
-        if (packset.size() != 32) {
-            alloc.release();
-            return fail("big-state PACKSET is missing before compaction");
-        }
-        std::memcpy(&old_generation, packset.data() + 12, sizeof(old_generation));
-        q36::detail::KVDiskCache compacting(cfg);
-        compacting.wait_idle_and_fsync();
-        const auto compacted = read_bytes(dir.path / "PACKSET");
-        std::uint64_t new_generation = 0;
-        if (compacted.size() != 32) {
-            alloc.release();
-            return fail("big-state PACKSET is missing after compaction");
-        }
-        std::memcpy(&new_generation, compacted.data() + 12, sizeof(new_generation));
-        if (new_generation <= old_generation) {
-            alloc.release();
-            return fail("big-state retained object prevented compaction");
+            return fail("big-state could not evict A");
         }
     }
     q36::detail::KVDiskCache reopened(cfg);
     const auto prompt_b = text_prompt(tokens_b);
-    const auto match_b = reopened.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+    const auto match_b  = reopened.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
     if (!match_b || match_b->entry_id != entry_b) {
         alloc.release();
-        return fail("big-state compaction/reopen lost B");
+        return fail("big-state reopen lost B");
     }
     ninfer::DeviceBuffer hidden_out_storage(hidden_bytes);
     hidden_out_storage.fill(0);
@@ -12422,11 +14147,11 @@ int test_fingerprint_state_over_64mib_is_accepted(ninfer::DeviceContext& ctx,
     }
     ctx.synchronize_all();
     unsigned char first = 0;
-    unsigned char last = 0;
+    unsigned char last  = 0;
     CUDA_CHECK(cudaMemcpy(&first, hidden_out_storage.p, 1, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&last, static_cast<unsigned char*>(hidden_out_storage.p) +
-                                     hidden_bytes - 1,
-                          1, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&last,
+                          static_cast<unsigned char*>(hidden_out_storage.p) + hidden_bytes - 1, 1,
+                          cudaMemcpyDeviceToHost));
     reopened.cancel_restore();
     reopened.release(match_b->entry_id);
     dest.release();
@@ -12455,8 +14180,8 @@ int test_torn_tombstone_does_not_drop_entry(ninfer::DeviceContext& ctx, ninfer::
             alloc.release();
             return fail("torn-tomb spill failed");
         }
-        const auto match =
-            disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
+        const auto match = disk.plan_match(text_prompt(tokens),
+                                           q36::detail::prefix_hash_chain(text_prompt(tokens)));
         if (!match) {
             alloc.release();
             return fail("torn-tomb match failed");
@@ -12470,7 +14195,8 @@ int test_torn_tombstone_does_not_drop_entry(ninfer::DeviceContext& ctx, ninfer::
         out.write("xx", 2);
     }
     q36::detail::KVDiskCache reopened(cfg);
-    if (!reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
+    if (!reopened.plan_match(text_prompt(tokens),
+                             q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
         alloc.release();
         return fail("torn tombstone discarded a committed generation");
     }
@@ -12479,7 +14205,7 @@ int test_torn_tombstone_does_not_drop_entry(ninfer::DeviceContext& ctx, ninfer::
 }
 
 int test_too_long_corrupt_identity_is_not_skipped(ninfer::DeviceContext& ctx,
-                                                 ninfer::PagedKVPool& pool) {
+                                                  ninfer::PagedKVPool& pool) {
     TmpDir dir("skip-ident");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(4);
@@ -12488,7 +14214,7 @@ int test_too_long_corrupt_identity_is_not_skipped(ninfer::DeviceContext& ctx,
                            64ULL << 20, 4096);
     std::vector<ninfer::TokenId> long_chat(80, 1);
     std::vector<ninfer::TokenId> short_chat{9, 8, 7, 6};
-    std::uint64_t long_id = 0;
+    std::uint64_t long_id     = 0;
     std::uint64_t identity_id = 0;
     {
         q36::detail::KVDiskCache disk(cfg);
@@ -12498,14 +14224,14 @@ int test_too_long_corrupt_identity_is_not_skipped(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("skip-ident long spill failed");
         }
-        const auto long_match =
-            disk.plan_match(text_prompt(long_chat), q36::detail::prefix_hash_chain(text_prompt(long_chat)));
+        const auto long_match = disk.plan_match(
+            text_prompt(long_chat), q36::detail::prefix_hash_chain(text_prompt(long_chat)));
         if (!long_match) {
             alloc.release();
             return fail("skip-ident long match failed");
         }
-        long_id = long_match->entry_id;
-        identity_id = disk.test_load_meta(long_id).identity_id;
+        long_id              = long_match->entry_id;
+        identity_id          = disk.test_load_meta(long_id).identity_id;
         const auto ram_short = capture_tokens(ram, pool, alloc, ctx, short_chat);
         disk.note_ram_resident(ram_short, 0);
         if (!disk.emergency_spill_ram(ram_short)) {
@@ -12514,8 +14240,8 @@ int test_too_long_corrupt_identity_is_not_skipped(ninfer::DeviceContext& ctx,
         }
     }
     const char junk[16] = {static_cast<char>(0xff)};
-    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::Identity, identity_id,
-                             junk, sizeof(junk))) {
+    if (!packed_write_prefix(dir.path, q36::detail::DiskObjectKind::Identity, identity_id, junk,
+                             sizeof(junk))) {
         alloc.release();
         return fail("skip-ident could not corrupt packed identity");
     }
@@ -12526,7 +14252,7 @@ int test_too_long_corrupt_identity_is_not_skipped(ninfer::DeviceContext& ctx,
         return fail("corrupt too-long identity was installed as a skipped tree");
     }
     if (!reopened.plan_match(text_prompt(short_chat),
-                              q36::detail::prefix_hash_chain(text_prompt(short_chat)))) {
+                             q36::detail::prefix_hash_chain(text_prompt(short_chat)))) {
         alloc.release();
         return fail("valid sibling was lost after a corrupt too-long identity");
     }
@@ -12535,7 +14261,7 @@ int test_too_long_corrupt_identity_is_not_skipped(ninfer::DeviceContext& ctx,
 }
 
 int test_stale_manifest_extras_keep_entry_id_order(ninfer::DeviceContext& ctx,
-                                                    ninfer::PagedKVPool& pool) {
+                                                   ninfer::PagedKVPool& pool) {
     TmpDir dir("extra-fifo");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(4);
@@ -12573,12 +14299,13 @@ int test_stale_manifest_extras_keep_entry_id_order(ninfer::DeviceContext& ctx,
         alloc.release();
         return fail("extra-fifo evict failed");
     }
-    if (reopened.plan_match(text_prompt(first), q36::detail::prefix_hash_chain(text_prompt(first)))) {
+    if (reopened.plan_match(text_prompt(first),
+                            q36::detail::prefix_hash_chain(text_prompt(first)))) {
         alloc.release();
         return fail("stale-MANIFEST extras evicted the newer extra first");
     }
     if (!reopened.plan_match(text_prompt(second),
-                              q36::detail::prefix_hash_chain(text_prompt(second)))) {
+                             q36::detail::prefix_hash_chain(text_prompt(second)))) {
         alloc.release();
         return fail("stale-MANIFEST extras did not keep the newer extra");
     }
@@ -12610,7 +14337,10 @@ void inject_startup_allocation(int stage) {
         }
     }
     if (stage != startup_fault_stage.load() || !startup_fault_armed.exchange(false)) { return; }
-    if (stage == 5) { fail_disk_caller_allocations = true; return; }
+    if (stage == 5) {
+        fail_disk_caller_allocations = true;
+        return;
+    }
     startup_allocations_before_failure = startup_fault_after.load();
     if (stage == 2) { startup_worker_entered.store(true, std::memory_order_release); }
 }
@@ -12620,11 +14350,10 @@ int test_startup_allocation_preserves_ownership(ninfer::DeviceContext& ctx,
                                                 int selected_stage = -1) {
     // Bucket, FIFO, node and staging buckets; skipped ownership; spawned worker;
     // fallback rebuild after an indexed or skipped manifest prefix was loaded.
-    for (const auto [stage, after, too_long] : {
-             std::tuple{0, 0, false}, std::tuple{0, 1, false},
-             std::tuple{0, 2, false}, std::tuple{0, 3, false},
-             std::tuple{1, 0, true}, std::tuple{2, 0, false},
-             std::tuple{4, 0, false}, std::tuple{4, 0, true}, std::tuple{5, 0, false}}) {
+    for (const auto& [stage, after, too_long] :
+         {std::tuple{0, 0, false}, std::tuple{0, 1, false}, std::tuple{0, 2, false},
+          std::tuple{0, 3, false}, std::tuple{1, 0, true}, std::tuple{2, 0, false},
+          std::tuple{4, 0, false}, std::tuple{4, 0, true}, std::tuple{5, 0, false}}) {
         if (selected_stage >= 0 && stage != selected_stage) { continue; }
         TmpDir dir("startup-allocation");
         q36::detail::KVRamCache ram(32ULL << 20);
@@ -12633,8 +14362,8 @@ int test_startup_allocation_preserves_ownership(ninfer::DeviceContext& ctx,
         fill_logical_pages(pool, pages, 91);
         auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                                64ULL << 20, 4096);
-        cfg.restore_io_threads = 2;
-        std::uint64_t first_id = 0;
+        cfg.restore_io_threads     = 2;
+        std::uint64_t first_id     = 0;
         std::uint64_t first_object = 0;
         const std::vector<ninfer::TokenId> first(128, 91);
         const std::vector<ninfer::TokenId> second(32, 92);
@@ -12645,7 +14374,7 @@ int test_startup_allocation_preserves_ownership(ninfer::DeviceContext& ctx,
                 seed.note_ram_resident(ram_id, 0);
                 if (!seed.emergency_spill_ram(ram_id)) { return fail("startup seed spill failed"); }
                 if (tokens == &first) {
-                    first_id = ram.load_host(ram_id).disk_entry_id;
+                    first_id     = ram.load_host(ram_id).disk_entry_id;
                     first_object = seed.test_main_page_ids(first_id).front();
                 }
             }
@@ -12668,7 +14397,7 @@ int test_startup_allocation_preserves_ownership(ninfer::DeviceContext& ctx,
                 denied_disk_caller_allocations.load() != 0) {
                 return fail("startup fixture did not fail exactly one real allocation");
             }
-            const bool rebuilt = stage == 4 || stage == 5;
+            const bool rebuilt       = stage == 4 || stage == 5;
             const bool indexed_first = rebuilt && !too_long;
             if (disk.test_entry_in_index(first_id) != indexed_first ||
                 disk.test_object_refcount(first_object) != (rebuilt ? 1U : 0U) ||
@@ -12677,7 +14406,7 @@ int test_startup_allocation_preserves_ownership(ninfer::DeviceContext& ctx,
                 std::cerr << "startup stage=" << stage << " after=" << after
                           << " indexed=" << disk.test_entry_in_index(first_id)
                           << " refs=" << disk.test_object_refcount(first_object)
-                          << " skiprefs=" << disk.test_object_skip_refcount(first_object) << std::endl;
+                          << " skiprefs=" << disk.test_object_skip_refcount(first_object) << '\n';
                 return fail("failed startup publication leaked or duplicated ownership");
             }
             const auto healthy = text_prompt(second);
@@ -12717,7 +14446,7 @@ int test_startup_allocation_preserves_ownership(ninfer::DeviceContext& ctx,
 }
 
 int test_prepare_spill_exception_releases_pins(ninfer::DeviceContext& ctx,
-                                              ninfer::PagedKVPool& pool) {
+                                               ninfer::PagedKVPool& pool) {
     TmpDir dir("prep-throw");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -12735,8 +14464,8 @@ int test_prepare_spill_exception_releases_pins(ninfer::DeviceContext& ctx,
         alloc.release();
         return fail("prep-throw spill of B failed");
     }
-    const auto match_b = disk.plan_match(text_prompt(aligned),
-                                         q36::detail::prefix_hash_chain(text_prompt(aligned)));
+    const auto match_b =
+        disk.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
     if (!match_b) {
         alloc.release();
         return fail("prep-throw match of B failed");
@@ -12757,7 +14486,8 @@ int test_prepare_spill_exception_releases_pins(ninfer::DeviceContext& ctx,
         alloc.release();
         return fail("prepare_spill exception leaked a RAM I/O pin");
     }
-    if (!disk.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)))) {
+    if (!disk.plan_match(text_prompt(aligned),
+                         q36::detail::prefix_hash_chain(text_prompt(aligned)))) {
         alloc.release();
         return fail("prepare_spill exception dropped the committed parent");
     }
@@ -12766,7 +14496,7 @@ int test_prepare_spill_exception_releases_pins(ninfer::DeviceContext& ctx,
 }
 
 int test_spill_queue_failure_preserves_other_ram_pin(ninfer::DeviceContext& ctx,
-                                                    ninfer::PagedKVPool& pool) {
+                                                     ninfer::PagedKVPool& pool) {
     for (bool emergency : {false, true}) {
         for (int queued : {0, 1, 2}) {
             TmpDir dir("spill-queue-pin");
@@ -12777,16 +14507,17 @@ int test_spill_queue_failure_preserves_other_ram_pin(ninfer::DeviceContext& ctx,
             auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                                    64ULL << 20, 4096);
             q36::detail::KVDiskCache disk(cfg);
-            const auto ram_id = capture_tokens(ram, pool, pages, ctx,
-                                              std::vector<ninfer::TokenId>(128, 81));
+            const auto ram_id =
+                capture_tokens(ram, pool, pages, ctx, std::vector<ninfer::TokenId>(128, 81));
             disk.note_ram_resident(ram_id, 0);
             // Retain an independent I/O lease, as a RAM event snapshot does.
             // Failure may release the preparing caller's lease exactly once.
             ram.pin_for_io(ram_id);
             disk.test_fail_spill_enqueue_after(queued);
             bool spilled = false;
-            if (emergency) { spilled = disk.emergency_spill_ram(ram_id); }
-            else {
+            if (emergency) {
+                spilled = disk.emergency_spill_ram(ram_id);
+            } else {
                 disk.request_idle_spill();
                 if (!wait_pred([&] { return !disk.test_spill_enqueue_fault_pending(); },
                                std::chrono::seconds(5))) {
@@ -12800,15 +14531,21 @@ int test_spill_queue_failure_preserves_other_ram_pin(ninfer::DeviceContext& ctx,
             if (spilled || disk.ram_is_durable(ram_id) || remaining != 1 ||
                 disk.test_payload_io_inflight() != 0) {
                 std::cerr << "spill queue failure emergency=" << emergency << " queued=" << queued
-                          << " remaining_external_pins=" << remaining << std::endl;
+                          << " remaining_external_pins=" << remaining << '\n';
                 if (remaining != 0) { ram.unpin_for_io(ram_id); }
                 return fail("spill queue failure consumed another RAM owner's pin");
             }
-            if (ram.evict_one_unpinned(ram_id)) { return fail("external RAM lease did not prevent eviction"); }
+            if (ram.evict_one_unpinned(ram_id)) {
+                return fail("external RAM lease did not prevent eviction");
+            }
             ram.unpin_for_io(ram_id);
-            if (!disk.emergency_spill_ram(ram_id)) { return fail("spill queue fault prevented retry"); }
+            if (!disk.emergency_spill_ram(ram_id)) {
+                return fail("spill queue fault prevented retry");
+            }
             disk.forget_ram_resident(ram_id);
-            if (!ram.evict_one_unpinned(ram_id)) { return fail("spill queue retry leaked RAM ownership"); }
+            if (!ram.evict_one_unpinned(ram_id)) {
+                return fail("spill queue retry leaked RAM ownership");
+            }
             pages.release();
         }
     }
@@ -12828,13 +14565,15 @@ int test_branch_ref_allocation_preserves_parent(ninfer::DeviceContext& ctx,
                                64ULL << 20, 4096);
         q36::detail::KVDiskCache disk(cfg);
         std::vector<ninfer::TokenId> parent_tokens(128, 83);
-        auto child_tokens = parent_tokens;
-        child_tokens[64] = 84;
+        auto child_tokens     = parent_tokens;
+        child_tokens[64]      = 84;
         const auto parent_ram = capture_tokens(ram, pool, pages, ctx, parent_tokens);
         disk.note_ram_resident(parent_ram, 0);
-        if (!disk.emergency_spill_ram(parent_ram)) { return fail("branch ref fixture parent spill failed"); }
+        if (!disk.emergency_spill_ram(parent_ram)) {
+            return fail("branch ref fixture parent spill failed");
+        }
         const auto parent_id = ram.load_host(parent_ram).disk_entry_id;
-        const auto objects = disk.test_main_page_ids(parent_id);
+        const auto objects   = disk.test_main_page_ids(parent_id);
         if (objects.size() != 2 || disk.test_object_refcount(objects.front()) != 1) {
             return fail("branch ref fixture parent ownership invalid");
         }
@@ -12845,11 +14584,13 @@ int test_branch_ref_allocation_preserves_parent(ninfer::DeviceContext& ctx,
         // exposes the original untracked reference instead of failing early.
         disk.test_before_branch_refs([] { fail_next_disk_allocation = true; });
         const auto drops = disk.snapshot().drops;
-        bool spilled = false;
-        if (emergency) { spilled = disk.emergency_spill_ram(child_ram); }
-        else {
+        bool spilled     = false;
+        if (emergency) {
+            spilled = disk.emergency_spill_ram(child_ram);
+        } else {
             disk.request_idle_spill();
-            if (!wait_pred([&] { return disk.snapshot().drops > drops; }, std::chrono::seconds(5))) {
+            if (!wait_pred([&] { return disk.snapshot().drops > drops; },
+                           std::chrono::seconds(5))) {
                 disk.cancel_idle_spill();
                 return fail("branch reference allocation fault was not reached");
             }
@@ -12860,14 +14601,16 @@ int test_branch_ref_allocation_preserves_parent(ninfer::DeviceContext& ctx,
             disk.test_object_refcount(objects.front()) != 1 ||
             disk.test_object_refcount(objects.back()) != 1) {
             std::cerr << "branch ref failure emergency=" << emergency
-                      << " parent_first_refs=" << disk.test_object_refcount(objects.front()) << std::endl;
+                      << " parent_first_refs=" << disk.test_object_refcount(objects.front())
+                      << '\n';
             return fail("failed branch retained an untracked shared-object reference");
         }
         const auto parent_prompt = text_prompt(parent_tokens);
         if (!disk.plan_match(parent_prompt, q36::detail::prefix_hash_chain(parent_prompt))) {
             return fail("failed branch lost parent reuse");
         }
-        if (!disk.emergency_spill_ram(child_ram) || disk.test_object_refcount(objects.front()) != 2) {
+        if (!disk.emergency_spill_ram(child_ram) ||
+            disk.test_object_refcount(objects.front()) != 2) {
             return fail("branch retry did not acquire exactly one shared reference");
         }
         if (!disk.test_fifo_evict_one_unpersisted() || !disk.test_fifo_evict_one_unpersisted() ||
@@ -12881,7 +14624,7 @@ int test_branch_ref_allocation_preserves_parent(ninfer::DeviceContext& ctx,
 }
 
 int test_failed_spill_jobs_do_not_commit_retry(ninfer::DeviceContext& ctx,
-                                                 ninfer::PagedKVPool& pool) {
+                                               ninfer::PagedKVPool& pool) {
     TmpDir dir("stale-job");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -12921,7 +14664,7 @@ int test_failed_spill_jobs_do_not_commit_retry(ninfer::DeviceContext& ctx,
 }
 
 int test_uncertainty_holds_reclaim_on_evict_and_reopen(ninfer::DeviceContext& ctx,
-                                                        ninfer::PagedKVPool& pool) {
+                                                       ninfer::PagedKVPool& pool) {
     TmpDir dir("hold-reclaim");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -12947,15 +14690,14 @@ int test_uncertainty_holds_reclaim_on_evict_and_reopen(ninfer::DeviceContext& ct
             alloc.release();
             return fail("hold-reclaim match of B failed");
         }
-        pages_b = disk.test_main_page_ids(match_b->entry_id);
+        pages_b          = disk.test_main_page_ids(match_b->entry_id);
         const auto ram_d = capture_tokens(ram, pool, alloc, ctx, extended);
         ram.set_disk_entry_id(ram_d, match_b->entry_id);
         disk.note_ram_resident(ram_d, match_b->entry_id);
         disk.test_arm_fail_after_meta_rename();
         disk.request_idle_spill();
         const auto renamed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-        while (!disk.test_meta_renamed() &&
-               std::chrono::steady_clock::now() < renamed_deadline) {
+        while (!disk.test_meta_renamed() && std::chrono::steady_clock::now() < renamed_deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (!disk.test_meta_renamed()) {
@@ -12965,7 +14707,8 @@ int test_uncertainty_holds_reclaim_on_evict_and_reopen(ninfer::DeviceContext& ct
         }
         disk.wait_idle_and_fsync();
         for (std::uint64_t id : pages_b) {
-            if (id != 0 && !packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, id)) {
+            if (id != 0 &&
+                !packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, id)) {
                 alloc.release();
                 return fail("uncertain rename deleted predecessor objects before reclamation");
             }
@@ -12975,9 +14718,11 @@ int test_uncertainty_holds_reclaim_on_evict_and_reopen(ninfer::DeviceContext& ct
             return fail("hold-reclaim evict failed");
         }
         for (std::uint64_t id : pages_b) {
-            if (id != 0 && !packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, id)) {
+            if (id != 0 &&
+                packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, id)) {
                 alloc.release();
-                return fail("fifo eviction left uncertainty-protected predecessor objects");
+                return fail("durable eviction retained predecessor extents after releasing "
+                            "uncertainty holds");
             }
         }
     }
@@ -13005,8 +14750,7 @@ int test_uncertainty_holds_reclaim_on_evict_and_reopen(ninfer::DeviceContext& ct
         disk.test_arm_fail_after_rollback_rename();
         disk.request_idle_spill();
         const auto renamed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-        while (!disk.test_meta_renamed() &&
-               std::chrono::steady_clock::now() < renamed_deadline) {
+        while (!disk.test_meta_renamed() && std::chrono::steady_clock::now() < renamed_deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (!disk.test_meta_renamed()) {
@@ -13019,20 +14763,16 @@ int test_uncertainty_holds_reclaim_on_evict_and_reopen(ninfer::DeviceContext& ct
     }
     q36::detail::KVDiskCache reopened(cfg2);
     if (!reopened.plan_match(text_prompt(aligned),
-                              q36::detail::prefix_hash_chain(text_prompt(aligned)))) {
+                             q36::detail::prefix_hash_chain(text_prompt(aligned)))) {
         alloc.release();
         return fail("reopen after uncertain rollback lost the previous generation");
     }
     const auto hit128 = reopened.plan_match(text_prompt(extended),
-                                             q36::detail::prefix_hash_chain(text_prompt(extended)));
+                                            q36::detail::prefix_hash_chain(text_prompt(extended)));
     if (hit128 && hit128->reuse_base == 128) {
         alloc.release();
         return fail("reopen after uncertain rollback kept the unpublished new generation");
     }
-    // A durable location append can precede a failed meta publication. In the packed format,
-    // that extent is intentionally retained as unreachable pack garbage until
-    // generation compaction; the observable requirement is that it is not
-    // resurrected as a matching entry.
     alloc.release();
     return 0;
 }
@@ -13053,8 +14793,8 @@ int test_emergency_promote_survives_restore(ninfer::DeviceContext& ctx, ninfer::
         alloc.release();
         return fail("em-promote spill of A failed");
     }
-    const auto match_a =
-        disk.plan_match(text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
+    const auto match_a = disk.plan_match(text_prompt(tokens_a),
+                                         q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
     if (!match_a) {
         alloc.release();
         return fail("em-promote match of A failed");
@@ -13066,8 +14806,7 @@ int test_emergency_promote_survives_restore(ninfer::DeviceContext& ctx, ninfer::
     disk.test_set_payload_io_stall_ms(300);
     disk.request_idle_spill();
     const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-    while (!disk.test_payload_io_entered() &&
-           std::chrono::steady_clock::now() < entered_deadline) {
+    while (!disk.test_payload_io_entered() && std::chrono::steady_clock::now() < entered_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (!disk.test_payload_io_entered()) {
@@ -13146,8 +14885,8 @@ int test_emergency_promote_survives_restore(ninfer::DeviceContext& ctx, ninfer::
         alloc.release();
         return fail("promoted emergency spill left RAM pinned");
     }
-    const auto match_b =
-        disk.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+    const auto match_b = disk.plan_match(text_prompt(tokens_b),
+                                         q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
     if (!match_b || match_b->reuse_base != 128) {
         alloc.release();
         return fail("promoted emergency spill was not hittable");
@@ -13157,7 +14896,7 @@ int test_emergency_promote_survives_restore(ninfer::DeviceContext& ctx, ninfer::
 }
 
 int test_corrupt_meta_does_not_delete_objects(ninfer::DeviceContext& ctx,
-                                               ninfer::PagedKVPool& pool) {
+                                              ninfer::PagedKVPool& pool) {
     TmpDir dir("corrupt-meta");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -13182,8 +14921,8 @@ int test_corrupt_meta_does_not_delete_objects(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("corrupt-meta match of A failed");
         }
-        entry_a = match_a->entry_id;
-        pages_a = disk.test_main_page_ids(match_a->entry_id);
+        entry_a          = match_a->entry_id;
+        pages_a          = disk.test_main_page_ids(match_a->entry_id);
         const auto ram_b = capture_tokens(ram, pool, alloc, ctx, second);
         disk.note_ram_resident(ram_b, 0);
         if (!disk.emergency_spill_ram(ram_b)) {
@@ -13199,7 +14938,8 @@ int test_corrupt_meta_does_not_delete_objects(ninfer::DeviceContext& ctx,
     }
     std::vector<std::uint64_t> page_sizes;
     for (std::uint64_t id : pages_a) {
-        const auto location = packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, id);
+        const auto location =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, id);
         if (!location || !fs::exists(location->path)) {
             alloc.release();
             return fail("corrupt-meta page missing before reopen");
@@ -13207,7 +14947,8 @@ int test_corrupt_meta_does_not_delete_objects(ninfer::DeviceContext& ctx,
         page_sizes.push_back(location->extent);
     }
     q36::detail::KVDiskCache reopened(cfg);
-    if (reopened.plan_match(text_prompt(first), q36::detail::prefix_hash_chain(text_prompt(first)))) {
+    if (reopened.plan_match(text_prompt(first),
+                            q36::detail::prefix_hash_chain(text_prompt(first)))) {
         alloc.release();
         return fail("corrupt meta remained hittable");
     }
@@ -13217,8 +14958,8 @@ int test_corrupt_meta_does_not_delete_objects(ninfer::DeviceContext& ctx,
         return fail("sibling was lost after a corrupt neighbor meta");
     }
     for (std::size_t i = 0; i < pages_a.size(); ++i) {
-        const auto location = packed_object_location(dir.path, q36::detail::DiskObjectKind::Main,
-                                                     pages_a[i]);
+        const auto location =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, pages_a[i]);
         if (!location || !fs::exists(location->path) || location->extent != page_sizes[i]) {
             alloc.release();
             return fail("orphan reclaim deleted objects of a corrupt entry meta");
@@ -13229,7 +14970,7 @@ int test_corrupt_meta_does_not_delete_objects(ninfer::DeviceContext& ctx,
 }
 
 int test_capped_extras_keep_smallest_and_objects(ninfer::DeviceContext& ctx,
-                                                   ninfer::PagedKVPool& pool) {
+                                                 ninfer::PagedKVPool& pool) {
     TmpDir dir("cap-extra");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -13257,21 +14998,21 @@ int test_capped_extras_keep_smallest_and_objects(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("cap-extra match of A failed");
         }
-        id_a = match_a->entry_id;
+        id_a             = match_a->entry_id;
         const auto ram_b = capture_tokens(ram, pool, alloc, ctx, second);
         disk.note_ram_resident(ram_b, 0);
         if (!disk.emergency_spill_ram(ram_b)) {
             alloc.release();
             return fail("cap-extra spill of B failed");
         }
-        const auto match_b =
-            disk.plan_match(text_prompt(second), q36::detail::prefix_hash_chain(text_prompt(second)));
+        const auto match_b = disk.plan_match(text_prompt(second),
+                                             q36::detail::prefix_hash_chain(text_prompt(second)));
         if (!match_b) {
             alloc.release();
             return fail("cap-extra match of B failed");
         }
-        id_b = match_b->entry_id;
-        pages_b = disk.test_main_page_ids(match_b->entry_id);
+        id_b             = match_b->entry_id;
+        pages_b          = disk.test_main_page_ids(match_b->entry_id);
         const auto ram_c = capture_tokens(ram, pool, alloc, ctx, third);
         disk.note_ram_resident(ram_c, 0);
         if (!disk.emergency_spill_ram(ram_c)) {
@@ -13302,7 +15043,8 @@ int test_capped_extras_keep_smallest_and_objects(ninfer::DeviceContext& ctx,
         alloc.release();
         return fail("capped extras did not keep the smallest entry id");
     }
-    if (!reopened.plan_match(text_prompt(first), q36::detail::prefix_hash_chain(text_prompt(first)))) {
+    if (!reopened.plan_match(text_prompt(first),
+                             q36::detail::prefix_hash_chain(text_prompt(first)))) {
         alloc.release();
         return fail("capped extras dropped the resident generation");
     }
@@ -13331,15 +15073,15 @@ int test_capped_extras_keep_smallest_and_objects(ninfer::DeviceContext& ctx,
 int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("zero-hid");
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 2,
-                      .conv_channels  = 4,
-                      .conv_width     = 2,
-                      .value_heads    = 1,
-                      .value_head_dim = 4,
-                      .key_head_dim   = 2,
-                      .slot_count     = 4,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 2,
+                                                               .conv_channels  = 4,
+                                                               .conv_width     = 2,
+                                                               .value_heads    = 1,
+                                                               .value_head_dim = 4,
+                                                               .key_head_dim   = 2,
+                                                               .slot_count     = 4,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     std::vector<unsigned char> conv(gdn.conv_host_image_bytes(), 0x41);
@@ -13353,15 +15095,17 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
     auto retained = prompt;
     retained.token_ids.push_back(0);
     q36::detail::ResidentPrefixIdentity identity;
-    auto source                  = make_source(retained, identity, alloc, pool, ctx.copy_stream, 8);
-    source.gdn                   = &gdn;
-    source.gdn_current_slot     = 0;
-    source.gdn_checkpoint_slot  = 0;
-    source.rewrite_valid        = true;
-    source.rewrite_kind         = q36::RewriteCheckpointKind::TurnClosure;
-    source.rewrite_frontier      = 4;
-    source.hash_c_valid         = true;
-    source.hash_c               = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    auto source             = make_source(retained, identity, alloc, pool, ctx.copy_stream, 8);
+    source.gdn              = &gdn;
+    source.gdn_current_slot = 0;
+    const auto source_rewrite =
+        ninfer::test::RewriteStateHostImage::packed(gdn, 0, nullptr, 0, ctx.stream);
+    source.rewrite_state    = source_rewrite.source();
+    source.rewrite_valid    = true;
+    source.rewrite_kind     = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier = 4;
+    source.hash_c_valid     = true;
+    source.hash_c           = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
     q36::detail::RamLadderHead rollback;
     rollback.frontier        = 3;
     rollback.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 3);
@@ -13371,11 +15115,11 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
     rollback.conv_bytes      = conv.size();
     rollback.recurrent_bytes = rec.size();
     q36::detail::RamLadderHead ladder = rollback;
-    ladder.frontier                  = 5;
-    ladder.hash = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
-    ladder.kind = q36::detail::ContextCheckpointKind::Ladder;
+    ladder.frontier                   = 5;
+    ladder.hash         = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
+    ladder.kind         = q36::detail::ContextCheckpointKind::Ladder;
     source.ladder_heads = {rollback, ladder};
-    auto id = capture_or_evict(ram, source);
+    auto id             = capture_or_evict(ram, source);
     if (!id) {
         alloc.release();
         return fail("zero-hid capture failed");
@@ -13402,7 +15146,7 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
             alloc.release();
             return fail("zero-hid exact frontier was not selected");
         }
-        entry_id            = match->entry_id;
+        entry_id        = match->entry_id;
         const auto meta = disk.test_load_meta(match->entry_id);
         if (!meta.tail_hidden_valid || meta.current_hidden_id != 0 || meta.rewrite_hidden_id != 0 ||
             meta.rollback.hidden_id != 0 || meta.ladders[0].hidden_id != 0) {
@@ -13415,9 +15159,10 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
             return fail("zero-hid load_host dropped current or rewrite validity");
         }
         bool saw_rollback = false;
-        bool saw_ladder    = false;
+        bool saw_ladder   = false;
         for (const auto& slot : host->ladders) {
-            if (slot.frontier == 3 && slot.kind == q36::detail::ContextCheckpointKind::TurnRollback) {
+            if (slot.frontier == 3 &&
+                slot.kind == q36::detail::ContextCheckpointKind::TurnRollback) {
                 saw_rollback = true;
             }
             if (slot.frontier == 5 && slot.kind == q36::detail::ContextCheckpointKind::Ladder) {
@@ -13428,59 +15173,56 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
             alloc.release();
             return fail("zero-hid load_host omitted GDN-only checkpoint heads");
         }
-        if (!disk.populate_checkpoint_images(*host)) {
+        const auto images =
+            decode_checkpoint_images(disk, *host, {.conv = conv.size(), .recurrent = rec.size()});
+        if (!images) {
             alloc.release();
             return fail("zero-hid populate failed on GDN-only heads");
         }
-        bool img_rollback = false;
-        bool saw_ladder_img = false;
-        for (const auto& image : host->ladder_images) {
-            if (image.frontier == 3) { img_rollback = true; }
-            if (image.frontier == 5) { saw_ladder_img = true; }
+        for (const DecodedCheckpointImage& image : *images) {
+            if (std::memcmp(image.conv->data(), conv.data(), conv.size()) != 0 ||
+                std::memcmp(image.recurrent->data(), rec.data(), rec.size()) != 0) {
+                alloc.release();
+                return fail("zero-hid populate decoded the wrong GDN-only checkpoint image");
+            }
         }
-        if (!img_rollback || !saw_ladder_img) {
-            alloc.release();
-            return fail("zero-hid populate omitted GDN-only checkpoint images");
-        }
-        auto prompt3 = text_prompt({3, 3, 3});
-        const auto rb =
-            disk.plan_match(prompt3, q36::detail::prefix_hash_chain(prompt3));
+        auto prompt3  = text_prompt({3, 3, 3});
+        const auto rb = disk.plan_match(prompt3, q36::detail::prefix_hash_chain(prompt3));
         if (!rb || rb->reuse_base != 3 ||
             rb->reuse != ninfer::PrefixReusePath::RestoreTurnRollback) {
             alloc.release();
             return fail("zero-hid did not select the GDN-only rollback head");
         }
-        auto prompt4 = text_prompt({3, 3, 3, 3});
-        const auto rw =
-            disk.plan_match(prompt4, q36::detail::prefix_hash_chain(prompt4));
+        auto prompt4  = text_prompt({3, 3, 3, 3});
+        const auto rw = disk.plan_match(prompt4, q36::detail::prefix_hash_chain(prompt4));
         if (!rw || rw->reuse_base != 4 ||
             rw->reuse != ninfer::PrefixReusePath::RestoreTurnCheckpoint) {
             alloc.release();
             return fail("zero-hid did not select the GDN-only rewrite head");
         }
-        auto prompt5 = text_prompt({3, 3, 3, 3, 3});
-        const auto ld =
-            disk.plan_match(prompt5, q36::detail::prefix_hash_chain(prompt5));
+        auto prompt5  = text_prompt({3, 3, 3, 3, 3});
+        const auto ld = disk.plan_match(prompt5, q36::detail::prefix_hash_chain(prompt5));
         if (!ld || ld->reuse_base != 5 ||
             ld->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint) {
             alloc.release();
             return fail("zero-hid did not select the GDN-only ladder head");
         }
         if (!disk.claim(match->entry_id, match->hash_f, match->execution_frontier, 8,
-                         ninfer::PrefixReusePath::AppendAtFrontier)) {
+                        ninfer::PrefixReusePath::AppendAtFrontier)) {
             alloc.release();
             return fail("zero-hid claim of exact frontier failed");
         }
         auto dest = pool.reserve(4);
         dest.materialize_pages(1, ctx.stream);
         q36::detail::DiskRestoreTarget target;
-        target.text              = &dest;
-        target.text_pool         = &pool;
-        target.text_dst_pages    = 1;
-        target.gdn               = &gdn;
+        target.text             = &dest;
+        target.text_pool        = &pool;
+        target.text_dst_pages   = 1;
+        target.gdn              = &gdn;
         target.gdn_current_slot = 1;
-        target.gdn_checkpoint_slot = 2;
-        target.stream            = ctx.copy_stream;
+        auto target_rewrite     = ninfer::test::RewriteStateHostImage::sized(gdn);
+        target.rewrite_state    = target_rewrite.target();
+        target.stream           = ctx.copy_stream;
         disk.restore_device(match->entry_id, target);
         try {
             if (const int rc = wait_restore_bounded(disk, ctx, "zero-hid exact restore hung");
@@ -13501,22 +15243,22 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
         disk.release(match->entry_id);
         dest.release();
         if (!disk.claim(match->entry_id, match->hash_f, match->execution_frontier, 3,
-                         ninfer::PrefixReusePath::RestoreTurnRollback)) {
+                        ninfer::PrefixReusePath::RestoreTurnRollback)) {
             alloc.release();
             return fail("zero-hid claim of rollback head failed");
         }
         auto dest_rb = pool.reserve(4);
         dest_rb.materialize_pages(1, ctx.stream);
         q36::detail::DiskRestoreTarget rb_target;
-        rb_target.text              = &dest_rb;
-        rb_target.text_pool         = &pool;
-        rb_target.text_dst_pages    = 1;
-        rb_target.gdn               = &gdn;
+        rb_target.text             = &dest_rb;
+        rb_target.text_pool        = &pool;
+        rb_target.text_dst_pages   = 1;
+        rb_target.gdn              = &gdn;
         rb_target.gdn_current_slot = 1;
-        rb_target.gdn_checkpoint_slot = 2;
+        rb_target.rewrite_state    = target_rewrite.target();
         rb_target.reuse            = ninfer::PrefixReusePath::RestoreTurnRollback;
         rb_target.reuse_base       = 3;
-        rb_target.stream            = ctx.copy_stream;
+        rb_target.stream           = ctx.copy_stream;
         disk.restore_device(match->entry_id, rb_target);
         try {
             if (const int rc = wait_restore_bounded(disk, ctx, "zero-hid rollback restore hung");
@@ -13547,9 +15289,8 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
         alloc.release();
         return fail("zero-hid reopen lost exact reuse");
     }
-    auto prompt3 = text_prompt({3, 3, 3});
-    const auto rb =
-        reopened.plan_match(prompt3, q36::detail::prefix_hash_chain(prompt3));
+    auto prompt3  = text_prompt({3, 3, 3});
+    const auto rb = reopened.plan_match(prompt3, q36::detail::prefix_hash_chain(prompt3));
     if (!rb || rb->reuse_base != 3) {
         alloc.release();
         return fail("zero-hid reopen lost the rollback head");
@@ -13565,11 +15306,12 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
 
 constexpr std::uint32_t kRestoreReaders = 8;
 
-q36::detail::DiskOpenConfig reader_disk_config(const fs::path& location, q36::detail::KVRamCache& ram,
-                                                ninfer::PagedKVPool& pool, std::size_t capacity,
-                                                std::uint32_t max_context) {
+q36::detail::DiskOpenConfig reader_disk_config(const fs::path& location,
+                                               q36::detail::KVRamCache& ram,
+                                               ninfer::PagedKVPool& pool, std::size_t capacity,
+                                               std::uint32_t max_context) {
     auto cfg = disk_config(location, ram, pool, nullptr, ninfer::SpeculativeBackend::None, capacity,
-                            max_context);
+                           max_context);
     cfg.restore_io_threads = kRestoreReaders;
     return cfg;
 }
@@ -13597,19 +15339,19 @@ int test_cancel_drains_dequeued_prefetch_before_invalidation(ninfer::DeviceConte
         for (const bool worker_error : {false, true}) {
             TmpDir dir("cancel-dequeued-invalidate");
             auto plan = plan_paged_cache(4, 2, 2,
-                                        {{ninfer::DType::I8, 64, 2},
-                                         {ninfer::DType::I8, 64, 2},
-                                         {ninfer::DType::FP16, 1, 2},
-                                         {ninfer::DType::FP16, 1, 2}});
+                                         {{ninfer::DType::I8, 64, 2},
+                                          {ninfer::DType::I8, 64, 2},
+                                          {ninfer::DType::FP16, 1, 2},
+                                          {ninfer::DType::FP16, 1, 2}});
             ninfer::DeviceArena arena(plan.bytes);
             ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
             auto source = pool.reserve(2);
-            auto dest = pool.reserve(2);
+            auto dest   = pool.reserve(2);
             source.materialize_pages(2, ctx.stream);
             dest.materialize_pages(2, ctx.stream);
             fill_logical_pages(pool, source, 61);
             q36::detail::KVRamCache ram(32ULL << 20);
-            auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
+            auto cfg               = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
             cfg.restore_io_threads = readers;
             q36::detail::KVDiskCache disk(std::move(cfg));
             const auto prompt = text_prompt(std::vector<ninfer::TokenId>(128, 23));
@@ -13617,10 +15359,13 @@ int test_cancel_drains_dequeued_prefetch_before_invalidation(ninfer::DeviceConte
             disk.note_ram_resident(ram_id, 0);
             if (!disk.emergency_spill_ram(ram_id)) { return fail("cancel dequeued fixture spill"); }
             const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
-            if (!match || !disk.claim(match->entry_id)) { return fail("cancel dequeued fixture claim"); }
+            if (!match || !disk.claim(match->entry_id)) {
+                return fail("cancel dequeued fixture claim");
+            }
             disk.test_arm_restore_job_barrier();
             disk.prefetch_window(match->entry_id, 2, 0);
-            if (!wait_pred([&] { return disk.test_restore_job_dequeued(); }, std::chrono::seconds(3))) {
+            if (!wait_pred([&] { return disk.test_restore_job_dequeued(); },
+                           std::chrono::seconds(3))) {
                 disk.test_release_restore_job_barrier();
                 disk.cancel_restore();
                 disk.release(match->entry_id);
@@ -13630,37 +15375,43 @@ int test_cancel_drains_dequeued_prefetch_before_invalidation(ninfer::DeviceConte
             std::atomic<bool> observed_drain{false};
             std::jthread controller([&] {
                 observed_drain.store(wait_pred([&] { return disk.test_waiting_reader_drain(); },
-                                                std::chrono::seconds(3)));
+                                               std::chrono::seconds(3)));
                 disk.test_release_restore_job_barrier();
             });
             disk.cancel_restore();
             const auto pins_at_return = disk.test_disk_io_pins(match->entry_id);
             disk.release(match->entry_id);
             bool invalidated = true;
-            try { disk.invalidate_entry(match->entry_id); }
-            catch (const std::logic_error&) { invalidated = false; }
+            try {
+                disk.invalidate_entry(match->entry_id);
+            } catch (const std::logic_error&) { invalidated = false; }
             controller.join();
             if (!observed_drain.load() || pins_at_return != 0 || !invalidated) {
-                std::cerr << "cancel dequeued readers=" << readers << " worker_error=" << worker_error
+                std::cerr << "cancel dequeued readers=" << readers
+                          << " worker_error=" << worker_error
                           << " observed_drain=" << observed_drain.load()
-                          << " pins_at_return=" << pins_at_return
-                          << " invalidated=" << invalidated << '\n';
+                          << " pins_at_return=" << pins_at_return << " invalidated=" << invalidated
+                          << '\n';
                 return fail("cancel returned before dequeued prefetch ownership retired");
             }
-            if (!disk.emergency_spill_ram(ram_id)) { return fail("cancel dequeued worker did not recover"); }
+            if (!disk.emergency_spill_ram(ram_id)) {
+                return fail("cancel dequeued worker did not recover");
+            }
             const auto retry = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
-            if (!retry || !disk.claim(retry->entry_id)) { return fail("cancel dequeued retry claim"); }
+            if (!retry || !disk.claim(retry->entry_id)) {
+                return fail("cancel dequeued retry claim");
+            }
             q36::detail::DiskRestoreTarget target;
-            target.text = &dest;
-            target.text_pool = &pool;
+            target.text           = &dest;
+            target.text_pool      = &pool;
             target.text_dst_pages = 2;
-            target.stream = ctx.copy_stream;
-            const auto ticket = disk.restore_device(retry->entry_id, target);
+            target.stream         = ctx.copy_stream;
+            const auto ticket     = disk.restore_device(retry->entry_id, target);
             disk.wait_copies(ticket);
             disk.release_restore_ticket(ticket);
             disk.release(retry->entry_id);
-            if (expect_mapped_pages_equal(pool, source, dest, 2, ctx,
-                                          "cancel dequeued retry") != 0) {
+            if (expect_mapped_pages_equal(pool, source, dest, 2, ctx, "cancel dequeued retry") !=
+                0) {
                 return fail("cancel dequeued retry changed KV");
             }
         }
@@ -13673,37 +15424,42 @@ int test_prefetch_queue_allocation_failure(ninfer::DeviceContext& ctx) {
         for (const int successful_jobs : {0, 1}) {
             TmpDir dir("prefetch-queue-allocation");
             auto plan = plan_paged_cache(4, 2, 2,
-                                        {{ninfer::DType::I8, 64, 2},
-                                         {ninfer::DType::I8, 64, 2},
-                                         {ninfer::DType::FP16, 1, 2},
-                                         {ninfer::DType::FP16, 1, 2}});
+                                         {{ninfer::DType::I8, 64, 2},
+                                          {ninfer::DType::I8, 64, 2},
+                                          {ninfer::DType::FP16, 1, 2},
+                                          {ninfer::DType::FP16, 1, 2}});
             ninfer::DeviceArena arena(plan.bytes);
             ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
             auto source = pool.reserve(2);
-            auto dest = pool.reserve(2);
+            auto dest   = pool.reserve(2);
             source.materialize_pages(2, ctx.stream);
             dest.materialize_pages(2, ctx.stream);
             fill_logical_pages(pool, source, 43);
             q36::detail::KVRamCache ram(32ULL << 20);
-            auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
+            auto cfg               = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
             cfg.restore_io_threads = readers;
             q36::detail::KVDiskCache disk(std::move(cfg));
             const auto prompt = text_prompt(std::vector<ninfer::TokenId>(128, 17));
             const auto ram_id = capture_tokens(ram, pool, source, ctx, prompt.token_ids);
             disk.note_ram_resident(ram_id, 0);
-            if (!disk.emergency_spill_ram(ram_id)) { return fail("prefetch allocation fixture spill"); }
+            if (!disk.emergency_spill_ram(ram_id)) {
+                return fail("prefetch allocation fixture spill");
+            }
             const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
-            if (!match || !disk.claim(match->entry_id)) { return fail("prefetch allocation fixture claim"); }
+            if (!match || !disk.claim(match->entry_id)) {
+                return fail("prefetch allocation fixture claim");
+            }
             disk.test_fail_prefetch_enqueue_after(successful_jobs);
             bool allocation_escaped = false;
-            try { disk.prefetch_window(match->entry_id, 2, 0); }
-            catch (const std::bad_alloc&) { allocation_escaped = true; }
+            try {
+                disk.prefetch_window(match->entry_id, 2, 0);
+            } catch (const std::bad_alloc&) { allocation_escaped = true; }
             q36::detail::DiskRestoreTarget target;
-            target.text = &dest;
-            target.text_pool = &pool;
+            target.text           = &dest;
+            target.text_pool      = &pool;
             target.text_dst_pages = 2;
-            target.stream = ctx.copy_stream;
-            const auto ticket = disk.restore_device(match->entry_id, target);
+            target.stream         = ctx.copy_stream;
+            const auto ticket     = disk.restore_device(match->entry_id, target);
             disk.wait_copies(ticket);
             disk.release_restore_ticket(ticket);
             const auto pins = disk.test_disk_io_pins(match->entry_id);
@@ -13722,10 +15478,10 @@ int test_prefetch_queue_allocation_failure(ninfer::DeviceContext& ctx) {
                 if (!disk.claim(match->entry_id)) { return fail("setup allocation fixture claim"); }
                 q36::detail::KVDiskCache::test_fail_next_restore_setup_allocation();
                 bool setup_failed = false;
-                try { (void)disk.restore_device(match->entry_id, target); }
-                catch (const std::bad_alloc&) { setup_failed = true; }
-                if (!setup_failed || !disk.copies_ready() ||
-                    disk.test_retired_copy_events() != 0 ||
+                try {
+                    (void)disk.restore_device(match->entry_id, target);
+                } catch (const std::bad_alloc&) { setup_failed = true; }
+                if (!setup_failed || !disk.copies_ready() || disk.test_retired_copy_events() != 0 ||
                     disk.test_disk_io_pins(match->entry_id) != 0 ||
                     q36::detail::KVDiskCache::test_restore_setup_allocation_failure_pending()) {
                     disk.cancel_restore();
@@ -13750,30 +15506,30 @@ int test_failed_restore_invalidation_preserves_shared_entries(ninfer::DeviceCont
     for (const bool tombstone_failure : {false, true}) {
         TmpDir dir("failed-restore-invalidation");
         auto plan = plan_paged_cache(4, 2, 2,
-                                    {{ninfer::DType::I8, 64, 2},
-                                     {ninfer::DType::I8, 64, 2},
-                                     {ninfer::DType::FP16, 1, 2},
-                                     {ninfer::DType::FP16, 1, 2}});
+                                     {{ninfer::DType::I8, 64, 2},
+                                      {ninfer::DType::I8, 64, 2},
+                                      {ninfer::DType::FP16, 1, 2},
+                                      {ninfer::DType::FP16, 1, 2}});
         ninfer::DeviceArena arena(plan.bytes);
         ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
         auto source = pool.reserve(2);
-        auto dest = pool.reserve(2);
+        auto dest   = pool.reserve(2);
         source.materialize_pages(2, ctx.stream);
         dest.materialize_pages(2, ctx.stream);
         fill_logical_pages(pool, source, 37);
         q36::detail::KVRamCache ram(32ULL << 20);
         const auto prompt_a = text_prompt(std::vector<ninfer::TokenId>(128, 11));
-        auto prompt_b = prompt_a;
+        auto prompt_b       = prompt_a;
         std::fill(prompt_b.token_ids.begin() + 64, prompt_b.token_ids.end(), 29);
         std::uint64_t a = 0, b = 0, shared_page = 0;
         auto require = [](bool ok, const char* why) {
             if (!ok) { throw std::runtime_error(why); }
         };
         q36::detail::DiskRestoreTarget target;
-        target.text = &dest;
-        target.text_pool = &pool;
+        target.text           = &dest;
+        target.text_pool      = &pool;
         target.text_dst_pages = 2;
-        target.stream = ctx.copy_stream;
+        target.stream         = ctx.copy_stream;
         try {
             {
                 auto cfg = disk_config(dir.path, ram, pool, nullptr,
@@ -13782,7 +15538,9 @@ int test_failed_restore_invalidation_preserves_shared_entries(ninfer::DeviceCont
                 const auto ram_a = capture_tokens(ram, pool, source, ctx, prompt_a.token_ids);
                 disk.note_ram_resident(ram_a, 0);
                 require(disk.emergency_spill_ram(ram_a), "invalidation persist A");
-                a = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a))->entry_id;
+                a = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a))
+                        .value()
+                        .entry_id;
                 const auto ram_b = capture_tokens(ram, pool, source, ctx, prompt_b.token_ids);
                 if (!tombstone_failure) {
                     const auto drops = disk.snapshot().drops;
@@ -13814,31 +15572,39 @@ int test_failed_restore_invalidation_preserves_shared_entries(ninfer::DeviceCont
                             "idle worker failed to spill after snapshot allocation failure");
                 }
                 require(disk.emergency_spill_ram(ram_b), "invalidation persist B branch");
-                b = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b))->entry_id;
+                b = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b))
+                        .value()
+                        .entry_id;
                 const auto pages_a = disk.test_main_page_ids(a);
                 const auto pages_b = disk.test_main_page_ids(b);
-                shared_page = pages_a.front();
+                shared_page        = pages_a.front();
                 require(a != b && pages_b.front() == shared_page && pages_a[1] != pages_b[1],
                         "invalidation fixture must share only first page");
                 for (const bool state_error : {false, true}) {
                     require(disk.claim(b), "unexpected worker fixture claim");
-                    if (state_error) { disk.test_arm_fail_restore_state_invariant(); }
-                    else { disk.test_arm_fail_restore_job(); }
+                    if (state_error) {
+                        disk.test_arm_fail_restore_state_invariant();
+                    } else {
+                        disk.test_arm_fail_restore_job();
+                    }
                     const auto unexpected_ticket = disk.restore_device(b, target);
-                    bool original_error = false;
-                    try { disk.wait_copies(unexpected_ticket); }
-                    catch (const std::logic_error&) { original_error = true; }
+                    bool original_error          = false;
+                    try {
+                        disk.wait_copies(unexpected_ticket);
+                    } catch (const std::logic_error&) { original_error = true; }
                     disk.cancel_restore();
                     disk.release_restore_ticket(unexpected_ticket);
                     disk.release(b);
-                    require(original_error, "unexpected worker error became a recoverable cache miss");
+                    require(original_error,
+                            "unexpected worker error became a recoverable cache miss");
                 }
                 disk.test_break_object(pages_a[1], q36::detail::DiskObjectKind::Main);
                 require(disk.claim(a), "invalidation claim A");
                 const auto ticket = disk.restore_device(a, target);
-                bool recoverable = false;
-                try { disk.wait_copies(ticket); }
-                catch (const ninfer::runtime::CacheRestoreFailure&) { recoverable = true; }
+                bool recoverable  = false;
+                try {
+                    disk.wait_copies(ticket);
+                } catch (const ninfer::runtime::CacheRestoreFailure&) { recoverable = true; }
                 disk.cancel_restore();
                 disk.release_restore_ticket(ticket);
                 disk.cancel_idle_spill();
@@ -13847,7 +15613,12 @@ int test_failed_restore_invalidation_preserves_shared_entries(ninfer::DeviceCont
                 if (tombstone_failure) { disk.test_arm_fail_tombstone(); }
                 disk.invalidate_entry(a);
                 require(!disk.claim(a) && !disk.load_host(a), "invalid source remained claimable");
-                const auto replanned = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+                // The disk worker performs the eviction (and its tombstone attempt).
+                require(wait_pred([&] { return disk.test_pending_invalidations() == 0; },
+                                  std::chrono::seconds(10)),
+                        "disk worker did not process the invalidation");
+                const auto replanned =
+                    disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
                 require(!replanned || replanned->entry_id != a,
                         "invalid source selected by repeated request");
                 require(!disk.ram_is_durable(ram_a), "invalid source left RAM falsely durable");
@@ -13855,6 +15626,9 @@ int test_failed_restore_invalidation_preserves_shared_entries(ninfer::DeviceCont
                     require(disk.test_object_refcount(shared_page) == 2,
                             "failed tombstone released live shared references");
                     disk.invalidate_entry(a);
+                    require(wait_pred([&] { return disk.test_pending_invalidations() == 0; },
+                                      std::chrono::seconds(10)),
+                            "disk worker did not retry the invalidation");
                 }
                 require(!disk.test_entry_in_index(a) && disk.test_object_refcount(shared_page) == 1,
                         "invalidation did not preserve surviving shared page");
@@ -13894,27 +15668,29 @@ int test_prefetch_interleaving_matrix(ninfer::DeviceContext& ctx) {
     for (std::uint32_t readers = 1; readers <= 16; ++readers) {
         TmpDir dir("prefetch-schedule-matrix");
         constexpr std::uint32_t pages = 4;
-        auto plan = plan_paged_cache(pages * 3, pages, 2,
-                                    {{ninfer::DType::I8, 64, 2},
-                                     {ninfer::DType::I8, 64, 2},
-                                     {ninfer::DType::FP16, 1, 2},
-                                     {ninfer::DType::FP16, 1, 2}});
+        auto plan                     = plan_paged_cache(pages * 3, pages, 2,
+                                                         {{ninfer::DType::I8, 64, 2},
+                                                          {ninfer::DType::I8, 64, 2},
+                                                          {ninfer::DType::FP16, 1, 2},
+                                                          {ninfer::DType::FP16, 1, 2}});
         ninfer::DeviceArena arena(plan.bytes);
         ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
         q36::detail::KVRamCache ram(32ULL << 20);
         auto source_a = pool.reserve(pages);
         auto source_b = pool.reserve(pages);
-        auto dest = pool.reserve(pages);
+        auto dest     = pool.reserve(pages);
         source_a.materialize_pages(pages, ctx.stream);
         source_b.materialize_pages(pages, ctx.stream);
         dest.materialize_pages(pages, ctx.stream);
         fill_logical_pages(pool, source_a, 29);
         fill_logical_pages(pool, source_b, 93);
-        auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
+        auto cfg               = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
         cfg.restore_io_threads = readers;
         q36::detail::KVDiskCache disk(std::move(cfg));
+
         struct Cleanup {
             q36::detail::KVDiskCache& disk;
+
             ~Cleanup() {
                 disk.test_release_restore_job_barrier();
                 disk.test_release_page_read_barrier();
@@ -13923,11 +15699,12 @@ int test_prefetch_interleaving_matrix(ninfer::DeviceContext& ctx) {
                 disk.cancel_restore();
             }
         } cleanup{disk};
+
         auto require = [](bool ok, const char* why) {
             if (!ok) { throw std::runtime_error(why); }
         };
-        const std::vector<ninfer::TokenId> tokens_a(pages * 64, 13);
-        const std::vector<ninfer::TokenId> tokens_b(pages * 64, 41);
+        const std::vector<ninfer::TokenId> tokens_a(static_cast<std::size_t>(pages) * 64, 13);
+        const std::vector<ninfer::TokenId> tokens_b(static_cast<std::size_t>(pages) * 64, 41);
         const auto ram_a = capture_tokens(ram, pool, source_a, ctx, tokens_a);
         const auto ram_b = capture_tokens(ram, pool, source_b, ctx, tokens_b);
         disk.note_ram_resident(ram_a, 0);
@@ -13936,14 +15713,14 @@ int test_prefetch_interleaving_matrix(ninfer::DeviceContext& ctx) {
         require(disk.emergency_spill_ram(ram_b), "matrix spill B");
         const auto prompt_a = text_prompt(tokens_a);
         const auto prompt_b = text_prompt(tokens_b);
-        const auto a = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
-        const auto b = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+        const auto a        = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+        const auto b        = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
         require(a && b && a->entry_id != b->entry_id, "matrix distinct disk entries");
         q36::detail::DiskRestoreTarget target;
-        target.text = &dest;
-        target.text_pool = &pool;
+        target.text           = &dest;
+        target.text_pool      = &pool;
         target.text_dst_pages = pages;
-        target.stream = ctx.copy_stream;
+        target.stream         = ctx.copy_stream;
         auto release_barriers = [&] {
             disk.test_release_restore_job_barrier();
             disk.test_release_page_read_barrier();
@@ -13953,18 +15730,23 @@ int test_prefetch_interleaving_matrix(ninfer::DeviceContext& ctx) {
             fill_logical_pages(pool, dest, 177);
             ctx.synchronize_all();
             disk.restore_device(entry, target);
-            require(wait_pred([&] {
-                disk.pump_restore(ctx.copy_stream);
-                return disk.restore_failed() || disk.copies_ready();
-            }, std::chrono::seconds(8)), "matrix restore timed out");
+            require(wait_pred(
+                        [&] {
+                            disk.pump_restore(ctx.copy_stream);
+                            return disk.restore_failed() || disk.copies_ready();
+                        },
+                        std::chrono::seconds(8)),
+                    "matrix restore timed out");
             require(!disk.restore_failed(), "matrix fresh restore failed");
             disk.wait_copies();
-            require(expect_mapped_pages_equal(pool, source, dest, pages, ctx,
-                                             "prefetch matrix") == 0,
+            require(expect_mapped_pages_equal(pool, source, dest, pages, ctx, "prefetch matrix") ==
+                        0,
                     "matrix stale or incomplete KV");
         };
-        for (const auto boundary : {Boundary::Dequeued, Boundary::Assigned, Boundary::Reading, Boundary::Filled}) {
-            for (const auto action : {Action::Promote, Action::Cancel, Action::Reclaim, Action::Switch}) {
+        for (const auto boundary :
+             {Boundary::Dequeued, Boundary::Assigned, Boundary::Reading, Boundary::Filled}) {
+            for (const auto action :
+                 {Action::Promote, Action::Cancel, Action::Reclaim, Action::Switch}) {
                 for (const bool fault : {false, true}) {
                     if (fault && boundary != Boundary::Reading) { continue; }
                     try {
@@ -13975,13 +15757,22 @@ int test_prefetch_interleaving_matrix(ninfer::DeviceContext& ctx) {
                         if (boundary == Boundary::Assigned) { disk.test_arm_slot_assign_barrier(); }
                         if (boundary == Boundary::Reading) { disk.test_arm_page_read_barrier(); }
                         disk.prefetch_window(a->entry_id, 2, 0);
-                        require(wait_pred([&] {
-                            if (boundary == Boundary::Dequeued) { return disk.test_restore_job_dequeued(); }
-                            if (boundary == Boundary::Assigned) { return disk.test_slot_assign_entered(); }
-                            if (boundary == Boundary::Reading) { return disk.test_page_read_entered(); }
-                            return disk.test_window_filled_for(a->entry_id) &&
-                                   disk.test_disk_io_pins(a->entry_id) == 0;
-                        }, std::chrono::seconds(3)), "matrix boundary not reached");
+                        require(wait_pred(
+                                    [&] {
+                                        if (boundary == Boundary::Dequeued) {
+                                            return disk.test_restore_job_dequeued();
+                                        }
+                                        if (boundary == Boundary::Assigned) {
+                                            return disk.test_slot_assign_entered();
+                                        }
+                                        if (boundary == Boundary::Reading) {
+                                            return disk.test_page_read_entered();
+                                        }
+                                        return disk.test_window_filled_for(a->entry_id) &&
+                                               disk.test_disk_io_pins(a->entry_id) == 0;
+                                    },
+                                    std::chrono::seconds(3)),
+                                "matrix boundary not reached");
                         if (fault) { disk.test_arm_fail_page_read(); }
                         auto selected = a->entry_id;
                         if (action == Action::Promote) {
@@ -14000,34 +15791,40 @@ int test_prefetch_interleaving_matrix(ninfer::DeviceContext& ctx) {
                                                   std::chrono::seconds(3)),
                                         "matrix page failure not published");
                                 disk.test_release_restore_state_barrier();
-                                require(wait_pred([&] { return disk.test_restore_state_inflight() == 0; },
-                                                  std::chrono::seconds(3)),
+                                require(wait_pred(
+                                            [&] { return disk.test_restore_state_inflight() == 0; },
+                                            std::chrono::seconds(3)),
                                         "matrix state owner did not drain");
                             }
-                            require(wait_pred([&] {
-                                disk.pump_restore(ctx.copy_stream);
-                                return disk.restore_failed() || disk.copies_ready();
-                            }, std::chrono::seconds(8)), "matrix promoted restore timed out");
+                            require(wait_pred(
+                                        [&] {
+                                            disk.pump_restore(ctx.copy_stream);
+                                            return disk.restore_failed() || disk.copies_ready();
+                                        },
+                                        std::chrono::seconds(8)),
+                                    "matrix promoted restore timed out");
                             require(disk.restore_failed() == fault,
                                     "matrix promoted read result not propagated");
                             if (!fault) {
                                 disk.wait_copies();
                                 require(expect_mapped_pages_equal(pool, source_a, dest, pages, ctx,
-                                                                 "matrix promotion") == 0,
+                                                                  "matrix promotion") == 0,
                                         "matrix promotion lost prefetched bytes");
                             }
                             disk.cancel_restore();
                         } else if (action == Action::Cancel) {
-                            const auto epoch = disk.test_restore_epoch();
+                            const auto epoch     = disk.test_restore_epoch();
                             bool observed_cancel = false;
                             std::jthread release_after_cancel([&] {
-                                observed_cancel = wait_pred([&] { return disk.test_restore_epoch() != epoch; },
-                                                            std::chrono::seconds(3));
+                                observed_cancel =
+                                    wait_pred([&] { return disk.test_restore_epoch() != epoch; },
+                                              std::chrono::seconds(3));
                                 release_barriers();
                             });
                             disk.cancel_restore();
                             release_after_cancel.join();
-                            require(observed_cancel, "matrix cancellation did not invalidate epoch");
+                            require(observed_cancel,
+                                    "matrix cancellation did not invalidate epoch");
                         } else {
                             disk.release(a->entry_id);
                             if (action == Action::Switch) { selected = b->entry_id; }
@@ -14035,20 +15832,24 @@ int test_prefetch_interleaving_matrix(ninfer::DeviceContext& ctx) {
                             release_barriers();
                         }
                         require(wait_pred([&] { return disk.test_disk_io_pins(a->entry_id) == 0; },
-                                          std::chrono::seconds(3)), "matrix abandoned reader pin leaked");
+                                          std::chrono::seconds(3)),
+                                "matrix abandoned reader pin leaked");
                         require(disk.test_window_inflight() == 0,
                                 "matrix page read outlived its I/O pin");
-                        if (disk.snapshot().drops != drops + (fault && action == Action::Promote ? 1u : 0u)) {
-                            std::cerr << "matrix drop delta=" << disk.snapshot().drops - drops << '\n';
+                        if (disk.snapshot().drops !=
+                            drops + (fault && action == Action::Promote ? 1u : 0u)) {
+                            std::cerr << "matrix drop delta=" << disk.snapshot().drops - drops
+                                      << '\n';
                         }
-                        require(disk.snapshot().drops == drops + (fault && action == Action::Promote ? 1u : 0u),
+                        require(disk.snapshot().drops ==
+                                    drops + (fault && action == Action::Promote ? 1u : 0u),
                                 "matrix stale failure billed or live failure lost");
                         restore_exact(selected, action == Action::Switch ? source_b : source_a);
                         disk.cancel_restore();
                         disk.consume(selected);
                         require(disk.test_disk_io_pins(a->entry_id) == 0 &&
-                                disk.test_disk_io_pins(b->entry_id) == 0 &&
-                                ram.test_io_pins(ram_a) == 0 && ram.test_io_pins(ram_b) == 0,
+                                    disk.test_disk_io_pins(b->entry_id) == 0 &&
+                                    ram.test_io_pins(ram_a) == 0 && ram.test_io_pins(ram_b) == 0,
                                 "matrix completion leaked cache pins");
                         ++cases;
                     } catch (const std::exception& e) {
@@ -14077,35 +15878,38 @@ int test_disk_retirement_with_blocked_dma(ninfer::DeviceContext& ctx) {
             for (const bool shutdown : {false, true}) {
                 TmpDir dir("disk-dma-retirement");
                 auto plan = plan_paged_cache(6, 2, 2,
-                                            {{ninfer::DType::I8, 64, 2},
-                                             {ninfer::DType::I8, 64, 2},
-                                             {ninfer::DType::FP16, 1, 2},
-                                             {ninfer::DType::FP16, 1, 2}});
+                                             {{ninfer::DType::I8, 64, 2},
+                                              {ninfer::DType::I8, 64, 2},
+                                              {ninfer::DType::FP16, 1, 2},
+                                              {ninfer::DType::FP16, 1, 2}});
                 ninfer::DeviceArena arena(plan.bytes);
                 ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
                 q36::detail::KVRamCache ram(32ULL << 20);
-                auto source_a = pool.reserve(2);
-                auto source_b = pool.reserve(2);
+                auto source_a    = pool.reserve(2);
+                auto source_b    = pool.reserve(2);
                 auto destination = pool.reserve(2);
                 source_a.materialize_pages(2, ctx.stream);
                 source_b.materialize_pages(2, ctx.stream);
                 destination.materialize_pages(2, ctx.stream);
                 fill_logical_pages(pool, source_a, 35);
                 fill_logical_pages(pool, source_b, 129);
-                ninfer::DeviceBuffer hidden_a_buffer(64), hidden_b_buffer(64), hidden_out_buffer(64);
+                ninfer::DeviceBuffer hidden_a_buffer(64), hidden_b_buffer(64),
+                    hidden_out_buffer(64);
                 hidden_a_buffer.fill(0x35);
                 hidden_b_buffer.fill(0xc9);
                 hidden_out_buffer.fill(0);
                 ninfer::Tensor hidden_a(hidden_a_buffer.p, ninfer::DType::U8, {64});
                 ninfer::Tensor hidden_b(hidden_b_buffer.p, ninfer::DType::U8, {64});
                 ninfer::Tensor hidden_out(hidden_out_buffer.p, ninfer::DType::U8, {64});
-                auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
+                auto cfg               = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
                 cfg.restore_io_threads = readers;
-                cfg.hidden_bytes = 64;
-                auto disk = std::make_unique<q36::detail::KVDiskCache>(cfg);
+                cfg.hidden_bytes       = 64;
+                auto disk              = std::make_unique<q36::detail::KVDiskCache>(cfg);
                 const std::vector<ninfer::TokenId> tokens_a(128, 23), tokens_b(128, 47);
-                const auto ram_a = capture_tokens_hidden(ram, pool, source_a, ctx, tokens_a, hidden_a);
-                const auto ram_b = capture_tokens_hidden(ram, pool, source_b, ctx, tokens_b, hidden_b);
+                const auto ram_a =
+                    capture_tokens_hidden(ram, pool, source_a, ctx, tokens_a, hidden_a);
+                const auto ram_b =
+                    capture_tokens_hidden(ram, pool, source_b, ctx, tokens_b, hidden_b);
                 disk->note_ram_resident(ram_a, 0);
                 disk->note_ram_resident(ram_b, 0);
                 if (!disk->emergency_spill_ram(ram_a) || !disk->emergency_spill_ram(ram_b)) {
@@ -14120,48 +15924,59 @@ int test_disk_retirement_with_blocked_dma(ninfer::DeviceContext& ctx) {
                 // Both pages must already occupy their window slots so the
                 // first pump enqueues their H2D before joining state H2D.
                 disk->prefetch_window(a->entry_id, 2, 0);
-                if (!wait_pred([&] {
-                        return disk->test_window_filled_for(a->entry_id) &&
-                               disk->test_disk_io_pins(a->entry_id) == 0;
-                    }, std::chrono::seconds(3))) {
+                if (!wait_pred(
+                        [&] {
+                            return disk->test_window_filled_for(a->entry_id) &&
+                                   disk->test_disk_io_pins(a->entry_id) == 0;
+                        },
+                        std::chrono::seconds(3))) {
                     return fail("DMA retirement fixture prefetch did not complete");
                 }
                 ctx.synchronize_all();
-                struct GateEvent {
-                    cudaEvent_t event = nullptr;
-                    ~GateEvent() { if (event) { (void)cudaEventDestroy(event); } }
-                } gate_event;
+
                 ninfer::test::StreamCopyGate gate;
-                if (state_dma) {
-                    CUDA_CHECK(cudaEventCreateWithFlags(&gate_event.event, cudaEventDisableTiming));
-                    gate.launch(ctx.stream);
-                    CUDA_CHECK(cudaEventRecord(gate_event.event, ctx.stream));
-                    disk->test_gate_state_h2d(gate_event.event);
-                } else {
-                    gate.launch(ctx.copy_stream);
-                }
+                disk->test_before_restore_completion(
+                    state_dma,
+                    [](void* context, cudaStream_t stream) {
+                        static_cast<ninfer::test::StreamCopyGate*>(context)->launch(stream);
+                    },
+                    &gate);
+
+                struct ClearCompletionArm {
+                    q36::detail::KVDiskCache* disk;
+
+                    ~ClearCompletionArm() {
+                        if (disk != nullptr) {
+                            disk->test_before_restore_completion(false, nullptr, nullptr);
+                        }
+                    }
+                } completion_arm{disk.get()};
+
                 q36::detail::DiskRestoreTarget target;
-                target.text = &destination;
-                target.text_pool = &pool;
+                target.text           = &destination;
+                target.text_pool      = &pool;
                 target.text_dst_pages = 2;
-                target.tail_hidden = state_dma ? &hidden_out : nullptr;
-                target.stream = ctx.copy_stream;
+                target.tail_hidden    = state_dma ? &hidden_out : nullptr;
+                target.stream         = ctx.copy_stream;
                 const auto old_ticket = disk->restore_device(a->entry_id, target);
                 cudaEvent_t aggregate = nullptr;
-                if (!wait_pred([&] {
-                        disk->pump_restore(ctx.copy_stream);
-                        aggregate = disk->test_copies_done();
-                        if (state_dma) {
-                            return disk->test_page_read_count() >= 2 &&
-                                   !disk->test_window_assigned(0, 0) &&
-                                   !disk->test_window_assigned(0, 1);
-                        }
-                        return aggregate != nullptr;
-                    }, std::chrono::seconds(3)) || disk->restore_failed() ||
-                    aggregate == nullptr || cudaEventQuery(aggregate) != cudaErrorNotReady ||
-                    disk->copies_ready()) {
+                if (!wait_pred(
+                        [&] {
+                            disk->pump_restore(ctx.copy_stream);
+                            aggregate = disk->test_copies_done();
+                            if (state_dma) {
+                                return disk->test_page_read_count() >= 2 &&
+                                       !disk->test_window_assigned(0, 0) &&
+                                       !disk->test_window_assigned(0, 1);
+                            }
+                            return aggregate != nullptr;
+                        },
+                        std::chrono::seconds(3)) ||
+                    disk->restore_failed() || aggregate == nullptr ||
+                    cudaEventQuery(aggregate) != cudaErrorNotReady || disk->copies_ready()) {
                     std::cerr << "DMA readiness readers=" << readers << " state=" << state_dma
-                              << " shutdown=" << shutdown << " copies_ready=" << disk->copies_ready()
+                              << " shutdown=" << shutdown
+                              << " copies_ready=" << disk->copies_ready()
                               << " live_join=" << (aggregate != nullptr) << '\n';
                     return fail("DMA retirement reported ready before CUDA transfer completion");
                 }
@@ -14179,6 +15994,8 @@ int test_disk_retirement_with_blocked_dma(ninfer::DeviceContext& ctx) {
                     disk->cancel_restore();
                 }
                 controller.join();
+                completion_arm.disk->test_before_restore_completion(false, nullptr, nullptr);
+                completion_arm.disk = nullptr;
                 if (!saw_drain) {
                     return fail("disk retired pending DMA without entering its CUDA drain");
                 }
@@ -14193,19 +16010,24 @@ int test_disk_retirement_with_blocked_dma(ninfer::DeviceContext& ctx) {
                 fill_logical_pages(pool, destination, 201);
                 hidden_out_buffer.fill(0);
                 ctx.synchronize_all();
-                if (!disk->claim(b->entry_id)) { return fail("DMA retirement replacement claim failed"); }
+                if (!disk->claim(b->entry_id)) {
+                    return fail("DMA retirement replacement claim failed");
+                }
                 target.text_dst_pages = 2;
-                target.tail_hidden = &hidden_out;
+                target.tail_hidden    = &hidden_out;
                 const auto new_ticket = disk->restore_device(b->entry_id, target);
-                if (!wait_pred([&] {
-                        disk->pump_restore(ctx.copy_stream);
-                        return disk->copies_ready() || disk->restore_failed();
-                    }, std::chrono::seconds(5)) || disk->restore_failed()) {
+                if (!wait_pred(
+                        [&] {
+                            disk->pump_restore(ctx.copy_stream);
+                            return disk->copies_ready() || disk->restore_failed();
+                        },
+                        std::chrono::seconds(5)) ||
+                    disk->restore_failed()) {
                     return fail("DMA retirement replacement restore failed");
                 }
                 disk->wait_copies(new_ticket);
                 if (expect_mapped_pages_equal(pool, source_b, destination, 2, ctx,
-                                             "disk DMA retirement") != 0) {
+                                              "disk DMA retirement") != 0) {
                     return fail("late disk DMA corrupted replacement KV");
                 }
                 std::array<std::uint8_t, 64> actual_hidden{};
@@ -14233,104 +16055,111 @@ int test_disk_retirement_with_blocked_dma(ninfer::DeviceContext& ctx) {
 
 int test_queued_prefetch_promotion_progresses_past_idle(ninfer::DeviceContext& ctx) {
     for (const std::uint32_t readers : {1u, 16u}) {
-      for (const bool cancel_promoted : {false, true}) {
-        TmpDir dir("promote-prefetch-idle");
-        auto plan = plan_paged_cache(3, 1, 2,
-                                    {{ninfer::DType::I8, 64, 2},
-                                     {ninfer::DType::I8, 64, 2},
-                                     {ninfer::DType::FP16, 1, 2},
-                                     {ninfer::DType::FP16, 1, 2}});
-        ninfer::DeviceArena arena(plan.bytes);
-        ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
-        q36::detail::KVRamCache ram(32ULL << 20);
-        auto source = pool.reserve(1);
-        auto idle_source = pool.reserve(1);
-        auto destination = pool.reserve(1);
-        source.materialize_pages(1, ctx.stream);
-        idle_source.materialize_pages(1, ctx.stream);
-        destination.materialize_pages(1, ctx.stream);
-        fill_logical_pages(pool, source, 23);
-        fill_logical_pages(pool, idle_source, 79);
-        auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
-        cfg.restore_io_threads = readers;
-        q36::detail::KVDiskCache disk(std::move(cfg));
-        struct Cleanup {
-            q36::detail::KVDiskCache& disk;
-            ~Cleanup() {
-                disk.test_release_payload_take_barrier();
-                disk.test_release_restore_job_barrier();
+        for (const bool cancel_promoted : {false, true}) {
+            TmpDir dir("promote-prefetch-idle");
+            auto plan = plan_paged_cache(3, 1, 2,
+                                         {{ninfer::DType::I8, 64, 2},
+                                          {ninfer::DType::I8, 64, 2},
+                                          {ninfer::DType::FP16, 1, 2},
+                                          {ninfer::DType::FP16, 1, 2}});
+            ninfer::DeviceArena arena(plan.bytes);
+            ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
+            q36::detail::KVRamCache ram(32ULL << 20);
+            auto source      = pool.reserve(1);
+            auto idle_source = pool.reserve(1);
+            auto destination = pool.reserve(1);
+            source.materialize_pages(1, ctx.stream);
+            idle_source.materialize_pages(1, ctx.stream);
+            destination.materialize_pages(1, ctx.stream);
+            fill_logical_pages(pool, source, 23);
+            fill_logical_pages(pool, idle_source, 79);
+            auto cfg               = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
+            cfg.restore_io_threads = readers;
+            q36::detail::KVDiskCache disk(std::move(cfg));
+
+            struct Cleanup {
+                q36::detail::KVDiskCache& disk;
+
+                ~Cleanup() {
+                    disk.test_release_payload_take_barrier();
+                    disk.test_release_restore_job_barrier();
+                    cancel_restore_releasing_dequeued_job(disk);
+                    disk.cancel_idle_spill();
+                }
+            } cleanup{disk};
+
+            const std::vector<ninfer::TokenId> tokens(64, 13);
+            const auto ram_a = capture_tokens(ram, pool, source, ctx, tokens);
+            disk.note_ram_resident(ram_a, 0);
+            if (!disk.emergency_spill_ram(ram_a)) { return fail("promotion fixture spill failed"); }
+            const auto prompt = text_prompt(tokens);
+            const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+            if (!match || !disk.claim(match->entry_id)) {
+                return fail("promotion fixture claim failed");
+            }
+            const auto ram_b =
+                capture_tokens(ram, pool, idle_source, ctx, std::vector<ninfer::TokenId>(64, 47));
+            disk.note_ram_resident(ram_b, 0);
+            // Freeze the idle payload after dequeue. Its commit stays queued; the
+            // executor can enqueue prefetch while that payload is still in hand.
+            disk.test_arm_payload_take_barrier();
+            disk.request_idle_spill();
+            if (!wait_pred([&] { return disk.test_payload_take_entered(); },
+                           std::chrono::seconds(3))) {
+                return fail("promotion fixture idle spill never started");
+            }
+            disk.prefetch_window(match->entry_id, 1, 0);
+            q36::detail::DiskRestoreTarget target;
+            target.text           = &destination;
+            target.text_pool      = &pool;
+            target.text_dst_pages = 1;
+            target.stream         = ctx.copy_stream;
+            if (cancel_promoted) { disk.test_arm_restore_job_barrier(); }
+            auto ticket = disk.restore_device(match->entry_id, target);
+            if (cancel_promoted) {
+                // With one reader the job is still queued behind the frozen idle
+                // payload; with multiple readers it may be dequeued but cannot yet
+                // assign a slot. Both cancellation routes must drop queue ownership.
                 cancel_restore_releasing_dequeued_job(disk);
-                disk.cancel_idle_spill();
+                disk.release_restore_ticket(ticket);
+                if (disk.test_disk_io_pins(match->entry_id) != 0) {
+                    return fail("cancelled promoted prefetch leaked its queued I/O pin");
+                }
+                disk.test_release_restore_job_barrier();
+                disk.test_release_payload_take_barrier();
+                disk.wait_idle_and_fsync();
+                ticket = disk.restore_device(match->entry_id, target);
             }
-        } cleanup{disk};
-        const std::vector<ninfer::TokenId> tokens(64, 13);
-        const auto ram_a = capture_tokens(ram, pool, source, ctx, tokens);
-        disk.note_ram_resident(ram_a, 0);
-        if (!disk.emergency_spill_ram(ram_a)) { return fail("promotion fixture spill failed"); }
-        const auto prompt = text_prompt(tokens);
-        const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
-        if (!match || !disk.claim(match->entry_id)) { return fail("promotion fixture claim failed"); }
-        const auto ram_b = capture_tokens(ram, pool, idle_source, ctx,
-                                          std::vector<ninfer::TokenId>(64, 47));
-        disk.note_ram_resident(ram_b, 0);
-        // Freeze the idle payload after dequeue. Its commit stays queued; the
-        // executor can enqueue prefetch while that payload is still in hand.
-        disk.test_arm_payload_take_barrier();
-        disk.request_idle_spill();
-        if (!wait_pred([&] { return disk.test_payload_take_entered(); },
-                       std::chrono::seconds(3))) {
-            return fail("promotion fixture idle spill never started");
-        }
-        disk.prefetch_window(match->entry_id, 1, 0);
-        q36::detail::DiskRestoreTarget target;
-        target.text = &destination;
-        target.text_pool = &pool;
-        target.text_dst_pages = 1;
-        target.stream = ctx.copy_stream;
-        if (cancel_promoted) { disk.test_arm_restore_job_barrier(); }
-        auto ticket = disk.restore_device(match->entry_id, target);
-        if (cancel_promoted) {
-            // With one reader the job is still queued behind the frozen idle
-            // payload; with multiple readers it may be dequeued but cannot yet
-            // assign a slot. Both cancellation routes must drop queue ownership.
-            cancel_restore_releasing_dequeued_job(disk);
-            disk.release_restore_ticket(ticket);
-            if (disk.test_disk_io_pins(match->entry_id) != 0) {
-                return fail("cancelled promoted prefetch leaked its queued I/O pin");
-            }
-            disk.test_release_restore_job_barrier();
             disk.test_release_payload_take_barrier();
-            disk.wait_idle_and_fsync();
-            ticket = disk.restore_device(match->entry_id, target);
-        }
-        disk.test_release_payload_take_barrier();
-        // Once idle payload finishes, demanded restore work must run before the
-        // queued idle commit. Neither path may wait for the other to empty first.
-        const bool progressed = wait_pred([&] {
-            disk.pump_restore(ctx.copy_stream);
-            return disk.restore_failed() || disk.copies_ready();
-        }, std::chrono::seconds(5));
-        if (!progressed || disk.restore_failed()) {
-            std::cerr << "prefetch promotion readers=" << readers
-                      << " progress=" << progressed << '\n';
-            cancel_restore_releasing_dequeued_job(disk);
+            // Once idle payload finishes, demanded restore work must run before the
+            // queued idle commit. Neither path may wait for the other to empty first.
+            const bool progressed = wait_pred(
+                [&] {
+                    disk.pump_restore(ctx.copy_stream);
+                    return disk.restore_failed() || disk.copies_ready();
+                },
+                std::chrono::seconds(5));
+            if (!progressed || disk.restore_failed()) {
+                std::cerr << "prefetch promotion readers=" << readers << " progress=" << progressed
+                          << '\n';
+                cancel_restore_releasing_dequeued_job(disk);
+                disk.release_restore_ticket(ticket);
+                disk.release(match->entry_id);
+                return fail("queued prefetch and idle commit starved an active restore");
+            }
+            disk.wait_copies(ticket);
             disk.release_restore_ticket(ticket);
-            disk.release(match->entry_id);
-            return fail("queued prefetch and idle commit starved an active restore");
+            if (expect_mapped_pages_equal(pool, source, destination, 1, ctx,
+                                          "prefetch promotion") != 0) {
+                return fail("prefetch promotion restored incorrect KV");
+            }
+            disk.consume(match->entry_id);
+            disk.wait_idle_and_fsync();
+            if (!disk.ram_is_durable(ram_b) || disk.test_disk_io_pins(match->entry_id) != 0 ||
+                ram.test_io_pins(ram_b) != 0) {
+                return fail("prefetch promotion lost idle spill progress or leaked pins");
+            }
         }
-        disk.wait_copies(ticket);
-        disk.release_restore_ticket(ticket);
-        if (expect_mapped_pages_equal(pool, source, destination, 1, ctx,
-                                     "prefetch promotion") != 0) {
-            return fail("prefetch promotion restored incorrect KV");
-        }
-        disk.consume(match->entry_id);
-        disk.wait_idle_and_fsync();
-        if (!disk.ram_is_durable(ram_b) || disk.test_disk_io_pins(match->entry_id) != 0 ||
-            ram.test_io_pins(ram_b) != 0) {
-            return fail("prefetch promotion lost idle spill progress or leaked pins");
-        }
-      }
     }
     std::cout << "queued prefetch promotion: 4 schedules passed\n";
     return 0;
@@ -14339,11 +16168,11 @@ int test_queued_prefetch_promotion_progresses_past_idle(ninfer::DeviceContext& c
 int test_restore_io_threads_roundtrip(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-roundtrip");
     constexpr std::uint32_t kPages = 8;
-    auto plan = plan_paged_cache(kPages * 2, kPages, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+    auto plan                      = plan_paged_cache(kPages * 2, kPages, 2,
+                                                      {{ninfer::DType::I8, 64, 2},
+                                                       {ninfer::DType::I8, 64, 2},
+                                                       {ninfer::DType::FP16, 1, 2},
+                                                       {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(64ULL << 20);
@@ -14352,7 +16181,7 @@ int test_restore_io_threads_roundtrip(ninfer::DeviceContext& ctx) {
     fill_logical_pages(pool, alloc, 21);
     auto cfg = reader_disk_config(dir.path, ram, pool, 64ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
-    std::vector<ninfer::TokenId> tokens(kPages * 64, 13);
+    std::vector<ninfer::TokenId> tokens(static_cast<std::size_t>(kPages) * 64, 13);
     const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
     disk.note_ram_resident(ram_id, 0);
     if (!disk.emergency_spill_ram(ram_id)) {
@@ -14435,7 +16264,7 @@ int test_restore_io_threads_roundtrip(ninfer::DeviceContext& ctx) {
     disk.release(match->entry_id);
     fill_logical_pages(pool, alloc, 77);
     ctx.synchronize_all();
-    std::vector<ninfer::TokenId> other(kPages * 64, 9);
+    std::vector<ninfer::TokenId> other(static_cast<std::size_t>(kPages) * 64, 9);
     const auto ram_b = capture_tokens(ram, pool, alloc, ctx, other);
     disk.note_ram_resident(ram_b, 0);
     if (!disk.emergency_spill_ram(ram_b)) {
@@ -14456,10 +16285,10 @@ int test_restore_io_threads_roundtrip(ninfer::DeviceContext& ctx) {
 int test_restore_io_threads_idle_extra_readers(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-idle");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -14527,8 +16356,8 @@ int test_restore_io_threads_idle_extra_readers(ninfer::DeviceContext& ctx) {
         alloc.release();
         return fail("readers-idle spill B failed");
     }
-    const auto match_b =
-        disk.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+    const auto match_b = disk.plan_match(text_prompt(tokens_b),
+                                         q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
     if (!match_b) {
         alloc.release();
         return fail("readers-idle match B failed");
@@ -14542,7 +16371,8 @@ int test_restore_io_threads_idle_extra_readers(ninfer::DeviceContext& ctx) {
     target.text = &dest;
     disk.restore_device(match_b->entry_id, target);
     try {
-        if (const int rc = wait_restore_bounded(disk, ctx, "readers-idle restore B hung"); rc != 0) {
+        if (const int rc = wait_restore_bounded(disk, ctx, "readers-idle restore B hung");
+            rc != 0) {
             disk.release(match_b->entry_id);
             dest.release();
             alloc.release();
@@ -14573,11 +16403,11 @@ int test_restore_io_threads_idle_extra_readers(ninfer::DeviceContext& ctx) {
 int test_restore_io_threads_pread_fail(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-pread");
     constexpr std::uint32_t kPages = 8;
-    auto plan = plan_paged_cache(kPages * 2, kPages, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+    auto plan                      = plan_paged_cache(kPages * 2, kPages, 2,
+                                                      {{ninfer::DType::I8, 64, 2},
+                                                       {ninfer::DType::I8, 64, 2},
+                                                       {ninfer::DType::FP16, 1, 2},
+                                                       {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(64ULL << 20);
@@ -14586,7 +16416,7 @@ int test_restore_io_threads_pread_fail(ninfer::DeviceContext& ctx) {
     fill_logical_pages(pool, alloc, 21);
     auto cfg = reader_disk_config(dir.path, ram, pool, 64ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
-    std::vector<ninfer::TokenId> tokens_a(kPages * 64, 13);
+    std::vector<ninfer::TokenId> tokens_a(static_cast<std::size_t>(kPages) * 64, 13);
     const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     disk.note_ram_resident(ram_a, 0);
     if (!disk.emergency_spill_ram(ram_a)) {
@@ -14594,17 +16424,17 @@ int test_restore_io_threads_pread_fail(ninfer::DeviceContext& ctx) {
         return fail("readers-pread spill A failed");
     }
     fill_logical_pages(pool, alloc, 33);
-    std::vector<ninfer::TokenId> tokens_b(kPages * 64, 7);
+    std::vector<ninfer::TokenId> tokens_b(static_cast<std::size_t>(kPages) * 64, 7);
     const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
     disk.note_ram_resident(ram_b, 0);
     if (!disk.emergency_spill_ram(ram_b)) {
         alloc.release();
         return fail("readers-pread spill B failed");
     }
-    const auto match_a =
-        disk.plan_match(text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
-    const auto match_b =
-        disk.plan_match(text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+    const auto match_a = disk.plan_match(text_prompt(tokens_a),
+                                         q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
+    const auto match_b = disk.plan_match(text_prompt(tokens_b),
+                                         q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
     if (!match_a || !match_b || match_a->entry_id == match_b->entry_id) {
         alloc.release();
         return fail("readers-pread did not persist two entries");
@@ -14629,7 +16459,8 @@ int test_restore_io_threads_pread_fail(ninfer::DeviceContext& ctx) {
     disk.restore_device(match_a->entry_id, target);
     bool threw = false;
     try {
-        if (const int rc = wait_restore_bounded(disk, ctx, "readers-pread A restore hung"); rc != 0) {
+        if (const int rc = wait_restore_bounded(disk, ctx, "readers-pread A restore hung");
+            rc != 0) {
             disk.release(match_a->entry_id);
             dest.release();
             alloc.release();
@@ -14645,7 +16476,8 @@ int test_restore_io_threads_pread_fail(ninfer::DeviceContext& ctx) {
     }
     disk.cancel_restore();
     disk.release(match_a->entry_id);
-    if (!disk.plan_match(text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)))) {
+    if (!disk.plan_match(text_prompt(tokens_a),
+                         q36::detail::prefix_hash_chain(text_prompt(tokens_a)))) {
         dest.release();
         alloc.release();
         return fail("readers-pread consumed A after pread fail");
@@ -14661,7 +16493,8 @@ int test_restore_io_threads_pread_fail(ninfer::DeviceContext& ctx) {
     target.text = &dest;
     disk.restore_device(match_b->entry_id, target);
     try {
-        if (const int rc = wait_restore_bounded(disk, ctx, "readers-pread B restore hung"); rc != 0) {
+        if (const int rc = wait_restore_bounded(disk, ctx, "readers-pread B restore hung");
+            rc != 0) {
             disk.release(match_b->entry_id);
             dest.release();
             alloc.release();
@@ -14692,11 +16525,11 @@ int test_restore_io_threads_pread_fail(ninfer::DeviceContext& ctx) {
 int test_restore_io_threads_cancel_does_not_poison_next(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-cancel");
     constexpr std::uint32_t kPages = 8;
-    auto plan = plan_paged_cache(kPages * 2, kPages, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+    auto plan                      = plan_paged_cache(kPages * 2, kPages, 2,
+                                                      {{ninfer::DType::I8, 64, 2},
+                                                       {ninfer::DType::I8, 64, 2},
+                                                       {ninfer::DType::FP16, 1, 2},
+                                                       {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(64ULL << 20);
@@ -14705,11 +16538,14 @@ int test_restore_io_threads_cancel_does_not_poison_next(ninfer::DeviceContext& c
     fill_logical_pages(pool, alloc, 21);
     auto cfg = reader_disk_config(dir.path, ram, pool, 64ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_restore_job_barrier(); }
     } barrier{disk};
-    std::vector<ninfer::TokenId> tokens(kPages * 64, 13);
+
+    std::vector<ninfer::TokenId> tokens(static_cast<std::size_t>(kPages) * 64, 13);
     const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
     disk.note_ram_resident(ram_id, 0);
     if (!disk.emergency_spill_ram(ram_id)) {
@@ -14751,7 +16587,8 @@ int test_restore_io_threads_cancel_does_not_poison_next(ninfer::DeviceContext& c
     disk.restore_device(match->entry_id, target);
     disk.test_release_restore_job_barrier();
     try {
-        if (const int rc = wait_restore_bounded(disk, ctx, "readers-cancel restore hung"); rc != 0) {
+        if (const int rc = wait_restore_bounded(disk, ctx, "readers-cancel restore hung");
+            rc != 0) {
             disk.release(match->entry_id);
             dest.release();
             alloc.release();
@@ -14789,11 +16626,11 @@ int test_restore_io_threads_cancel_does_not_poison_next(ninfer::DeviceContext& c
 int test_restore_io_threads_single_state_owner(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-state-owner");
     constexpr std::uint32_t kPages = 8;
-    auto plan = plan_paged_cache(kPages * 2, kPages, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+    auto plan                      = plan_paged_cache(kPages * 2, kPages, 2,
+                                                      {{ninfer::DType::I8, 64, 2},
+                                                       {ninfer::DType::I8, 64, 2},
+                                                       {ninfer::DType::FP16, 1, 2},
+                                                       {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(64ULL << 20);
@@ -14803,14 +16640,17 @@ int test_restore_io_threads_single_state_owner(ninfer::DeviceContext& ctx) {
     ninfer::DeviceBuffer hid(64);
     hid.fill(0xaa);
     ninfer::Tensor hidden(hid.p, ninfer::DType::U8, {64});
-    auto cfg = reader_disk_config(dir.path, ram, pool, 64ULL << 20, 4096);
+    auto cfg         = reader_disk_config(dir.path, ram, pool, 64ULL << 20, 4096);
     cfg.hidden_bytes = 64;
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_restore_state_barrier(); }
     } barrier{disk};
-    std::vector<ninfer::TokenId> tokens(kPages * 64, 13);
+
+    std::vector<ninfer::TokenId> tokens(static_cast<std::size_t>(kPages) * 64, 13);
     const auto ram_id = capture_tokens_hidden(ram, pool, alloc, ctx, tokens, hidden);
     disk.note_ram_resident(ram_id, 0);
     if (!disk.emergency_spill_ram(ram_id)) {
@@ -14899,10 +16739,10 @@ int test_restore_io_threads_single_state_owner(ninfer::DeviceContext& ctx) {
 int test_restore_io_threads_idle_waits_for_restore(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-idle-wait");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -14911,10 +16751,13 @@ int test_restore_io_threads_idle_waits_for_restore(ninfer::DeviceContext& ctx) {
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_page_read_barrier(); }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens_a(128, 4);
     const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     disk.note_ram_resident(ram_a, 0);
@@ -14927,7 +16770,7 @@ int test_restore_io_threads_idle_waits_for_restore(ninfer::DeviceContext& ctx) {
     const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
     disk.note_ram_resident(ram_b, 0);
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("readers-idle-wait match A failed");
@@ -14989,10 +16832,10 @@ int test_restore_io_threads_idle_waits_for_restore(ninfer::DeviceContext& ctx) {
 int test_claim_does_not_wait_other_ram_idle(ninfer::DeviceContext& ctx) {
     TmpDir dir("claim-duplex-idle");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15013,35 +16856,29 @@ int test_claim_does_not_wait_other_ram_idle(ninfer::DeviceContext& ctx) {
     const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
     disk.note_ram_resident(ram_b, 0);
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("claim-duplex-idle match A failed");
     }
     const auto drops_before = disk.snapshot().drops;
-    disk.test_set_payload_io_stall_ms(400);
+    // The other entry's idle pwrite stays held until the restore read has overlapped it.
+    UnlockedIoHold write(disk, q36::detail::DiskUnlockedIo::PayloadWrite);
     disk.request_idle_spill();
-    if (!wait_pred([&] { return disk.test_payload_io_entered(); }, std::chrono::seconds(2))) {
-        disk.test_set_payload_io_stall_ms(0);
+    if (!write.entered()) {
         alloc.release();
         return fail("claim-duplex-idle idle never entered payload I/O");
     }
-    const auto claim_start = std::chrono::steady_clock::now();
-    if (!disk.claim(match->entry_id, match->hash_f, match->execution_frontier)) {
-        disk.test_set_payload_io_stall_ms(0);
+    write.arm();
+    const bool claimed = disk.claim(match->entry_id, match->hash_f, match->execution_frontier);
+    if (!write.disarm()) {
+        if (claimed) { disk.release(match->entry_id); }
+        alloc.release();
+        return fail("claim-duplex-idle waited for other-ram idle persist");
+    }
+    if (!claimed) {
         alloc.release();
         return fail("claim-duplex-idle claim A failed");
-    }
-    const auto claim_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now() - claim_start)
-                              .count();
-    if (claim_ms > 200) {
-        disk.test_set_payload_io_stall_ms(0);
-        disk.release(match->entry_id);
-        alloc.release();
-        std::cerr << "claim-duplex-idle claim waited " << claim_ms
-                  << "ms for other-ram idle persist\n";
-        return fail("claim-duplex-idle waited for other-ram idle persist");
     }
     auto dest = pool.reserve(4);
     dest.materialize_pages(2, ctx.stream);
@@ -15050,16 +16887,24 @@ int test_claim_does_not_wait_other_ram_idle(ninfer::DeviceContext& ctx) {
     target.text_pool      = &pool;
     target.text_dst_pages = 2;
     target.stream         = ctx.copy_stream;
+    write.arm();
     disk.restore_device(match->entry_id, target);
-    if (!wait_pred([&] { return disk.test_page_read_count() != 0; }, std::chrono::seconds(2))) {
-        disk.test_set_payload_io_stall_ms(0);
+    if (!write.disarm()) {
+        disk.cancel_restore();
+        disk.release(match->entry_id);
+        dest.release();
+        alloc.release();
+        return fail("claim-duplex-idle restore setup waited for other-ram idle persist");
+    }
+    if (!wait_pred([&] { return disk.test_page_read_count() != 0; }, std::chrono::seconds(10))) {
+        write.release();
         disk.cancel_restore();
         disk.release(match->entry_id);
         dest.release();
         alloc.release();
         return fail("claim-duplex-idle RestoreRead did not overlap in-hand idle pwrite");
     }
-    disk.test_set_payload_io_stall_ms(0);
+    write.release();
     if (disk.snapshot().drops != drops_before) {
         disk.cancel_restore();
         disk.release(match->entry_id);
@@ -15099,21 +16944,21 @@ int test_prefetch_before_retained_capture_pressure(ninfer::DeviceContext& ctx) {
     enum class Boundary { Dequeued, Assigned, Reading, Filled };
     std::uint32_t cases = 0;
     for (const std::uint32_t readers : {1U, 2U, 8U, 16U}) {
-        for (const auto boundary : {Boundary::Dequeued, Boundary::Assigned,
-                                    Boundary::Reading, Boundary::Filled}) {
+        for (const auto boundary :
+             {Boundary::Dequeued, Boundary::Assigned, Boundary::Reading, Boundary::Filled}) {
             TmpDir dir("prefetch-retained-pressure");
             constexpr std::uint32_t pages = 2;
-            auto plan = plan_paged_cache(8, pages, 2,
-                                        {{ninfer::DType::I8, 64, 2},
-                                         {ninfer::DType::I8, 64, 2},
-                                         {ninfer::DType::FP16, 1, 2},
-                                         {ninfer::DType::FP16, 1, 2}});
+            auto plan                     = plan_paged_cache(8, pages, 2,
+                                                             {{ninfer::DType::I8, 64, 2},
+                                                              {ninfer::DType::I8, 64, 2},
+                                                              {ninfer::DType::FP16, 1, 2},
+                                                              {ninfer::DType::FP16, 1, 2}});
             ninfer::DeviceArena arena(plan.bytes);
             ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
-            auto source = pool.reserve(pages);
-            auto victim_source = pool.reserve(pages);
+            auto source          = pool.reserve(pages);
+            auto victim_source   = pool.reserve(pages);
             auto retained_source = pool.reserve(pages);
-            auto dest = pool.reserve(pages);
+            auto dest            = pool.reserve(pages);
             source.materialize_pages(pages, ctx.stream);
             victim_source.materialize_pages(pages, ctx.stream);
             retained_source.materialize_pages(pages, ctx.stream);
@@ -15121,13 +16966,14 @@ int test_prefetch_before_retained_capture_pressure(ninfer::DeviceContext& ctx) {
             fill_logical_pages(pool, source, 19);
             fill_logical_pages(pool, victim_source, 53);
             fill_logical_pages(pool, retained_source, 97);
-            const std::vector<ninfer::TokenId> tokens_a(pages * 64, 7);
-            const std::vector<ninfer::TokenId> tokens_b(pages * 64, 31);
-            auto retained = text_prompt(std::vector<ninfer::TokenId>(pages * 64, 59));
+            const std::vector<ninfer::TokenId> tokens_a(static_cast<std::size_t>(pages) * 64, 7);
+            const std::vector<ninfer::TokenId> tokens_b(static_cast<std::size_t>(pages) * 64, 31);
+            auto retained =
+                text_prompt(std::vector<ninfer::TokenId>(static_cast<std::size_t>(pages) * 64, 59));
             retained.token_ids.push_back(0);
             q36::detail::ResidentPrefixIdentity identity;
-            auto capture_source = make_source(retained, identity, retained_source, pool,
-                                               ctx.copy_stream, pages * 64);
+            auto capture_source =
+                make_source(retained, identity, retained_source, pool, ctx.copy_stream, pages * 64);
             std::size_t one_entry_bytes = 0;
             {
                 q36::detail::KVRamCache probe(32ULL << 20);
@@ -15135,7 +16981,7 @@ int test_prefetch_before_retained_capture_pressure(ninfer::DeviceContext& ctx) {
                 one_entry_bytes = probe.snapshot().used_bytes;
             }
             q36::detail::KVRamCache ram(one_entry_bytes);
-            auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
+            auto cfg               = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
             cfg.restore_io_threads = readers;
             q36::detail::KVDiskCache disk(std::move(cfg));
             const auto release_barriers = [&] {
@@ -15143,8 +16989,10 @@ int test_prefetch_before_retained_capture_pressure(ninfer::DeviceContext& ctx) {
                 disk.test_release_slot_assign_barrier();
                 disk.test_release_page_read_barrier();
             };
+
             struct Cleanup {
                 q36::detail::KVDiskCache& disk;
+
                 ~Cleanup() {
                     disk.test_release_restore_job_barrier();
                     disk.test_release_slot_assign_barrier();
@@ -15152,6 +17000,7 @@ int test_prefetch_before_retained_capture_pressure(ninfer::DeviceContext& ctx) {
                     disk.cancel_restore();
                 }
             } cleanup{disk};
+
             const auto require = [](bool ok, const char* why) {
                 if (!ok) { throw std::runtime_error(why); }
             };
@@ -15164,29 +17013,41 @@ int test_prefetch_before_retained_capture_pressure(ninfer::DeviceContext& ctx) {
                 const auto ram_b = capture_tokens(ram, pool, victim_source, ctx, tokens_b);
                 disk.note_ram_resident(ram_b, 0);
                 const auto prompt = text_prompt(tokens_a);
-                const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
-                require(match && disk.claim(match->entry_id), "pressure claim disk source");
+                const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+                require(match.has_value(), "pressure plan disk source");
+                const std::uint64_t entry_id = match.value().entry_id;
+                require(disk.claim(entry_id), "pressure claim disk source");
                 if (boundary == Boundary::Dequeued) { disk.test_arm_restore_job_barrier(); }
                 if (boundary == Boundary::Assigned) { disk.test_arm_slot_assign_barrier(); }
                 if (boundary == Boundary::Reading) { disk.test_arm_page_read_barrier(); }
-                disk.prefetch_window(match->entry_id, pages, 0);
-                require(wait_pred([&] {
-                    if (boundary == Boundary::Dequeued) { return disk.test_restore_job_dequeued(); }
-                    if (boundary == Boundary::Assigned) { return disk.test_slot_assign_entered(); }
-                    if (boundary == Boundary::Reading) { return disk.test_page_read_entered(); }
-                    return disk.test_window_filled_for(match->entry_id) &&
-                           disk.test_disk_io_pins(match->entry_id) == 0;
-                }, std::chrono::seconds(3)), "pressure prefetch boundary");
-                require(ram.capture(capture_source).status == q36::detail::RamCaptureStatus::NeedsEviction,
+                disk.prefetch_window(entry_id, pages, 0);
+                require(wait_pred(
+                            [&] {
+                                if (boundary == Boundary::Dequeued) {
+                                    return disk.test_restore_job_dequeued();
+                                }
+                                if (boundary == Boundary::Assigned) {
+                                    return disk.test_slot_assign_entered();
+                                }
+                                if (boundary == Boundary::Reading) {
+                                    return disk.test_page_read_entered();
+                                }
+                                return disk.test_window_filled_for(entry_id) &&
+                                       disk.test_disk_io_pins(entry_id) == 0;
+                            },
+                            std::chrono::seconds(3)),
+                        "pressure prefetch boundary");
+                require(ram.capture(capture_source).status ==
+                            q36::detail::RamCaptureStatus::NeedsEviction,
                         "retained capture must encounter RAM pressure");
                 disk.cancel_idle_spill();
-                require(ram.peek_oldest_unpinned() == ram_b, "pressure selects RAM victim");
+                require(oldest_unpinned(ram) == ram_b, "pressure selects RAM victim");
                 std::atomic<bool> saw_emergency{boundary == Boundary::Filled};
                 std::jthread controller;
                 if (boundary != Boundary::Filled) {
                     controller = std::jthread([&] {
                         saw_emergency.store(wait_pred([&] { return disk.test_emergency_queued(); },
-                                                       std::chrono::seconds(3)));
+                                                      std::chrono::seconds(3)));
                         release_barriers();
                     });
                 }
@@ -15194,41 +17055,42 @@ int test_prefetch_before_retained_capture_pressure(ninfer::DeviceContext& ctx) {
                 if (controller.joinable()) { controller.join(); }
                 require(saw_emergency.load(), "pressure emergency did not queue behind reader");
                 require(spilled && disk.ram_is_durable(ram_b), "pressure emergency spill failed");
-                disk.begin_ram_idle_exclusion(ram_b);
                 const bool evicted = ram.evict_one_unpinned(ram_b);
                 if (evicted) { disk.forget_ram_resident(ram_b); }
-                disk.end_ram_idle_exclusion(ram_b);
                 require(evicted, "pressure victim remained pinned");
                 const auto captured = ram.capture(capture_source);
                 require(captured.status == q36::detail::RamCaptureStatus::Captured,
                         "retained capture did not recover after pressure");
                 disk.note_ram_resident(captured.entry_id, 0);
                 q36::detail::DiskRestoreTarget target;
-                target.text = &dest;
-                target.text_pool = &pool;
+                target.text           = &dest;
+                target.text_pool      = &pool;
                 target.text_dst_pages = pages;
-                target.stream = ctx.copy_stream;
-                const auto ticket = disk.restore_device(match->entry_id, target);
-                require(wait_pred([&] {
-                    disk.pump_restore(ctx.copy_stream);
-                    return disk.restore_failed() || disk.copies_ready();
-                }, std::chrono::seconds(8)), "pressure disk restore stalled");
+                target.stream         = ctx.copy_stream;
+                const auto ticket     = disk.restore_device(entry_id, target);
+                require(wait_pred(
+                            [&] {
+                                disk.pump_restore(ctx.copy_stream);
+                                return disk.restore_failed() || disk.copies_ready();
+                            },
+                            std::chrono::seconds(8)),
+                        "pressure disk restore stalled");
                 require(!disk.restore_failed(), "pressure disk source invalidated");
                 disk.wait_copies(ticket);
                 disk.release_restore_ticket(ticket);
-                require(disk.test_retired_copy_events() == 0, "pressure restore leaked event ticket");
+                require(disk.test_retired_copy_events() == 0,
+                        "pressure restore leaked event ticket");
                 require(expect_mapped_pages_equal(pool, source, dest, pages, ctx,
                                                   "prefetch retained pressure") == 0,
                         "pressure restore changed source KV");
-                require(disk.test_disk_io_pins(match->entry_id) == 0,
-                        "pressure restore leaked disk pin");
-                disk.release(match->entry_id);
+                require(disk.test_disk_io_pins(entry_id) == 0, "pressure restore leaked disk pin");
+                disk.release(entry_id);
                 ram.wait_pending_copies();
                 ++cases;
             } catch (const std::exception& error) {
                 std::cerr << "prefetch retained pressure readers=" << readers
-                          << " boundary=" << static_cast<int>(boundary) << ": "
-                          << error.what() << '\n';
+                          << " boundary=" << static_cast<int>(boundary) << ": " << error.what()
+                          << '\n';
                 return fail("prefetch before retained capture pressure");
             }
         }
@@ -15240,10 +17102,10 @@ int test_prefetch_before_retained_capture_pressure(ninfer::DeviceContext& ctx) {
 int test_restore_io_threads_emergency_waits_for_prefetch(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-emerg-wait");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15252,10 +17114,13 @@ int test_restore_io_threads_emergency_waits_for_prefetch(ninfer::DeviceContext& 
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_page_read_barrier(); }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens_a(128, 4);
     const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     disk.note_ram_resident(ram_a, 0);
@@ -15268,7 +17133,7 @@ int test_restore_io_threads_emergency_waits_for_prefetch(ninfer::DeviceContext& 
     const auto ram_c = capture_tokens(ram, pool, alloc, ctx, tokens_c);
     disk.note_ram_resident(ram_c, 0);
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("readers-emerg-wait match A failed");
@@ -15296,18 +17161,20 @@ int test_restore_io_threads_emergency_waits_for_prefetch(ninfer::DeviceContext& 
     if (overlapped) {
         return fail("readers-emerg-wait emergency pwrite overlapped prefetch pread");
     }
-    if (!spilled.load()) { return fail("readers-emerg-wait emergency spill failed after prefetch"); }
+    if (!spilled.load()) {
+        return fail("readers-emerg-wait emergency spill failed after prefetch");
+    }
     return 0;
 }
 
 int test_restore_io_threads_prefetch_at_most_two_pages(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-prefetch-2");
     constexpr std::uint32_t kPages = 8;
-    auto plan = plan_paged_cache(kPages * 2, kPages, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+    auto plan                      = plan_paged_cache(kPages * 2, kPages, 2,
+                                                      {{ninfer::DType::I8, 64, 2},
+                                                       {ninfer::DType::I8, 64, 2},
+                                                       {ninfer::DType::FP16, 1, 2},
+                                                       {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(64ULL << 20);
@@ -15316,7 +17183,7 @@ int test_restore_io_threads_prefetch_at_most_two_pages(ninfer::DeviceContext& ct
     fill_logical_pages(pool, alloc, 21);
     auto cfg = reader_disk_config(dir.path, ram, pool, 64ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
-    std::vector<ninfer::TokenId> tokens(kPages * 64, 13);
+    std::vector<ninfer::TokenId> tokens(static_cast<std::size_t>(kPages) * 64, 13);
     const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
     disk.note_ram_resident(ram_id, 0);
     if (!disk.emergency_spill_ram(ram_id)) {
@@ -15353,10 +17220,10 @@ int test_restore_io_threads_prefetch_at_most_two_pages(ninfer::DeviceContext& ct
 int test_restore_io_threads_restore_does_not_double_fill_prefetch(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-no-dup");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15365,10 +17232,13 @@ int test_restore_io_threads_restore_does_not_double_fill_prefetch(ninfer::Device
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_restore_job_barrier(); }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens(128, 4);
     const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
     disk.note_ram_resident(ram_id, 0);
@@ -15405,7 +17275,8 @@ int test_restore_io_threads_restore_does_not_double_fill_prefetch(ninfer::Device
     disk.restore_device(match->entry_id, target);
     disk.test_release_restore_job_barrier();
     try {
-        if (const int rc = wait_restore_bounded(disk, ctx, "readers-no-dup restore hung"); rc != 0) {
+        if (const int rc = wait_restore_bounded(disk, ctx, "readers-no-dup restore hung");
+            rc != 0) {
             disk.release(match->entry_id);
             dest.release();
             alloc.release();
@@ -15434,10 +17305,10 @@ int test_restore_io_threads_restore_does_not_double_fill_prefetch(ninfer::Device
 int test_restore_io_threads_cancel_drains_state(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-cancel-state");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15447,7 +17318,7 @@ int test_restore_io_threads_cancel_drains_state(ninfer::DeviceContext& ctx) {
     ninfer::DeviceBuffer hid(64);
     hid.fill(0xaa);
     ninfer::Tensor hidden(hid.p, ninfer::DType::U8, {64});
-    auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
+    auto cfg         = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     cfg.hidden_bytes = 64;
     q36::detail::KVDiskCache disk(std::move(cfg));
     std::vector<ninfer::TokenId> tokens(128, 4);
@@ -15480,7 +17351,7 @@ int test_restore_io_threads_cancel_drains_state(ninfer::DeviceContext& ctx) {
     disk.test_set_state_decode_stall_ms(150);
     disk.restore_device(match->entry_id, target);
     if (!wait_pred([&] { return disk.test_restore_state_inflight() >= 1; },
-                    std::chrono::seconds(2))) {
+                   std::chrono::seconds(2))) {
         disk.cancel_restore();
         disk.release(match->entry_id);
         dest.release();
@@ -15503,10 +17374,10 @@ int test_restore_io_threads_cancel_drains_state(ninfer::DeviceContext& ctx) {
 int test_restore_io_threads_emergency_waits_for_in_hand_reader(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-emerg-claim");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15515,10 +17386,13 @@ int test_restore_io_threads_emergency_waits_for_in_hand_reader(ninfer::DeviceCon
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_restore_job_barrier(); }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens_a(128, 4);
     const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     disk.note_ram_resident(ram_a, 0);
@@ -15531,7 +17405,7 @@ int test_restore_io_threads_emergency_waits_for_in_hand_reader(ninfer::DeviceCon
     const auto ram_c = capture_tokens(ram, pool, alloc, ctx, tokens_c);
     disk.note_ram_resident(ram_c, 0);
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("readers-emerg-claim match A failed");
@@ -15568,10 +17442,10 @@ int test_restore_io_threads_emergency_waits_for_in_hand_reader(ninfer::DeviceCon
 int test_restore_io_threads_readers_sleep_while_emergency(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-emerg-sleep");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15592,7 +17466,7 @@ int test_restore_io_threads_readers_sleep_while_emergency(ninfer::DeviceContext&
     const auto ram_c = capture_tokens(ram, pool, alloc, ctx, tokens_c);
     disk.note_ram_resident(ram_c, 0);
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("readers-emerg-sleep match A failed");
@@ -15601,11 +17475,12 @@ int test_restore_io_threads_readers_sleep_while_emergency(ninfer::DeviceContext&
         alloc.release();
         return fail("readers-emerg-sleep claim A failed");
     }
-    disk.test_set_payload_io_stall_ms(300);
+    // The emergency pwrite stays in hand until the parked prefetch has been observed.
+    UnlockedIoHold write(disk, q36::detail::DiskUnlockedIo::PayloadWrite);
     std::atomic<bool> spilled{false};
     std::thread emergency([&] { spilled.store(disk.emergency_spill_ram(ram_c)); });
-    if (!wait_pred([&] { return disk.test_payload_io_entered(); }, std::chrono::seconds(2))) {
-        disk.test_set_payload_io_stall_ms(0);
+    if (!write.entered()) {
+        write.release();
         if (emergency.joinable()) { emergency.join(); }
         disk.release(match->entry_id);
         alloc.release();
@@ -15615,14 +17490,12 @@ int test_restore_io_threads_readers_sleep_while_emergency(ninfer::DeviceContext&
     disk.prefetch_window(match->entry_id, 2, 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     const auto spins = disk.test_restore_loop_idle_spins();
-    const int reads   = disk.test_page_read_count();
-    disk.test_set_payload_io_stall_ms(0);
+    const int reads  = disk.test_page_read_count();
+    write.release();
     if (emergency.joinable()) { emergency.join(); }
     disk.release(match->entry_id);
     alloc.release();
-    if (reads != 0) {
-        return fail("readers-emerg-sleep prefetch pread ran during emergency");
-    }
+    if (reads != 0) { return fail("readers-emerg-sleep prefetch pread ran during emergency"); }
     if (spins != 0) {
         std::cerr << "readers-emerg-sleep restore_loop idle spins=" << spins << '\n';
         return fail("readers-emerg-sleep restore workers spun on parked prefetch");
@@ -15634,10 +17507,10 @@ int test_restore_io_threads_readers_sleep_while_emergency(ninfer::DeviceContext&
 int test_restore_io_threads_restore_waits_for_in_hand_emergency(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-restore-emerg");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15658,7 +17531,7 @@ int test_restore_io_threads_restore_waits_for_in_hand_emergency(ninfer::DeviceCo
     const auto ram_c = capture_tokens(ram, pool, alloc, ctx, tokens_c);
     disk.note_ram_resident(ram_c, 0);
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("readers-restore-emerg match A failed");
@@ -15674,22 +17547,32 @@ int test_restore_io_threads_restore_waits_for_in_hand_emergency(ninfer::DeviceCo
     target.text_pool      = &pool;
     target.text_dst_pages = 2;
     target.stream         = ctx.copy_stream;
-    disk.test_set_payload_io_stall_ms(400);
+    // The emergency pwrite stays in hand until the restore has had time to (wrongly) read.
+    UnlockedIoHold write(disk, q36::detail::DiskUnlockedIo::PayloadWrite);
     std::atomic<bool> spilled{false};
     std::thread emergency([&] { spilled.store(disk.emergency_spill_ram(ram_c)); });
-    if (!wait_pred([&] { return disk.test_payload_io_entered(); }, std::chrono::seconds(2))) {
-        disk.test_set_payload_io_stall_ms(0);
+    if (!write.entered()) {
+        write.release();
         if (emergency.joinable()) { emergency.join(); }
         disk.release(match->entry_id);
         dest.release();
         alloc.release();
         return fail("readers-restore-emerg emergency never entered payload I/O");
     }
+    write.arm();
     disk.restore_device(match->entry_id, target);
+    const bool setup_returned = write.disarm();
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     const bool overlapped = disk.test_page_read_count() != 0;
-    disk.test_set_payload_io_stall_ms(0);
+    write.release();
     if (emergency.joinable()) { emergency.join(); }
+    if (!setup_returned) {
+        disk.cancel_restore();
+        disk.release(match->entry_id);
+        dest.release();
+        alloc.release();
+        return fail("readers-restore-emerg restore setup blocked on the in-hand emergency pwrite");
+    }
     if (overlapped) {
         disk.cancel_restore();
         disk.release(match->entry_id);
@@ -15724,10 +17607,10 @@ int test_restore_io_threads_restore_waits_for_in_hand_emergency(ninfer::DeviceCo
 int test_restore_io_threads_prefetch_waits_for_in_hand_idle(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-prefetch-idle");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15748,7 +17631,7 @@ int test_restore_io_threads_prefetch_waits_for_in_hand_idle(ninfer::DeviceContex
     const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
     disk.note_ram_resident(ram_b, 0);
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("readers-prefetch-idle match A failed");
@@ -15757,10 +17640,11 @@ int test_restore_io_threads_prefetch_waits_for_in_hand_idle(ninfer::DeviceContex
         alloc.release();
         return fail("readers-prefetch-idle claim A failed");
     }
-    disk.test_set_payload_io_stall_ms(400);
+    // The idle pwrite stays in hand until the prefetch has had time to (wrongly) read.
+    UnlockedIoHold write(disk, q36::detail::DiskUnlockedIo::PayloadWrite);
     disk.request_idle_spill();
-    if (!wait_pred([&] { return disk.test_payload_io_entered(); }, std::chrono::seconds(2))) {
-        disk.test_set_payload_io_stall_ms(0);
+    if (!write.entered()) {
+        write.release();
         disk.release(match->entry_id);
         alloc.release();
         return fail("readers-prefetch-idle idle never entered payload I/O");
@@ -15768,7 +17652,7 @@ int test_restore_io_threads_prefetch_waits_for_in_hand_idle(ninfer::DeviceContex
     disk.prefetch_window(match->entry_id, 2, 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     const bool overlapped = disk.test_page_read_count() != 0;
-    disk.test_set_payload_io_stall_ms(0);
+    write.release();
     disk.release(match->entry_id);
     alloc.release();
     if (overlapped) {
@@ -15780,10 +17664,10 @@ int test_restore_io_threads_prefetch_waits_for_in_hand_idle(ninfer::DeviceContex
 int test_restore_io_threads_wait_idle_waits_for_in_hand_reader(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-wait-idle-claim");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15792,10 +17676,13 @@ int test_restore_io_threads_wait_idle_waits_for_in_hand_reader(ninfer::DeviceCon
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_restore_job_barrier(); }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens_a(128, 4);
     const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     disk.note_ram_resident(ram_a, 0);
@@ -15804,7 +17691,7 @@ int test_restore_io_threads_wait_idle_waits_for_in_hand_reader(ninfer::DeviceCon
         return fail("readers-wait-idle-claim spill A failed");
     }
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("readers-wait-idle-claim match A failed");
@@ -15840,10 +17727,10 @@ int test_restore_io_threads_wait_idle_waits_for_in_hand_reader(ninfer::DeviceCon
 int test_restore_io_threads_restore_waits_for_taken_emergency(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-restore-taken");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15852,10 +17739,13 @@ int test_restore_io_threads_restore_waits_for_taken_emergency(ninfer::DeviceCont
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_payload_take_barrier(); }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens_a(128, 4);
     const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     disk.note_ram_resident(ram_a, 0);
@@ -15868,7 +17758,7 @@ int test_restore_io_threads_restore_waits_for_taken_emergency(ninfer::DeviceCont
     const auto ram_c = capture_tokens(ram, pool, alloc, ctx, tokens_c);
     disk.note_ram_resident(ram_c, 0);
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("readers-restore-taken match A failed");
@@ -15934,10 +17824,10 @@ int test_restore_io_threads_restore_waits_for_taken_emergency(ninfer::DeviceCont
 int test_restore_io_threads_prefetch_does_not_cancel_in_hand_idle(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-prefetch-nocancel");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -15946,13 +17836,16 @@ int test_restore_io_threads_prefetch_does_not_cancel_in_hand_idle(ninfer::Device
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() {
             disk.test_release_payload_take_barrier();
             disk.test_release_restore_job_barrier();
         }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens_a(128, 4);
     const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     disk.note_ram_resident(ram_a, 0);
@@ -15965,7 +17858,7 @@ int test_restore_io_threads_prefetch_does_not_cancel_in_hand_idle(ninfer::Device
     const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
     disk.note_ram_resident(ram_b, 0);
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("readers-prefetch-nocancel match A failed");
@@ -15985,7 +17878,8 @@ int test_restore_io_threads_prefetch_does_not_cancel_in_hand_idle(ninfer::Device
         return fail("readers-prefetch-nocancel idle was not taken");
     }
     disk.prefetch_window(match->entry_id, 2, 0);
-    (void)wait_pred([&] { return disk.test_restore_job_dequeued(); }, std::chrono::milliseconds(200));
+    (void)wait_pred([&] { return disk.test_restore_job_dequeued(); },
+                    std::chrono::milliseconds(200));
     disk.test_release_payload_take_barrier();
     disk.test_release_restore_job_barrier();
     std::atomic<bool> idle_done{false};
@@ -16003,19 +17897,17 @@ int test_restore_io_threads_prefetch_does_not_cancel_in_hand_idle(ninfer::Device
     const bool durable = disk.ram_is_durable(ram_b);
     disk.release(match->entry_id);
     alloc.release();
-    if (!durable) {
-        return fail("readers-prefetch-nocancel prefetch cancelled in-hand idle");
-    }
+    if (!durable) { return fail("readers-prefetch-nocancel prefetch cancelled in-hand idle"); }
     return 0;
 }
 
 int test_restore_io_threads_already_does_not_treat_unfilled_as_page0(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-already-00");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -16024,10 +17916,13 @@ int test_restore_io_threads_already_does_not_treat_unfilled_as_page0(ninfer::Dev
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_slot_assign_barrier(); }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens(128, 4);
     const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
     disk.note_ram_resident(ram_id, 0);
@@ -16075,19 +17970,17 @@ int test_restore_io_threads_already_does_not_treat_unfilled_as_page0(ninfer::Dev
     disk.release(match->entry_id);
     dest.release();
     alloc.release();
-    if (!covering) {
-        return fail("readers-already-00 skipped RestoreRead for main page 0");
-    }
+    if (!covering) { return fail("readers-already-00 skipped RestoreRead for main page 0"); }
     return 0;
 }
 
 int test_restore_io_threads_payload_throw_does_not_leak_inflight(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-payload-throw");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -16096,10 +17989,13 @@ int test_restore_io_threads_payload_throw_does_not_leak_inflight(ninfer::DeviceC
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_payload_take_barrier(); }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens_a(128, 4);
     const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     disk.note_ram_resident(ram_a, 0);
@@ -16146,10 +18042,10 @@ int test_restore_io_threads_payload_throw_does_not_leak_inflight(ninfer::DeviceC
 int test_restore_io_threads_idle_beats_queued_prefetch(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-idle-gt-prefetch");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -16158,10 +18054,13 @@ int test_restore_io_threads_idle_beats_queued_prefetch(ninfer::DeviceContext& ct
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_payload_take_barrier(); }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens_a(128, 4);
     const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     disk.note_ram_resident(ram_a, 0);
@@ -16174,7 +18073,7 @@ int test_restore_io_threads_idle_beats_queued_prefetch(ninfer::DeviceContext& ct
     const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
     disk.note_ram_resident(ram_b, 0);
     const auto prompt = text_prompt(tokens_a);
-    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
         alloc.release();
         return fail("readers-idle-gt-prefetch match A failed");
@@ -16207,10 +18106,10 @@ int test_restore_io_threads_idle_beats_queued_prefetch(ninfer::DeviceContext& ct
 int test_restore_io_threads_emergency_waits_for_filled_window(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-filled-window");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(64ULL << 20);
@@ -16226,14 +18125,14 @@ int test_restore_io_threads_emergency_waits_for_filled_window(ninfer::DeviceCont
         alloc.release();
         return fail("readers-filled-window parent spill failed");
     }
-    const auto match_p = disk.plan_match(text_prompt(parent_tokens),
-                                           q36::detail::prefix_hash_chain(text_prompt(parent_tokens)));
+    const auto match_p = disk.plan_match(
+        text_prompt(parent_tokens), q36::detail::prefix_hash_chain(text_prompt(parent_tokens)));
     if (!match_p) {
         alloc.release();
         return fail("readers-filled-window parent match failed");
     }
     const std::uint64_t entry_id = match_p->entry_id;
-    auto dest = pool.reserve(2);
+    auto dest                    = pool.reserve(2);
     dest.materialize_pages(1, ctx.stream);
     q36::detail::DiskRestoreTarget target;
     target.text           = &dest;
@@ -16241,7 +18140,8 @@ int test_restore_io_threads_emergency_waits_for_filled_window(ninfer::DeviceCont
     target.text_dst_pages = 1;
     target.stream         = ctx.copy_stream;
     disk.restore_device(entry_id, target);
-    if (!wait_pred([&] { return disk.test_window_filled_for(entry_id); }, std::chrono::seconds(2))) {
+    if (!wait_pred([&] { return disk.test_window_filled_for(entry_id); },
+                   std::chrono::seconds(2))) {
         disk.cancel_restore();
         dest.release();
         alloc.release();
@@ -16271,10 +18171,10 @@ int test_restore_io_threads_emergency_waits_for_filled_window(ninfer::DeviceCont
 int test_restore_io_threads_destructor_joins_queued_emergency(ninfer::DeviceContext& ctx) {
     TmpDir dir("readers-dtor-join");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(64ULL << 20);
@@ -16290,14 +18190,14 @@ int test_restore_io_threads_destructor_joins_queued_emergency(ninfer::DeviceCont
         alloc.release();
         return fail("readers-dtor-join parent spill failed");
     }
-    const auto match_p = disk.plan_match(text_prompt(parent_tokens),
-                                           q36::detail::prefix_hash_chain(text_prompt(parent_tokens)));
+    const auto match_p = disk.plan_match(
+        text_prompt(parent_tokens), q36::detail::prefix_hash_chain(text_prompt(parent_tokens)));
     if (!match_p) {
         alloc.release();
         return fail("readers-dtor-join parent match failed");
     }
     const std::uint64_t entry_id = match_p->entry_id;
-    auto dest = pool.reserve(2);
+    auto dest                    = pool.reserve(2);
     dest.materialize_pages(1, ctx.stream);
     q36::detail::DiskRestoreTarget target;
     target.text           = &dest;
@@ -16305,7 +18205,8 @@ int test_restore_io_threads_destructor_joins_queued_emergency(ninfer::DeviceCont
     target.text_dst_pages = 1;
     target.stream         = ctx.copy_stream;
     disk.restore_device(entry_id, target);
-    if (!wait_pred([&] { return disk.test_window_filled_for(entry_id); }, std::chrono::seconds(2))) {
+    if (!wait_pred([&] { return disk.test_window_filled_for(entry_id); },
+                   std::chrono::seconds(2))) {
         disk.cancel_restore();
         dest.release();
         alloc.release();
@@ -16348,10 +18249,10 @@ int test_restore_io_threads_destructor_joins_queued_emergency(ninfer::DeviceCont
 int test_emergency_spill_stopping_waits_for_in_hand_commit(ninfer::DeviceContext& ctx) {
     TmpDir dir("spill-stop-commit");
     auto plan = plan_paged_cache(8, 4, 2,
-                                  {{ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::I8, 64, 2},
-                                   {ninfer::DType::FP16, 1, 2},
-                                   {ninfer::DType::FP16, 1, 2}});
+                                 {{ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::I8, 64, 2},
+                                  {ninfer::DType::FP16, 1, 2},
+                                  {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
     q36::detail::KVRamCache ram(32ULL << 20);
@@ -16360,10 +18261,13 @@ int test_emergency_spill_stopping_waits_for_in_hand_commit(ninfer::DeviceContext
     fill_logical_pages(pool, alloc, 5);
     auto cfg = reader_disk_config(dir.path, ram, pool, 32ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
+
     struct BarrierGuard {
         q36::detail::KVDiskCache& disk;
+
         ~BarrierGuard() { disk.test_release_payload_take_barrier(); }
     } barrier{disk};
+
     std::vector<ninfer::TokenId> tokens(128, 4);
     const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
     disk.note_ram_resident(ram_id, 0);
@@ -16383,26 +18287,23 @@ int test_emergency_spill_stopping_waits_for_in_hand_commit(ninfer::DeviceContext
     disk.test_set_stopping();
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     const bool returned_early = returned.load();
-    const bool spilled          = ok.load();
+    const bool spilled        = ok.load();
     disk.test_release_payload_take_barrier();
     disk.test_stop_io_threads();
     if (spill.joinable()) { spill.join(); }
     const bool durable = disk.ram_is_durable(ram_id);
     alloc.release();
     if (returned_early && !spilled) {
-        return fail("spill-stop-commit emergency_spill_ram returned false while commit was in-hand");
+        return fail(
+            "spill-stop-commit emergency_spill_ram returned false while commit was in-hand");
     }
-    if (!ok.load()) {
-        return fail("spill-stop-commit emergency spill failed after drain");
-    }
-    if (!durable) {
-        return fail("spill-stop-commit drain did not mark RAM durable");
-    }
+    if (!ok.load()) { return fail("spill-stop-commit emergency spill failed after drain"); }
+    if (!durable) { return fail("spill-stop-commit drain did not mark RAM durable"); }
     return 0;
 }
 
 int test_publication_allocation_preserves_generation(ninfer::DeviceContext& ctx,
-                                                       ninfer::PagedKVPool& pool) {
+                                                     ninfer::PagedKVPool& pool) {
     for (const bool emergency : {false, true}) {
         for (const int action : {0, 1, 2, 3}) { // create, refresh, extend, branch
             TmpDir dir("publication-allocation");
@@ -16411,8 +18312,8 @@ int test_publication_allocation_preserves_generation(ninfer::DeviceContext& ctx,
             source.materialize_pages(2, ctx.stream);
             fill_logical_pages(pool, source, 37);
             ctx.synchronize_all();
-            auto cfg = disk_config(dir.path, ram, pool, nullptr,
-                                   ninfer::SpeculativeBackend::None, 64ULL << 20, 4096);
+            auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   64ULL << 20, 4096);
             std::vector<ninfer::TokenId> tokens(64, 4);
             {
                 q36::detail::KVDiskCache disk(cfg);
@@ -16421,12 +18322,15 @@ int test_publication_allocation_preserves_generation(ninfer::DeviceContext& ctx,
                     const auto seed = capture_tokens(ram, pool, source, ctx, tokens);
                     disk.note_ram_resident(seed, 0);
                     if (!disk.emergency_spill_ram(seed)) { return fail("publication seed failed"); }
-                    const auto match = disk.plan_match(text_prompt(tokens),
-                        q36::detail::prefix_hash_chain(text_prompt(tokens)));
+                    const auto match = disk.plan_match(
+                        text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
                     if (!match) { return fail("publication seed missing"); }
                     previous = match->entry_id;
                 }
-                if (action == 2) { tokens.push_back(0); tokens.resize(128, 5); }
+                if (action == 2) {
+                    tokens.push_back(0);
+                    tokens.resize(128, 5);
+                }
                 if (action == 3) { tokens[32] = 9; }
                 const auto id = capture_tokens(ram, pool, source, ctx, tokens);
                 ram.set_disk_entry_id(id, previous);
@@ -16450,8 +18354,8 @@ int test_publication_allocation_preserves_generation(ninfer::DeviceContext& ctx,
                     (previous != 0 && disk.test_disk_io_pins(previous) != 0)) {
                     return fail("publication allocation stranded ownership");
                 }
-                const auto failed = disk.plan_match(text_prompt(tokens),
-                    q36::detail::prefix_hash_chain(text_prompt(tokens)));
+                const auto failed = disk.plan_match(
+                    text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
                 if ((previous == 0 && failed) ||
                     (previous != 0 && disk.test_load_meta(previous).execution_frontier != 64)) {
                     return fail("publication allocation replaced the previous generation");
@@ -16460,7 +18364,9 @@ int test_publication_allocation_preserves_generation(ninfer::DeviceContext& ctx,
                 publication_guard_entries.store(0, std::memory_order_relaxed);
                 disk.test_publication_install_hook([](bool enabled) noexcept {
                     fail_disk_caller_allocations = enabled;
-                    if (enabled) { publication_guard_entries.fetch_add(1, std::memory_order_relaxed); }
+                    if (enabled) {
+                        publication_guard_entries.fetch_add(1, std::memory_order_relaxed);
+                    }
                 });
                 if (!disk.emergency_spill_ram(id) || ram.test_io_pins(id) != 0) {
                     return fail("publication worker did not recover after allocation failure");
@@ -16476,29 +18382,34 @@ int test_publication_allocation_preserves_generation(ninfer::DeviceContext& ctx,
             // the store; compare actual restored KV against its captured source.
             {
                 q36::detail::KVDiskCache disk(cfg);
-                const auto match = disk.plan_match(text_prompt(tokens),
-                    q36::detail::prefix_hash_chain(text_prompt(tokens)));
+                const auto match = disk.plan_match(
+                    text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)));
                 if (!match || match->execution_frontier != tokens.size() ||
-                    !disk.claim(match->entry_id)) { return fail("publication retry missing on reopen"); }
-                const auto pages = ninfer::pages_for_tokens(static_cast<std::uint32_t>(tokens.size()));
+                    !disk.claim(match->entry_id)) {
+                    return fail("publication retry missing on reopen");
+                }
+                const auto pages =
+                    ninfer::pages_for_tokens(static_cast<std::uint32_t>(tokens.size()));
                 auto dest = pool.reserve(pages);
                 dest.materialize_pages(pages, ctx.stream);
                 ctx.synchronize_all();
                 q36::detail::DiskRestoreTarget target;
-                target.text = &dest;
-                target.text_pool = &pool;
+                target.text           = &dest;
+                target.text_pool      = &pool;
                 target.text_dst_pages = pages;
-                target.stream = ctx.copy_stream;
-                const auto ticket = disk.restore_device(match->entry_id, target);
+                target.stream         = ctx.copy_stream;
+                const auto ticket     = disk.restore_device(match->entry_id, target);
                 const int rc = wait_restore_bounded(disk, ctx, "publication retry restore hung");
                 if (rc != 0) { return rc; }
                 if (expect_mapped_pages_equal(pool, source, dest, pages, ctx,
-                                              "publication retry") != 0) { return 1; }
+                                              "publication retry") != 0) {
+                    return 1;
+                }
                 disk.release_restore_ticket(ticket);
                 disk.release(match->entry_id);
             }
-            std::cout << "publication allocation action=" << action
-                      << " emergency=" << emergency << " passed\n";
+            std::cout << "publication allocation action=" << action << " emergency=" << emergency
+                      << " passed\n";
         }
     }
     return 0;
@@ -16518,18 +18429,12 @@ int test_disk_crc32c_matches_naive_oracle() {
         state ^= state >> 27;
         byte = static_cast<std::uint8_t>((state * 0x2545f4914f6cdd1dULL) >> 56);
     }
-    constexpr std::size_t kSizes[] = {0,
-                                      1,
-                                      7,
-                                      8,
-                                      15,
-                                      4095,
-                                      4096,
-                                      4097,
-                                      10'000,
-                                      (512U << 10) - 1,
-                                      512U << 10,
-                                      (512U << 10) + 1,
+    constexpr std::size_t kSizes[] = {0,          1,
+                                      7,          8,
+                                      15,         4095,
+                                      4096,       4097,
+                                      10'000,     (512U << 10) - 1,
+                                      512U << 10, (512U << 10) + 1,
                                       1U << 20};
     for (std::size_t offset = 0; offset < 8; ++offset) {
         for (std::size_t size : kSizes) {
@@ -16569,6 +18474,20 @@ int main(int argc, char** argv) {
     ninfer::PagedKVPool paged_pool({paged_arena.base(), paged_arena.capacity()}, paged_plan.layout);
 
     if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+        std::string_view(argv[2]) == "idle-defrag") {
+        return test_idle_defrag(ctx, paged_pool);
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+        std::string_view(argv[2]) == "storage-recovery") {
+        return test_smaller_capacity_open_persists_eviction(ctx, paged_pool) +
+               test_backing_file_recovery(ctx, paged_pool) +
+               test_retirement_durability_failure(ctx, paged_pool);
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+        std::string_view(argv[2]) == "bounded-storage") {
+        return test_bounded_storage(ctx, paged_pool);
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--case" &&
         std::string_view(argv[2]) == "spill-allocation") {
         return test_spill_batch_allocation_and_promotion(ctx);
     }
@@ -16576,6 +18495,15 @@ int main(int argc, char** argv) {
     if (argc == 3 && std::string_view(argv[1]) == "--case" &&
         std::string_view(argv[2]) == "branch-ref") {
         return test_branch_ref_allocation_preserves_parent(ctx, paged_pool);
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+        std::string_view(argv[2]) == "stalls") {
+        return test_idle_cancel_during_capacity_eviction(ctx, paged_pool) +
+               test_spill_pin_waits_only_its_entry(ctx, paged_pool) +
+               test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool) +
+               test_ram_reclaim_waits_for_inflight_spill(ctx, paged_pool) +
+               test_ram_reclaim_skips_attempt_captures(ctx, paged_pool) +
+               test_restore_setup_ready_tracks_window_reads(ctx, paged_pool);
     }
     if (argc == 3 && std::string_view(argv[1]) == "--case" &&
         std::string_view(argv[2]) == "spill-queue") {
@@ -16600,12 +18528,15 @@ int main(int argc, char** argv) {
     }
     if (argc == 3 && std::string_view(argv[1]) == "--case") {
         const std::string_view selected = argv[2];
-        const int stage = selected == "startup-publication" ? 0
-                        : selected == "startup-skipped" ? 1
-                        : selected == "startup-worker" ? 2
-                        : selected == "startup-rebuild" ? 4
-                        : selected == "startup-cleanup" ? 5 : -1;
-        if (stage >= 0) { return test_startup_allocation_preserves_ownership(ctx, paged_pool, stage); }
+        const int stage                 = selected == "startup-publication" ? 0
+                                          : selected == "startup-skipped"   ? 1
+                                          : selected == "startup-worker"    ? 2
+                                          : selected == "startup-rebuild"   ? 4
+                                          : selected == "startup-cleanup"   ? 5
+                                                                            : -1;
+        if (stage >= 0) {
+            return test_startup_allocation_preserves_ownership(ctx, paged_pool, stage);
+        }
     }
     failures += test_startup_allocation_preserves_ownership(ctx, paged_pool);
     failures += test_publication_allocation_preserves_generation(ctx, paged_pool);
@@ -16635,12 +18566,10 @@ int main(int argc, char** argv) {
     failures += test_disk_match_filters_unready_heads(ctx, paged_pool);
     failures += test_disk_claim_rejects_refreshed_generation(ctx, paged_pool);
     failures += test_pack_rollover_and_partial_pwritev(ctx, paged_pool);
-    failures += test_compaction_reclaims_retired_pack_generation(ctx, paged_pool);
     failures += test_spill_durability_phase_matrix(ctx, paged_pool);
-    failures += test_compaction_publication_phase_matrix(ctx, paged_pool);
     failures += test_tombstone_durability_phase_matrix(ctx, paged_pool);
     failures += test_physical_preflight_rejects_before_pack_write(ctx, paged_pool);
-    failures += test_low_free_subthreshold_garbage_rejects_without_write(ctx, paged_pool);
+    failures += test_low_free_recycled_extent_rejects_without_write(ctx, paged_pool);
     failures += test_restore_pread_fail(ctx, paged_pool);
     failures += test_failed_restore_invalidation_preserves_shared_entries(ctx);
     failures += test_prefetch_queue_allocation_failure(ctx);
@@ -16673,8 +18602,7 @@ int main(int argc, char** argv) {
     failures += test_extend_preserves_disk_claim(ctx, paged_pool);
     failures += test_claimed_generation_not_extended(ctx, paged_pool);
     failures += test_claimed_parent_branch_clones_partial_page(ctx, paged_pool);
-    failures += test_consume_failure_keeps_ram_note(ctx, paged_pool);
-    failures += test_claim_cancels_in_flight_idle_extend(ctx, paged_pool);
+    failures += test_claim_returns_during_in_flight_idle_extend(ctx, paged_pool);
     failures += test_cancel_after_meta_rename_keeps_parent(ctx, paged_pool);
     failures += test_claim_missing_after_fifo_evict(ctx, paged_pool);
     failures += test_stale_plan_claim_rejects_extended_generation(ctx, paged_pool);
@@ -16696,9 +18624,15 @@ int main(int argc, char** argv) {
     failures += test_refresh_clears_absent_rollback(ctx, paged_pool);
     failures += test_plan_match_does_not_wait_on_payload_io(ctx, paged_pool);
     failures += test_populate_does_not_hold_mutex_across_pread(ctx, paged_pool);
-    failures += test_idle_pin_aborts_for_ram_claim(ctx, paged_pool);
-    failures += test_ram_idle_exclusion_covers_claim(ctx, paged_pool);
-    failures += test_discard_keeps_note_until_evict(ctx, paged_pool);
+    failures += test_ram_restore_does_not_wait_for_spill(ctx, paged_pool);
+    failures += test_abandoned_capture_cancels_spill_without_waiting(ctx, paged_pool);
+    failures += test_claim_during_encode_aborts_idle_extend(ctx, paged_pool);
+    failures += test_spill_crc_runs_without_index_mutex(ctx, paged_pool);
+    failures += test_capacity_eviction_tombstone_runs_without_index_mutex(ctx, paged_pool);
+    failures += test_capacity_eviction_tombstone_failure(ctx, paged_pool, false);
+    failures += test_capacity_eviction_tombstone_failure(ctx, paged_pool, true);
+    failures += test_invalidate_during_spill_defers_eviction(ctx, paged_pool);
+    failures += test_discard_while_spill_pinned_defers_free(ctx, paged_pool);
     failures += test_checkpoint_images_survive_host_load(ctx, paged_pool);
     failures += test_ram_header_ticket_roundtrip(ctx, paged_pool);
     failures += test_inclusive_disk_after_ram_consume(ctx, paged_pool);
@@ -16724,12 +18658,18 @@ int main(int argc, char** argv) {
     failures += test_claim_rejects_checkpoint_only_refresh(ctx, paged_pool);
     failures += test_claim_rejects_replaced_head_at_same_frontier(ctx, paged_pool);
     failures += test_invalid_checkpoint_kind_is_skipped(ctx, paged_pool);
-    failures += test_refresh_does_not_evict_sibling(ctx, paged_pool);
+    failures += test_refresh_shares_pages_with_replacement_headroom(ctx, paged_pool);
     failures += test_raw_state_unequal_codec_bytes_is_skipped(ctx, paged_pool);
     failures += test_gdn_checkpoint_without_hidden_is_not_selected(ctx, paged_pool);
     failures += test_load_host_misses_evicted_entry(ctx, paged_pool);
     failures += test_wrong_gdn_decoded_size_is_skipped(ctx, paged_pool);
     failures += test_plan_match_does_not_wait_on_manifest(ctx, paged_pool);
+    failures += test_idle_cancel_during_capacity_eviction(ctx, paged_pool);
+    failures += test_spill_pin_waits_only_its_entry(ctx, paged_pool);
+    failures += test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool);
+    failures += test_ram_reclaim_waits_for_inflight_spill(ctx, paged_pool);
+    failures += test_ram_reclaim_skips_attempt_captures(ctx, paged_pool);
+    failures += test_restore_setup_ready_tracks_window_reads(ctx, paged_pool);
     failures += test_disk_fifo_evict_clears_ram_durable(ctx, paged_pool);
     failures += test_lock_does_not_wipe_tmp_before_flock(ctx, paged_pool);
     failures += test_missing_current_hidden_is_not_advertised(ctx, paged_pool);
@@ -16762,7 +18702,9 @@ int main(int argc, char** argv) {
     failures += test_kind_conflict_is_skipped(ctx, paged_pool);
     failures += test_short_text_kv_valid_is_skipped(ctx, paged_pool);
     failures += test_skipped_corrupt_ids_do_not_poison_valid_entry(ctx, paged_pool);
-    failures += test_failed_object_unlink_keeps_tombstone(ctx, paged_pool);
+    failures += test_bounded_storage(ctx, paged_pool);
+    failures += test_idle_defrag(ctx, paged_pool);
+    failures += test_eviction_reclaims_pack_extent(ctx, paged_pool);
     failures += test_ledger_frontier_must_be_execution_plus_one(ctx, paged_pool);
     failures += test_mtp_frontier_beyond_valid_backend_is_not_reused(ctx);
     failures += test_fingerprint_state_over_64mib_is_accepted(ctx, paged_pool);

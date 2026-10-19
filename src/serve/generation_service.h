@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -24,14 +25,14 @@ struct MediaInputCapacity;
 
 struct GenerationMetrics {
     ninfer::GenerationRecoveryStats recovery;
-    double prepare_seconds = 0.0;
-    double ttft_seconds    = 0.0;
-    double vision_seconds  = 0.0;
-    double prefill_seconds = 0.0;
+    double prepare_seconds       = 0.0;
+    double ttft_seconds          = 0.0;
+    double vision_seconds        = 0.0;
+    double prefill_seconds       = 0.0;
     double prefill_tail_tok_s    = 0.0;
     double prefill_tail_window_s = 0.0;
-    double decode_seconds  = 0.0;
-    double total_seconds   = 0.0;
+    double decode_seconds        = 0.0;
+    double total_seconds         = 0.0;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
     std::uint32_t speculative_draft_window    = 0;
@@ -41,31 +42,25 @@ struct GenerationMetrics {
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t speculative_live_draft_tokens = 0;
+    float speculative_p_less_draft_temperature  = 0.0F;
     std::vector<std::uint64_t> speculative_rounds_per_draft;
-    std::uint32_t prefix_cache_hit_tokens     = 0;
-    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
-    ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;
+    std::uint32_t prefix_cache_hit_tokens            = 0;
+    ninfer::PrefixReusePath prefix_reuse_path        = ninfer::PrefixReusePath::FullReset;
+    ninfer::PrefixReuseSource prefix_reuse_source    = ninfer::PrefixReuseSource::None;
     std::uint32_t captured_context_checkpoint_tokens = 0;
     std::uint32_t restored_context_checkpoint_tokens = 0;
-    std::size_t kv_ram_capacity_bytes = 0;
-    std::size_t kv_ram_used_bytes     = 0;
-    std::size_t kv_ram_entry_count    = 0;
-    std::uint64_t kv_ram_captures     = 0;
-    std::uint64_t kv_ram_restores     = 0;
-    std::uint64_t kv_ram_evictions    = 0;
-    std::uint64_t kv_ram_drops        = 0;
-    double kv_ram_save_seconds        = 0;
-    double kv_ram_load_seconds        = 0;
-    std::size_t kv_disk_capacity_bytes = 0;
-    std::size_t kv_disk_used_bytes     = 0;
-    std::size_t kv_disk_entry_count    = 0;
-    std::uint64_t kv_disk_captures     = 0;
-    std::uint64_t kv_disk_restores     = 0;
-    std::uint64_t kv_disk_evictions    = 0;
-    std::uint64_t kv_disk_drops        = 0;
-    double kv_disk_save_seconds        = 0;
-    double kv_disk_load_seconds        = 0;
-    double kv_disk_h2d_seconds         = 0;
+    double kv_ram_save_seconds                       = 0;
+    double kv_ram_load_seconds                       = 0;
+    double kv_disk_save_seconds                      = 0;
+    double kv_disk_load_seconds                      = 0;
+    double kv_disk_h2d_seconds                       = 0;
+    double prepare_cpu_seconds                       = 0;
+    double media_wait_seconds                        = 0;
+    double media_fetch_seconds                       = 0;
+    double queued_seconds                            = 0;
+    double copy_hold_seconds                         = 0;
+    // HTTP handler clock minus engine e2e. Set by the HTTP layer, not the Engine.
+    double http_tail_seconds = 0;
 };
 
 struct GenerationOutcome {
@@ -75,6 +70,9 @@ struct GenerationOutcome {
     // Set when the model emitted parseable Qwen <tool_call> markup but the request
     // was not tool-capable. The markup stays in `text`; serve logs a warning.
     std::vector<std::string> ignored_qwen_tool_call_names;
+    // One entry per content token, in order, when the request asked for logprobs. Entries are
+    // token-aligned: a token trimmed from `text` by a stop string still has its entry.
+    std::vector<TokenLogprobEntry> content_logprobs;
     int prompt_tokens                  = 0;
     int completion_tokens              = 0;
     int reasoning_tokens               = 0;
@@ -84,7 +82,10 @@ struct GenerationOutcome {
 };
 
 struct StreamSink {
-    std::function<void(const std::string& delta_text)> on_content;
+    // `logprobs` holds the content tokens committed with this delta when the request asked for
+    // them; such a delta may carry tokens and no text while text is held back.
+    std::function<void(const std::string& delta_text, std::span<const TokenLogprobEntry> logprobs)>
+        on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
     std::function<bool()> is_cancelled;
 };
@@ -95,8 +96,7 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 // HTTP 400 owner for capture_context_checkpoint on a server that cannot pin.
 // Throws before Engine submit. No-op when capture is not requested, or when
 // prefix reuse and a speculative backend are both available.
-void reject_unavailable_context_checkpoint_capture(bool capture_requested,
-                                                   bool allow_prefix_reuse,
+void reject_unavailable_context_checkpoint_capture(bool capture_requested, bool allow_prefix_reuse,
                                                    ninfer::SpeculativeBackend spec);
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
@@ -106,6 +106,9 @@ struct PreparedRequest {
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
     double prepare_seconds                 = 0.0;
+    double prepare_cpu_seconds             = 0.0;
+    double media_wait_seconds              = 0.0;
+    double media_fetch_seconds             = 0.0;
     int prompt_tokens                      = 0;
     bool include_usage                     = false;
     bool tool_capable                      = false;
@@ -128,18 +131,21 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    [[nodiscard]] std::size_t in_flight_requests() const;
+
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
     }
 
-    [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
+    [[nodiscard]] PreparedRequest prepare(const GenerationRequest& request,
                                           std::function<bool()> is_cancelled = {}) const;
-    [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
+    [[nodiscard]] int count_prompt_tokens(const GenerationRequest& request,
                                           std::function<bool()> is_cancelled = {}) const;
 
     // Consumes prepared.generation. A PreparedRequest is single-use.
-    GenerationOutcome run(PreparedRequest& prepared, std::uint64_t request_id, const StreamSink* sink,
-                          std::function<bool()> is_cancelled = {});
+    GenerationOutcome run(PreparedRequest& prepared, std::uint64_t request_id,
+                          const StreamSink* sink, std::function<bool()> is_cancelled = {},
+                          std::function<void(const ninfer::RecoveryEvent&)> on_recovery = {});
 
     void warmup();
 

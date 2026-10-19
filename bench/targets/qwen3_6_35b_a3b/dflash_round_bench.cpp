@@ -45,7 +45,7 @@ void print_usage(const char* executable) {
     std::cout << "usage: " << executable
               << " [--artifact <model.ninfer>] [--device <id>] [--context <tokens>]"
                  " [--warmup <n>] [--reps <n>] [--draft-tokens <1..15>]"
-                 " [--batch <1..4>]"
+                 " [--batch <1..6>]"
                  " [--proposal-head full|optimized] [--no-cuda-graph]\n";
 }
 
@@ -112,7 +112,7 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--draft-tokens must be in [1,15]");
     }
     if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
-        throw std::invalid_argument("--batch must be in [1,4]");
+        throw std::invalid_argument("--batch must be in [1,6]");
     }
     return options;
 }
@@ -189,9 +189,9 @@ int run(const Options& options) {
     const std::uint64_t per_request_capacity =
         options.context_tokens + (measured_rounds + 1ULL) * block;
     const std::uint64_t aligned_request_capacity = (per_request_capacity + 63ULL) & ~63ULL;
-    const std::uint64_t capacity                 = options.batch_size == 1
-                                                       ? per_request_capacity
-                                                       : aligned_request_capacity * options.batch_size;
+    const std::uint64_t capacity = options.batch_size == 1
+                                       ? per_request_capacity
+                                       : aligned_request_capacity * options.batch_size;
     if (per_request_capacity > 262144 || capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("context and measured rounds exceed native capacity");
     }
@@ -203,6 +203,7 @@ int run(const Options& options) {
     engine.kv_capacity =
         ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(capacity));
     engine.prefill_chunk             = 128;
+    engine.mixed_forward             = 0;
     engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
     engine.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
     engine.speculative.draft_tokens  = options.draft_tokens;
@@ -214,7 +215,7 @@ int run(const Options& options) {
     ninfer::artifact::Reader reader(options.artifact);
     ninfer::artifact::Binder binder(reader);
     const auto weights_profile = target::Package::resolve_weights(reader.identity(), binder);
-    auto load_plan        = target::Package::plan_load(binder, engine, weights_profile);
+    auto load_plan             = target::Package::plan_load(binder, engine, weights_profile);
     auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile);
     const auto resolution = ninfer::runtime::resolve_kv_capacity(
         engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
@@ -251,8 +252,11 @@ int run(const Options& options) {
         request_memory.activate(request_plan.summary().transient_bytes,
                                 request_plan.summary().transient_alignment);
         auto prefill = program->start_prefill_lane(lane, std::move(prompt), std::move(request_plan),
-                                                   request_memory.region());
-        while (!prefill.complete) { prefill = program->advance_prefill_lane(lane); }
+                                                   request_memory.region(),
+                                                   ninfer::runtime::PrefillPace::Exclusive);
+        while (!prefill.complete) {
+            prefill = program->advance_prefill_lane(lane, ninfer::runtime::PrefillPace::Exclusive);
+        }
         request_memory.deactivate();
         if (prefill.round.tokens.size() != 1) {
             throw std::runtime_error("benchmark seed prefill did not license exactly one token");

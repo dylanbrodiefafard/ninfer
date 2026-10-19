@@ -7,16 +7,13 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
-#include "targets/qwen3_6/impl/runtime/context_checkpoint_image.h"
-#include "cuda_stream_gate.h"
-#include <atomic>
-#include <chrono>
-#include <future>
 #define NINFER_QWEN36_RUNTIME_NS mechanism_slots
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #undef NINFER_QWEN36_RUNTIME_NS
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
+#include "targets/qwen3_6/impl/runtime/prefill_schedule.h"
+#include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <ninfer/types.h>
 
@@ -29,7 +26,10 @@
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
+
+ninfer::targets::qwen3_6::PreparedPromptData text_prompt(std::uint32_t tokens);
 
 namespace {
 
@@ -122,7 +122,8 @@ void test_decoder_layout() {
     expect(int8.mtp_kv && int8.mtp_kv->pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
                int8.mtp_kv->pool.planes[3].spec.dtype == ninfer::DType::FP16,
            "INT8 MTP KV has scale planes");
-    expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
+    expect(int8.kv_payload_bytes() ==
+               int8.text_kv.payload_bytes() + int8.mtp_kv.value().payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
 
     ninfer::LayoutBuilder nvfp4_builder;
@@ -152,7 +153,7 @@ void test_round_layout() {
                round.mtp->target_input_ids.shape[0] == 6,
            "MTP prefill scratch shapes");
     expect(round.logits.region.offset < exact_prefill.region.offset &&
-               exact_prefill.region.offset < round.mtp->draft_tokens.region.offset,
+               exact_prefill.region.offset < round.mtp.value().draft_tokens.region.offset,
            "exact prefill extension retains established round-region order");
     expect(round.mtp.has_value() && round.mtp->position.shape[0] == 1,
            "MTP prefill scratch is explicit");
@@ -197,6 +198,133 @@ void test_mtp_alignment() {
            "final shifted visual overlap excludes generated-token column");
 }
 
+void check_vision_prefill_shifted_inputs(const std::array<std::vector<std::int32_t>, 2>& scatter) {
+    constexpr std::uint32_t tokens = 18;
+    std::vector<int> composed(tokens + 1);
+    for (std::uint32_t i = 0; i <= tokens; ++i) { composed[i] = static_cast<int>(i); }
+    for (std::size_t item = 0; item < scatter.size(); ++item) {
+        for (const auto column : scatter[item]) {
+            composed[column] = 1000 + static_cast<int>(item * 100) + column;
+        }
+    }
+    for (const bool mtp : {false, true}) {
+        std::array<q36::detail::VisionUseSpan, 2> uses;
+        for (std::size_t item = 0; item < scatter.size(); ++item) {
+            const auto first = static_cast<std::uint32_t>(scatter[item].front());
+            const auto end   = static_cast<std::uint32_t>(scatter[item].back()) + 1;
+            uses[item]       = {mtp && first != 0 ? first - 1 : first, first, end,
+                                static_cast<std::uint32_t>(item), 0};
+        }
+        for (const std::uint32_t base : {0U, 3U, 4U, 5U, 7U, 10U, 11U, 14U}) {
+            for (const std::uint32_t maximum : {1U, 4U, 128U}) {
+                std::uint32_t begin = base;
+                while (begin < tokens) {
+                    const auto chunk = q36::detail::select_vision_prefill_chunk(
+                        uses, begin, std::min(maximum, tokens - begin));
+                    expect(chunk.length != 0, "Vision chunk always advances");
+                    if (chunk.length == 0) { break; }
+                    // Independent exact oracle: Text consumes e[t], MTP consumes e[t+1].
+                    std::vector<int> text(chunk.length);
+                    std::vector<int> shifted(chunk.length);
+                    for (std::uint32_t j = 0; j < chunk.length; ++j) {
+                        text[j]    = static_cast<int>(begin + j);
+                        shifted[j] = static_cast<int>(begin + j + 1);
+                    }
+                    if (chunk.use_index) {
+                        const auto item = uses[*chunk.use_index].item_index;
+                        for (const auto column : scatter[item]) {
+                            if (column >= static_cast<int>(begin) &&
+                                column < static_cast<int>(begin + chunk.length)) {
+                                text[column - begin] = composed[column];
+                            }
+                        }
+                        if (mtp) {
+                            const auto overlap = q36::shifted_visual_overlap(
+                                scatter[item], tokens,
+                                q36::plan_mtp_alignment_window(tokens, begin, chunk.length));
+                            for (std::size_t j = 0; j < overlap.size(); ++j) {
+                                shifted[overlap.destination_columns[j]] =
+                                    composed[scatter[item][overlap.source_begin + j]];
+                            }
+                        }
+                    }
+                    for (std::uint32_t j = 0; j < chunk.length; ++j) {
+                        expect(text[j] == composed[begin + j],
+                               "Vision chunk preserves every Text visual embedding");
+                        if (mtp) {
+                            expect(shifted[j] == composed[begin + j + 1],
+                                   "Vision chunk preserves MTP's shifted visual embedding");
+                        }
+                    }
+                    begin += chunk.length;
+                }
+            }
+        }
+    }
+}
+
+void test_vision_prefill_shifted_inputs() {
+    // A normal text gap before a noncontiguous video, minimum separation between
+    // image consumer spans, and a visual item starting at the first token.
+    check_vision_prefill_shifted_inputs({{{4, 5, 6}, {11, 13}}});
+    check_vision_prefill_shifted_inputs({{{4, 5, 6}, {8, 9}}});
+    check_vision_prefill_shifted_inputs({{{0, 1}, {3, 5}}});
+
+    const std::array<q36::detail::VisionUseSpan, 2> uses{{{3, 4, 7, 0, 0}, {10, 11, 14, 1, 3}}};
+    const auto cold = q36::detail::select_vision_prefill_chunk(uses, 0, 18);
+    expect(cold.length == 4 && cold.use_index == 0,
+           "cold Text matches a four-token reused prefix while MTP sees the first image");
+    const auto prefix = q36::detail::select_vision_prefill_chunk(uses, 0, 3);
+    expect(prefix.length == 3 && !prefix.use_index,
+           "text before the shifted visual consumer needs no Vision embeddings");
+    const auto visual = q36::detail::select_vision_prefill_chunk(uses, 4, 14);
+    expect(visual.length == 6 && visual.use_index == 0,
+           "active image stops before the next item's shifted visual consumer");
+    const auto next_bridge = q36::detail::select_vision_prefill_chunk(uses, 10, 8);
+    expect(next_bridge.length == 1 && next_bridge.use_index == 1,
+           "next item's bridge-only chunk receives its shifted visual embedding");
+}
+
+void test_multimodal_prefill_service_projection() {
+    q36::PreparedPromptData prompt;
+    prompt.token_ids.resize(800);
+    prompt.vision_items.resize(1);
+    prompt.turn_closure_frontiers   = {100, 160, 220, 280, 340, 400, 460, 520, 580, 640, 700, 760};
+    constexpr std::uint32_t rewrite = 770;
+    const std::array<q36::detail::VisionUseSpan, 1> uses{{{3, 4, 67, 0, 0}}};
+    // Cold: one text/image boundary, twelve historical headers, the rewrite
+    // frontier, then the tail. Reused suffixes omit the boundaries behind them.
+    const std::array<std::pair<std::uint32_t, std::uint64_t>, 5> cases{
+        {{0, 15}, {67, 14}, {400, 8}, {760, 2}, {800, 1}}};
+    for (const auto& [base, expected] : cases) {
+        for (const std::uint32_t maximum : {128U, 1024U, 8192U}) {
+            const auto reserved =
+                q36::detail::projected_prefill_work(prompt, base, maximum, uses, rewrite);
+            expect(reserved == expected,
+                   "one-token image request reserves all historical turn prefill steps");
+        }
+    }
+    prompt.vision_items.clear();
+    expect(q36::detail::projected_prefill_work(prompt, 0, 1024, {}, rewrite) == 2,
+           "text-only projection does not reserve unused historical turn splits");
+    prompt.token_ids.resize(8192);
+    expect(q36::detail::projected_prefill_work(prompt, 0, 8192, {}, 100) == 3,
+           "rewrite split of aligned 8192 tokens reserves both irregular tail steps");
+    prompt.vision_items.resize(1);
+    prompt.turn_closure_frontiers = {100};
+    expect(q36::detail::projected_prefill_work(prompt, 0, 8192, {}, std::nullopt) == 3,
+           "historical turn split reserves both irregular tail steps");
+    prompt.turn_closure_frontiers.clear();
+    const std::array<q36::detail::VisionUseSpan, 1> tail_image{{{100, 100, 164, 0, 0}}};
+    expect(q36::detail::projected_prefill_work(prompt, 0, 8192, tail_image, std::nullopt) == 3,
+           "Vision split reserves both irregular tail steps");
+    prompt.token_ids.resize(18);
+    const std::array<q36::detail::VisionUseSpan, 2> two_images{
+        {{3, 4, 7, 0, 0}, {10, 11, 14, 1, 3}}};
+    expect(q36::detail::projected_prefill_work(prompt, 0, 128, two_images, std::nullopt) == 4,
+           "MTP image request reserves text-prefix, first image, next bridge, and next image");
+}
+
 void test_vision_control() {
     q36::PreparedPromptData prompt;
     prompt.token_ids.resize(7);
@@ -209,15 +337,15 @@ void test_vision_control() {
     prompt.prepare.vision_tokens = 3;
     prompt.vision_items          = {
         q36::VisionItem{.modality    = q36::PromptModality::Image,
-                                 .grid        = {.temporal = 1, .height = 2, .width = 2},
-                                 .patch_begin = 0,
-                                 .patch_count = 4,
-                                 .token_spans = {{.begin = 1, .count = 1}}},
+                        .grid        = {.temporal = 1, .height = 2, .width = 2},
+                        .patch_begin = 0,
+                        .patch_count = 4,
+                        .token_spans = {{.begin = 1, .count = 1}}},
         q36::VisionItem{.modality    = q36::PromptModality::Video,
-                                 .grid        = {.temporal = 2, .height = 2, .width = 2},
-                                 .patch_begin = 4,
-                                 .patch_count = 8,
-                                 .token_spans = {{.begin = 3, .count = 1}, {.begin = 5, .count = 1}}},
+                        .grid        = {.temporal = 2, .height = 2, .width = 2},
+                        .patch_begin = 4,
+                        .patch_count = 8,
+                        .token_spans = {{.begin = 3, .count = 1}, {.begin = 5, .count = 1}}},
     };
 
     const q36::VisionControl control = q36::build_vision_control(prompt);
@@ -319,7 +447,8 @@ void test_prefix_identity() {
         packed.pack(blob.data());
         q36::detail::ResidentPrefixIdentity restored;
         restored.unpack(blob.data(), blob.size());
-        expect(q36::detail::prefix_matches(prompt_only, ledger, restored, prompt_only.token_ids.size()),
+        expect(q36::detail::prefix_matches(prompt_only, ledger, restored,
+                                           prompt_only.token_ids.size()),
                "prefix identity pack/unpack roundtrip");
         std::vector<std::uint8_t> huge_count(8, 0);
         const std::uint32_t huge = 0xffffffffu;
@@ -333,10 +462,141 @@ void test_prefix_identity() {
     }
 }
 
+// Independent little-endian encoder of the persisted identity layout: token and item counts,
+// token types, three position axes, then each Vision item.
+std::vector<std::uint8_t> reference_identity_bytes(const q36::PreparedPromptData& prompt) {
+    std::vector<std::uint8_t> out;
+    const auto put = [&out](std::uint64_t value, int bytes) {
+        for (int i = 0; i < bytes; ++i) {
+            out.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+        }
+    };
+    const std::size_t tokens = prompt.token_ids.size();
+    put(tokens, 4);
+    put(prompt.vision_items.size(), 4);
+    for (const std::uint8_t type : prompt.token_types) { put(type, 1); }
+    for (const std::int32_t position : prompt.positions) {
+        put(static_cast<std::uint32_t>(position), 4);
+    }
+    for (const q36::VisionItem& item : prompt.vision_items) {
+        put(static_cast<std::uint8_t>(item.modality), 1);
+        put(static_cast<std::uint32_t>(item.grid.temporal), 4);
+        put(static_cast<std::uint32_t>(item.grid.height), 4);
+        put(static_cast<std::uint32_t>(item.grid.width), 4);
+        put(item.patch_begin, 8);
+        put(item.patch_count, 8);
+        for (const std::uint8_t byte : item.content_digest) { put(byte, 1); }
+        put(item.timestamps.size(), 4);
+        for (const double timestamp : item.timestamps) {
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &timestamp, sizeof(bits));
+            put(bits, 8);
+        }
+        put(item.token_spans.size(), 4);
+        for (const q36::TokenSpan& span : item.token_spans) {
+            put(span.begin, 8);
+            put(span.count, 8);
+        }
+    }
+    return out;
+}
+
+void test_prefix_identity_packed_layout() {
+    q36::PreparedPromptData prompt = identity_prompt(7);
+    prompt.positions[5]            = -3;
+    q36::VisionItem video{.modality    = q36::PromptModality::Video,
+                          .grid        = {.temporal = 2, .height = 2, .width = 2},
+                          .patch_begin = 8,
+                          .patch_count = 8,
+                          .timestamps  = {0.5, -1.25},
+                          .token_spans = {{.begin = 5, .count = 1}, {.begin = 7, .count = 1}}};
+    video.content_digest.fill(0xA5);
+    for (std::int32_t position : {4, 5, 6, 7}) { append_text_token(prompt, 248056, position); }
+    prompt.token_types[5] = prompt.token_types[7] =
+        static_cast<std::uint8_t>(q36::PromptModality::Video);
+    prompt.vision_items.push_back(std::move(video));
+
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(prompt);
+    std::vector<std::uint8_t> packed(identity.packed_bytes());
+    identity.pack(packed.data());
+    expect(packed == reference_identity_bytes(prompt),
+           "packed prefix identity keeps the persisted little-endian layout");
+
+    q36::detail::ResidentPrefixIdentity restored;
+    restored.unpack(packed.data(), packed.size());
+    std::vector<std::uint8_t> repacked(restored.packed_bytes());
+    restored.pack(repacked.data());
+    expect(repacked == packed && q36::detail::prefix_matches(prompt, prompt.token_ids, restored,
+                                                             prompt.token_ids.size()),
+           "prefix identity unpack round-trips every field");
+
+    bool truncated_threw = false;
+    try {
+        restored.unpack(packed.data(), packed.size() - 1);
+    } catch (const std::logic_error&) { truncated_threw = true; }
+    expect(truncated_threw, "prefix identity unpack rejects a truncated item");
+}
+
+// The cached resident hashes equal a fresh prefix_hash_at at every frontier, from any cached
+// extent, after truncation, and for Vision item orders that hold the recurrence's item cursor.
+void test_resident_prefix_hashes() {
+    const auto item = [](std::size_t begin, std::size_t count, std::uint8_t digest) {
+        q36::VisionItem value;
+        value.content_digest.fill(digest);
+        value.token_spans = {{.begin = begin, .count = count}};
+        return value;
+    };
+    q36::VisionItem empty;
+    empty.content_digest.fill(9);
+    const std::vector<std::vector<q36::VisionItem>> orders = {
+        {item(3, 2, 1), item(8, 3, 2), item(20, 1, 3)},
+        {item(8, 3, 2), item(3, 2, 1), item(20, 1, 3)},
+        {empty, item(3, 2, 1), empty, item(5, 2, 2)},
+        {item(3, 2, 1), item(4, 1, 2), item(30, 2, 3)},
+        {item(0, 0, 4), item(3, 2, 1)},
+    };
+    for (const auto& items : orders) {
+        q36::PreparedPromptData prompt = text_prompt(40);
+        prompt.vision_items            = items;
+        const auto chain               = q36::detail::prefix_hash_chain(prompt);
+        q36::detail::ResidentPrefixIdentity identity;
+        identity.assign(prompt);
+        std::vector<ninfer::TokenId> ledger = prompt.token_ids;
+        bool exact                          = true;
+        for (std::size_t cached = 0; cached <= prompt.token_ids.size(); ++cached) {
+            q36::detail::ResidentPrefixHashes hashes;
+            hashes.assign(std::span(chain).first(cached + 1));
+            for (std::size_t count = prompt.token_ids.size() + 1; count-- > 0;) {
+                exact = exact && hashes.at(ledger, identity, count) == chain[count];
+            }
+            hashes.truncate(cached / 2);
+            for (std::size_t count = cached / 2; count <= prompt.token_ids.size(); count += 3) {
+                exact = exact && hashes.at(ledger, identity, count) == chain[count];
+            }
+        }
+        expect(exact, "resident prefix hashes extend the prefix hash recurrence exactly");
+
+        q36::detail::ResidentPrefixHashes generated;
+        generated.assign(chain);
+        identity.append_generated(3, prompt.rope_delta);
+        ledger.insert(ledger.end(), {5, 6, 7});
+        expect(generated.at(ledger, identity, ledger.size()) ==
+                   q36::detail::prefix_hash_at(ledger, identity, ledger.size()),
+               "resident prefix hashes extend over generated tokens");
+    }
+}
+
 void test_prefix_hash_and_dflash_gate() {
     q36::PreparedPromptData original = identity_prompt();
     const auto chain                 = q36::detail::prefix_hash_chain(original);
     expect(chain.size() == original.token_ids.size() + 1, "hash chain includes the empty prefix");
+    // Persisted RAM/disk entries are keyed by these values; a recurrence change orphans them.
+    expect(chain[1] == q36::detail::PrefixHash128{0x6262F4B41269B81DULL, 0xBDC2602062B28BFEULL} &&
+               chain[3] ==
+                   q36::detail::PrefixHash128{0xA2C2FE32316E8FD6ULL, 0xA2C6397022371C9FULL} &&
+               chain[4] == q36::detail::PrefixHash128{0x7EFE1C2D333D3CE4ULL, 0xC12A38647DE70FDFULL},
+           "prefix hash values match the persisted key recurrence");
 
     q36::detail::ResidentPrefixIdentity resident;
     resident.assign(original);
@@ -408,7 +668,8 @@ void test_prefill_context_marks() {
         expect(q36::detail::next_prefill_context_mark(mark - 1) == mark, "next mark just before");
         if (i + 1 < q36::detail::kPrefillContextMarks.size()) {
             const std::uint32_t following = q36::detail::kPrefillContextMarks[i + 1];
-            expect(q36::detail::next_prefill_context_mark(mark) == following, "next mark at freeze");
+            expect(q36::detail::next_prefill_context_mark(mark) == following,
+                   "next mark at freeze");
             expect(q36::detail::next_prefill_context_mark(mark + 1) == following,
                    "next mark just after freeze");
         } else {
@@ -426,23 +687,23 @@ void test_prefill_context_marks() {
            "off-grid F still uses next mark");
 
     expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 4096, 12288, false,
-                                                                 true),
+                                                                  true),
            "chunk end 4096 does not freeze");
     expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 8192, 12288, false,
-                                                                 true),
+                                                                  true),
            "chunk end 8192 does not freeze");
     expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 10240, 12288, false,
-                                                                 true),
+                                                                  true),
            "raw named size 10240 is not a freeze coordinate");
     expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 12288, 12288, false,
-                                                                true),
+                                                                 true),
            "chunk end 12288 freezes");
     expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 12288, 12288, true,
-                                                                 true),
+                                                                  true),
            "already-captured F does not freeze again");
-    expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 200000, 0, false,
-                                                                 true),
-           "no freeze after the last mark");
+    expect(
+        !q36::detail::should_freeze_prefill_context_checkpoint(true, true, 200000, 0, false, true),
+        "no freeze after the last mark");
     expect(q36::detail::newly_frozen_context_checkpoint_tokens(12288, 0) == 12288,
            "first freeze reports coverage from 0");
     expect(q36::detail::newly_frozen_context_checkpoint_tokens(24576, 12288) == 12288,
@@ -457,24 +718,23 @@ void test_prefill_context_marks() {
            "catch-up advertised F is the later chunk end");
 
     const std::uint32_t catch_up_first = 8000u + 4096u;
-    expect(catch_up_first == 12096 &&
-               !q36::detail::should_freeze_prefill_context_checkpoint(true, true, catch_up_first,
-                                                                     12288, false, true),
+    expect(catch_up_first == 12096 && !q36::detail::should_freeze_prefill_context_checkpoint(
+                                          true, true, catch_up_first, 12288, false, true),
            "resume 8000 first 4096 chunk ends at 12096 and does not freeze");
     expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 16000, 12288, false,
-                                                                true) &&
+                                                                 true) &&
                q36::detail::advertised_context_checkpoint_frontier(16000) == 16000,
            "resume 8000 then prefill to 16000 freezes 16000 not 12288");
     expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 8192u + 4096u, 12288,
-                                                                false, true) &&
+                                                                 false, true) &&
                q36::detail::advertised_context_checkpoint_frontier(12288) == 12288,
            "resume 8192 first chunk end 12288 freezes 12288");
 
     expect(!q36::detail::should_freeze_prefill_context_checkpoint(false, true, 15000, 12288, false,
-                                                                 true),
+                                                                  true),
            "decode-only past 12288 does not freeze");
     expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, false, 12288, 12288, false,
-                                                                 true),
+                                                                  true),
            "capture-disabled prefill does not freeze");
 
     expect(q36::detail::capture_prefill_context_checkpoints(true, true),
@@ -495,16 +755,17 @@ void test_prefill_context_marks() {
            "off table has no next mark");
     expect(q36::detail::next_prefill_context_mark(30000) == 36864u,
            "rollback-only restore at 30000 does not re-arm 24576");
-    expect(!q36::detail::next_prefill_context_mark(30000, std::span<const std::uint32_t>{}).has_value(),
+    expect(!q36::detail::next_prefill_context_mark(30000, std::span<const std::uint32_t>{})
+                .has_value(),
            "off table after restore at 30000 stays inert");
     expect(q36::detail::retain_context_checkpoint_head(24576, 30000) &&
                q36::detail::next_prefill_context_mark(30000) == 36864u,
            "drop_after occupy frontier 30000 keeps a 24576 ladder head but latches 36864");
     expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 32768, 151552, false,
-                                                                 true),
+                                                                  true),
            "mark at or past max_context stays inert");
-    q36::detail::validate_configured_context_checkpoint_marks(
-        std::vector<std::uint32_t>{151552u}, ninfer::SpeculativeBackend::Mtp);
+    q36::detail::validate_configured_context_checkpoint_marks(std::vector<std::uint32_t>{151552u},
+                                                              ninfer::SpeculativeBackend::Mtp);
     expect(q36::detail::first_prefill_context_mark({}) == 0, "off table first mark is 0");
     expect(q36::detail::first_prefill_context_mark(custom) == 8192u, "custom first mark");
     expect(q36::detail::resolved_prefill_context_marks(std::nullopt).size() == 6,
@@ -517,8 +778,8 @@ void test_prefill_context_marks() {
                                                               ninfer::SpeculativeBackend::None);
     bool custom_without_spec = false;
     try {
-        q36::detail::validate_configured_context_checkpoint_marks(
-            std::vector<std::uint32_t>{8192u}, ninfer::SpeculativeBackend::None);
+        q36::detail::validate_configured_context_checkpoint_marks(std::vector<std::uint32_t>{8192u},
+                                                                  ninfer::SpeculativeBackend::None);
     } catch (const std::invalid_argument&) { custom_without_spec = true; }
     expect(custom_without_spec, "custom marks without spec are rejected");
     q36::detail::validate_configured_context_checkpoint_marks(std::vector<std::uint32_t>{8192u},
@@ -577,8 +838,9 @@ void test_prefill_context_marks() {
            "RestoreContextCheckpoint is not a rewrite restore");
     expect(q36::detail::mtp_complete_checkpoint_ready(Path::RestoreContextCheckpoint, 12288, 12287),
            "RestoreContextCheckpoint with mtp_kv_valid >= F-1 is not forced to FullReset");
-    expect(!q36::detail::mtp_complete_checkpoint_ready(Path::RestoreContextCheckpoint, 12288, 12286),
-           "short MTP KV is not checkpoint-ready");
+    expect(
+        !q36::detail::mtp_complete_checkpoint_ready(Path::RestoreContextCheckpoint, 12288, 12286),
+        "short MTP KV is not checkpoint-ready");
     expect(!q36::detail::mtp_bridge_reads_rewrite_hidden(Path::RestoreContextCheckpoint),
            "context restore installs/reads tail_hidden not rewrite hidden");
     expect(q36::detail::mtp_bridge_reads_rewrite_hidden(Path::RestoreTurnCheckpoint),
@@ -598,13 +860,13 @@ void test_prefill_context_marks() {
            "empty staging must not D2D");
 
     expect(q36::detail::occupy_drops_rewrite_ahead_of_restore(Path::RestoreContextCheckpoint, true,
-                                                             15000, 12288),
+                                                              15000, 12288),
            "occupy drops rewrite when rewrite.frontier > restore F");
     expect(!q36::detail::occupy_drops_rewrite_ahead_of_restore(Path::RestoreContextCheckpoint, true,
-                                                              8000, 12288),
+                                                               8000, 12288),
            "occupy keeps rewrite when rewrite.frontier <= restore F");
     expect(!q36::detail::occupy_drops_rewrite_ahead_of_restore(Path::AppendAtFrontier, true, 15000,
-                                                              12288),
+                                                               12288),
            "append occupy does not drop rewrite via the restore helper");
     expect(q36::detail::occupy_clears_context_checkpoints(Path::FullReset),
            "FullReset clears ladder heads");
@@ -617,16 +879,16 @@ void test_prefill_context_marks() {
     expect(!q36::detail::occupy_keeps_context_checkpoint_head(Path::FullReset, 12288, 0),
            "FullReset keeps no ladder heads");
     expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreContextCheckpoint, 12288,
-                                                            12288),
+                                                             12288),
            "restore keeps the head at F");
     expect(!q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreContextCheckpoint, 24576,
-                                                             12288),
+                                                              12288),
            "restore drops heads after F");
     expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnCheckpoint, 12288,
-                                                            13000),
+                                                             13000),
            "rewrite occupy keeps ladder heads with frontier <= new base");
     expect(!q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnCheckpoint, 24576,
-                                                             13000),
+                                                              13000),
            "rewrite occupy drops ladder heads after the new base");
     expect(q36::detail::next_prefill_context_mark(24576) == 36864,
            "rollback to first mark recaptures the second");
@@ -634,13 +896,13 @@ void test_prefill_context_marks() {
            "catch-up head between marks still recaptures the second");
 
     expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 24576, 24576, false,
-                                                                true),
+                                                                 true),
            "product first mark 24576 freezes at that chunk end");
     expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 24384, 24576, false,
-                                                                 true),
+                                                                  true),
            "chunk end 24384 still waits for 24576");
     expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 25000, 24576, false,
-                                                                true) &&
+                                                                 true) &&
                q36::detail::advertised_context_checkpoint_frontier(25000) == 25000,
            "catch-up past 24576 freezes the later chunk end");
     expect(q36::detail::newly_frozen_context_checkpoint_tokens(36864, 24576) == 12288,
@@ -660,7 +922,7 @@ void test_prefill_context_marks() {
     expect(q36::detail::next_prefill_context_mark(24576) == 36864,
            "occupy restore to 24576 recaptures 36864 next");
     expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreContextCheckpoint, 8192,
-                                                            24576) ==
+                                                             24576) ==
                q36::detail::retain_context_checkpoint_head(8192, 24576),
            "occupy keep-helper matches retain for restore");
     expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::FullReset, 24576, 0) == false,
@@ -669,19 +931,19 @@ void test_prefill_context_marks() {
     expect(q36::detail::mtp_prefix_reuse_ready(Path::FullReset, 0, 0, false, false),
            "FullReset does not require MTP reuse readiness");
     expect(q36::detail::mtp_prefix_reuse_ready(Path::RestoreContextCheckpoint, 24576, 24575, false,
-                                              true),
+                                               true),
            "checkpoint restore with mtp_kv_valid == F-1 is ready");
     expect(!q36::detail::mtp_prefix_reuse_ready(Path::RestoreContextCheckpoint, 24576, 24574, true,
-                                               true),
+                                                true),
            "checkpoint restore with mtp_kv_valid == F-2 FullResets");
-    expect(!q36::detail::mtp_prefix_reuse_ready(Path::RestoreTurnCheckpoint, 24576, 24574, true,
-                                               true),
-           "turn restore with mtp_kv_valid == F-2 FullResets");
+    expect(
+        !q36::detail::mtp_prefix_reuse_ready(Path::RestoreTurnCheckpoint, 24576, 24574, true, true),
+        "turn restore with mtp_kv_valid == F-2 FullResets");
     expect(q36::detail::mtp_prefix_reuse_ready(Path::RestoreResponseCheckpoint, 24576, 24575, true,
-                                              true),
+                                               true),
            "response restore with mtp_kv_valid == F-1 is ready");
     expect(!q36::detail::mtp_prefix_reuse_ready(Path::RestoreContextCheckpoint, 24576, 24575, true,
-                                               false),
+                                                false),
            "checkpoint restore without an MTP cache FullResets");
     expect(q36::detail::mtp_prefix_reuse_ready(Path::AppendAtFrontier, 24576, 24575, true, true),
            "append with tail_hidden and F-1 MTP KV is ready");
@@ -705,23 +967,23 @@ void test_prefill_context_marks() {
     expect(!q36::detail::mtp_bridge_reads_rewrite_hidden(Path::RestoreTurnRollback),
            "turn-rollback restore reads tail_hidden not rewrite hidden");
     expect(q36::detail::occupy_drops_rewrite_ahead_of_restore(Path::RestoreTurnRollback, true, 1500,
-                                                             1000),
+                                                              1000),
            "rollback occupy drops rewrite ahead of E");
     expect(!q36::detail::occupy_drops_rewrite_ahead_of_restore(Path::RestoreTurnRollback, true, 800,
-                                                              1000),
+                                                               1000),
            "rollback occupy keeps rewrite at or before E");
     expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnRollback, 1000, 1000),
            "rollback restore keeps the head at E");
-    expect(!q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnRollback, 24576,
-                                                             1000),
-           "rollback restore drops heads after E");
+    expect(
+        !q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnRollback, 24576, 1000),
+        "rollback restore drops heads after E");
 
     using Kind = q36::detail::ContextCheckpointKind;
     expect(q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true, true,
                                                      false, true),
            "append with prompt_tokens > E pins rollback");
-    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1000, true, true,
-                                                      false, true),
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1000, true,
+                                                      true, false, true),
            "exact-hit append does not replace an older rollback pin");
     expect(q36::detail::should_capture_exact_hit_pin(true, 1000, 1000, true, true, false, true),
            "exact-hit flag pins at E");
@@ -753,17 +1015,17 @@ void test_prefill_context_marks() {
     expect(!q36::detail::should_capture_turn_rollback(Path::RestoreTurnRollback, 1000, 1200, true,
                                                       true, false, true),
            "restore occupy does not recapture rollback");
-    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true, true,
-                                                      true, true),
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true,
+                                                      true, true, true),
            "skip pin when any head already sits at E");
-    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, false, true,
-                                                      false, true),
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, false,
+                                                      true, false, true),
            "MTP-off / reuse-off does not pin rollback");
-    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true, false,
-                                                      false, true),
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true,
+                                                      false, false, true),
            "invalid tail_hidden does not pin rollback");
-    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true, true,
-                                                      false, false),
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true,
+                                                      true, false, false),
            "incomplete Vision item at E skips the rollback pin");
 
     const std::array<q36::detail::PrefillReuseHead, 1> rollback_e1{
@@ -804,8 +1066,8 @@ void test_prefill_context_marks() {
     expect(q36::detail::reuse_path_for_context_checkpoint_kind(Kind::OnDemand) ==
                Path::RestoreContextCheckpoint,
            "reserved OnDemand kind is not RestoreTurnRollback");
-    expect(!q36::detail::should_capture_turn_rollback(Path::FullReset, 1000, 1200, true, true, false,
-                                                      true),
+    expect(!q36::detail::should_capture_turn_rollback(Path::FullReset, 1000, 1200, true, true,
+                                                      false, true),
            "FullReset occupy does not pin rollback");
     expect(!q36::detail::should_capture_turn_rollback(Path::RestoreContextCheckpoint, 1000, 1200,
                                                       true, true, false, true),
@@ -824,8 +1086,7 @@ void test_prefill_context_marks() {
         q36::detail::PrefillReuseHead{1000u, Kind::TurnRollback}};
     const auto longest_rollback = q36::detail::select_resident_prefill_reuse(
         false, 2000, false, 0, Path::RestoreTurnCheckpoint, two_rollbacks);
-    expect(longest_rollback.path == Path::RestoreTurnRollback &&
-               longest_rollback.frontier == 1000,
+    expect(longest_rollback.path == Path::RestoreTurnRollback && longest_rollback.frontier == 1000,
            "longest matching rollback head wins");
     const std::array<q36::detail::PrefillReuseHead, 2> rollback_and_ladder{
         q36::detail::PrefillReuseHead{1000u, Kind::TurnRollback},
@@ -865,25 +1126,21 @@ void test_prefill_context_marks() {
            "rewrite wins a product-mark same-F tie");
     const auto response_tie = q36::detail::select_resident_prefill_reuse(
         false, 30000, true, 24576, Path::RestoreResponseCheckpoint, same_f);
-    expect(response_tie.path == Path::RestoreResponseCheckpoint &&
-               response_tie.frontier == 24576,
+    expect(response_tie.path == Path::RestoreResponseCheckpoint && response_tie.frontier == 24576,
            "response rewrite also wins a same-F ladder tie");
 
     using Slots = q36::detail::mechanism_slots::LinearStateSlots;
-    expect(Slots::state_slot_count(1, true) == 3, "C=1 MTP/DFlash GDN pool is 2C+1");
-    expect(Slots::staging_state_slot(1) == 2, "C=1 staging is slot 2C");
+    expect(Slots::state_slot_count(1, true) == 2, "C=1 MTP/DFlash GDN pool is C+1");
+    expect(Slots::staging_state_slot(1) == 1, "C=1 staging is slot C");
     expect(Slots::current_state_slot(0, 1) == 0, "C=1 current is slot 0");
-    expect(Slots::rewrite_checkpoint_state_slot(0, 1) == 1, "C=1 rewrite is slot C");
-    expect(Slots::state_slot_count(1, false) == 2, "ordinary GDN pool is 2C, no staging");
-    expect(Slots::state_slot_count(2, true) == 5, "C=2 MTP/DFlash GDN pool is 2C+1");
-    expect(Slots::staging_state_slot(2) == 4, "C=2 staging is slot 2C");
+    expect(Slots::state_slot_count(1, false) == 1, "ordinary GDN pool is C, no staging");
+    expect(Slots::state_slot_count(2, true) == 3, "C=2 MTP/DFlash GDN pool is C+1");
+    expect(Slots::staging_state_slot(2) == 2, "C=2 staging is slot C");
     expect(Slots::current_state_slot(1, 2) == 1, "C=2 lane 1 current is slot 1");
-    expect(Slots::rewrite_checkpoint_state_slot(1, 2) == 3, "C=2 lane 1 rewrite is slot C+1");
-    expect(Slots::state_slot_count(8, true) == 17, "C=8 MTP/DFlash GDN pool is 2C+1");
-    expect(Slots::staging_state_slot(8) == 16, "C=8 staging is slot 2C");
+    expect(Slots::state_slot_count(8, true) == 9, "C=8 MTP/DFlash GDN pool is C+1");
+    expect(Slots::staging_state_slot(8) == 8, "C=8 staging is slot C");
     expect(Slots::current_state_slot(7, 8) == 7, "C=8 last-lane current is slot 7");
-    expect(Slots::rewrite_checkpoint_state_slot(7, 8) == 15, "C=8 last-lane rewrite is slot C+7");
-    expect(Slots::staging_state_slot(3) == 6, "C=3 staging is slot 2C");
+    expect(Slots::staging_state_slot(3) == 3, "C=3 staging is slot C");
 }
 
 } // namespace
@@ -915,49 +1172,141 @@ struct ResidentReuseFixture {
     q36::detail::ResidentReuseState state;
 
     ResidentReuseFixture()
-        : prompt(text_prompt(6)),
-          ledger(text_prompt(4).token_ids),
-          state{&ledger, &identity, 4, false, q36::RewriteCheckpointKind::TurnClosure, 0, 0, 0,
-                false, false, {}} {
+        : prompt(text_prompt(6)), ledger(text_prompt(4).token_ids),
+          state{&ledger, &identity, 4,     false, q36::RewriteCheckpointKind::TurnClosure, 0, 0,
+                0,       false,     false, {}} {
         identity.assign(text_prompt(4));
     }
 };
 
 q36::detail::PrefillReuseSelection decide(const q36::detail::ResidentReuseState& state,
                                           const q36::PreparedPromptData& prompt,
-                                          ninfer::SpeculativeBackend backend,
-                                          bool mtp_cache = true, bool dflash = false,
-                                          bool dflash_full_layers = false) {
-    return q36::detail::decide_resident_reuse(state, prompt, backend, mtp_cache, dflash,
-                                               dflash_full_layers);
+                                          ninfer::SpeculativeBackend backend, bool mtp_cache = true,
+                                          bool dflash = false, bool dflash_full_layers = false) {
+    return q36::detail::decide_resident_reuse(state, prompt, q36::detail::prefix_hash_chain(prompt),
+                                              backend, mtp_cache, dflash, dflash_full_layers);
 }
 
 // Speculative cancellation folds GDN back to E but cannot restore current tail
 // hidden. DFlash context remains at E; an exact-prefix continuation must restore a
 // checkpoint or recompute, while a nonempty suffix can establish new tail hidden.
 void test_cancelled_dflash_exact_prefix_reuse() {
-    using Path = ninfer::PrefixReusePath;
+    using Path    = ninfer::PrefixReusePath;
     using Backend = ninfer::SpeculativeBackend;
     ResidentReuseFixture fixture;
-    auto state = fixture.state;
+    auto state                    = fixture.state;
     state.dflash_context_frontier = state.execution_frontier;
-    state.tail_hidden_valid = false;
-    const auto exact = text_prompt(state.execution_frontier);
-    auto selected = decide(state, exact, Backend::DFlash, false, true);
+    state.tail_hidden_valid       = false;
+    const auto exact              = text_prompt(state.execution_frontier);
+    auto selected                 = decide(state, exact, Backend::DFlash, false, true);
     expect(selected.path == Path::FullReset && selected.frontier == 0,
            "cancelled DFlash exact prefix without hidden must recompute");
     selected = decide(state, fixture.prompt, Backend::DFlash, false, true);
     expect(selected.path == Path::AppendAtFrontier && selected.frontier == 4,
            "cancelled DFlash nonempty suffix can establish new hidden");
-    state.rewrite_valid = true;
+    state.rewrite_valid    = true;
     state.rewrite_frontier = 2;
-    selected = decide(state, exact, Backend::DFlash, false, true);
+    selected               = decide(state, exact, Backend::DFlash, false, true);
     expect(selected.path == Path::RestoreTurnCheckpoint && selected.frontier == 2,
            "cancelled DFlash exact prefix restores an available earlier checkpoint");
     state.tail_hidden_valid = true;
-    selected = decide(state, exact, Backend::DFlash, false, true);
+    selected                = decide(state, exact, Backend::DFlash, false, true);
     expect(selected.path == Path::AppendAtFrontier && selected.frontier == 4,
            "valid DFlash exact prefix still appends ahead of its checkpoint");
+}
+
+q36::PreparedPromptData text_ids(std::vector<ninfer::TokenId> ids) {
+    q36::PreparedPromptData prompt;
+    const auto tokens = static_cast<std::uint32_t>(ids.size());
+    prompt.token_ids  = std::move(ids);
+    prompt.token_types.assign(tokens, 0);
+    std::vector<std::int32_t> positions;
+    positions.reserve(3 * static_cast<std::size_t>(tokens));
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        for (std::uint32_t i = 0; i < tokens; ++i) {
+            positions.push_back(static_cast<std::int32_t>(i));
+        }
+    }
+    prompt.positions = std::move(positions);
+    return prompt;
+}
+
+// Recovery splice: the ledger still holds the failed generation after the prompt
+// prefix, and the candidate replaces that tail with a different suffix.
+void test_recovery_prefix_reuse() {
+    using Path                          = ninfer::PrefixReusePath;
+    using Kind                          = q36::RewriteCheckpointKind;
+    using Backend                       = ninfer::SpeculativeBackend;
+    constexpr std::uint32_t P           = 16;
+    const auto prefix                   = text_prompt(P);
+    std::vector<ninfer::TokenId> ledger = prefix.token_ids;
+    ledger.insert(ledger.end(), {9001, 9002, 9003, 9004});
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(prefix);
+    identity.append_generated(4, 0);
+    auto candidate_ids = prefix.token_ids;
+    candidate_ids.insert(candidate_ids.end(), {42, 43, 44});
+    const auto prompt = text_ids(candidate_ids);
+    q36::detail::ResidentReuseState state{
+        &ledger, &identity, P + 4, true, Kind::ResponseReplay, P, 0, 0, true, false, {}};
+
+    {
+        const auto sel = decide(state, prompt, Backend::None);
+        expect(sel.path == Path::RestoreResponseCheckpoint && sel.frontier == P,
+               "response replay at the prompt prefix restores that checkpoint");
+    }
+    {
+        auto turn             = state;
+        turn.rewrite_kind     = Kind::TurnClosure;
+        turn.rewrite_frontier = P - 3;
+        const auto sel        = decide(turn, prompt, Backend::None);
+        expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == P - 3,
+               "a turn checkpoint before the prompt end restores that frontier");
+    }
+    {
+        auto missed         = prompt;
+        missed.token_ids[3] = 1;
+        const auto sel      = decide(state, missed, Backend::None);
+        expect(sel.path == Path::FullReset && sel.frontier == 0,
+               "one changed prompt token misses the advertised rewrite checkpoint");
+    }
+    {
+        auto mtp         = state;
+        mtp.mtp_kv_valid = 8;
+        mtp.context_checkpoints.push_back({8, q36::detail::prefix_hash_at(ledger, identity, 8),
+                                           q36::detail::ContextCheckpointKind::Ladder});
+        const auto sel = decide(mtp, prompt, Backend::Mtp);
+        expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 8,
+               "an unready rewrite falls through to an earlier ready ladder");
+    }
+    {
+        constexpr std::uint32_t S1           = 24;
+        std::vector<ninfer::TokenId> stacked = prefix.token_ids;
+        for (std::uint32_t i = 0; i < S1 - P; ++i) { stacked.push_back(5000 + i); }
+        std::vector<ninfer::TokenId> long_ledger = stacked;
+        long_ledger.insert(long_ledger.end(), {9001, 9002, 9003, 9004});
+        q36::detail::ResidentPrefixIdentity stacked_identity;
+        stacked_identity.assign(prefix);
+        stacked_identity.append_generated(long_ledger.size() - P, 0);
+        stacked.push_back(77);
+        stacked.push_back(78);
+        const auto candidate = text_ids(std::move(stacked));
+        q36::detail::ResidentReuseState stacked_state{
+            &long_ledger,
+            &stacked_identity,
+            static_cast<std::uint32_t>(long_ledger.size()),
+            true,
+            Kind::ResponseReplay,
+            S1,
+            0,
+            0,
+            true,
+            false,
+            {}};
+        const auto sel = decide(stacked_state, candidate, Backend::None);
+        expect(sel.path == Path::RestoreResponseCheckpoint && sel.frontier == S1,
+               "a second recovery suffix restores the previous spliced prompt");
+    }
 }
 
 void test_resident_reuse_decision() {
@@ -965,8 +1314,8 @@ void test_resident_reuse_decision() {
     using Kind    = q36::RewriteCheckpointKind;
     using Backend = ninfer::SpeculativeBackend;
     ResidentReuseFixture fixture;
-    const auto& prompt  = fixture.prompt;
-    auto state          = fixture.state;
+    const auto& prompt = fixture.prompt;
+    auto state         = fixture.state;
 
     // A ready MTP append at the frontier beats a matching checkpoint.
     state.tail_hidden_valid = true;
@@ -1007,7 +1356,7 @@ void test_resident_reuse_decision() {
     }
 
     // Without an MTP cache no reuse path is selectable.
-    state          = fixture.state;
+    state                   = fixture.state;
     state.rewrite_valid     = true;
     state.rewrite_frontier  = 4;
     state.mtp_kv_valid      = 3;
@@ -1018,13 +1367,13 @@ void test_resident_reuse_decision() {
     }
 
     // A staged head longer than the rewrite frontier wins; kind maps to its restore path.
-    state          = fixture.state;
-    state.rewrite_valid    = true;
-    state.rewrite_frontier = 2;
-    state.mtp_kv_valid     = 3;
-    state.context_checkpoints = {
-        {4, q36::detail::prefix_hash_at(fixture.ledger, fixture.identity, 4),
-         q36::detail::ContextCheckpointKind::Ladder}};
+    state                     = fixture.state;
+    state.rewrite_valid       = true;
+    state.rewrite_frontier    = 2;
+    state.mtp_kv_valid        = 3;
+    state.context_checkpoints = {{4,
+                                  q36::detail::prefix_hash_at(fixture.ledger, fixture.identity, 4),
+                                  q36::detail::ContextCheckpointKind::Ladder}};
     {
         const auto sel = decide(state, prompt, Backend::Mtp);
         expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 4,
@@ -1038,10 +1387,10 @@ void test_resident_reuse_decision() {
         expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == 2,
                "unready longer MTP staged head does not shadow ready rewrite");
     }
-    state.rewrite_frontier = 4;
-    state.context_checkpoints = {
-        {2, q36::detail::prefix_hash_at(fixture.ledger, fixture.identity, 2),
-         q36::detail::ContextCheckpointKind::Ladder}};
+    state.rewrite_frontier    = 4;
+    state.context_checkpoints = {{2,
+                                  q36::detail::prefix_hash_at(fixture.ledger, fixture.identity, 2),
+                                  q36::detail::ContextCheckpointKind::Ladder}};
     {
         const auto sel = decide(state, prompt, Backend::Mtp);
         expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 2,
@@ -1057,7 +1406,7 @@ void test_resident_reuse_decision() {
     }
     state.context_checkpoints.resize(1);
     state.dflash_context_frontier = 3;
-    state.backend_image_present = true;
+    state.backend_image_present   = true;
     {
         const auto sel = decide(state, prompt, Backend::DFlash, true, true, true);
         expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 2,
@@ -1065,7 +1414,7 @@ void test_resident_reuse_decision() {
     }
 
     // The checkpoint kind determines the restore path.
-    state          = fixture.state;
+    state                  = fixture.state;
     state.rewrite_valid    = true;
     state.rewrite_kind     = Kind::ResponseReplay;
     state.rewrite_frontier = 4;
@@ -1078,15 +1427,14 @@ void test_resident_reuse_decision() {
 
     // DFlash gates the append on its context frontier; a short context still FullResets a
     // selected rewrite restore even with the backend image present.
-    state          = fixture.state;
+    state                         = fixture.state;
     state.rewrite_valid           = true;
     state.rewrite_frontier        = 4;
     state.dflash_context_frontier = 3;
     state.backend_image_present   = true;
     {
         const auto sel = decide(state, prompt, Backend::DFlash, true, /*dflash=*/true, true);
-        expect(sel.path == Path::FullReset,
-               "short DFlash context FullResets a rewrite restore");
+        expect(sel.path == Path::FullReset, "short DFlash context FullResets a rewrite restore");
     }
 
     // A context between the rewrite frontier and the execution frontier keeps the restore.
@@ -1097,7 +1445,7 @@ void test_resident_reuse_decision() {
                "DFlash context past the rewrite frontier keeps the restore");
     }
 
-    state          = fixture.state;
+    state                         = fixture.state;
     state.rewrite_valid           = true;
     state.rewrite_frontier        = 2;
     state.dflash_context_frontier = 2;
@@ -1108,7 +1456,7 @@ void test_resident_reuse_decision() {
     }
 
     // A checkpoint frontier beyond the prompt is not a candidate.
-    state          = fixture.state;
+    state                  = fixture.state;
     state.rewrite_valid    = true;
     state.rewrite_frontier = 8;
     {
@@ -1117,12 +1465,11 @@ void test_resident_reuse_decision() {
     }
 
     // An unmatched frontier with no checkpoint is a FullReset.
-    state          = fixture.state;
+    state = fixture.state;
     fixture.ledger.resize(3);
     {
         const auto sel = decide(state, prompt, Backend::Mtp);
-        expect(sel.path == Path::FullReset,
-               "unmatched frontier with no checkpoint FullResets");
+        expect(sel.path == Path::FullReset, "unmatched frontier with no checkpoint FullResets");
     }
 }
 
@@ -1132,7 +1479,7 @@ void test_dflash_chain_verify_kv_headroom() {
     // entitlement only covers reserved_context (= prompt+output-1), a page-boundary reserved
     // length makes pages_for_tokens(reserved+W) exceed entitlement and throws
     // "Paged KV materialize extent is outside entitlement", poisoning the executor.
-    constexpr std::uint32_t kPage = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+    constexpr std::uint32_t kPage        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
     constexpr std::uint32_t kVerifyWidth = 6;
     const std::uint32_t reserved         = kPage; // exact page boundary
     expect(ninfer::pages_for_tokens(reserved) == 1, "reserved context fits one KV page");
@@ -1144,15 +1491,13 @@ void test_adaptive_capture_and_topology() {
     using ninfer::SpeculativeBackend;
     const auto same = [](const std::vector<std::uint32_t>& got,
                          std::initializer_list<std::uint32_t> want, std::string_view msg) {
-        expect(got.size() == want.size() &&
-                   std::equal(got.begin(), got.end(), want.begin()),
-               msg);
+        expect(got.size() == want.size() && std::equal(got.begin(), got.end(), want.begin()), msg);
     };
-    same(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false), {5}, "frozen MTP {N}");
-    same(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true), {3, 4, 5}, "MTP adaptive set");
-    same(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 7, true), {3, 4, 5}, "DFlash {3,4,5}");
-    same(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 6, true), {3, 4, 5},
-         "DFlash N=6 still {3,4,5}");
+    same(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false, 7), {5}, "frozen MTP {N}");
+    same(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true, 7), {3, 4, 5},
+         "MTP adaptive set");
+    same(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true, 7), {3, 4, 5},
+         "DFlash adaptive set");
     const std::uint32_t c        = 3;
     const std::uint32_t planned  = 0;
     const std::uint32_t k_stride = q36::adaptive_k_stride(c, planned);
@@ -1163,87 +1508,21 @@ void test_adaptive_capture_and_topology() {
            "k_index folds before B");
 }
 
-void test_full_checkpoint_pool_drains_copy() {
-    using Head = q36::detail::ContextCheckpointHead;
-    std::vector<Head> pool;
-    pool.reserve(1);
-    pool.emplace_back();
-    cudaStream_t stream = nullptr;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    std::uint32_t* device_value = nullptr;
-    CUDA_CHECK(cudaMalloc(&device_value, sizeof(std::uint32_t)));
-    CUDA_CHECK(cudaMemsetAsync(device_value, 0x5a, sizeof(std::uint32_t), stream));
-    ninfer::test::StreamCopyGate gate;
-    std::atomic<std::uint32_t> value_at_release{0};
-    Head head;
-    head.hidden = std::shared_ptr<ninfer::PinnedHostBuffer>(
-        new ninfer::PinnedHostBuffer(sizeof(std::uint32_t)), [&](auto* buffer) {
-            std::uint32_t value = 0;
-            std::memcpy(&value, buffer->data(), sizeof(value));
-            value_at_release.store(value, std::memory_order_release);
-            delete buffer;
-    });
-    std::memset(head.hidden->data(), 0, sizeof(std::uint32_t));
-    Head::test_fail_next_copy_event_allocation();
-    bool allocation_failed = false;
-    try { head.prepare_copy_event(); }
-    catch (const std::bad_alloc&) { allocation_failed = true; }
-    expect(allocation_failed && head.copies_done == nullptr && head.hidden &&
-               !Head::test_copy_event_allocation_pending(),
-           "checkpoint event exhaustion was not recoverable before DMA");
-    head.prepare_copy_event();
-    gate.launch(stream);
-    CUDA_CHECK(cudaMemcpyAsync(head.hidden->data(), device_value, sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaEventRecord(head.copies_done, stream));
-    std::promise<void> entered;
-    auto entered_future = entered.get_future();
-    auto retire = std::async(std::launch::async, [&] {
-        entered.set_value();
-        q36::detail::recycle_checkpoint_image(pool, std::move(head));
-    });
-    entered_future.wait();
-    expect(retire.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
-           "full checkpoint pool did not wait for the excess image's DMA");
-    gate.release();
-    retire.get();
-    expect(value_at_release.load(std::memory_order_acquire) == 0x5a5a5a5aU,
-           "full checkpoint pool did not release the completed image");
-    expect(pool.size() == 1 && head.copies_done == nullptr,
-           "full checkpoint pool grew or retained the retired event");
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    pool.clear();
-    CUDA_CHECK(cudaFree(device_value));
-    CUDA_CHECK(cudaStreamDestroy(stream));
-}
-
-void test_context_checkpoint_image_pool_policy() {
-    using q36::detail::ContextCheckpointImageLayout;
-    constexpr ContextCheckpointImageLayout mtp{.conv_bytes      = 64,
-                                               .recurrent_bytes = 128,
-                                               .hidden_bytes    = 32,
-                                               .dflash_bytes    = 0};
-    constexpr ContextCheckpointImageLayout dflash{.conv_bytes      = 64,
-                                                  .recurrent_bytes = 128,
-                                                  .hidden_bytes    = 32,
-                                                  .dflash_bytes    = 96};
-    expect(q36::detail::context_checkpoint_image_layout_matches(mtp, mtp),
-           "exact MTP checkpoint image layout reuses its host image");
-    expect(!q36::detail::context_checkpoint_image_layout_matches(mtp, dflash),
-           "MTP image must not reuse DFlash cyclic-state storage");
-    expect(!q36::detail::context_checkpoint_image_layout_matches(
-               mtp, ContextCheckpointImageLayout{64, 127, 32, 0}),
-           "recurrent-state size mismatch must not reuse a host image");
-    expect(!q36::detail::context_checkpoint_image_layout_matches(
-               mtp, ContextCheckpointImageLayout{63, 128, 32, 0}),
-           "convolution-state size mismatch must not reuse a host image");
-    expect(!q36::detail::context_checkpoint_image_layout_matches(
-               mtp, ContextCheckpointImageLayout{64, 128, 31, 0}),
-           "hidden-state size mismatch must not reuse a host image");
-    expect(q36::detail::context_checkpoint_image_pool_capacity(1, 0) == 1 &&
-               q36::detail::context_checkpoint_image_pool_capacity(1, 3) == 4 &&
-               q36::detail::context_checkpoint_image_pool_capacity(8, 16) == 136,
-           "pool high-water bound is one rollback plus every mark per lane");
+void test_context_checkpoint_image_pool_capacity() {
+    using q36::detail::context_checkpoint_image_pool_capacity;
+    constexpr std::array<std::uint32_t, 6> marks = {24576u, 36864u,  53248u,
+                                                    77824u, 102400u, 151552u};
+    expect(context_checkpoint_image_pool_capacity(1, marks, 262144, 262144) == 7,
+           "one lane owns a rollback plus every reachable mark");
+    expect(context_checkpoint_image_pool_capacity(2, marks, 100000, 1000000) == 10,
+           "marks above the sequence capacity are unreachable");
+    expect(context_checkpoint_image_pool_capacity(6, marks, 262144, 1000000000) == 42,
+           "an unconstrained KV pool lets every lane reach every mark");
+    // 15 ladder images would need under 17476 tokens each; three marks per lane cost 17749.
+    expect(context_checkpoint_image_pool_capacity(6, marks, 262144, 262144) == 20,
+           "the shared KV pool bounds how many marks all lanes reach at once");
+    expect(context_checkpoint_image_pool_capacity(3, {}, 262144, 262144) == 3,
+           "without marks each lane owns only its rollback image");
 }
 
 int main() {
@@ -1251,16 +1530,20 @@ int main() {
     test_decoder_layout();
     test_round_layout();
     test_mtp_alignment();
+    test_vision_prefill_shifted_inputs();
+    test_multimodal_prefill_service_projection();
     test_vision_control();
     test_prefix_identity();
     test_prefix_hash_and_dflash_gate();
+    test_prefix_identity_packed_layout();
+    test_resident_prefix_hashes();
     test_prefill_context_marks();
     test_resident_reuse_decision();
+    test_recovery_prefix_reuse();
     test_cancelled_dflash_exact_prefix_reuse();
     test_dflash_chain_verify_kv_headroom();
     test_adaptive_capture_and_topology();
-    test_context_checkpoint_image_pool_policy();
-    test_full_checkpoint_pool_drains_copy();
+    test_context_checkpoint_image_pool_capacity();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

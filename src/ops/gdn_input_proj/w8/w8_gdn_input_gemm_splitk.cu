@@ -70,7 +70,7 @@ __device__ __forceinline__ unsigned bf16_pair_from_s8(unsigned values) {
 
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 __global__
-__launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_gdn_input_medium_t_splitk_kernel(
+__launch_bounds__(KSplits * NGroups * 32, MinBlocks) void w8_gdn_input_medium_t_splitk_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, int active_cols) {
     constexpr int kKernelWarps = KSplits * NGroups;
@@ -366,9 +366,9 @@ void launch_medium_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
 
 using ProjectionLauncher = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t);
 using SnapshotLauncher   = void (*)(const Tensor&, const Weight&, const Tensor&, Tensor&,
-                                  const Tensor&, const Tensor&, const Tensor&, Tensor&, Tensor&,
-                                  Tensor&, Tensor&, cudaStream_t);
-using RecordLauncher     = void (*)(const Tensor&, const Weight&, const Tensor&, const Tensor&,
+                                    const Tensor&, const Tensor&, const Tensor&, Tensor&, Tensor&,
+                                    Tensor&, Tensor&, cudaStream_t);
+using RecordLauncher = void (*)(const Tensor&, const Weight&, const Tensor&, const Tensor&,
                                 const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
                                 Tensor&, cudaStream_t);
 

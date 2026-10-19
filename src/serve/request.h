@@ -31,6 +31,8 @@ struct ApiError {
     std::string message;
     std::string param; // optional
     std::string code;  // optional
+    // Engine recovery totals when this error ended a generation. Empty otherwise.
+    ninfer::GenerationRecoveryStats recovery;
 };
 
 class ApiException : public std::runtime_error {
@@ -56,7 +58,8 @@ struct CompletionUsage {
 
 // Prefill emits the first generated token (counted in prefill.ms / TTFT). Decode
 // rates use the remaining completion tokens so tok_s = tokens / (ms/1000).
-[[nodiscard]] inline int decode_eval_tokens(int completion_tokens, int recovery_prefill_samples = 0) {
+[[nodiscard]] inline int decode_eval_tokens(int completion_tokens,
+                                            int recovery_prefill_samples = 0) {
     return std::max(0, completion_tokens - 1 - recovery_prefill_samples);
 }
 
@@ -69,56 +72,39 @@ struct CompletionUsage {
 // llama.cpp-compatible timing block for Open WebUI / LiteLLM info bubbles.
 struct CompletionTimings {
     ninfer::GenerationRecoveryStats recovery;
-    int prompt_n                = 0;
+    int prompt_n = 0;
     // Prefix tokens served from prefix reuse (no recompute). Prefill rates below are
     // computed over the non-reused suffix only, so cached prefixes do not inflate them.
-    int prompt_reused_n         = 0;
-    double prompt_ms            = 0.0;
-    double prompt_per_token_ms  = 0.0;
-    double prompt_per_second    = 0.0;
+    int prompt_reused_n        = 0;
+    double prompt_ms           = 0.0;
+    double prompt_per_token_ms = 0.0;
+    double prompt_per_second   = 0.0;
     // Prefill throughput over the trailing window (<= 1s) of prefill: the steady-state rate.
-    double prefill_tail_tok_s      = 0.0;
-    double prefill_tail_window_s   = 0.0;
+    double prefill_tail_tok_s    = 0.0;
+    double prefill_tail_window_s = 0.0;
     // HTTP prepare + engine time to first token (queue wait, vision, prefill).
     // Same definition as [req] done ttft; not equal to prefill.ms.
-    double ttft_ms              = 0.0;
+    double ttft_ms = 0.0;
     // Decode eval token count (completion_tokens - 1). Prefill samples the first
     // generated token; rates use this so tok_s = predicted_n / (predicted_ms/1000).
-    int predicted_n             = 0;
-    double predicted_ms         = 0.0;
+    int predicted_n               = 0;
+    double predicted_ms           = 0.0;
     double predicted_per_token_ms = 0.0;
-    double predicted_per_second = 0.0;
-    int draft_n                 = 0;
-    int draft_n_accepted        = 0;
+    double predicted_per_second   = 0.0;
+    int draft_n                   = 0;
+    int draft_n_accepted          = 0;
     // Reasoning (thinking) portion of the completion; 0 when thinking is off.
-    int reasoning_tokens        = 0;
-    ninfer::PrefixReusePath prefix_reuse_path     = ninfer::PrefixReusePath::FullReset;
-    ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;
+    int reasoning_tokens                             = 0;
+    ninfer::PrefixReusePath prefix_reuse_path        = ninfer::PrefixReusePath::FullReset;
+    ninfer::PrefixReuseSource prefix_reuse_source    = ninfer::PrefixReuseSource::None;
     std::uint32_t captured_context_checkpoint_tokens = 0;
     std::uint32_t restored_context_checkpoint_tokens = 0;
-    // Host KV RAM tier stats, all zero when the tier is off. used_bytes / entry_count
-    // are live engine-level gauges at request end; the *_total counters are
-    // engine-lifetime cumulative; save_ms / load_ms are this request's D2H/H2D copy
-    // time. capacity_bytes is the static pin budget (not serialized).
-    std::size_t kv_ram_capacity_bytes = 0;
-    std::size_t kv_ram_used_bytes     = 0;
-    std::size_t kv_ram_entry_count    = 0;
-    std::uint64_t kv_ram_captures     = 0;
-    std::uint64_t kv_ram_restores     = 0;
-    std::uint64_t kv_ram_evictions    = 0;
-    std::uint64_t kv_ram_drops        = 0;
-    double kv_ram_save_ms             = 0.0;
-    double kv_ram_load_ms             = 0.0;
-    std::size_t kv_disk_capacity_bytes = 0;
-    std::size_t kv_disk_used_bytes     = 0;
-    std::size_t kv_disk_entry_count    = 0;
-    std::uint64_t kv_disk_captures     = 0;
-    std::uint64_t kv_disk_restores     = 0;
-    std::uint64_t kv_disk_evictions    = 0;
-    std::uint64_t kv_disk_drops        = 0;
-    double kv_disk_save_ms             = 0.0;
-    double kv_disk_load_ms             = 0.0;
-    double kv_disk_h2d_ms              = 0.0;
+    // This request's KV copy time. Process occupancy and lifetime counters are scrape gauges.
+    double kv_ram_save_ms  = 0.0;
+    double kv_ram_load_ms  = 0.0;
+    double kv_disk_save_ms = 0.0;
+    double kv_disk_load_ms = 0.0;
+    double kv_disk_h2d_ms  = 0.0;
 };
 
 enum class ContentKind {
@@ -170,6 +156,20 @@ struct ChatTurn {
     std::string tool_call_id;      // populated for role=tool
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
+};
+
+// One reported token alternative. `bytes` is the token's exact byte string, which may hold a
+// partial UTF-8 sequence.
+struct TokenLogprobAlternative {
+    std::string bytes;
+    double logprob = 0.0;
+};
+
+// One content token's logprob record with its ranked alternatives, most likely first.
+struct TokenLogprobEntry {
+    std::string bytes;
+    double logprob = 0.0;
+    std::vector<TokenLogprobAlternative> top;
 };
 
 // OpenAI sampling fields carried by the protocol adapter. `logit_bias` remains
@@ -249,7 +249,12 @@ struct GenerationRequest {
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
-    bool capture_context_checkpoint = false;
+    // Set to report every content token's logprob with this many ranked alternatives (0..20).
+    std::optional<int> top_logprobs;
+    std::optional<ninfer::OutputConstraint> output_constraint;
+    std::string output_constraint_param = "response_format";
+    bool cache_write                    = true;
+    bool capture_context_checkpoint     = false;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

@@ -1,0 +1,295 @@
+[
+  {
+    "id": "causal-prefill-wave-tile-selection",
+    "priority": 5.875,
+    "title": "Select causal prefill tiles using query waves per SM",
+    "original_ids": [
+      "repo:zhuoyao1012/sglang"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:zhuoyao1012/sglang",
+        "repository": "zhuoyao1012/sglang",
+        "head": "8acfae4fbeba6822e54dc034b3d1fdb555174992",
+        "path": "python/sglang/kernels/ops/attention/flash_attn/cute/flash_fwd_sm120.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/ops/launcher/gqa_attention_prefill_s3_tma.cu",
+        "range": [
+          170,
+          213
+        ]
+      },
+      {
+        "path": "src/ops/kernel/gqa_attention_nvfp4s3_tma.cuh",
+        "range": [
+          177,
+          193
+        ]
+      }
+    ],
+    "decision": "Reached SM120 head256 attention chooses query tiles32 or48 within particular single-batch query-length bands normalized by SM count, otherwise64. Native already uses TMA producers and staged NVFP4 code/scale consumers; the inspected prefill schedule does not have that query-wave-band heuristic. This is a prefill workload scheduling question, with foreign BF16/FP8 and native NVFP4 costs differing.",
+    "next_step": "Classify admitted query-tile variants for native causal head256 NVFP4 prefill using actual GPU SM count, sequence lengths and batch1\u20136. Compare occupancy and causal critical paths before a bounded phase-cost experiment; do not copy source band coefficients or treat this as small decode acceleration.",
+    "qualification": "Keep complete causal masks, page/address ownership, signed codes and exact stored scales with the independent represented-input attention oracle. Account for CTA waves, extra blocks, producer/consumer roles, shared memory and stage count together. The existing native TMA design is the baseline; no foreign timing or native speedup is qualified.",
+    "owner": "draft_and_frontend",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "deterministic-topk-histogram",
+    "source_anchors": [
+      {
+        "original_id": "repo:darksharpness/sglang",
+        "repository": "darksharpness/sglang",
+        "head": "197d8bb15247e46781517d407272a7fa020556b3",
+        "path": "python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh"
+      },
+      {
+        "original_id": "repo:xijiaat/vllm",
+        "repository": "xijiaat/vllm",
+        "head": "95794d0cc5818406de77ed3b318bd2a5a7a9b01c",
+        "path": "csrc/libtorch_stable/persistent_topk.cuh"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "include/ninfer/ops/sampling.h",
+        "range": [
+          129,
+          139
+        ]
+      },
+      {
+        "path": "include/ninfer/ops/dflash2_path_select.h",
+        "range": [
+          29,
+          63
+        ]
+      }
+    ],
+    "priority": 6,
+    "title": "Use coarse shortlisting and cold overflow refinement for deterministic top-k",
+    "original_ids": [
+      "repo:darksharpness/sglang",
+      "repo:xijiaat/vllm",
+      "repo:yuan-luo/sglang"
+    ],
+    "decision": "Foreign histogram/radix separation provides a portable register-pressure idea, but its atomic2048-candidate quota can discard lower token IDs on equal scores. A second actual2048-bin producer with shared overlay corroborates the composition and replaces clipped overflow counts with cold exact full-score rescanning. A third producer contributes warp-ballot aggregated collection before deferred FP32 radix refinement, but clips its candidate buffer. Their atomic equal-pivot quotas lack native lower-ID refinement. None satisfies native shortlist membership/ties or sampling's sorted top20 behavior unchanged.",
+    "next_step": "Classify a native shortlist with deterministic composite(value,id) overflow quota and isolated cold refinement at actual native domains; use the existing exact sorted top-k oracle.",
+    "qualification": "Cover2049 equal finite1.0 scores embedded in a supported larger domain, signed zeros, nonfinite filtering and lower-ID ties. Preserve each consumer's observable order: sampling's sorted top20 and DFlash2's documented unsorted top16 inverse-CDF walk are different contracts. Do not adopt foreign1024-thread/2048 geometry or its performance claims without native evidence.",
+    "owner": "state_and_policy",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "confidence-ranked-verify-prefixes",
+    "source_anchors": [
+      {
+        "original_id": "repo:eanwang211123/sglang",
+        "repository": "eanwang211123/sglang",
+        "head": "cba4066a0663621be6af1800ce8dd98c7cd8734a",
+        "path": "python/sglang/srt/speculative/dspark_components/kernels/schedule_verify_lens_topk.py"
+      },
+      {
+        "original_id": "repo:hamstergamerszhang-ops/sglang",
+        "repository": "hamstergamerszhang-ops/sglang",
+        "head": "4731d151bf616381ac89679e16cdc266f0621f07",
+        "path": "python/sglang/srt/speculative/dspark_components/dspark_planner.py"
+      },
+      {
+        "original_id": "repo:mxadam99/sglang",
+        "repository": "mxadam99/sglang",
+        "head": "8b682cd6119ac5977b4b78a135ec253a875fcf2f",
+        "path": "python/sglang/srt/speculative/dflash_confidence.py"
+      },
+      {
+        "original_id": "repo:mxadam99/sglang",
+        "repository": "mxadam99/sglang",
+        "head": "8b682cd6119ac5977b4b78a135ec253a875fcf2f",
+        "path": "python/sglang/srt/speculative/dflash_worker_v2.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/targets/qwen3_6/impl/runtime/adaptive_draft.h",
+        "range": [
+          488,
+          529
+        ]
+      },
+      {
+        "path": "src/targets/qwen3_6/impl/runtime/program_impl.h",
+        "range": [
+          4310,
+          4366
+        ]
+      }
+    ],
+    "priority": 6.5,
+    "title": "Allocate heterogeneous verify prefixes within a shared token budget",
+    "original_ids": [
+      "repo:eanwang211123/sglang",
+      "repo:hamstergamerszhang-ops/sglang",
+      "repo:mxadam99/sglang"
+    ],
+    "decision": "An actual DSpark scheduler ranks cumulative confidence survival with deterministic position/request ties to allocate continuous per-row prefixes. A second inspected caller chooses a budget using expected yield B+sum(top survival) and a batch/token cost frontier. These corroborate one heterogeneous-prefix question; the original DSpark-to-DFlash integration was a plan. A separately inspected Mx DFlash producer uses actual selected-predecessor conditional likelihood, sorts prefix survival and picks a budget against a cost table; its worker reaches ragged graph/padding/full-verify guards. This provides source-level DFlash caller refinement, with host synchronization and a separate hybrid commit signature defect preventing working-integration credit. Native chooses a shared captured block length from aggregate expected yield and measured round time, with row capacity limits; it does not implement this confidence-ranked compact allocation.",
+    "next_step": "Measure request acceptance heterogeneity and padded verify cost at batch2\u20136. If the classifier admits a benefit, compare a bounded confidence-ranked prefix budget and calibrated positive cost frontier with the existing shared-length policy while retaining fixed round membership and stable capture buckets.",
+    "qualification": "Require finite confidence in[0,1] for nonincreasing cumulative survival and prefix selection; raw draft softmax confidence is not target acceptance probability. Qualify calibration, clipping, positive measured cost, bonus token and every KV/GDN/hidden commit domain with the supported greedy state-transition oracle. Keep the existing sampling route: this greedy-only plan proves no p-less distribution equivalence. Compact metadata/projection/graph costs may outweigh saved padded work, and no completed DFlash caller or native gain is established. Model likelihood is an acceptance proxy, not p/q acceptance probability. Include drafting, allocation, host synchronization, padding and accepted replay in the complete-round objective. Confidence overwrites on suffix hits need a justified policy; foreign partial cost tables are not native measured objectives.",
+    "owner": "state_and_policy",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "committed-suffix-proposals",
+    "priority": 6.75,
+    "title": "Use committed-history suffix continuations as explicit point-mass proposals",
+    "original_ids": [
+      "repo:kvcop/vllm",
+      "repo:zebrahack0/sglang"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:kvcop/vllm",
+        "repository": "kvcop/vllm",
+        "head": "d9cc8381adaa59260cc165f7ca883f837ef3026b",
+        "path": "vllm/v1/worker/gpu/spec_decode/dflash2/lookup.py"
+      },
+      {
+        "original_id": "repo:kvcop/vllm",
+        "repository": "kvcop/vllm",
+        "head": "d9cc8381adaa59260cc165f7ca883f837ef3026b",
+        "path": "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py"
+      },
+      {
+        "original_id": "repo:zebrahack0/sglang",
+        "repository": "zebrahack0/sglang",
+        "head": "58ccda0960d9f7eb1387b943f63420a5438b5597",
+        "path": "python/sglang/srt/speculative/suffix_cache_adapter.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "include/ninfer/ops/speculative_round.h",
+        "range": [
+          63,
+          96
+        ]
+      },
+      {
+        "path": "include/ninfer/ops/dflash2_path_select.h",
+        "range": [
+          14,
+          58
+        ]
+      }
+    ],
+    "decision": "Actual GPU lookup ranks longest historical suffix then most recent endpoint and copies available continuation. Its caller replaces selected already-computed DFlash rows and explicitly rewrites proposal logits to a point mass. Native can represent point-mass q but does not have this committed-history proposer refinement. Computing lookup after draft inference establishes no saved draft compute. A second actual adapter/worker offers a model-free CPU committed-history proposal source and hybrid trained-draft fallback; this corroborates the proposer interface, without proving Arctic matching is the same longest/recent algorithm. It can avoid a trained draft only with the added matching, deferred-commit and MTP keep-up costs included.",
+    "next_step": "Classify a bounded per-request GPU lookup over committed history with explicit point-mass proposal rows. Compare ordinary DFlash, model-plus-lookup and a cheap lookup-only route on repeated and nonrepeated supported prompts after independently qualifying complete-round verification and state transitions. Treat the CPU adapter as a lower-priority variant after bounding matching and trained-state refresh costs; its acceptance-only EMA does not replace the native full-round latency objective.",
+    "qualification": "Keep rejected tentative tokens out of lookup history, bound continuations/cursors/capacity, preserve longest/recent ties and the2^32 history bound, and record the actual q law for every replaced row. Preserve native p-less block correction, RNG, stop/publication and accepted-state ownership rather than importing foreign per-hop verification. Bound tails to fixed graph frontiers; include lookup/history traffic and model work in measured cost. The separate foreign strict-midpoint packed KV encoder fails native RNE identity and is excluded. No gain is established. Imported Arctic match mathematics and installed immutable dependency remain unqualified. Native adoption needs an explicit deterministic point-mass proposal, monotone committed cursor and complete MTP/DFlash2 refresh; zero-token padding must be masked invalid instead of accidentally accepted as a real token. Foreign tree padding/ancestry and host matching are not a direct native sampler or speed qualification.",
+    "owner": "state_and_policy",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "mtp-target-anchor",
+    "source_anchors": [
+      {
+        "original_id": "repo:gavinzhu-gmi/tensorrt-llm",
+        "repository": "gavinzhu-gmi/TensorRT-LLM",
+        "head": "1b5d23d4db297a54dd2b8a2632ef05985910a849",
+        "path": "tensorrt_llm/_torch/speculative/mtp.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/targets/qwen3_6/impl/runtime/mtp_impl.h",
+        "range": [
+          198,
+          228
+        ]
+      }
+    ],
+    "priority": 7,
+    "title": "Check whether a fixed target-hidden MTP anchor matches the trained checkpoint",
+    "original_ids": [
+      "repo:gavinzhu-gmi/tensorrt-llm"
+    ],
+    "decision": "Foreign GLM5.1 route reuses the accepted target hidden row across draft iterations; current native autoregression consumes the preceding draft hidden. This is checkpoint-dependent and does not establish a native correctness defect.",
+    "next_step": "First recover the supported checkpoint's trained/reference hidden-input convention. Only if that convention supports it, define a separate bounded reference comparison of accepted-row dependency and commit state.",
+    "qualification": "Foreign source explicitly reports no acceptance improvement in its GLM5.1 FP8 TP8 H200 experiment. Preserve native speculative transaction and selector semantics; no hidden-input change is authorized or justified solely by that patch.",
+    "owner": "draft_and_frontend",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "tool-close-search-cursor",
+    "source_anchors": [
+      {
+        "original_id": "repo:ehuaa/sglang",
+        "repository": "ehuaa/sglang",
+        "head": "d55d75ad2632b1e002a96bf4de8beb9d1675c9b2",
+        "path": "python/sglang/srt/function_call/qwen3_coder_detector.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/targets/qwen3_6/impl/frontend/frontend.cpp",
+        "range": [
+          790,
+          831
+        ]
+      },
+      {
+        "path": "src/targets/qwen3_6/impl/frontend/tool_grammar.cpp",
+        "range": [
+          465,
+          478
+        ]
+      }
+    ],
+    "priority": 8,
+    "title": "Avoid repeated prefix searches during long tool-call publication",
+    "original_ids": [
+      "repo:ehuaa/sglang"
+    ],
+    "decision": "Native ToolPublication searches growing pending text from its beginning after each delta. Foreign monotone parsing illustrates a possible CPU complexity improvement, with low expected inference benefit until measured.",
+    "next_step": "Measure publication CPU cost for long supported tool calls. If material, design a monotone close-marker search cursor with boundary overlap and grammar-aware failed-candidate handling while keeping complete-call publication.",
+    "qualification": "Native raw strings may contain literal delimiter text; lexical first-close parsing and foreign incremental argument publication cannot be substituted. Verify unchanged decoded calls, streamed visible text, escaping, terminal cancellation and split-marker behavior. No CPU cost or end-to-end speedup has been measured.",
+    "owner": "draft_and_frontend",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "target-nll-draft-length-predictor",
+    "priority": 8.125,
+    "title": "Test incremental value of acceptance-conditioned target NLL for draft length",
+    "original_ids": [
+      "repo:subsir/vllm"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:subsir/vllm",
+        "repository": "subsir/vllm",
+        "head": "cf73770d3cf9b0f1be4d3e2afe7a2849a4783d90",
+        "path": "vllm/v1/worker/gpu_model_runner.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/targets/qwen3_6/impl/runtime/adaptive_draft.h",
+        "range": [
+          488,
+          573
+        ]
+      },
+      {
+        "path": "src/targets/qwen3_6/impl/runtime/program_impl.h",
+        "range": [
+          4310,
+          4366
+        ]
+      }
+    ],
+    "decision": "Actual foreign caller accumulates target-token NLL vectors into sums/counts conditioned on observed accepted length, uses diagonal means as thresholds, predicts the first prior-NLL threshold exceedance, adds an offset and truncates next draft width. Native already has censored hop feedback, captured common-k selection, row caps and measured full-round cost; this target-NLL signal is a distinct optional predictor, not a missing generic controller or the same mathematics as confidence-ranked survival allocation.",
+    "next_step": "First test whether already licensed target/acceptance signals provide incremental calibration beyond native existing policy and price required statistics. Reject the foreign full-vocabulary log_softmax, per-request allocation and GPU any/item synchronization pattern. Only a useful cheap signal merits a bounded length-policy comparison inside current prepared envelopes.",
+    "qualification": "Previous-round NLL need not predict next-round content or calibrated sampled acceptance. Preserve actual conditional q, independent RNG, native p-less block acceptance, accepted-state transaction, startup-fixed batch and graph frontiers. Include complete drafting/verify/fold and switching costs in the objective. Imported deterministic sorted radix flags do not qualify lower-ID tie behavior or establish an alternate selection algorithm; the inspected selected wrapper only substitutes imported sorted/deterministic top_k with a torch fallback and authors no threshold/tie algorithm. Its fork contribution is closed; optional future adoption of imported mathematics would require independent exact producer qualification. No calibrated predictor, numerical advantage or speed gain is established.",
+    "owner": "state_and_policy",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  }
+]

@@ -1,5 +1,9 @@
 # NInfer Paged KV Context Store
 
+Current product execution supports ordinary decoding and DFlash2 only. MTP execution is
+rejected at Engine admission. MTP algorithms and layouts below describe dormant private
+machinery, not an available product backend.
+
 本文定义 NInfer 在单 GPU、单 resident model、少量并发请求下的 growing KV 存储架构。它是
 [小规模并发推理架构](concurrent-inference-architecture.md)所依赖的 KV substrate。
 
@@ -11,7 +15,7 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 
 ## 1. Requirements
 
-- `max_concurrency=1..4` 的 active requests 共享各类 growing KV capacity；
+- `max_concurrency=1..6` 的 active requests 共享各类 growing KV capacity；
 - 单个 request 可以使用 main KV pool 的大部分容量，不按 slot 平均切分；
 - 不同 request 的物理 KV 不要求连续；
 - active、retained 和 speculative provisional KV 使用同一套 reservation accounting；
@@ -141,9 +145,22 @@ persistent 部分直接来自生产 `LayoutBuilder`，workspace 来自生产 sch
 resolver 不维护模型维度或 bytes-per-token 公式，也不做 allocation probing。最终 plan 再由同一 builder
 按 `M` 生成并核对 reservation curve。
 
+单 schedule graph families（ordinary、MTP、DFlash2）的 CUDA Graph allowance 按 `(K, B, topology)`
+executable 数 `n` 计 `min(12n, 24+6n)` MiB，包含其 reachable definitions：实测总量是固定 warm-up 部分加
+每 executable 约 4 MiB（RTX 5090 serve benches：4 个 executable 最多 46 MiB，30 个 146 MiB）。以前的 DFlash adaptive
+`K={1,2,3,4,5}`、`C=4` 的 20 个 executable 实测 144 MiB（现在 `K={3,4,5}`、`C=4` 为 12 个）。不能套用 autoregressive DFlash 的 64/96 MiB
+unroll allowance。所有 definitions 和 executables
+在 startup 建立。实测值是 preparation 前后的 device-wide free-memory 差，会计入同一 GPU 上其他进程的
+分配/释放，因此只作为 observed/allowance 报告，不作为启动失败条件；allowance 校准由 real-artifact
+capacity test 在独占 GPU 上检查。4096-token prefill 和 adaptive
+K 切换使用已规划的共享 workspace，不增加 graph family 或扩展 KV pool。
+
 `R` 是 capacity solver 刻意不消费的 sizing headroom。CUDA allocator、context 和 module 的物理占用不全
 等同于 arena payload；因此 Instance 与 Graph 完整建立并同步后再次查询实际 free memory，并与 policy、
-planned slack 一起报告。默认 1 GiB 同时吸收这部分差值，并为同一 GPU 上后续的小额占用留下实际余量。
+planned slack 一起报告。Engine 在 startup 之后不再分配 device memory（C=6、6 个约 158k-token 请求的
+serve 实测 per-process 占用恒定），所以默认 `R` 为 64 MiB，只覆盖 driver 侧增长（lazy per-kernel local
+memory，最大 kernel stack 1128 B/thread）；与桌面或其他进程共享 GPU 时用 `--kv-capacity-headroom`
+增大。Automatic 模式下的 startup 失败信息会提示该选项。
 
 Engine 对外同时报告 configured `max_context` 和 resolved `kv_capacity=M*P_main`。最后一个 physical page
 的 rounding tail 只属于 storage padding，不能让 sequence frontier 超过 `S`。Admission 以 page-group
@@ -778,6 +795,18 @@ Qwen3.6 retained sequence 包含：
   尚无任何 context-checkpoint head 时写入同一 slot。编辑最后一条 user 消息走
   `restore_turn_rollback`；同一 last user 再生成仍走更长的 rewrite `TurnClosure`。
 
+Host RAM capture（因而也包括其后的 disk spill）对已关闭的 preserve-off turn 例外：request 以 stop
+token/string 结束且没有 tool call，并且其 `TurnClosure` checkpoint 就是本 request 自己的 generation
+opener（frontend 标记 `generation_opener`；tool loop 内的 checkpoint 位于 loop 首个 opener，不标记）时，
+下一 preserve-off prompt 会去掉该回复的 reasoning 重新渲染并在该 opener 后分叉，checkpoint 之后的
+frontier 不再可达。此时 entry 按回退到 checkpoint `F` 的状态保存：ledger/identity/Main Text 与 backend
+KV 截到 `F`，current GDN、DFlash cyclic lane 与 tail hidden 取自 checkpoint，不保存 rewrite 副本，
+只保留 frontier 不超过 `F` 的 heads。下一轮因此在 `F` 走 `append_frontier`（复用长度与
+`restore_turn_checkpoint` 相同），每个 entry 只存一份 state。带自身 generation-opener `TurnClosure`
+checkpoint 的 request 从 cut RAM/disk entry append 时不自动写 turn-rollback head（与之前走
+`restore_turn_checkpoint` 时一致）；resident append（例如取消后重发）照常写。VRAM 上的 retained lane 不变。代价：下一轮
+改用 preserve on、或以 assistant continuation 继续该回复时，要重新 prefill 该回复。
+
 每个 checkpoint 都必须同时描述：
 
 - Main Text allocation 可到达的 frontier 和 page mapping；
@@ -799,12 +828,12 @@ Incoming prompt 的复用路径为：
   frontier、恢复 checkpoint，再 prefill suffix；
 - prompt 匹配一条 ladder head 于 `F` 时，走 `restore_context_checkpoint`：把该 head 的 GDN 装入
   current、hidden 装入 `tail_hidden`（不写 rewrite hidden），trim KV 到 `F`，保留 `frontier<=F`
-  的 heads（含 `F` 本身），丢掉 `frontier>F` 的 heads 以及 `rewrite.frontier>F` 的 VRAM rewrite；
+  的 heads（含 `F` 本身），丢掉 `frontier>F` 的 heads 以及 `rewrite.frontier>F` 的 resident rewrite；
   DFlash 同时从该 head 恢复 cyclic 并设 `dflash_context_frontier=F`；
 - prompt 匹配 turn-rollback head 于上一完成 `E` 时，走 `restore_turn_rollback`：同一套完整
   checkpoint 配方（GDN→current，hidden→`tail_hidden`，MTP `mtp_kv_valid=E-1`，DFlash cyclic 与
-  `dflash_context_frontier=E`）。VRAM D2D `2C→current`
-  仅当 staging identity 仍是该 head；否则 unpack host。Ladder freeze 借 `2C` 后必须装回 rollback；
+  `dflash_context_frontier=E`）。VRAM D2D `C→current`（staging slot）
+  仅当 staging identity 仍是该 head；否则 unpack host。Ladder freeze 借 staging slot 后必须装回 rollback；
 - common prefix 结束在没有完整 checkpoint 的任意其他位置时，cache miss。
 
 Planner 先试 current frontier；否则在 rewrite 与该 bundle 上的 ladder / turn-rollback heads 中取最长完整
@@ -837,9 +866,24 @@ allocations，使相应 IDs 不属于各自 free sets；不需要 page refcount 
 pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuation state 一起切换到该 checkpoint。
 该过程不复制 retained KV payload。
 
-多个 active requests 不从同一 retained bundle 分叉。若未来产品需要同一大 prefix 同时 fan-out，必须
-连同 Linear Attention/backend state branching 一起重新设计；仅共享 Main Text pages 不能形成完整
-可继续的 sequence state。
+Ordinary requests consume one retained bundle in place. `cache_write: false` forks a selected
+retained prefix into independent allocations and complete continuation state. It does not share
+writable pages, mutate source checkpoints, or consume a RAM/disk original. Copy main/backend KV
+in their stored representations, including scale planes and partial final pages; preserve exact
+logical frontiers and initialize GDN, hidden, position/media metadata, and MTP/DFlash state at the
+same selected frontier. Transfer readers protect source allocations and images through fences.
+
+If the source prevents admission, ordinary state may migrate into a full-original RAM image,
+without the normal closed-turn rewrite cut, before its GPU bundle is released. Preserve existing
+checkpoints without capturing new ones. An independently retained disposable source may only be
+forked when another preserving destination is feasible; it is never offloaded.
+
+Disposable completion retains only coherent current continuation state in VRAM, with no reuse
+checkpoint captures and no RAM/disk persistence. It is the first eligible retained victim for
+both lane replacement and page pressure. A later true request can promote its own result.
+Insufficient permanent preservation capacity returns a bounded overload rather than destructively
+claiming the source. Cancellation releases destination resources after reader fences; a committed
+original migration remains cached. See the concurrent architecture for admission and cleanup.
 
 ### 10.4 Host RAM second tier
 
@@ -850,24 +894,31 @@ the host budget increments `drops` once and the incoming request still proceeds.
 `Captured`, `NeedsEviction`, or `Dropped`; only `NeedsEviction` permits the caller to spill/evict
 residents and retry. An image larger than the entire arena is `Dropped` without evicting any
 resident. D2H/H2D run on
-`DeviceContext::copy_stream`. Source GPU pages stay mapped until that entry's `copies_done` is
+`DeviceContext::copy_stream`. Rewrite-image and ladder-head copies between pinned host buffers
+run as host callbacks (4 MiB chunks) on the tier's own startup host-copy stream, ordered only
+after each image's fence, so they overlap the entry's KV/GDN D2H or H2D; that stream then joins
+`copy_stream` before the entry's `copies_done`, which still covers every copy. Source GPU pages stay mapped until that entry's `copies_done` is
 ready; unpack is not ordered behind block-table publish on the compute stream. Restore writes the
 host image onto a new page mapping of the chosen free lane (an empty lane
 first; a dirty lane only when none is empty, and among equal-reuse dirty lanes the
-least-recently-admitted retained bundle), records H2D completion on the same event, then
+disposable bundle before ordinary bundles, then the least-recently-admitted bundle), records H2D completion on the same event, then
 `device.stream` waits on that event only immediately before this lane's `start_prefill_lane`.
 Capture and restore both require a selected
 free lane; a queued request that cannot admit does not dump in-flight or other retained GPU
-state. Consume erases the host entry wherever it sits
-in the FIFO and retires the block; capacity eviction destroys the oldest unpinned resident and
-waits for its copy event and all host-side event borrowers before freeing. A disk worker waiting
-on another pending image can borrow this event while the eviction's CUDA wait releases the RAM
-mutex; transfer completion alone does not retire that borrow. Both then follow the same checkpoint decision as VRAM
-prefix reuse.
+state. Consume, a rollback discard, and capacity eviction
+(of the oldest unpinned resident) erase the host entry wherever it sits in the FIFO without
+waiting and retire its block. A retired block is freed once its copy and block events have completed and its
+last I/O pin has dropped: a disk spill still reading the image, or a disk worker's pending-copy
+snapshot borrowing its event. A RAM restore claim therefore neither cancels nor waits for a spill
+of the same entry; the spill commits from the pinned bytes. Harvest bills only completed copies;
+a retired entry's never-harvested copies count only toward the lifetime totals.
+Both then follow the same checkpoint decision as VRAM prefix reuse.
 Before requesting capacity eviction, capture checks whether the image can fit a contiguous
 arena interval after removing unclaimed residents. A claimed restore source divides the arena
 into fixed gaps; if none can fit the image, capture drops once and preserves the other residents.
-Retired copies drain before this decision; temporary idle-spill I/O pins can drain before eviction.
+Retired blocks and idle-spill I/O pins are temporary and do not count against this decision. A
+blocking reclaim waits for a victim's copies or a retired block's fence; a non-blocking reclaim
+selects only victims whose copies have landed and otherwise defers the admission.
 Logged `used`/`entries` (human `kv-ram=` / `n=`) are live host residents only. Serve and CLI also
 print CUDA D2H `save=` and H2D `load=` elapsed harvested after the first non-throwing
 `start_prefill_lane`. The host image packs logical page `i`
@@ -880,27 +931,55 @@ One long MTP or DFlash bundle with six ladder heads is about 6 GiB (Main+backend
 moved live heads, including DFlash cyclic). `--kv-ram-capacity off` still keeps the live-lane pinned GDN log for same-lane
 rollback; other-lane restore after eviction remains a miss without the FIFO. Eviction of a retained
 bundle is the existing KV dump plus those ladder heads **moved** (not aliased) into the same FIFO
-entry. A middle-head hit unpacks that head's GDN+hidden (and DFlash cyclic) into current/`tail_hidden` and KV
+entry. A middle-head hit unpacks that head's GDN+hidden (and DFlash cyclic) into current/`tail_hidden`, so
+occupy does not unpack it again, and installs only the entry's heads at or before the restored
+base (occupy drops later ones) into the Program's checkpoint pool. Those head copies run on the
+RAM tier's host-copy stream behind only each head's fence; the entry's copy fence, which gates the
+lane's first prefill chunk, does not include them, and a separate block fence keeps the retired
+block allocated until they land. A RAM or disk restore reads only the state its planned path keeps: a turn- or response-checkpoint restore skips the entry's
+frontier GDN, tail hidden and DFlash lane, which `start_prefill_lane` overwrites with the checkpoint
+set (the disk tier neither reads nor decodes them), and a request that drops its rewrite checkpoint
+skips the entry's rewrite set and installs no rewrite checkpoint. A RAM restore starts only once the entry's own capture copies
+are ready; while other lanes decode, the copy-hold polls that instead of blocking. KV
 `dst_extent` Main `pages_for_tokens(F)` / MTP `pages_for_tokens(F-1)` / DFlash Full `pages_for_tokens(F)`. Host RAM is not a second GPU
 working set.
 
 ### 10.5 Inclusive SSD third tier
 
 `--kv-disk-capacity` enables an inclusive SSD store of completed bundles and requires
-`--kv-ram-capacity > 0`. Equal reuse prefers VRAM, then RAM, then disk. A disk hit claims an
-immutable entry and its pack-generation lease, restores directly into the selected VRAM lane,
-and never parks the restored bundle in the RAM FIFO. Consuming the claim releases its generation
-lease but does not delete the durable entry; a later VRAM or RAM hit likewise leaves the disk copy
+`--kv-ram-capacity > 0`. Each RAM capture requests a write-behind spill on the disk worker, so
+entries usually become durable while other requests decode. When a capture needs RAM, the oldest
+unpinned disk-durable entry is evicted first. Without one, the in-flight write-behind spill, or
+else the oldest savable entry, is spilled first: synchronously when no other lane is decoding,
+otherwise at emergency priority on the disk worker while the admission stays queued and the
+other lanes keep decoding. The admission retries once that spill commits, so decoding never waits
+for a disk write and an entry is dropped unsaved only when the disk cannot store it. The
+admission's own earlier captures, which a deferral rolls back, are never that spill or drop
+target; when only they remain, the capture is dropped and the admission proceeds. Equal reuse prefers VRAM, then RAM, then disk. A disk hit claims an
+immutable entry, and each unlocked payload read acquires a per-extent lease. The hit restores
+directly into the selected VRAM lane and never parks the restored bundle in the RAM FIFO.
+Consuming the claim releases request ownership but does not delete the durable entry; a later VRAM or RAM hit likewise leaves the disk copy
 available. C=1 does not submit restore reads until the selected retained victim has been captured
 and its GPU pages released.
 
-Disk format v6 stores objects in 1 GiB, per-kind pack segments under an atomically selected
-generation. `PACKSET` names the generation and reserves monotonically increasing object-ID ranges.
-The immutable base map and append-only, CRC-framed log resolve stable object IDs to aligned
-extents. Page and state records carry header/payload CRC32C; ledger and identity records retain
-their exact codecs. Page records are individually 4 KiB padded even when a spill submits four
-contiguous records with one `pwritev`. Capacity bills unique retained extents and includes all
-physically allocated active, stale, and rolled pack files when deciding whether a write can start.
+Disk format v8 stores objects in reusable, 4 KiB-aligned extents in per-kind pack files of at
+most 1 GiB under `packs/1`. `PACKSET` selects an object-index epoch and reserves monotonically
+increasing object IDs; its epoch does not identify a second payload copy. The immutable base
+map and CRC-framed Put/Delete/Move journal resolve stable object IDs to extents. Record codecs and
+CRC32C checks remain unchanged. Adjacent page writes use one `pwritev`; reused nonadjacent slots
+are submitted as separate contiguous runs.
+
+The existing `--kv-disk-capacity` MiB value bounds the sum of pack-file lengths, including
+interior free extents and writes reserved before I/O starts. Extents are allocated from a
+coalescing best-fit index before growing a pack. A completely free segment is truncated with
+its slot unavailable to writers until truncation finishes. Index, entry, and filesystem metadata
+is additional overhead. Metadata-only journal checkpoints bound the index: after the log exceeds
+the greater of 64 KiB or twice the current object population's frame bytes, a quiescent worker
+writes a new base and empty log, syncs their namespace, and atomically publishes the index epoch.
+Old index files can then be removed without moving any payload. Captures that cannot fit a
+free extent or bounded pack growth are optional misses, not inference failures. Reopening with
+a smaller budget evicts ordinary and skipped entries until pack lengths fit; fragmentation may
+require evicting extra entries to release a whole segment.
 
 The publication order is segment bytes and segment namespace, object-map log, entry metadata,
 then manifest. Each preceding stage is synchronized before the next one becomes durable. A crash
@@ -924,7 +1003,19 @@ ownership without allocating; failed preparation drops the optional spill while 
 previous generation and releasing its pins. Spill page batches have a fixed maximum of eight
 jobs, and idle-to-emergency promotion transfers its queue without allocation.
 Spill preparation transfers the caller's RAM pin only after all jobs are queued, so a failed
-queue allocation leaves exactly one caller-owned pin to release. Branch sharing reserves all
+queue allocation leaves exactly one caller-owned pin to release. The state-blob encode runs
+with the index mutex released for both codecs, after the filesystem-space refusal it cannot change: it compresses (zstd) and seals each
+record's codec header and record CRC32C, so the commit only reserves an object ID and extent
+under the mutex; a cancelled worker prepare stops between 8 MiB compression chunks. A page
+batch likewise builds its record headers and CRCs unlocked from the I/O-pinned RAM image, then
+relocks to reserve IDs and the contiguous append range. An object-ID reservation that must
+extend `PACKSET` writes it unlocked; only the installed spill session allocates IDs, and it
+blocks index checkpoint publication. After relocking, preparation re-validates cancellation, a claim of the
+entry an Extend or Refresh would rewrite, and quarantine or eviction of its source, and abandons
+without marking the RAM entry failed so a retry re-plans. A commit's unlocked object sync and map append
+use object records copied under the mutex. MANIFEST images are sequenced under the index mutex
+and published by one writer at a time (tmp write, fsync, rename, directory fsync); an image older
+than the last published one is dropped. Branch sharing reserves all
 rollback bookkeeping before acquiring references; allocation failure cannot leave an untracked
 shared reference.
 
@@ -938,15 +1029,41 @@ size, logical plane schema, speculative backend, and persistent GDN/DFlash state
 strict compatibility boundaries. Vision media identity remains in each entry's exact identity
 record, so changed image or video content cannot reuse a stored prefix.
 
-The v6 fingerprint additionally requires the opened artifact's local file-generation identity:
-device, inode, byte length, and nanosecond modification/change timestamps, captured from the
-Reader's open descriptor. Distinct quantization variants may share `model_id`/`weights_id` but
-must never share retained numerical state. This is an immutable-local-file identity, not a
-content hash or an integrity check against concurrent/adversarial file mutation. Unchanged
-reopens are stable; replacement, metadata modification, or copying to a different inode may
-conservatively require a fresh cache directory. No model-size hashing pass is introduced at
-startup. The trusted local owner must not mutate an artifact while an Engine is using it.
-Pre-v6 stores lack this boundary and are rejected, not silently adopted or automatically deleted.
+The v8 fingerprint binds model/weights identity and a SHA-256 digest of target-selected tensor
+names, shapes, numeric formats, storage layouts, encoded byte ranges, and their contents. The
+artifact reader maps logical row selections to registered code/scale/divisor ranges and hashes
+in canonical name/range order; dependency selection belongs to each target package. For 27B:
+
+- Text embedding, layers, and final norm produce retained KV/GDN and tail/checkpoint hidden state.
+  Output heads, proposal heads, and proposal token maps are excluded.
+- Vision weights remain included even when Vision is disabled at startup: the directory can
+  retain media entries across Vision on/off reopens.
+- Stored MTP tensors are excluded because MTP execution is disabled.
+- DFlash2 includes feature projection, context norm, per-layer key norms, and fused projection
+  key/value rows. Its query, output, MLP, convolution, final-norm, and selector paths produce
+  proposals, not retained context KV. Inactive backend weights are excluded.
+
+For packed row selections, codes and corresponding stored scales are included; NVFP4 also
+includes the shared weight divisor. Its row selections align to complete 128-row scale tiles.
+Filesystem device/inode numbers, timestamps, pathname, total file length, directory formatting,
+object order/placement, padding between objects, and frontend resources are absent. A copy or
+repack of the same retained-state dependencies is compatible; changing a selected numerical
+value or representation is not. Hashing reads the selected bytes only when disk caching is
+enabled. Artifacts remain immutable while an Engine uses them. Frontend resources determine
+prepared inputs and sampling defaults, not the numerical state for an already represented
+prefix. Each entry independently matches token IDs, token types, MRoPE positions, and exact
+media identity.
+
+The attention profile (`sage_attn`, `keep_frac`, `xattn_tau`, and `xattn_min_len` when `xattn_tau <
+1`) is a directory boundary because it changes the computation that produced retained state. KV
+dtype, speculative backend, page size, logical plane schemas, GDN byte extents, per-lane DFlash
+cyclic geometry, and snapshot version remain boundaries. Allocated DFlash lane count is excluded:
+the disk image stores one lane and restore selects a destination lane. Sampling parameters, draft
+token count, transport settings, RAM/disk budgets, compression choice, GPU resident capacity, and
+request concurrency do not invalidate a directory unless they also change the recorded per-lane
+geometry. Model/weights identity identifies the target's fixed mathematical contract; code changes
+that invalidate persistent state must advance the snapshot version. Pre-v8 stores are rejected
+rather than silently adopted or automatically deleted.
 
 Exact-frontier reuse also requires a valid target tail-hidden image. In particular, speculative
 DFlash cancellation can retain the committed KV/GDN/context frontier while invalidating that
@@ -963,25 +1080,69 @@ frontier. A same-frontier refresh preserves the full backend only when that toke
 and the valid extent are unchanged; otherwise it rewrites the affected tail, including any
 new page required when an exact-hit bridge extends validity after cancelled prefill.
 
-Compaction copies live extents into a new generation, publishes its complete base map, and then
-atomically replaces `PACKSET`. Old pack roots and their maps are removed only after publication is
-durable and all reader leases have drained. Admission requires the copy-on-write reserve before
-the first compaction or spill byte is written. Eviction uses durable tombstones so an uncertain
-metadata publication cannot make a referenced object reusable. Before capacity eviction, admission
+Whole-store payload generations are not rewritten. Retirement requires a durable entry tombstone, zero live,
+skipped, and uncertainty references, and drainage of the per-extent leases that unlocked
+payload readers acquire with their copied locations. A CRC-framed Delete becomes durable
+before its extent enters the free index. Replacement data is then written and synchronized,
+its Put is synchronized, and only then may entry metadata publish it. Crash recovery replays
+Put/Delete/Move frames before validating final extents for overlap, reconstructs free space from
+those extents and actual segment lengths, and preserves the durable object-ID high-water mark.
+An interrupted metadata checkpoint retains both index epochs until `PACKSET` publication is
+durable; no reuse or new spill publication can rely on an uncertain epoch. No payload generation
+is copied or retained for index checkpointing.
+
+The Engine explicitly sets cache idleness only when every lane, pending ingress, and copy hold
+is empty; a RAM capture's write-behind permission does not enable defragmentation. Admission
+clears idleness before request execution, including disposable requests. After 250 ms idle,
+maintenance drains reader-delayed retirement and truncates free tails. A single candidate pass
+visits each kind in increasing address order, selecting source packs with at least 25% free bytes and
+the earliest adequate earlier hole of the same kind, preserving contiguous page order when
+the available hole can hold the run. The destination never grows a pack. Copies use a
+1 MiB buffer and at least 16 ms per chunk (at most 62.5 MiB/s copied payload), with cancellation
+checks between chunks and before sync/publication. Restore, prefetch, and spill work take
+priority. Existing holes are coalesced without payload copying; fragmented space without an
+adequate hole is deferred, and maintenance never evicts an entry to fund relocation.
+
+A relocation holds its source object and verifies its stored-record CRC while copying. It syncs
+the destination, durably appends a Move for the same object ID, then publishes the location.
+Move preserves kind, extent/encoded/logical sizes, and CRC. Old locations retire independently
+of IDs and remain occupied until their individual read leases drain; a later Move or Delete
+cannot release an older reader's extent. Cancellation before publication releases the temporary
+destination. Once Move is durable, the location handoff finishes even if a request arrives.
+A failed journal append truncates and syncs its original boundary before later appends. If that
+rollback also fails, journal/checkpoint/spill writes freeze and both possible locations stay
+reserved until reopening resolves the journal. Startup needs only the final selected locations
+because readers do not survive a restart.
+
+Eviction uses durable tombstones so an uncertain
+metadata publication cannot make a referenced object reusable. Capacity and quarantine
+eviction are two-phase: victims are selected under the mutex (capacity eviction projects the
+unique bytes released by FIFO victims so one round covers the shortfall) and made unavailable
+to planning, claims, spill tickets, and RAM durability; their tombstones are written, synced
+and renamed, and the tombstone directory fsynced once per round, with the mutex released.
+Only a durably tombstoned victim then drops its object references and index position under
+the mutex; a victim whose tombstone did not become durable keeps its references, has any
+tombstone its attempt renamed removed, and returns to service unless it is quarantined. Capacity
+eviction then moves on to the next FIFO candidate, and it waits for another thread's in-flight
+round instead of evicting around victims whose bytes are about to be released. A tombstone is released only after a store fsync that
+follows the unlocked scan finding its entry directory gone, and only when no entry, skipped
+tree, or object reference still needs it. Before capacity eviction, admission
 checks that the incoming incremental bytes plus unique extents protected by claims or I/O pins
 (including a spill's parent) fit the budget. Known capacity shortfalls are rejected without
-evicting unrelated residents. Shared protected extents are counted once, and refresh/extend
-replacement credit remains included in the incremental-byte calculation.
+evicting unrelated residents. Shared protected extents are counted once. Refresh and extension reserve replacement bytes
+without crediting the old image, which remains owned until publication.
 
 Restore owns `2 * restore_io_threads` pinned page slots and equally sized device staging slots.
 Readers issue aligned direct reads into the pinned slots, validate each packed record, enqueue one
 dense H2D per logical page, and scatter it into the target's physical planes. Raw state objects
-read directly into their final pinned owners using 4 MiB read/CRC chunks; each object uses at most
+read directly into their final pinned owners using 4 MiB read/CRC chunks; saved checkpoint heads
+decode straight into Program pool heads handed in with the restore target, only for the heads at
+or before the restored base, after each head's previous DMA or host-copy owner has finished; each object uses at most
 four readers and independent objects share the startup-fixed reader budget. Compressed state uses
 bounded decoded owners. Contiguous CRC32C checks use the serial SSE4.2 dependency chain below
 512 KiB and three interleaved hardware chains for larger payloads; incremental checks remain
 serial.
-The page window, state owners, destination page mappings, and generation lease remain alive until
+The page window, state owners, destination page mappings, and object read lease remain alive until
 the copy-stream completion event has been consumed. The spill side uses separate pinned scratch,
 so an idle spill may overlap restore reads; emergency spill remains exclusive with restore I/O.
 Restore readiness requires the completed join of page scatter and independent state H2D, not
@@ -996,7 +1157,15 @@ retirement, including the interval before a transfer slot is assigned and except
 Prefix matching filters append and checkpoint candidates using the same backend-readiness
 rules as resident reuse before ranking them. An unusable canceled tail cannot shadow a usable
 checkpoint or another cache entry. Disk plans carry the selected committed generation; claim
-checks it before and after waiting for an idle rewrite, so a same-prefix refresh requires replanning.
+checks it, so a same-prefix refresh requires replanning. A claim never waits for an idle Extend or
+Refresh of its entry, not even for the commit's fsyncs: it cancels the spill, and the commit
+abandons at its next check: before its `meta.bin` rename when the claim lands during the object
+sync, otherwise by rolling the renamed `meta.bin` back, so the claimed generation stays published
+and its objects untouched. Only if that rollback cannot be written, or the post-rename syncs fail,
+is the newer generation published, with the replaced objects held until the entry is next
+replaced or evicted; the claimed restore then fails its committed-generation check (at setup in
+`load_host`/`restore_device`, or while running) as a `CacheRestoreFailure` cache miss, and the
+request falls back to cold prefill.
 MTP disk validation requires pages for the declared valid backend extent; readiness checks exclude
 frontiers beyond that extent while preserving eligible earlier checkpoints.
 Cache-owned CUDA event creation treats only `cudaErrorMemoryAllocation` as recoverable
@@ -1012,8 +1181,13 @@ without reuse. Re-admission preserves request identity and FIFO ordering, rechec
 reservation, and does not apply the initial queue deadline to an already-admitted recovery.
 The fallback is bounded to one cold-prefill retry, preserving the request's checkpoint-capture
 settings. Invariant and execution failures are not
-cache-miss signals. Quarantine uses normal tombstone/refcount eviction; if tombstone persistence
-fails, the entry stays unavailable in memory without dropping shared-object references.
+cache-miss signals. Quarantine marks the entry unavailable and invalidates RAM tickets naming it at once,
+without waiting for claims, restores, or spills that pin it; a spill that extends, refreshes, or
+branches from it abandons its commit. The disk worker then evicts it with normal
+tombstone/refcount eviction once its pins drop; if tombstone persistence fails, the entry stays
+unavailable in memory without dropping shared-object references. Disk-worker allocation and I/O
+failures (an unopenable pack, a failed read) surface as the cache-miss signal; invariant
+violations keep their type.
 
 ---
 
@@ -1427,6 +1601,11 @@ epilogue不因 paging 改变。最后一个partial tile继续通过logical visib
 未初始化page tail作为有效key。
 
 Cached prompt route使用相同page-aware key traversal，但不执行fill。
+
+Dense NVFP4 prompt在grid未填满GPU时按grid.z切分每个CTA的key tiles：split `z` 遍历连续的
+`[z*ceil(n/Z), min(n,(z+1)*ceil(n/Z)))` tile区间，其中 `n` 是该query block的causal tile数。
+每个tile仍是一个page，因此split边界天然page-aligned，fill与visibility mask不变。各split写FP32
+未归一化P·V、log2域running max与exp2 sum，merge kernel稳定合并后写BF16输出。
 
 ### 17.5 Standalone append
 

@@ -30,14 +30,14 @@ namespace ninfer::ops {
 template <int Block, int MaxPairsPerThread>
 __launch_bounds__(Block) __global__
     void residual_rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* y, __nv_bfloat162* x,
-                                             const __nv_bfloat162* weight, __nv_bfloat162* out,
-                                             std::int32_t d, std::int64_t rows, float eps) {
+                                            const __nv_bfloat162* weight, __nv_bfloat162* out,
+                                            std::int32_t d, std::int64_t rows, float eps) {
     static_assert(Block % kWarpSize == 0);
-    const std::int64_t row            = static_cast<std::int64_t>(blockIdx.x);
+    const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 
-    const int pairs            = d / 2;
-    const int pairs_per_thread = pairs / Block;
+    const int pairs             = d / 2;
+    const int pairs_per_thread  = pairs / Block;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 values[MaxPairsPerThread];
     float sum = 0.0f;
@@ -47,11 +47,11 @@ __launch_bounds__(Block) __global__
         if (k < pairs_per_thread) {
             const int pair = static_cast<int>(threadIdx.x) + k * Block;
             // x_new = x + y (the residual update, in-place), identical to residual_add.
-            const float2 xf = __bfloat1622float2(x[row_base + pair]);
-            const float2 yf = __bfloat1622float2(y[row_base + pair]);
-            values[k] = __floats2bfloat162_rn(xf.x + yf.x, xf.y + yf.y);
-            x[row_base + pair] = values[k];  // in-place residual update (the residual_add)
-            const float2 xn = __bfloat1622float2(values[k]);
+            const float2 xf    = __bfloat1622float2(x[row_base + pair]);
+            const float2 yf    = __bfloat1622float2(y[row_base + pair]);
+            values[k]          = __floats2bfloat162_rn(xf.x + yf.x, xf.y + yf.y);
+            x[row_base + pair] = values[k]; // in-place residual update (the residual_add)
+            const float2 xn    = __bfloat1622float2(values[k]);
             sum += xn.x * xn.x + xn.y * xn.y;
         }
     }
@@ -59,16 +59,14 @@ __launch_bounds__(Block) __global__
     __shared__ float warp_sums[Block / kWarpSize];
     __shared__ float inv_shared;
     const float block_sum = block_reduce_sum<Block>(sum, warp_sums);
-    if (threadIdx.x == 0) {
-        inv_shared = rsqrtf(block_sum / static_cast<float>(d) + eps);
-    }
+    if (threadIdx.x == 0) { inv_shared = rsqrtf(block_sum / static_cast<float>(d) + eps); }
     __syncthreads();
     const float inv = inv_shared;
 
 #pragma unroll
     for (int k = 0; k < MaxPairsPerThread; ++k) {
         if (k < pairs_per_thread) {
-            const int pair = static_cast<int>(threadIdx.x) + k * Block;
+            const int pair  = static_cast<int>(threadIdx.x) + k * Block;
             const float2 xn = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
             // The per-layer Offset epilogue (unit_offset): out = x_new * inv * (1 + weight).

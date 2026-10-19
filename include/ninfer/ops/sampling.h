@@ -43,6 +43,9 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeAccept     = 2,
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
+    // Block verification's per-hop uniforms, keyed by the round's first position and the hop, so
+    // a later round never reuses a uniform this round's acceptance conditioned on.
+    kSamplePurposeSpeculativeBlockAccept = 5,
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32
@@ -53,15 +56,18 @@ enum SamplePurpose : std::int32_t {
 struct SamplingConfig {
     static constexpr std::int32_t kMaximumSuppressedTokens = 4;
 
-    float temperature          = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
-    std::int32_t top_k         = 0;    // clamped to 20: top_k <= 0 or top_k > 20 => 20
-    float top_p                = 1.0f; // >= 1 => disabled
-    float min_p                = 0.0f; // <= 0 => disabled
-    float presence_penalty     = 0.0f;
-    float frequency_penalty    = 0.0f;
-    std::int32_t p_less        = 0; // != 0 => p-less; ignore top_k/top_p/min_p/penalties
-    unsigned long long seed    = 0;
-    std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    float temperature       = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
+    std::int32_t top_k      = 0;    // clamped to 20: top_k <= 0 or top_k > 20 => 20
+    float top_p             = 1.0f; // >= 1 => disabled
+    float min_p             = 0.0f; // <= 0 => disabled
+    float presence_penalty  = 0.0f;
+    float frequency_penalty = 0.0f;
+    std::int32_t p_less     = 0; // != 0 => p-less; ignore top_k/top_p/min_p/penalties
+    // DFlash2 path-select temperature for p-less rows (<= 0 => greedy drafts). Verification uses
+    // the recorded proposal q, so any value keeps the target distribution exact.
+    float draft_temperature             = 0.0f;
+    unsigned long long seed             = 0;
+    std::int32_t* token_counts          = nullptr; // device [token_domain] i32, or null
     std::int32_t suppressed_token_count = 0;
     std::int32_t suppressed_tokens[kMaximumSuppressedTokens] = {-1, -1, -1, -1};
     // Cycle-exit continuation, or -1. Not a suppressed_tokens member: V and L are

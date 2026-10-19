@@ -14,13 +14,13 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_off
                                std::int32_t rows, Tensor& out, std::int32_t output_row_offset) {
     const std::int64_t groups = weight.padded_shape[1] / weight.group;
     const auto* codes         = static_cast<const std::uint8_t*>(weight.qdata) +
-                        static_cast<std::int64_t>(weight_row_offset) * groups * 32;
-    const auto* high   = weight.qtype == QType::Q5G64_F16S
-                             ? static_cast<const std::uint8_t*>(weight.qhigh) +
-                                 static_cast<std::int64_t>(weight_row_offset) * groups * 8
-                             : nullptr;
-    const auto* scales = static_cast<const std::uint8_t*>(weight.scales) +
-                         static_cast<std::int64_t>(weight_row_offset) * groups * 2;
+                                static_cast<std::int64_t>(weight_row_offset) * groups * 32;
+    const auto* high          = weight.qtype == QType::Q5G64_F16S
+                                    ? static_cast<const std::uint8_t*>(weight.qhigh) +
+                                          static_cast<std::int64_t>(weight_row_offset) * groups * 8
+                                    : nullptr;
+    const auto* scales        = static_cast<const std::uint8_t*>(weight.scales) +
+                                static_cast<std::int64_t>(weight_row_offset) * groups * 2;
     return RowSplitGroupedMmaJob{
         codes,
         high,
@@ -44,7 +44,7 @@ void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Wei
     RowSplitGroupedMmaJob empty{};
     const int tiles = div_up(qk.n, Schedule::BM) + div_up(value.n, Schedule::BM) +
                       div_up(output_gate.n, Schedule::BM);
-    const int cols = x.ne[1];
+    const int cols  = x.ne[1];
     const dim3 grid(static_cast<unsigned>(tiles),
                     static_cast<unsigned>(div_up(cols, Schedule::BN)));
 

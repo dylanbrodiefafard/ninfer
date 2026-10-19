@@ -41,7 +41,7 @@ suites:
           sleep_seconds: 0.02
 runtime:
   max_parallel_jobs: 2
-  runs_dir: {root / 'runs'}
+  runs_dir: {root / "runs"}
   progress:
     enabled: false
 """,
@@ -56,9 +56,7 @@ runtime:
             run_dir = Coordinator(config, "all").run()
             summary = json.loads((run_dir / "summary.json").read_text())
             self.assertEqual(summary["status"], "completed")
-            self.assertEqual(
-                [r["metrics"]["accuracy"] for r in summary["results"]], [0.75, 1.0]
-            )
+            self.assertEqual([r["metrics"]["accuracy"] for r in summary["results"]], [0.75, 1.0])
             # Each backend reports its observed internal peak. Slot reservations ensure the sum
             # across concurrently active jobs cannot exceed the target capacity of three.
             observed = [r["metrics"]["max_in_flight"] for r in summary["results"]]
@@ -76,12 +74,9 @@ runtime:
             resumed = Coordinator(resumed_config, suite).run(resume_dir=run_dir)
             self.assertEqual(resumed, run_dir)
             events = [
-                json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text().splitlines()
+                json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()
             ]
-            skipped = {
-                event["job_id"] for event in events if event["kind"] == "job_skipped"
-            }
+            skipped = {event["job_id"] for event in events if event["kind"] == "job_skipped"}
             self.assertEqual(skipped, {"first", "second"})
 
 

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <optional>
 #include <utility>
+#include <vector>
 #include <variant>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
@@ -152,6 +153,10 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
+// Selections borrow names from reader and cover every numerical input to persisted state.
+[[nodiscard]] std::vector<artifact::TensorContentSelection>
+cache_tensor_selections(const artifact::Reader& reader, qwen3_6::StartupFeatures features);
+
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features);
 
@@ -227,7 +232,7 @@ class LoadedModel::Impl {
 public:
     Impl(WeightsProfile weights_profile_in, BindingPlan plan,
          artifact::MaterializedArtifact materialized)
-        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
+        : weights_profile(weights_profile_in), data(plan, std::move(materialized)) {}
 
     WeightsProfile weights_profile;
     LoadedModelData data;

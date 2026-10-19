@@ -11,30 +11,25 @@
 #include "ops/kernel/gqa_kv_compact.cuh"
 #include "core/device.h" // CUDA_CHECK
 
+#include <algorithm>
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdexcept>
 
-
 namespace ninfer::ops::detail {
 namespace {
 
 
 template <typename Geometry, typename CacheView, typename Metadata>
-void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
-                                                float scale, const CacheView& cache,
-                                                Metadata metadata, Tensor& out,
-                                                cudaStream_t stream, float keep_frac = 1.0f,
-                                                float xattn_tau = 1.0f,
-                                                std::int32_t xattn_min_len = 8192,
-                                                GqaS3PrefillDump* dump = nullptr,
-                                                std::uint32_t* dbg_regs = nullptr,
-                                                std::uint8_t* dbg_q = nullptr,
-                                                void* xattn_scratch = nullptr,
-                                                GqaExecutionEnvelope envelope = {
-                                                    1, kGqaAttentionMaximumVisibleKeys}) {
+void gqa_attention_prompt_attention_launch_for(
+    const Tensor& q, const Tensor& positions, float scale, const CacheView& cache,
+    Metadata metadata, Tensor& out, cudaStream_t stream, float keep_frac = 1.0f,
+    float xattn_tau = 1.0f, std::int32_t xattn_min_len = 8192, GqaS3PrefillDump* dump = nullptr,
+    std::uint32_t* dbg_regs = nullptr, std::uint8_t* dbg_q = nullptr, void* xattn_scratch = nullptr,
+    GqaExecutionEnvelope envelope = {1, kGqaAttentionMaximumVisibleKeys},
+    const GqaPromptSplit& split   = {}) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
@@ -46,11 +41,6 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         cudaFuncSetAttribute(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
     CUDA_CHECK(attr_i8);
-    static const cudaError_t attr_nvfp4 = cudaFuncSetAttribute(
-        gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillNvfp4SmemBytes);
-    CUDA_CHECK(attr_nvfp4);
-
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::U8 && cache.sage_pv) {
         if (keep_frac != 1.0f || xattn_tau != 1.0f) {
@@ -66,8 +56,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                                                   keep_frac, dump, dbg_regs, dbg_q);
         return;
     }
-    if (cache.dtype == DType::U8 &&
-        (keep_frac < 1.0f || xattn_tau < 1.0f || dump != nullptr)) {
+    if (cache.dtype == DType::U8 && (keep_frac < 1.0f || xattn_tau < 1.0f || dump != nullptr)) {
         const bool skip_xattn_to_dense =
             xattn_tau < 1.0f && !(keep_frac < 1.0f) &&
             envelope.max_visible_keys <= static_cast<std::uint32_t>(xattn_min_len);
@@ -93,19 +82,48 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     } else if (cache.dtype == DType::U8) {
-        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillNvfp4Br)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
-        gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata>
-            <<<attention_grid, kGqaPrefillNvfp4Threads, kGqaPrefillNvfp4SmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const std::uint8_t*>(cache_k.data),
-                static_cast<const std::uint8_t*>(cache_v.data),
-                static_cast<const std::uint8_t*>(cache_k_scale.data),
-                static_cast<const std::uint8_t*>(cache_v_scale.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+        const auto launch_schedule  = [&]<typename Schedule>() {
+            const auto launch_attention = [&]<bool Split>(std::int32_t splits,
+                                                          GqaPrefillNvfp4SplitPartials partials) {
+                static const cudaError_t attr = cudaFuncSetAttribute(
+                    gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, Schedule, Split>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSmemBytes);
+                CUDA_CHECK(attr);
+                const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, Schedule::kBr)),
+                                          static_cast<unsigned>(Geometry::QHeads),
+                                          static_cast<unsigned>(splits));
+                gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, Schedule, Split>
+                    <<<attention_grid, Schedule::kThreads, Schedule::kSmemBytes, stream>>>(
+                        static_cast<const __nv_bfloat16*>(q.data),
+                        static_cast<const std::uint8_t*>(cache_k.data),
+                        static_cast<const std::uint8_t*>(cache_v.data),
+                        static_cast<const std::uint8_t*>(cache_k_scale.data),
+                        static_cast<const std::uint8_t*>(cache_v_scale.data), metadata,
+                        static_cast<const std::int32_t*>(positions.data), scale,
+                        static_cast<__nv_bfloat16*>(out.data), tokens, partials);
+            };
+            if (split.splits > 1) {
+                const GqaPrefillNvfp4SplitPartials partials{static_cast<float*>(split.acc.data),
+                                                            static_cast<float*>(split.m.data),
+                                                            static_cast<float*>(split.l.data)};
+                launch_attention.template operator()<true>(split.splits, partials);
+                CUDA_CHECK(cudaGetLastError());
+                gqa_attention_prefill_nvfp4_merge_kernel<Geometry, Metadata>
+                    <<<dim3(static_cast<unsigned>(tokens), static_cast<unsigned>(Geometry::QHeads)),
+                       kGqaPrefillHeadDim, 0, stream>>>(partials, metadata,
+                                                        static_cast<__nv_bfloat16*>(out.data),
+                                                        tokens, split.splits);
+            } else {
+                launch_attention.template operator()<false>(1, {});
+            }
+        };
+        if (gqa_dense_nvfp4_short_query(tokens)) {
+            launch_schedule.template operator()<GqaDenseNvfp4ShortSchedule>();
+        } else {
+            launch_schedule.template operator()<GqaDenseNvfp4WideSchedule>();
+        }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
@@ -167,8 +185,8 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         }
         CUDA_CHECK(cudaGetLastError());
     } else if (cache.dtype == DType::U8) {
-        Tensor& cache_k_scale    = cache.k_scale_pages;
-        Tensor& cache_v_scale    = cache.v_scale_pages;
+        Tensor& cache_k_scale = cache.k_scale_pages;
+        Tensor& cache_v_scale = cache.v_scale_pages;
         if (cache.sage_pv) {
             gqa_s3_prefill_fill_launch<Geometry>(k, v, positions, cache, metadata, stream);
             return;
@@ -233,25 +251,86 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
     }
 }
 
+constexpr std::int32_t kPromptSplitMaximum = 16;
+// W * splits bound on the FP32 partial rows (1 KiB per row and q head).
+constexpr std::int32_t kPromptSplitRowBudget = 2 * kGqaPromptSplitMaximumWidth;
+// Per-CTA fixed cost (Q quantization, first tile fill) in key-tile units.
+constexpr std::int32_t kPromptSplitFixedTiles = 1;
+
+std::int32_t prompt_split_ctas(std::int32_t q_heads, std::int32_t width) {
+    return div_up(width, gqa_dense_nvfp4_short_query(width) ? GqaDenseNvfp4ShortSchedule::kBr
+                                                            : GqaDenseNvfp4WideSchedule::kBr) *
+           q_heads;
+}
+
+std::int32_t prompt_key_tiles(std::int32_t width, std::uint32_t visible_keys) {
+    return static_cast<std::int32_t>(
+        div_up(visible_keys, static_cast<std::uint32_t>(gqa_dense_nvfp4_short_query(width)
+                                                            ? GqaDenseNvfp4ShortSchedule::kBc
+                                                            : GqaDenseNvfp4WideSchedule::kBc)));
+}
+
 } // namespace
+
+std::int32_t gqa_attention_prompt_split_capacity(std::int32_t q_heads, std::int32_t width,
+                                                 std::uint32_t visible_keys) {
+    if (width <= 0) { return 1; }
+    const std::int64_t resident_ctas = gqa_dense_nvfp4_short_query(width)
+                                           ? GqaDenseNvfp4ShortSchedule::kResidentCtas
+                                           : GqaDenseNvfp4WideSchedule::kResidentCtas;
+    const std::int32_t minimum_tiles = gqa_dense_nvfp4_short_query(width)
+                                           ? GqaDenseNvfp4ShortSchedule::kMinimumKeyTiles
+                                           : GqaDenseNvfp4WideSchedule::kMinimumKeyTiles;
+    const std::int32_t capacity =
+        std::min({kPromptSplitMaximum, prompt_key_tiles(width, visible_keys) / minimum_tiles,
+                  kPromptSplitRowBudget / width});
+    // Reserve nothing unless some admitted split count needs fewer waves per key tile than the
+    // unsplit grid; otherwise no history length makes splitting pay.
+    const std::int64_t ctas  = prompt_split_ctas(q_heads, width);
+    const std::int64_t waves = div_up(ctas, resident_ctas);
+    for (std::int32_t splits = 2; splits <= capacity; ++splits) {
+        if (div_up(ctas * splits, resident_ctas) < waves * splits) { return capacity; }
+    }
+    return 1;
+}
+
+std::int32_t gqa_attention_prompt_splits(std::int32_t q_heads, std::int32_t width,
+                                         std::uint32_t visible_keys) {
+    const std::int32_t capacity = gqa_attention_prompt_split_capacity(q_heads, width, visible_keys);
+    const std::int64_t resident_ctas = gqa_dense_nvfp4_short_query(width)
+                                           ? GqaDenseNvfp4ShortSchedule::kResidentCtas
+                                           : GqaDenseNvfp4WideSchedule::kResidentCtas;
+    const std::int64_t ctas          = prompt_split_ctas(q_heads, width);
+    const std::int64_t tiles         = prompt_key_tiles(width, visible_keys);
+    const auto cost                  = [&](std::int64_t splits) {
+        const std::int64_t waves = div_up(ctas * splits, resident_ctas);
+        return waves * (div_up(tiles, splits) + kPromptSplitFixedTiles);
+    };
+    std::int32_t best = 1;
+    for (std::int32_t splits = 2; splits <= capacity; ++splits) {
+        if (cost(splits) < cost(best)) { best = splits; }
+    }
+    return best;
+}
 
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                            const PagedKVLayerView& cache, Tensor& out,
                                            cudaStream_t stream, float keep_frac, float xattn_tau,
                                            std::int32_t xattn_min_len, GqaS3PrefillDump* dump,
                                            std::uint32_t* dbg_regs, std::uint8_t* dbg_q,
-                                           void* xattn_scratch, GqaExecutionEnvelope envelope) {
+                                           void* xattn_scratch, GqaExecutionEnvelope envelope,
+                                           const GqaPromptSplit& split) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(
             q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau, xattn_min_len,
-            dump, dbg_regs, dbg_q, xattn_scratch, envelope);
+            dump, dbg_regs, dbg_q, xattn_scratch, envelope, split);
         return;
     }
     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(
         q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau, xattn_min_len,
-        dump, dbg_regs, dbg_q, xattn_scratch, envelope);
+        dump, dbg_regs, dbg_q, xattn_scratch, envelope, split);
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -268,10 +347,10 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream, float keep_frac,
-                                 float xattn_tau, std::int32_t xattn_min_len,
-                                 GqaS3PrefillDump* dump, void* xattn_scratch,
-                                 GqaExecutionEnvelope envelope) {
+                                 Tensor& out, cudaStream_t stream, float keep_frac, float xattn_tau,
+                                 std::int32_t xattn_min_len, GqaS3PrefillDump* dump,
+                                 void* xattn_scratch, GqaExecutionEnvelope envelope,
+                                 const GqaPromptSplit& split) {
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -284,13 +363,13 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(
                 q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau,
-                xattn_min_len, dump, nullptr, nullptr, xattn_scratch, envelope);
+                xattn_min_len, dump, nullptr, nullptr, xattn_scratch, envelope, split);
             return;
         }
         gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
         gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(
             q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau, xattn_min_len,
-            dump, nullptr, nullptr, xattn_scratch, envelope);
+            dump, nullptr, nullptr, xattn_scratch, envelope, split);
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();
@@ -330,8 +409,8 @@ void gqa_kv_compact_path_launch(PagedKVBatchLayerView cache, const Tensor& kv_ta
             launch.template operator()<Geometry, std::int8_t, kGqaCompactHeadDim, __half,
                                        kGqaKvQuantGroups, true>();
         } else {
-            launch.template operator()<Geometry, __nv_bfloat16, kGqaCompactHeadDim, std::uint8_t, 1,
-                                       false>();
+            launch.template
+            operator()<Geometry, __nv_bfloat16, kGqaCompactHeadDim, std::uint8_t, 1, false>();
         }
     };
     if (cache.num_kv_heads == Gqa27Geometry::KVHeads) {

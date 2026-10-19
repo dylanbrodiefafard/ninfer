@@ -15,7 +15,8 @@ namespace ninfer::ops {
 
 inline constexpr int kSiluAndMulPairsPerThread = 4;
 
-__device__ __forceinline__ __nv_bfloat162 silu_mul_pair(__nv_bfloat162 g, __nv_bfloat162 u) {
+__device__ __forceinline__ __nv_bfloat162 silu_mul_pair(const __nv_bfloat162& g,
+                                                        const __nv_bfloat162& u) {
     const float r0 = silu(__low2float(g)) * __low2float(u);
     const float r1 = silu(__high2float(g)) * __high2float(u);
     return __floats2bfloat162_rn(r0, r1);

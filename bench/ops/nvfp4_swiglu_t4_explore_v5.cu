@@ -25,15 +25,15 @@ using namespace ninfer::ops::detail;
 
 namespace {
 
-constexpr int kT            = 4;
-constexpr int kGateUpRows   = Nvfp4MlpGateUpGeometry::kOutputRows;
-constexpr int kIntermediate = kGateUpRows / 2;
-constexpr int kHidden       = Nvfp4MlpGateUpGeometry::kInputRows;
+constexpr int kT                  = 4;
+constexpr int kGateUpRows         = Nvfp4MlpGateUpGeometry::kOutputRows;
+constexpr int kIntermediate       = kGateUpRows / 2;
+constexpr int kHidden             = Nvfp4MlpGateUpGeometry::kInputRows;
 constexpr std::size_t kFlushBytes = 256ULL << 20;
-constexpr int kColdWarmup = 8;
-constexpr int kColdRepeat = 40;
-constexpr int kWarmWarmup = 20;
-constexpr int kWarmRepeat = 200;
+constexpr int kColdWarmup         = 8;
+constexpr int kColdRepeat         = 40;
+constexpr int kWarmWarmup         = 20;
+constexpr int kWarmRepeat         = 200;
 
 using Geometry = Nvfp4MlpGateUpGeometry;
 using Schedule = Nvfp4SmallTSchedule<8, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::SharedPhase,
@@ -50,8 +50,8 @@ constexpr int kPacksPerToken  = kValuesPerPhase / 8;
 constexpr int kStagePacks     = kT * kPacksPerToken;
 constexpr int kBlocks         = kIntermediate / 8;
 
-__device__ __forceinline__ void
-resolve_rows(int& gate_row, int (&parent_rows)[2], int& lane, int& warp) {
+__device__ __forceinline__ void resolve_rows(int& gate_row, int (&parent_rows)[2], int& lane,
+                                             int& warp) {
     constexpr int kCtasPerM128 = 128 / Schedule::kWarpsPerCta;
     const int block            = static_cast<int>(blockIdx.x);
     const int m_tile           = block / kCtasPerM128;
@@ -74,15 +74,14 @@ __device__ __forceinline__ void stage_act(const __nv_bfloat16* x, int phase, __n
     for (int task = static_cast<int>(threadIdx.x); task < kStagePacks; task += 256) {
         const int tok  = task / kPacksPerToken;
         const int pack = task - tok * kPacksPerToken;
-        dst[task] =
-            load_vec<uint4>(x + static_cast<std::int64_t>(tok) * kHidden + phase * kValuesPerPhase +
-                            pack * 8);
+        dst[task]      = load_vec<uint4>(x + static_cast<std::int64_t>(tok) * kHidden +
+                                         phase * kValuesPerPhase + pack * 8);
     }
 }
 
-__device__ __forceinline__ void
-fma_phase(const __nv_bfloat16* act, const Nvfp4CodePack<16> (&codes)[2], const float (&coeff)[2],
-          int lane, float (&acc)[2][kT]) {
+__device__ __forceinline__ void fma_phase(const __nv_bfloat16* act,
+                                          const Nvfp4CodePack<16> (&codes)[2],
+                                          const float (&coeff)[2], int lane, float (&acc)[2][kT]) {
 #pragma unroll
     for (int pair = 0; pair < 8; ++pair) {
         float2 rw[2];
@@ -107,7 +106,7 @@ fma_phase(const __nv_bfloat16* act, const Nvfp4CodePack<16> (&codes)[2], const f
 }
 
 __device__ __forceinline__ void load_coeff(const std::uint8_t* scales, const int (&rows)[2],
-                                            int phase, int lane, float inverse, float (&coeff)[2]) {
+                                           int phase, int lane, float inverse, float (&coeff)[2]) {
     const int group = (phase * kValuesPerPhase + lane * 16) / 16;
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
@@ -117,7 +116,7 @@ __device__ __forceinline__ void load_coeff(const std::uint8_t* scales, const int
 }
 
 __device__ __forceinline__ void epilogue(float (&acc)[2][kT], int lane, int gate_row,
-                                          __nv_bfloat16* out) {
+                                         __nv_bfloat16* out) {
 #pragma unroll
     for (int t = 0; t < kT; ++t) {
         float g = warp_reduce_sum(acc[0][t]);
@@ -129,15 +128,18 @@ __device__ __forceinline__ void epilogue(float (&acc)[2][kT], int lane, int gate
     }
 }
 
-__global__ __launch_bounds__(256, 1) void kernel_prod(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse, __nv_bfloat16* __restrict__ out) {
+__global__ __launch_bounds__(256, 1) void kernel_prod(const __nv_bfloat16* __restrict__ x,
+                                                      const std::uint8_t* __restrict__ codes,
+                                                      const std::uint8_t* __restrict__ scales,
+                                                      float inverse,
+                                                      __nv_bfloat16* __restrict__ out) {
     __shared__ Nvfp4SmallTSharedStorage<Geometry, kT, Schedule> shared;
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, Schedule>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse, rows,
-                                                       warp * 2, 0, 0, lane, acc);
+    compute_nvfp4_small_t_rows<Geometry, kT, Schedule>(Nvfp4PackedActivation<Geometry>{x}, codes,
+                                                       scales, shared, inverse, rows, warp * 2, 0,
+                                                       0, lane, acc);
     float flat[2][kT];
 #pragma unroll
     for (int r = 0; r < 2; ++r)
@@ -147,9 +149,11 @@ __global__ __launch_bounds__(256, 1) void kernel_prod(
 }
 
 // Manual SharedPhase with no trailing sync (matches patched helper).
-__global__ __launch_bounds__(256, 1) void kernel_no_tail(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse, __nv_bfloat16* __restrict__ out) {
+__global__ __launch_bounds__(256, 1) void kernel_no_tail(const __nv_bfloat16* __restrict__ x,
+                                                         const std::uint8_t* __restrict__ codes,
+                                                         const std::uint8_t* __restrict__ scales,
+                                                         float inverse,
+                                                         __nv_bfloat16* __restrict__ out) {
     __shared__ __nv_bfloat16 act[kT * kValuesPerPhase];
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
@@ -160,8 +164,10 @@ __global__ __launch_bounds__(256, 1) void kernel_no_tail(
         __syncthreads();
         Nvfp4CodePack<16> c[2];
         float coeff[2];
-        c[0] = load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[0], phase, lane));
-        c[1] = load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[1], phase, lane));
+        c[0] =
+            load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[0], phase, lane));
+        c[1] =
+            load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[1], phase, lane));
         load_coeff(scales, rows, phase, lane, inverse, coeff);
         fma_phase(act, c, coeff, lane, acc);
         if (phase + 1 < kPhases) { __syncthreads(); }
@@ -169,9 +175,11 @@ __global__ __launch_bounds__(256, 1) void kernel_no_tail(
     epilogue(acc, lane, gate_row, out);
 }
 
-__global__ __launch_bounds__(256, 1) void kernel_reg_pipe2(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse, __nv_bfloat16* __restrict__ out) {
+__global__ __launch_bounds__(256, 1) void kernel_reg_pipe2(const __nv_bfloat16* __restrict__ x,
+                                                           const std::uint8_t* __restrict__ codes,
+                                                           const std::uint8_t* __restrict__ scales,
+                                                           float inverse,
+                                                           __nv_bfloat16* __restrict__ out) {
     __shared__ __nv_bfloat16 act_bufs[2][kT * kValuesPerPhase];
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
@@ -187,8 +195,10 @@ __global__ __launch_bounds__(256, 1) void kernel_reg_pipe2(
     for (int phase = 0; phase < kPhases; ++phase) {
         float coeff[2];
         load_coeff(scales, rows, phase, lane, inverse, coeff);
-        if ((phase & 1) == 0) fma_phase(act_bufs[0], c0, coeff, lane, acc);
-        else fma_phase(act_bufs[1], c1, coeff, lane, acc);
+        if ((phase & 1) == 0)
+            fma_phase(act_bufs[0], c0, coeff, lane, acc);
+        else
+            fma_phase(act_bufs[1], c1, coeff, lane, acc);
         if (phase + 1 < kPhases) stage_act(x, phase + 1, act_bufs[(phase + 1) & 1]);
         if (phase + 2 < kPhases) {
             if ((phase & 1) == 0) {
@@ -221,14 +231,24 @@ __global__ __launch_bounds__(256, 1) void kernel_full_unroll(
         __syncthreads();                                                                           \
         Nvfp4CodePack<16> c[2];                                                                    \
         float coeff[2];                                                                            \
-        c[0] = load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[0], (P), lane)); \
-        c[1] = load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[1], (P), lane)); \
+        c[0] =                                                                                     \
+            load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[0], (P), lane));   \
+        c[1] =                                                                                     \
+            load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[1], (P), lane));   \
         load_coeff(scales, rows, (P), lane, inverse, coeff);                                       \
         fma_phase(act, c, coeff, lane, acc);                                                       \
         if (TS) __syncthreads();                                                                   \
     } while (0)
-    PHASE(0, 1); PHASE(1, 1); PHASE(2, 1); PHASE(3, 1); PHASE(4, 1);
-    PHASE(5, 1); PHASE(6, 1); PHASE(7, 1); PHASE(8, 1); PHASE(9, 0);
+    PHASE(0, 1);
+    PHASE(1, 1);
+    PHASE(2, 1);
+    PHASE(3, 1);
+    PHASE(4, 1);
+    PHASE(5, 1);
+    PHASE(6, 1);
+    PHASE(7, 1);
+    PHASE(8, 1);
+    PHASE(9, 0);
 #undef PHASE
     epilogue(acc, lane, gate_row, out);
 }
@@ -267,8 +287,9 @@ __global__ __launch_bounds__(256, 1) void kernel_shared_cs_u10(
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCsU10>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse,
-                                                               rows, warp * 2, 0, 0, lane, acc);
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCsU10>(Nvfp4PackedActivation<Geometry>{x},
+                                                               codes, scales, shared, inverse, rows,
+                                                               warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
     for (int r = 0; r < 2; ++r)
@@ -277,15 +298,18 @@ __global__ __launch_bounds__(256, 1) void kernel_shared_cs_u10(
     epilogue(flat, lane, gate_row, out);
 }
 
-__global__ __launch_bounds__(256, 1) void kernel_shared_u10(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse, __nv_bfloat16* __restrict__ out) {
+__global__ __launch_bounds__(256, 1) void kernel_shared_u10(const __nv_bfloat16* __restrict__ x,
+                                                            const std::uint8_t* __restrict__ codes,
+                                                            const std::uint8_t* __restrict__ scales,
+                                                            float inverse,
+                                                            __nv_bfloat16* __restrict__ out) {
     __shared__ Nvfp4SmallTSharedStorage<Geometry, kT, SchedSharedU10> shared;
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedU10>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse,
-                                                             rows, warp * 2, 0, 0, lane, acc);
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedU10>(Nvfp4PackedActivation<Geometry>{x},
+                                                             codes, scales, shared, inverse, rows,
+                                                             warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
     for (int r = 0; r < 2; ++r)
@@ -308,27 +332,40 @@ __global__ __launch_bounds__(256, 1) void kernel_full_unroll_cs(
         __syncthreads();                                                                           \
         Nvfp4CodePack<16> c[2];                                                                    \
         float coeff[2];                                                                            \
-        c[0] = load_nvfp4_codes<Nvfp4CodeCache::Streaming, 16>(codes + code_off(rows[0], (P), lane)); \
-        c[1] = load_nvfp4_codes<Nvfp4CodeCache::Streaming, 16>(codes + code_off(rows[1], (P), lane)); \
+        c[0] =                                                                                     \
+            load_nvfp4_codes<Nvfp4CodeCache::Streaming, 16>(codes + code_off(rows[0], (P), lane)); \
+        c[1] =                                                                                     \
+            load_nvfp4_codes<Nvfp4CodeCache::Streaming, 16>(codes + code_off(rows[1], (P), lane)); \
         load_coeff(scales, rows, (P), lane, inverse, coeff);                                       \
         fma_phase(act, c, coeff, lane, acc);                                                       \
         if (TS) __syncthreads();                                                                   \
     } while (0)
-    PHASE(0, 1); PHASE(1, 1); PHASE(2, 1); PHASE(3, 1); PHASE(4, 1);
-    PHASE(5, 1); PHASE(6, 1); PHASE(7, 1); PHASE(8, 1); PHASE(9, 0);
+    PHASE(0, 1);
+    PHASE(1, 1);
+    PHASE(2, 1);
+    PHASE(3, 1);
+    PHASE(4, 1);
+    PHASE(5, 1);
+    PHASE(6, 1);
+    PHASE(7, 1);
+    PHASE(8, 1);
+    PHASE(9, 0);
 #undef PHASE
     epilogue(acc, lane, gate_row, out);
 }
 
-__global__ __launch_bounds__(256, 1) void kernel_tok_stream(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse, __nv_bfloat16* __restrict__ out) {
+__global__ __launch_bounds__(256, 1) void kernel_tok_stream(const __nv_bfloat16* __restrict__ x,
+                                                            const std::uint8_t* __restrict__ codes,
+                                                            const std::uint8_t* __restrict__ scales,
+                                                            float inverse,
+                                                            __nv_bfloat16* __restrict__ out) {
     __shared__ Nvfp4SmallTSharedStorage<Geometry, kT, SchedStream> shared;
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedStream>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse, rows,
-                                                          warp * 2, 0, 0, lane, acc);
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedStream>(Nvfp4PackedActivation<Geometry>{x}, codes,
+                                                          scales, shared, inverse, rows, warp * 2,
+                                                          0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
     for (int r = 0; r < 2; ++r)
@@ -337,14 +374,17 @@ __global__ __launch_bounds__(256, 1) void kernel_tok_stream(
     epilogue(flat, lane, gate_row, out);
 }
 
-__global__ __launch_bounds__(256, 1) void kernel_shared_cs(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse, __nv_bfloat16* __restrict__ out) {
+__global__ __launch_bounds__(256, 1) void kernel_shared_cs(const __nv_bfloat16* __restrict__ x,
+                                                           const std::uint8_t* __restrict__ codes,
+                                                           const std::uint8_t* __restrict__ scales,
+                                                           float inverse,
+                                                           __nv_bfloat16* __restrict__ out) {
     __shared__ Nvfp4SmallTSharedStorage<Geometry, kT, SchedSharedCs> shared;
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCs>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse, rows,
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCs>(Nvfp4PackedActivation<Geometry>{x},
+                                                            codes, scales, shared, inverse, rows,
                                                             warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
@@ -361,8 +401,9 @@ __global__ __launch_bounds__(256, 1) void kernel_shared_cs_u4(
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCsU4>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse,
-                                                              rows, warp * 2, 0, 0, lane, acc);
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCsU4>(Nvfp4PackedActivation<Geometry>{x},
+                                                              codes, scales, shared, inverse, rows,
+                                                              warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
     for (int r = 0; r < 2; ++r)
@@ -371,14 +412,17 @@ __global__ __launch_bounds__(256, 1) void kernel_shared_cs_u4(
     epilogue(flat, lane, gate_row, out);
 }
 
-__global__ __launch_bounds__(256, 1) void kernel_shared_u4(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse, __nv_bfloat16* __restrict__ out) {
+__global__ __launch_bounds__(256, 1) void kernel_shared_u4(const __nv_bfloat16* __restrict__ x,
+                                                           const std::uint8_t* __restrict__ codes,
+                                                           const std::uint8_t* __restrict__ scales,
+                                                           float inverse,
+                                                           __nv_bfloat16* __restrict__ out) {
     __shared__ Nvfp4SmallTSharedStorage<Geometry, kT, SchedSharedU4> shared;
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedU4>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse, rows,
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedU4>(Nvfp4PackedActivation<Geometry>{x},
+                                                            codes, scales, shared, inverse, rows,
                                                             warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
@@ -403,15 +447,18 @@ struct Candidate {
     LaunchFn fn;
 };
 
-__global__ __launch_bounds__(256, 2) void kernel_prod_occ2(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse, __nv_bfloat16* __restrict__ out) {
+__global__ __launch_bounds__(256, 2) void kernel_prod_occ2(const __nv_bfloat16* __restrict__ x,
+                                                           const std::uint8_t* __restrict__ codes,
+                                                           const std::uint8_t* __restrict__ scales,
+                                                           float inverse,
+                                                           __nv_bfloat16* __restrict__ out) {
     __shared__ Nvfp4SmallTSharedStorage<Geometry, kT, Schedule> shared;
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, Schedule>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse, rows,
-                                                       warp * 2, 0, 0, lane, acc);
+    compute_nvfp4_small_t_rows<Geometry, kT, Schedule>(Nvfp4PackedActivation<Geometry>{x}, codes,
+                                                       scales, shared, inverse, rows, warp * 2, 0,
+                                                       0, lane, acc);
     float flat[2][kT];
 #pragma unroll
     for (int r = 0; r < 2; ++r)
@@ -471,14 +518,24 @@ __global__ __launch_bounds__(256, 2) void kernel_full_unroll_occ2(
         __syncthreads();                                                                           \
         Nvfp4CodePack<16> c[2];                                                                    \
         float coeff[2];                                                                            \
-        c[0] = load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[0], (P), lane)); \
-        c[1] = load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[1], (P), lane)); \
+        c[0] =                                                                                     \
+            load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[0], (P), lane));   \
+        c[1] =                                                                                     \
+            load_nvfp4_codes<Nvfp4CodeCache::Default, 16>(codes + code_off(rows[1], (P), lane));   \
         load_coeff(scales, rows, (P), lane, inverse, coeff);                                       \
         fma_phase(act, c, coeff, lane, acc);                                                       \
         if (TS) __syncthreads();                                                                   \
     } while (0)
-    PHASE(0, 1); PHASE(1, 1); PHASE(2, 1); PHASE(3, 1); PHASE(4, 1);
-    PHASE(5, 1); PHASE(6, 1); PHASE(7, 1); PHASE(8, 1); PHASE(9, 0);
+    PHASE(0, 1);
+    PHASE(1, 1);
+    PHASE(2, 1);
+    PHASE(3, 1);
+    PHASE(4, 1);
+    PHASE(5, 1);
+    PHASE(6, 1);
+    PHASE(7, 1);
+    PHASE(8, 1);
+    PHASE(9, 0);
 #undef PHASE
     epilogue(acc, lane, gate_row, out);
 }
@@ -501,7 +558,7 @@ const Candidate kCandidates[] = {
 };
 
 struct Cmp {
-    int bit_mism = 0;
+    int bit_mism  = 0;
     float max_abs = 0.f;
 };
 
@@ -560,13 +617,13 @@ int main() {
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * kT);
         DeviceBuffer output(static_cast<std::size_t>(kIntermediate) * kT * 2);
         DeviceBuffer output_ref(output.bytes);
-        auto packed         = bench::make_nvfp4_weight(kGateUpRows, kHidden);
-        const float inverse = 1.0F / packed.weight.weight_scale_divisor;
-        const auto* x       = static_cast<const __nv_bfloat16*>(input.p);
-        const auto* codes   = static_cast<const std::uint8_t*>(packed.weight.qdata);
-        const auto* scales  = static_cast<const std::uint8_t*>(packed.weight.scales);
-        auto* out           = static_cast<__nv_bfloat16*>(output.p);
-        auto* out_ref       = static_cast<__nv_bfloat16*>(output_ref.p);
+        auto packed             = bench::make_nvfp4_weight(kGateUpRows, kHidden);
+        const float inverse     = 1.0F / packed.weight.weight_scale_divisor;
+        const auto* x           = static_cast<const __nv_bfloat16*>(input.p);
+        const auto* codes       = static_cast<const std::uint8_t*>(packed.weight.qdata);
+        const auto* scales      = static_cast<const std::uint8_t*>(packed.weight.scales);
+        auto* out               = static_cast<__nv_bfloat16*>(output.p);
+        auto* out_ref           = static_cast<__nv_bfloat16*>(output_ref.p);
         const std::size_t n_out = static_cast<std::size_t>(kIntermediate) * kT;
         std::vector<std::uint16_t> href(n_out), hgot(n_out);
 
@@ -603,11 +660,10 @@ int main() {
             }
             std::printf("%-12s %6s %10.3f %10.3f %+7.2f %+7.2f%s\n", cand.name,
                         ok ? "PASS" : "FAIL", cold_us, warm_us, cold_vs, warm_vs,
-                        (!ok) ? ""
-                        : (cold_vs >= 1.0 && warm_vs >= 1.0)
-                            ? "  <<WIN"
-                            : (cold_vs >= 1.0 && warm_vs < 1.0) ? "  (cold-only)"
-                                                                : "");
+                        (!ok)                                ? ""
+                        : (cold_vs >= 1.0 && warm_vs >= 1.0) ? "  <<WIN"
+                        : (cold_vs >= 1.0 && warm_vs < 1.0)  ? "  (cold-only)"
+                                                             : "");
             if (ok && cold_vs >= 1.0 && warm_vs >= 1.0) {
                 const double score = std::min(cold_vs, warm_vs);
                 if (score > best_min_vs) {

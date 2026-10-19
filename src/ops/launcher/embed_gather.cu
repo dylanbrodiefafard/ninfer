@@ -91,7 +91,7 @@ void embed_gather_q6_launch(const Tensor& ids, const Weight& table, Tensor& out,
     if (d == table.padded_shape[1] && d % kEmbedGatherQ6Group == 0) {
         embed_gather_q6_grouped_kernel<<<grid_for_q6_grouped(d, T), kQ6GroupedBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(ids.data), codes, high, scales,
-            static_cast<__nv_bfloat16*>(out.data), d, T);
+            static_cast<__nv_bfloat16*>(out.data), d);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -110,6 +110,18 @@ void embed_gather_w8_launch(const Tensor& ids, const Weight& table, Tensor& out,
     const auto* scales   = static_cast<const std::uint8_t*>(table.scales);
     if (d == kEmbedGatherW8D && table.padded_shape[1] == kEmbedGatherW8D) {
         embed_gather_w8_2048_launch(ids, table, out, W8EmbedRoute::Auto, stream);
+        return;
+    }
+    const auto aligned16 = [](const void* p) {
+        return (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0;
+    };
+    if (d == kEmbedGatherW8TextD && table.padded_shape[1] == kEmbedGatherW8TextD &&
+        aligned16(codes) && aligned16(out.data) &&
+        (reinterpret_cast<std::uintptr_t>(scales) & 1U) == 0) {
+        embed_gather_w8_row_5120_kernel<<<T, kEmbedGatherW8TextThreads, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data), codes, scales,
+            static_cast<__nv_bfloat16*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
         return;
     }
 

@@ -17,9 +17,8 @@ Tensor bf16_token_column(const Tensor& tensor, std::int32_t token, std::int32_t 
     return Tensor(data, DType::BF16, {rows, 1});
 }
 
-__global__ void nvfp4_gdn_column_valid_kernel(const std::int32_t* valid_columns,
-                                              std::int32_t token, std::int32_t width,
-                                              std::int32_t* out) {
+__global__ void nvfp4_gdn_column_valid_kernel(const std::int32_t* valid_columns, std::int32_t token,
+                                              std::int32_t width, std::int32_t* out) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         const std::int32_t valid = valid_columns == nullptr ? width : valid_columns[0];
         out[0]                   = token < valid ? 1 : 0;
@@ -54,8 +53,8 @@ void launch_decode_column(const Tensor& x, const Weight& weight, const Tensor& c
                           const Tensor& conv_states, const Tensor& valid_columns,
                           const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value,
                           Tensor& z, Publish publish, cudaStream_t stream) {
-    using Geometry = Nvfp4GdnInputGeometry;
-    using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
+    using Geometry        = Nvfp4GdnInputGeometry;
+    using Schedule        = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
     nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
@@ -105,18 +104,15 @@ __device__ __forceinline__ void nvfp4_gdn_store_qkv(std::int32_t row, std::int32
 }
 
 template <class Geometry, class Schedule, bool Tree>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
-nvfp4_gdn_record_t1_kernel(Nvfp4PackedActivation<Geometry> activation,
-                           const std::uint8_t* __restrict__ codes,
-                           const std::uint8_t* __restrict__ scales, float inverse_weight_divisor,
-                           const __nv_bfloat16* __restrict__ conv_weight,
-                           const __nv_bfloat16* __restrict__ state_read,
-                           const std::int32_t* __restrict__ initial_slots,
-                           const std::int32_t* __restrict__ valid_columns,
-                           const std::int32_t* __restrict__ parent_index,
-                           __nv_bfloat16* __restrict__ query, __nv_bfloat16* __restrict__ key,
-                           __nv_bfloat16* __restrict__ value, __nv_bfloat16* __restrict__ z,
-                           __nv_bfloat16* __restrict__ record, std::int32_t width) {
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_gdn_record_t1_kernel(
+    Nvfp4PackedActivation<Geometry> activation, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, float inverse_weight_divisor,
+    const __nv_bfloat16* __restrict__ conv_weight, const __nv_bfloat16* __restrict__ state_read,
+    const std::int32_t* __restrict__ initial_slots, const std::int32_t* __restrict__ valid_columns,
+    const std::int32_t* __restrict__ parent_index, __nv_bfloat16* __restrict__ query,
+    __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value,
+    __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ record, std::int32_t width) {
     static_assert((Geometry::kOutputRows % 128) == 0);
     __shared__ Nvfp4GemvSharedStorage<Geometry, Schedule> shared;
     constexpr int kCtasPerM128 = 128 / Schedule::kRowsPerCta;
@@ -137,11 +133,9 @@ nvfp4_gdn_record_t1_kernel(Nvfp4PackedActivation<Geometry> activation,
         parent_rows[local_row] = m_tile * 128 + rmod + quartile * 32;
     }
 
-    const std::int32_t valid =
-        valid_columns == nullptr ? width : valid_columns[0];
-    const std::int64_t slot_stride = static_cast<std::int64_t>(kNvfp4GdnChannels) * 3;
-    const std::int64_t initial_base =
-        static_cast<std::int64_t>(initial_slots[0]) * slot_stride;
+    const std::int32_t valid        = valid_columns == nullptr ? width : valid_columns[0];
+    const std::int64_t slot_stride  = static_cast<std::int64_t>(kNvfp4GdnChannels) * 3;
+    const std::int64_t initial_base = static_cast<std::int64_t>(initial_slots[0]) * slot_stride;
 
     float s0[Schedule::kRowsPerWarp];
     float s1[Schedule::kRowsPerWarp];
@@ -155,7 +149,8 @@ nvfp4_gdn_record_t1_kernel(Nvfp4PackedActivation<Geometry> activation,
             const int row = parent_rows[local_row];
             if (row < kNvfp4GdnChannels) {
                 s0[local_row] = __bfloat162float(state_read[initial_base + row]);
-                s1[local_row] = __bfloat162float(state_read[initial_base + kNvfp4GdnChannels + row]);
+                s1[local_row] =
+                    __bfloat162float(state_read[initial_base + kNvfp4GdnChannels + row]);
                 s2[local_row] =
                     __bfloat162float(state_read[initial_base + 2LL * kNvfp4GdnChannels + row]);
             }
@@ -207,7 +202,8 @@ nvfp4_gdn_record_t1_kernel(Nvfp4PackedActivation<Geometry> activation,
             conv           = fmaf(w1, h1, conv);
             conv           = fmaf(w2, h2, conv);
             conv           = fmaf(w3, total, conv);
-            nvfp4_gdn_store_qkv(row, token, width, query, key, value, __float2bfloat16_rn(silu(conv)));
+            nvfp4_gdn_store_qkv(row, token, width, query, key, value,
+                                __float2bfloat16_rn(silu(conv)));
             record[static_cast<std::int64_t>(token) * kNvfp4GdnChannels + row] =
                 __float2bfloat16_rn(total);
             if constexpr (Tree) {
@@ -243,11 +239,11 @@ void nvfp4_gdn_record_decode_launch(const Tensor& x, const Weight& weight,
                                     const Tensor& valid_columns, const Tensor& initial_slot,
                                     Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                     Tensor& z, cudaStream_t stream) {
-    launch_decode_column(
-        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
-        RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data), kNvfp4GdnChannels,
-                            x.ne[1]},
-        stream);
+    launch_decode_column(x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
+                         key, value, z,
+                         RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data),
+                                             kNvfp4GdnChannels, x.ne[1]},
+                         stream);
 }
 
 void nvfp4_gdn_snapshot_decode_columns(const Tensor& x, const Weight& weight,
@@ -263,10 +259,10 @@ void nvfp4_gdn_snapshot_decode_columns(const Tensor& x, const Weight& weight,
                                          stream);
         return;
     }
-    auto scope           = workspace.scope();
-    Tensor scratch       = workspace.alloc(DType::BF16, {kNvfp4GdnChannels, 3, 1});
-    Tensor scratch_slot  = workspace.alloc(DType::I32, {1});
-    Tensor valid_t       = workspace.alloc(DType::I32, {1});
+    auto scope          = workspace.scope();
+    Tensor scratch      = workspace.alloc(DType::BF16, {kNvfp4GdnChannels, 3, 1});
+    Tensor scratch_slot = workspace.alloc(DType::I32, {1});
+    Tensor valid_t      = workspace.alloc(DType::I32, {1});
     prepare_scratch(conv_states, initial_slot, scratch, scratch_slot, stream);
     for (std::int32_t token = 0; token < width; ++token) {
         fill_column_valid(valid_columns, token, width, valid_t, stream);
@@ -324,8 +320,8 @@ void nvfp4_gdn_record_decode_columns(const Tensor& x, const Weight& weight,
 void nvfp4_gdn_record_t1_fused_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, const Tensor& conv_states,
                                       const Tensor& valid_columns, const Tensor& initial_slot,
-                                      Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                      Tensor& z, cudaStream_t stream,
+                                      Tensor& conv_record, Tensor& query, Tensor& key,
+                                      Tensor& value, Tensor& z, cudaStream_t stream,
                                       const std::int32_t* parent_index) {
     if (x.ne[2] > 1) {
         const std::int32_t batch = x.ne[2];
@@ -339,20 +335,19 @@ void nvfp4_gdn_record_t1_fused_launch(const Tensor& x, const Weight& weight,
             Tensor value_b  = value.slice(2, b, 1);
             Tensor z_b      = z.slice(2, b, 1);
             const std::int32_t* parent_b =
-                parent_index == nullptr
-                    ? nullptr
-                    : parent_index + static_cast<std::int64_t>(b) * width;
+                parent_index == nullptr ? nullptr
+                                        : parent_index + static_cast<std::int64_t>(b) * width;
             nvfp4_gdn_record_t1_fused_launch(x.slice(2, b, 1), weight, conv_weight, conv_states,
-                                             valid_b, initial_slot.slice(0, b, 1), record_b, query_b,
-                                             key_b, value_b, z_b, stream, parent_b);
+                                             valid_b, initial_slot.slice(0, b, 1), record_b,
+                                             query_b, key_b, value_b, z_b, stream, parent_b);
         }
         return;
     }
 
-    using Geometry = Nvfp4GdnInputGeometry;
-    using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
-    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    const float inverse   = 1.0F / weight.weight_scale_divisor;
+    using Geometry           = Nvfp4GdnInputGeometry;
+    using Schedule           = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
+    constexpr int kBlocks    = Geometry::kOutputRows / Schedule::kRowsPerCta;
+    const float inverse      = 1.0F / weight.weight_scale_divisor;
     const std::int32_t width = x.ne[1];
     const Nvfp4PackedActivation<Geometry> activation{static_cast<const __nv_bfloat16*>(x.data)};
     if (parent_index == nullptr) {
@@ -363,8 +358,9 @@ void nvfp4_gdn_record_t1_fused_launch(const Tensor& x, const Weight& weight,
                 static_cast<const __nv_bfloat16*>(conv_weight.data),
                 static_cast<const __nv_bfloat16*>(conv_states.data),
                 static_cast<const std::int32_t*>(initial_slot.data),
-                valid_columns.data == nullptr ? nullptr
-                                              : static_cast<const std::int32_t*>(valid_columns.data),
+                valid_columns.data == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(valid_columns.data),
                 nullptr, static_cast<__nv_bfloat16*>(query.data),
                 static_cast<__nv_bfloat16*>(key.data), static_cast<__nv_bfloat16*>(value.data),
                 static_cast<__nv_bfloat16*>(z.data), static_cast<__nv_bfloat16*>(conv_record.data),
@@ -377,8 +373,9 @@ void nvfp4_gdn_record_t1_fused_launch(const Tensor& x, const Weight& weight,
                 static_cast<const __nv_bfloat16*>(conv_weight.data),
                 static_cast<const __nv_bfloat16*>(conv_states.data),
                 static_cast<const std::int32_t*>(initial_slot.data),
-                valid_columns.data == nullptr ? nullptr
-                                              : static_cast<const std::int32_t*>(valid_columns.data),
+                valid_columns.data == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(valid_columns.data),
                 parent_index, static_cast<__nv_bfloat16*>(query.data),
                 static_cast<__nv_bfloat16*>(key.data), static_cast<__nv_bfloat16*>(value.data),
                 static_cast<__nv_bfloat16*>(z.data), static_cast<__nv_bfloat16*>(conv_record.data),

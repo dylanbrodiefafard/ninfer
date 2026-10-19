@@ -39,9 +39,8 @@ ChatRole parse_message_role(const std::string& role) {
     bad_request("unsupported role: " + role, "messages", "unsupported_role");
 }
 
-const Json& require_object(const Json& body) {
+void require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
-    return body;
 }
 
 bool get_bool(const Json& obj, const char* key, bool fallback) {
@@ -155,6 +154,11 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
                         "messages");
         }
         const std::string type = part.at("type").get<std::string>();
+        if (turn.role == ChatRole::Tool && type != "text") {
+            bad_request("tool message " + std::to_string(index) +
+                            " content parts must have type 'text'",
+                        "messages");
+        }
         ContentPart out;
         out.type_raw = type;
         if (type == "text") {
@@ -253,12 +257,11 @@ void parse_messages(const Json& body, GenerationRequest& out) {
                 item.at("tool_call_id").get<std::string>().empty()) {
                 bad_request("tool messages must contain a string tool_call_id", "messages");
             }
-            if (!item.contains("content") || !item.at("content").is_string()) {
-                bad_request("tool messages must contain string content", "messages");
+            if (!item.contains("content") || item.at("content").is_null()) {
+                bad_request("tool messages must contain content", "messages");
             }
             turn.tool_call_id = item.at("tool_call_id").get<std::string>();
-            turn.content.push_back(
-                ContentPart{ContentKind::Text, item.at("content").get<std::string>(), "text"});
+            parse_content_parts(item.at("content"), turn, i);
             out.messages.push_back(std::move(turn));
             continue;
         }
@@ -435,6 +438,82 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     }
 }
 
+// OpenAI: `logprobs` enables the report and `top_logprobs` (0..20) requires it.
+void parse_logprobs(const Json& body, GenerationRequest& out) {
+    const bool enabled                    = get_bool(body, "logprobs", false);
+    const std::optional<int> alternatives = get_int(body, "top_logprobs");
+    if (alternatives && (*alternatives < 0 || *alternatives > 20)) {
+        bad_request("top_logprobs must be between 0 and 20", "top_logprobs");
+    }
+    if (alternatives && !enabled) {
+        bad_request("top_logprobs requires logprobs to be true", "top_logprobs");
+    }
+    if (enabled) { out.top_logprobs = alternatives.value_or(0); }
+}
+
+// Valid UTF-8 for a JSON string: each maximal ill-formed subpart of `bytes` becomes U+FFFD
+// (Unicode 3.9, Table 3-7 well-formed byte sequences).
+std::string utf8_lossy(std::string_view bytes) {
+    std::string out;
+    out.reserve(bytes.size());
+    std::size_t at = 0;
+    while (at < bytes.size()) {
+        const auto lead = static_cast<unsigned char>(bytes[at]);
+        if (lead < 0x80) {
+            out.push_back(static_cast<char>(lead));
+            ++at;
+            continue;
+        }
+        std::size_t continuation = 0;
+        unsigned char low        = 0x80;
+        unsigned char high       = 0xBF;
+        if (lead >= 0xC2 && lead <= 0xDF) {
+            continuation = 1;
+        } else if (lead >= 0xE0 && lead <= 0xEF) {
+            continuation = 2;
+            if (lead == 0xE0) { low = 0xA0; }
+            if (lead == 0xED) { high = 0x9F; }
+        } else if (lead >= 0xF0 && lead <= 0xF4) {
+            continuation = 3;
+            if (lead == 0xF0) { low = 0x90; }
+            if (lead == 0xF4) { high = 0x8F; }
+        }
+        std::size_t length = 1;
+        bool well_formed   = continuation != 0;
+        for (std::size_t k = 0; well_formed && k < continuation; ++k) {
+            if (at + length >= bytes.size()) {
+                well_formed = false;
+                break;
+            }
+            const auto next = static_cast<unsigned char>(bytes[at + length]);
+            if (next < low || next > high) {
+                well_formed = false;
+                break;
+            }
+            ++length;
+            low  = 0x80;
+            high = 0xBF;
+        }
+        if (well_formed) {
+            out.append(bytes.substr(at, length));
+        } else {
+            out.append("\xEF\xBF\xBD");
+        }
+        at += length;
+    }
+    return out;
+}
+
+Json token_bytes_json(std::string_view bytes) {
+    Json out = Json::array();
+    for (const char byte : bytes) { out.push_back(static_cast<unsigned char>(byte)); }
+    return out;
+}
+
+Json choice_logprobs_json(std::span<const TokenLogprobEntry> entries) {
+    return Json{{"content", token_logprobs_json(entries)}, {"refusal", nullptr}};
+}
+
 void reject_unsupported_features(const Json& body) {
     for (const char* key : {"functions", "function_call"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
@@ -442,19 +521,6 @@ void reject_unsupported_features(const Json& body) {
             error.message = std::string(key) + " is not supported yet";
             error.param   = key;
             error.code    = "tools_not_supported";
-            throw ApiException(std::move(error));
-        }
-    }
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& fmt  = body.at("response_format");
-        std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
-                               ? fmt.at("type").get<std::string>()
-                               : std::string();
-        if (type != "text") {
-            ApiError error;
-            error.message = "only response_format {type:text} is supported";
-            error.param   = "response_format";
-            error.code    = "response_format_not_supported";
             throw ApiException(std::move(error));
         }
     }
@@ -469,9 +535,9 @@ Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index
     Json out = Json::array();
     for (std::size_t i = 0; i < tool_calls.size(); ++i) {
         const ToolCall& call = tool_calls[i];
-        Json item            = {{"id", call.id},
-                                {"type", "function"},
-                                {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
+        Json item = {{"id", call.id},
+                     {"type", "function"},
+                     {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
         if (include_index) { item["index"] = static_cast<int>(i); }
         out.push_back(std::move(item));
     }
@@ -581,77 +647,60 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
     // Downstream proxies normalize OpenAI usage (e.g. LiteLLM drops unknown top-level
     // usage keys) but forward the standard details sub-objects, so every stat lives
     // exactly once, here:
-//  - prompt_tokens_details: the OpenAI-standard `cached_tokens` plus engine stats
+    //  - prompt_tokens_details: the OpenAI-standard `cached_tokens` plus engine stats
     //    under the `ninfer` vendor namespace (ttft_ms, prefill/decode rates, reuse source,
     //    prefix_reuse_path, context_checkpoint restored/captured head frontiers, KV RAM tier).
     //  - completion_tokens_details: OpenAI-standard keys only, so they survive proxy
     //    normalization (reasoning + speculative-decoding token breakdowns).
-    Json ptd = {{"cached_tokens", timings->prompt_reused_n}};
-    Json ninfer = {{"reuse_source", prefix_reuse_source_name(timings->prefix_reuse_source)},
-                   {"prefix_reuse_path", prefix_reuse_path_name(timings->prefix_reuse_path)},
-                   {"context_checkpoint",
-                    {{"restored_tokens",
-                      static_cast<int>(timings->restored_context_checkpoint_tokens)},
-                     {"captured_tokens",
-                      static_cast<int>(timings->captured_context_checkpoint_tokens)}}},
-                   {"ttft_ms", json_decimal3(timings->ttft_ms)},
-                   {"prefill",
-                    {{"tokens", prefill_eval_tokens(timings->prompt_n, timings->prompt_reused_n)},
-                     {"ms", json_decimal3(timings->prompt_ms)},
-                     {"tok_s", json_decimal3(timings->prompt_per_second)},
-                     {"ms_per_token", json_decimal3(timings->prompt_per_token_ms)},
-                     {"tail_tok_s", json_decimal3(timings->prefill_tail_tok_s)},
-                     {"tail_window_s", json_decimal3(timings->prefill_tail_window_s)}}},
-                   {"decode",
-                    {{"tokens", timings->predicted_n},
-                     {"ms", json_decimal3(timings->predicted_ms)},
-                     {"tok_s", json_decimal3(timings->predicted_per_second)},
-                     {"ms_per_token", json_decimal3(timings->predicted_per_token_ms)}}}};
+    Json ptd    = {{"cached_tokens", timings->prompt_reused_n}};
+    Json ninfer = {
+        {"reuse_source", prefix_reuse_source_name(timings->prefix_reuse_source)},
+        {"prefix_reuse_path", prefix_reuse_path_name(timings->prefix_reuse_path)},
+        {"context_checkpoint",
+         {{"restored_tokens", static_cast<int>(timings->restored_context_checkpoint_tokens)},
+          {"captured_tokens", static_cast<int>(timings->captured_context_checkpoint_tokens)}}},
+        {"ttft_ms", json_decimal3(timings->ttft_ms)},
+        {"prefill",
+         {{"tokens", prefill_eval_tokens(timings->prompt_n, timings->prompt_reused_n)},
+          {"ms", json_decimal3(timings->prompt_ms)},
+          {"tok_s", json_decimal3(timings->prompt_per_second)},
+          {"ms_per_token", json_decimal3(timings->prompt_per_token_ms)},
+          {"tail_tok_s", json_decimal3(timings->prefill_tail_tok_s)},
+          {"tail_window_s", json_decimal3(timings->prefill_tail_window_s)}}},
+        {"decode",
+         {{"tokens", timings->predicted_n},
+          {"ms", json_decimal3(timings->predicted_ms)},
+          {"tok_s", json_decimal3(timings->predicted_per_second)},
+          {"ms_per_token", json_decimal3(timings->predicted_per_token_ms)}}}};
     if (timings->recovery.discarded_tool_calls != 0 ||
         timings->recovery.discarded_reasoning_tokens != 0) {
         const auto& recovery = timings->recovery;
-        ninfer["recovery"] = {{"attempts", recovery.attempts},
-                              {"discarded_tool_calls", recovery.discarded_tool_calls},
-                              {"discarded_reasoning_tokens", recovery.discarded_reasoning_tokens},
-                              {"prefill_tokens", recovery.prefill_tokens},
-                              {"prefill_samples", recovery.prefill_samples},
-                              {"prepare_ms", json_decimal3(recovery.prepare_seconds * 1000.0)},
-                              {"prefill_ms", json_decimal3(recovery.prefill_seconds * 1000.0)}};
+        ninfer["recovery"]   = {{"attempts", recovery.attempts},
+                                {"discarded_tool_calls", recovery.discarded_tool_calls},
+                                {"discarded_reasoning_tokens", recovery.discarded_reasoning_tokens},
+                                {"prefill_tokens", recovery.prefill_tokens},
+                                {"prefill_samples", recovery.prefill_samples},
+                                {"prepare_ms", json_decimal3(recovery.prepare_seconds * 1000.0)},
+                                {"prefill_ms", json_decimal3(recovery.prefill_seconds * 1000.0)}};
     }
-    if (timings->kv_ram_capacity_bytes != 0) {
-        // Host KV RAM tier: live engine-wide gauges at request end, this request's
-        // D2H/H2D copy time, and engine-lifetime cumulative counters.
-        ninfer["kv_ram"] = {{"used_bytes", timings->kv_ram_used_bytes},
-                            {"entry_count", timings->kv_ram_entry_count},
-                            {"save_ms", json_decimal3(timings->kv_ram_save_ms)},
-                            {"load_ms", json_decimal3(timings->kv_ram_load_ms)},
-                            {"lifetime",
-                             {{"captures", timings->kv_ram_captures},
-                              {"restores", timings->kv_ram_restores},
-                              {"evictions", timings->kv_ram_evictions},
-                              {"drops", timings->kv_ram_drops}}}};
+    if (timings->kv_ram_save_ms != 0.0 || timings->kv_ram_load_ms != 0.0) {
+        ninfer["kv_ram"] = {{"save_ms", json_decimal3(timings->kv_ram_save_ms)},
+                            {"load_ms", json_decimal3(timings->kv_ram_load_ms)}};
     }
-    if (timings->kv_disk_capacity_bytes != 0) {
-        // Host KV disk tier: live gauges, this request's SSD-to-host restore wall,
-        // post-disk H2D wall, and engine-lifetime cumulative counters.
-        ninfer["kv_disk"] = {{"used_bytes", timings->kv_disk_used_bytes},
-                             {"entry_count", timings->kv_disk_entry_count},
-                             {"save_ms", json_decimal3(timings->kv_disk_save_ms)},
+    if (timings->kv_disk_save_ms != 0.0 || timings->kv_disk_load_ms != 0.0 ||
+        timings->kv_disk_h2d_ms != 0.0) {
+        ninfer["kv_disk"] = {{"save_ms", json_decimal3(timings->kv_disk_save_ms)},
                              {"load_ms", json_decimal3(timings->kv_disk_load_ms)},
-                             {"h2d_ms", json_decimal3(timings->kv_disk_h2d_ms)},
-                             {"lifetime",
-                              {{"captures", timings->kv_disk_captures},
-                               {"restores", timings->kv_disk_restores},
-                               {"evictions", timings->kv_disk_evictions},
-                               {"drops", timings->kv_disk_drops}}}};
+                             {"h2d_ms", json_decimal3(timings->kv_disk_h2d_ms)}};
     }
-    ptd["ninfer"] = std::move(ninfer);
+    ptd["ninfer"]                = std::move(ninfer);
     out["prompt_tokens_details"] = std::move(ptd);
 
     Json ctd = {{"reasoning_tokens", timings->reasoning_tokens}};
     if (timings->draft_n > 0) {
         ctd["accepted_prediction_tokens"] = timings->draft_n_accepted;
-        ctd["rejected_prediction_tokens"] = std::max(0, timings->draft_n - timings->draft_n_accepted);
+        ctd["rejected_prediction_tokens"] =
+            std::max(0, timings->draft_n - timings->draft_n_accepted);
     }
     out["completion_tokens_details"] = std::move(ctd);
     return out;
@@ -659,39 +708,90 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
 
 } // namespace
 
+std::optional<ninfer::OutputConstraint> parse_output_format(const Json& format, bool nested_schema,
+                                                            std::string_view param) {
+    const auto invalid = [&](const std::string& message) {
+        bad_request(message, std::string(param), "invalid_output_constraint");
+    };
+    if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+        invalid("output format requires a string type");
+    }
+    const auto type = format.at("type").get<std::string>();
+    if (type == "text" || type == "json_object") {
+        if (format.size() != 1) { invalid("output format only accepts type for " + type); }
+        if (type == "text") { return std::nullopt; }
+        return ninfer::OutputConstraint{ninfer::OutputConstraintKind::JsonObject, {}};
+    }
+    if (type != "json_schema") { invalid("unsupported output format type: " + type); }
+    if (nested_schema && (!format.contains("json_schema") ||
+                          !format.at("json_schema").is_object() || format.size() != 2)) {
+        invalid("json_schema output format requires a json_schema object");
+    }
+    const Json& schema = nested_schema ? format.at("json_schema") : format;
+    for (auto it = schema.begin(); it != schema.end(); ++it) {
+        if (it.key() != "name" && it.key() != "schema" && it.key() != "strict" &&
+            it.key() != "description" && !(it.key() == "type" && !nested_schema)) {
+            invalid("unsupported json_schema option: " + it.key());
+        }
+    }
+    if (!schema.contains("name") || !schema.at("name").is_string()) {
+        invalid("json_schema requires a name");
+    }
+    const auto name = schema.at("name").get<std::string>();
+    if (name.empty() || name.size() > 64 ||
+        !std::all_of(name.begin(), name.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                   c == '_' || c == '-';
+        })) {
+        invalid("json_schema name must contain 1 to 64 letters, digits, underscores or hyphens");
+    }
+    if (schema.contains("strict") && !schema.at("strict").is_null() &&
+        !schema.at("strict").is_boolean()) {
+        invalid("json_schema strict must be a boolean or null");
+    }
+    if (schema.contains("description") && !schema.at("description").is_string()) {
+        invalid("json_schema description must be a string");
+    }
+    if (!schema.contains("schema") ||
+        (!schema.at("schema").is_object() && !schema.at("schema").is_boolean())) {
+        invalid("json_schema requires an object or boolean schema");
+    }
+    return ninfer::OutputConstraint{ninfer::OutputConstraintKind::JsonSchema,
+                                    schema.at("schema").dump()};
+}
+
 CompletionTimings make_completion_timings(int prompt_tokens, int completion_tokens,
-                                           double prefill_seconds, double decode_seconds,
-                                           int draft_n, int draft_n_accepted,
-                                           double prefill_tail_tok_s,
-                                           double prefill_tail_window_s, int prompt_reused,
-                                           const ninfer::GenerationRecoveryStats& recovery) {
+                                          double prefill_seconds, double decode_seconds,
+                                          int draft_n, int draft_n_accepted,
+                                          double prefill_tail_tok_s, double prefill_tail_window_s,
+                                          int prompt_reused,
+                                          const ninfer::GenerationRecoveryStats& recovery) {
     CompletionTimings out;
-    out.recovery = recovery;
-    out.prompt_n            = prompt_tokens;
-    out.prompt_reused_n     = std::max(0, std::min(prompt_reused, prompt_tokens));
-    out.prompt_ms           = prefill_seconds * 1000.0;
+    out.recovery        = recovery;
+    out.prompt_n        = prompt_tokens;
+    out.prompt_reused_n = std::max(0, std::min(prompt_reused, prompt_tokens));
+    out.prompt_ms       = prefill_seconds * 1000.0;
     // Prefill rates cover the computed (non-reused) suffix only: a cached prefix is
     // not re-prefilled, so counting it would inflate the rate by the reuse ratio.
     const int computed_prompt_tokens = prefill_eval_tokens(prompt_tokens, out.prompt_reused_n);
     out.prompt_per_token_ms =
         computed_prompt_tokens > 0 ? out.prompt_ms / computed_prompt_tokens : 0.0;
-    out.prompt_per_second =
-        prefill_seconds > 0.0 && computed_prompt_tokens > 0
-            ? static_cast<double>(computed_prompt_tokens) / prefill_seconds
-            : 0.0;
+    out.prompt_per_second     = prefill_seconds > 0.0 && computed_prompt_tokens > 0
+                                    ? static_cast<double>(computed_prompt_tokens) / prefill_seconds
+                                    : 0.0;
     out.prefill_tail_tok_s    = prefill_tail_tok_s;
     out.prefill_tail_window_s = prefill_tail_window_s;
     // First completion token is sampled during prefill; decode.ms is later rounds only.
     const int decode_tokens = decode_eval_tokens(completion_tokens, recovery.prefill_samples);
-    out.predicted_n  = decode_tokens;
-    out.predicted_ms = decode_seconds * 1000.0;
+    out.predicted_n         = decode_tokens;
+    out.predicted_ms        = decode_seconds * 1000.0;
     out.predicted_per_token_ms =
         decode_tokens > 0 ? out.predicted_ms / static_cast<double>(decode_tokens) : 0.0;
     out.predicted_per_second = decode_seconds > 0.0 && decode_tokens > 0
                                    ? static_cast<double>(decode_tokens) / decode_seconds
                                    : 0.0;
-    out.draft_n          = draft_n;
-    out.draft_n_accepted = draft_n_accepted;
+    out.draft_n              = draft_n;
+    out.draft_n_accepted     = draft_n_accepted;
     return out;
 }
 
@@ -775,23 +875,30 @@ void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
                     "max",
                     "reasoning_effort");
     }
-    out.reasoning_effort       = *effort;
+    out.reasoning_effort       = effort;
     out.reasoning_effort_param = "reasoning_effort";
 }
 
 void apply_ninfer_object(const Json& ninfer, GenerationRequest& out) {
     if (!ninfer.is_object()) { bad_request("ninfer must be an object", "ninfer"); }
     for (auto it = ninfer.begin(); it != ninfer.end(); ++it) {
-        if (it.key() != "capture_context_checkpoint") {
+        if (it.key() != "capture_context_checkpoint" && it.key() != "cache_write") {
             bad_request("ninfer." + it.key() + " is not supported", "ninfer",
                         "ninfer_option_not_supported");
         }
     }
-    if (!ninfer.contains("capture_context_checkpoint")) { return; }
-    if (!ninfer.at("capture_context_checkpoint").is_boolean()) {
-        bad_request("ninfer.capture_context_checkpoint must be a boolean", "ninfer");
+    for (const char* key : {"cache_write", "capture_context_checkpoint"}) {
+        if (ninfer.contains(key) && !ninfer.at(key).is_boolean()) {
+            bad_request(std::string("ninfer.") + key + " must be a boolean", "ninfer");
+        }
     }
-    out.capture_context_checkpoint = ninfer.at("capture_context_checkpoint").get<bool>();
+    out.cache_write                = ninfer.value("cache_write", true);
+    out.capture_context_checkpoint = ninfer.value("capture_context_checkpoint", false);
+    if (!out.cache_write && out.capture_context_checkpoint) {
+        bad_request("capture_context_checkpoint=true requires cache_write=true because it creates "
+                    "a retained context checkpoint.",
+                    "ninfer.capture_context_checkpoint", "cache_write_conflict");
+    }
 }
 
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
@@ -807,16 +914,41 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
 
     parse_tools(body, out);
     parse_tool_choice(body, out);
+    if (body.contains("response_format") && !body.at("response_format").is_null()) {
+        out.output_constraint =
+            parse_output_format(body.at("response_format"), true, "response_format");
+    }
+    if (body.contains("structured_outputs") && !body.at("structured_outputs").is_null()) {
+        const auto& structured = body.at("structured_outputs");
+        if (out.output_constraint) {
+            bad_request("structured_outputs conflicts with response_format", "structured_outputs",
+                        "invalid_output_constraint");
+        }
+        if (!structured.is_object() || structured.size() != 1 || !structured.contains("grammar") ||
+            !structured.at("grammar").is_string() ||
+            structured.at("grammar").get<std::string>().empty()) {
+            bad_request("structured_outputs requires one nonempty EBNF grammar string",
+                        "structured_outputs", "invalid_output_constraint");
+        }
+        out.output_constraint = ninfer::OutputConstraint{
+            ninfer::OutputConstraintKind::Grammar, structured.at("grammar").get<std::string>()};
+        out.output_constraint_param = "structured_outputs";
+    }
+    if (out.output_constraint && !out.tools.empty()) {
+        bad_request("output constraints cannot be combined with tools", out.output_constraint_param,
+                    "invalid_output_constraint");
+    }
     parse_messages(body, out);
     parse_stop(body, out);
     parse_sampling(body, out);
+    parse_logprobs(body, out);
 
     out.stream = get_bool(body, "stream", false);
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
     if (const std::optional<bool> enable_thinking = parse_openai_enable_thinking(body)) {
-        out.enable_thinking = *enable_thinking;
+        out.enable_thinking = enable_thinking;
     }
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
@@ -835,22 +967,39 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     return out;
 }
 
+Json token_logprobs_json(std::span<const TokenLogprobEntry> entries) {
+    Json out = Json::array();
+    for (const TokenLogprobEntry& entry : entries) {
+        Json alternatives = Json::array();
+        for (const TokenLogprobAlternative& alternative : entry.top) {
+            alternatives.push_back(Json{{"token", utf8_lossy(alternative.bytes)},
+                                        {"logprob", alternative.logprob},
+                                        {"bytes", token_bytes_json(alternative.bytes)}});
+        }
+        out.push_back(Json{{"token", utf8_lossy(entry.bytes)},
+                           {"logprob", entry.logprob},
+                           {"bytes", token_bytes_json(entry.bytes)},
+                           {"top_logprobs", std::move(alternatives)}});
+    }
+    return out;
+}
+
 std::string make_chat_completion_response(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
                                           const std::string& reasoning, const char* finish_reason,
                                           const CompletionUsage& usage,
-                                          const CompletionTimings* timings) {
+                                          const CompletionTimings* timings,
+                                          const std::vector<TokenLogprobEntry>* logprobs) {
     Json message = {{"role", "assistant"}, {"content", content}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    Json payload = {
-        {"id", id},
-        {"object", "chat.completion"},
-        {"created", created},
-        {"model", model},
-        {"choices",
-         Json::array({Json{
-             {"index", 0}, {"message", std::move(message)}, {"finish_reason", finish_reason}}})},
-         {"usage", usage_to_json(usage, timings)}};
+    Json choice = {{"index", 0}, {"message", std::move(message)}, {"finish_reason", finish_reason}};
+    if (logprobs != nullptr) { choice["logprobs"] = choice_logprobs_json(*logprobs); }
+    Json payload = {{"id", id},
+                    {"object", "chat.completion"},
+                    {"created", created},
+                    {"model", model},
+                    {"choices", Json::array({std::move(choice)})},
+                    {"usage", usage_to_json(usage, timings)}};
     return payload.dump();
 }
 
@@ -859,20 +1008,20 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                                                const std::string& reasoning,
                                                const std::vector<ToolCall>& tool_calls,
                                                const CompletionUsage& usage,
-                                               const CompletionTimings* timings) {
+                                               const CompletionTimings* timings,
+                                               const std::vector<TokenLogprobEntry>* logprobs) {
     Json message = {{"role", "assistant"},
                     {"content", content.empty() ? Json(nullptr) : Json(content)},
                     {"tool_calls", tool_calls_json(tool_calls, false)}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    Json payload = {
-        {"id", id},
-        {"object", "chat.completion"},
-        {"created", created},
-        {"model", model},
-        {"choices",
-         Json::array({Json{
-             {"index", 0}, {"message", std::move(message)}, {"finish_reason", "tool_calls"}}})},
-         {"usage", usage_to_json(usage, timings)}};
+    Json choice = {{"index", 0}, {"message", std::move(message)}, {"finish_reason", "tool_calls"}};
+    if (logprobs != nullptr) { choice["logprobs"] = choice_logprobs_json(*logprobs); }
+    Json payload = {{"id", id},
+                    {"object", "chat.completion"},
+                    {"created", created},
+                    {"model", model},
+                    {"choices", Json::array({std::move(choice)})},
+                    {"usage", usage_to_json(usage, timings)}};
     return payload.dump();
 }
 
@@ -896,6 +1045,19 @@ std::string make_chat_chunk_content(const std::string& id, const std::string& mo
                                     std::int64_t created, const std::string& delta_text,
                                     bool include_usage) {
     return make_delta_chunk(id, model, created, "content", delta_text, include_usage);
+}
+
+std::string make_chat_chunk_content_logprobs(const std::string& id, const std::string& model,
+                                             std::int64_t created, const std::string& delta_text,
+                                             std::span<const TokenLogprobEntry> logprobs,
+                                             bool include_usage) {
+    Json payload       = base_chunk(id, model, created);
+    payload["choices"] = Json::array({Json{{"index", 0},
+                                           {"delta", Json{{"content", delta_text}}},
+                                           {"logprobs", choice_logprobs_json(logprobs)},
+                                           {"finish_reason", nullptr}}});
+    if (include_usage) { payload["usage"] = nullptr; }
+    return sse_event(payload);
 }
 
 std::string make_chat_chunk_tool_calls(const std::string& id, const std::string& model,

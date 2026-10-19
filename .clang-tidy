@@ -1,0 +1,79 @@
+# Static analysis for project C++ and CUDA. Run with ./scripts/run-clang-tidy.py, which pins the
+# clang-tidy version and translates nvcc commands into clang CUDA commands for sm_120a.
+# Every enabled check is an error: a finding is fixed, or suppressed at the line with
+# `// NOLINT(check-name): reason` when the code is correct and the reason is stated.
+# Policy and rationale: docs/maintainer/code-quality.md.
+#
+# Checks are selected for defect classes, not style: use-after-move, dangling references,
+# integer overflow in index arithmetic, slicing, missing virtual
+# destructors, unchecked optional access, exception-safety errors, and path-sensitive
+# analyzer findings (null dereference, leaks, uninitialized reads).
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-random-generator-seed,
+  clang-analyzer-*,
+  -clang-analyzer-optin.performance.Padding,
+  concurrency-thread-canceltype-asynchronous,
+  cppcoreguidelines-slicing,
+  cppcoreguidelines-virtual-class-destructor,
+  cppcoreguidelines-rvalue-reference-param-not-moved,
+  misc-*,
+  -misc-const-correctness,
+  -misc-definitions-in-headers,
+  -misc-include-cleaner,
+  -misc-no-recursion,
+  -misc-non-private-member-variables-in-classes,
+  -misc-use-anonymous-namespace,
+  -misc-use-internal-linkage,
+  modernize-use-nullptr,
+  modernize-use-override,
+  performance-*,
+  -performance-enum-size,
+  portability-*,
+  -portability-avoid-pragma-once,
+  -portability-simd-intrinsics,
+  readability-container-size-empty,
+  readability-delete-null-pointer,
+  readability-duplicate-include,
+  readability-inconsistent-declaration-parameter-name,
+  readability-misleading-indentation,
+  readability-misplaced-array-index,
+  readability-redundant-control-flow,
+  readability-redundant-smartptr-get,
+  readability-string-compare
+WarningsAsErrors: "*"
+HeaderFilterRegex: "/(apps|bench|include|src|tests)/"
+ExcludeHeaderFilterRegex: "/third_party/"
+SystemHeaders: false
+FormatStyle: file
+# Disabled above, with reasons: easily-swappable-parameters (kernel signatures are long runs of
+# same-typed pointers and extents, so it flags nearly every kernel and launcher signature
+# without identifying a defect; bugprone-swapped-arguments still checks the call sites),
+# narrowing-conversions (deliberate in quantization code; the overflow class is covered by the
+# widening checks), random-generator-seed (tests seed deliberately for reproducibility), and
+# definitions-in-headers (target runtime *_impl.h headers are single-inclusion implementation
+# units instantiated once per target namespace). readability-suspicious-call-argument is not
+# enabled: it matches argument and parameter names heuristically and its findings here were
+# false positives.
+#
+# The two widening checks (implicit-widening-of-multiplication-result, misplaced-widening-cast)
+# apply to host translation units only; run-clang-tidy.py disables them for CUDA translation
+# units. Device index arithmetic is 32-bit by design, bounded by each kernel's documented shape
+# contract, which its host launcher validates under these checks.
+CheckOptions:
+  # main() is a process boundary: an escaping exception terminates with its message, which is the
+  # intended failure for tests and benchmarks. Destructors, moves, swaps, and noexcept functions
+  # stay checked.
+  bugprone-exception-escape.CheckMain: false
+  # Constant products are evaluated at compile time, where the compiler diagnoses overflow.
+  bugprone-implicit-widening-of-multiplication-result.IgnoreConstantIntExpr: true
+  # .value() is checked access: it throws std::bad_optional_access.
+  bugprone-unchecked-optional-access.IgnoreValueCalls: true
+  # Packed int8 weight codes are sign-extended on purpose.
+  bugprone-signed-char-misuse.CharTypdefsToIgnore: "std::int8_t;int8_t"
+  bugprone-implicit-widening-of-multiplication-result.UseCXXStaticCastsInCppSources: true
+  bugprone-unchecked-optional-access.IgnoreSmartPointerDereference: true
+  readability-inconsistent-declaration-parameter-name.Strict: true

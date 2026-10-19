@@ -41,8 +41,8 @@ def vision_position_ids(grid_thw: torch.Tensor) -> torch.Tensor:
     merge = VISION_SPATIAL_MERGE
     device = grid_thw.device
     parts: list[torch.Tensor] = []
-    for t, h, w in grid_thw.tolist():
-        t, h, w = int(t), int(h), int(w)
+    for raw_t, raw_h, raw_w in grid_thw.tolist():
+        t, h, w = int(raw_t), int(raw_h), int(raw_w)
         if h % merge or w % merge:
             raise ValueError(f"vision grid {(t, h, w)} is not divisible by merge size {merge}")
         hpos = torch.arange(h, device=device).unsqueeze(1).expand(-1, w)
@@ -64,8 +64,8 @@ def bilinear_indices_and_weights(grid_thw: torch.Tensor) -> tuple[torch.Tensor, 
     device = grid_thw.device
     index_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
     weight_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
-    for t, h, w in grid_thw.tolist():
-        t, h, w = int(t), int(h), int(w)
+    for raw_t, raw_h, raw_w in grid_thw.tolist():
+        t, h, w = int(raw_t), int(raw_h), int(raw_w)
         h_grid = torch.linspace(0, side - 1, h, device=device)
         w_grid = torch.linspace(0, side - 1, w, device=device)
         h_floor, w_floor = h_grid.int(), w_grid.int()
@@ -87,7 +87,9 @@ def bilinear_indices_and_weights(grid_thw: torch.Tensor) -> tuple[torch.Tensor, 
         ]
         hi = torch.arange(h, device=device).view(h // merge, merge)
         wi = torch.arange(w, device=device).view(w // merge, merge)
-        reorder = (hi[:, :, None, None] * w + wi[None, None, :, :]).transpose(1, 2).flatten().repeat(t)
+        reorder = (
+            (hi[:, :, None, None] * w + wi[None, None, :, :]).transpose(1, 2).flatten().repeat(t)
+        )
         for corner in range(4):
             index_parts[corner].append(indices[corner][reorder])
             weight_parts[corner].append(weights[corner][reorder])
@@ -165,10 +167,17 @@ def vision_attention(
         begin, end = boundaries[segment], boundaries[run_end]
         batch = run_end - segment
 
-        def heads(x: torch.Tensor) -> torch.Tensor:
-            return x[begin:end].reshape(
-                batch, length, VISION_HEADS, VISION_HEAD_DIM
-            ).transpose(1, 2)
+        def heads(
+            x: torch.Tensor,
+            *,
+            begin: int = begin,
+            end: int = end,
+            batch: int = batch,
+            length: int = length,
+        ) -> torch.Tensor:
+            return (
+                x[begin:end].reshape(batch, length, VISION_HEADS, VISION_HEAD_DIM).transpose(1, 2)
+            )
 
         attended = _sdpa(heads(q), heads(k), heads(v))
         out[begin:end] = attended.transpose(1, 2).reshape(
