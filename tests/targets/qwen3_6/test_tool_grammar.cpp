@@ -961,6 +961,28 @@ int main(int argc, char** argv) {
         }
         check(rejected, "a multi-branch allOf was silently dropped");
     }
+    for (const bool tool : {false, true}) {
+        bool rejected_precision = false;
+        try {
+            if (tool) {
+                (void)compiler.compile(
+                    std::vector<std::string>{
+                        R"({"type":"function","function":{"name":"precise","parameters":{"const":9007199254740993.0}}})"},
+                    false);
+            } else {
+                ninfer::OutputConstraint constraint;
+                constraint.kind   = ninfer::OutputConstraintKind::JsonSchema;
+                constraint.source = R"({"const":9007199254740993.0})";
+                (void)compiler.compile({}, false, constraint);
+            }
+        } catch (const ninfer::RequestError& error) {
+            rejected_precision =
+                error.kind() == (tool ? ninfer::RequestErrorKind::InvalidToolSchema
+                                      : ninfer::RequestErrorKind::InvalidOutputConstraint) &&
+                std::string(error.what()).find("/const") != std::string::npos;
+        }
+        check(rejected_precision, "Engine schema lost decimal source precision");
+    }
     for (const std::string malformed : {"{", R"({"type":"function","function":{"name":7}})"}) {
         bool input_error = false;
         try {

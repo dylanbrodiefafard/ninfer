@@ -1,4 +1,5 @@
 #include "targets/qwen3_6/impl/frontend/token_grammar.h"
+#include "text/json_input.h"
 #include "ninfer/targets/qwen3_6/frontend.h"
 
 #include <algorithm>
@@ -383,7 +384,12 @@ TokenGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in
     std::set<std::string> names;
     for (const auto& text : tools) {
         try {
-            const auto tool      = Json::parse(text);
+            const auto parsed = text::parse_json_numbers(text);
+            if (const auto location = text::inexact_schema_number(parsed, "/function/parameters")) {
+                throw std::invalid_argument("schema numeric value cannot be preserved at " +
+                                            *location);
+            }
+            const auto& tool     = parsed.value;
             const auto& function = tool.at("function");
             const auto name      = function.at("name").get<std::string>();
             if (name.empty() || name.find_first_of("<>\r\n") != std::string::npos ||
@@ -429,9 +435,17 @@ TokenGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in
                 }
                 format = Json{{"type", "grammar"}, {"grammar", constraint->source}};
             } else {
-                Json schema = constraint->kind == OutputConstraintKind::JsonObject
-                                  ? Json{{"type", "object"}, {"additionalProperties", true}}
-                                  : Json::parse(constraint->source);
+                Json schema =
+                    constraint->kind == OutputConstraintKind::JsonObject
+                        ? Json{{"type", "object"}, {"additionalProperties", true}}
+                        : [&] {
+                              const auto parsed = text::parse_json_numbers(constraint->source);
+                              if (const auto location = text::inexact_schema_number(parsed)) {
+                                  throw std::invalid_argument(
+                                      "schema numeric value cannot be preserved at " + *location);
+                              }
+                              return parsed.value;
+                          }();
                 // Response constraints enforce assertions; tool-schema relaxation does not apply.
                 check_response_schema(schema);
                 name_required_properties(schema);

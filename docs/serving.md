@@ -517,6 +517,13 @@ This is not full JSON Schema or OpenAI strict-tool parity:
 `strict:true`, `tool_choice:required`, named tool choice,
 hosted tools, MCP tools, and custom free-form tools are rejected.
 
+Schema assertion numbers whose decimal source value changes during JSON parsing are rejected
+with HTTP 400 before schema serialization. For example, `9007199254740993.0` cannot become
+`9007199254740992.0` silently. Exact integer literals remain integers; ordinary request numbers
+such as sampling parameters retain their existing parsing behavior. Tool schema checks apply
+to Chat, Responses, and Anthropic; JSON response schema checks apply to Chat and Responses. On the OpenAI error
+surface, `param` identifies the source JSON Pointer, including the assertion key.
+
 Qwen argument framing uses exactly one LF before and after each parameter value.
 Declared arguments may appear in any order, independently of the order of
 `properties` in the supplied schema or its HTTP JSON normalization. The grammar

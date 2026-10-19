@@ -1,4 +1,5 @@
 #include "product/prompt_input/prompt_input.h"
+#include "text/json_input.h"
 
 #include "product/media_acquire/acquire.h"
 
@@ -242,7 +243,19 @@ PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_
 
     Json root;
     try {
-        stream >> root;
+        const auto parsed =
+            text::parse_json_numbers(std::string(std::istreambuf_iterator<char>(stream), {}));
+        if (parsed.value.is_object() && parsed.value.contains("tools") &&
+            parsed.value["tools"].is_array()) {
+            for (std::size_t i = 0; i < parsed.value["tools"].size(); ++i) {
+                const auto schema_path = "/tools/" + std::to_string(i) + "/function/parameters";
+                if (const auto location = text::inexact_schema_number(parsed, schema_path)) {
+                    throw std::invalid_argument(
+                        "tool schema numeric value cannot be preserved at " + *location);
+                }
+            }
+        }
+        root = parsed.value;
     } catch (const nlohmann::json::exception& error) {
         throw std::invalid_argument(std::string("failed to parse messages JSON: ") + error.what());
     }

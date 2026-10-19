@@ -302,6 +302,7 @@ target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
+  text/json_input.cpp
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
@@ -324,7 +325,7 @@ if(NINFER_BUILD_PROMPT_INPUT)
   add_library(ninfer_product_prompt_input STATIC
     product/prompt_input/prompt_input.cpp)
   ninfer_internal_includes(ninfer_product_prompt_input)
-  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire)
+  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire ninfer_text)
 endif()
 
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
@@ -366,6 +367,7 @@ add_library(ninfer::engine ALIAS ninfer_engine)
 if(NINFER_BUILD_SERVE)
   # HTTP protocol/product adapter. No serving header is part of the public API.
   add_library(ninfer_serve STATIC
+    serve/json_input.cpp
     serve/openai_schema.cpp
     serve/responses_schema.cpp
     serve/anthropic_schema.cpp
@@ -383,5 +385,5 @@ if(NINFER_BUILD_SERVE)
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire CUDA::cudart)
+    PRIVATE ninfer_media_acquire ninfer_text CUDA::cudart)
 endif()

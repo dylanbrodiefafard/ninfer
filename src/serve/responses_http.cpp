@@ -1,4 +1,5 @@
 #include "serve/http_server.h"
+#include "serve/json_input.h"
 
 #include "serve/openai_schema.h"
 #include "serve/responses_schema.h"
@@ -66,8 +67,8 @@ ApiError response_not_found(const std::string& id) {
 
 Json parse_json_body(const httplib::Request& request) {
     try {
-        return Json::parse(request.body);
-    } catch (const std::exception&) {
+        return parse_request_body(request.body, JsonRequestProtocol::Responses);
+    } catch (const ApiException&) { throw; } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;
         error.type    = "invalid_request_error";

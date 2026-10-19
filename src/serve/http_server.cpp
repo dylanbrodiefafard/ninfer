@@ -1,4 +1,5 @@
 #include "serve/http_server.h"
+#include "serve/json_input.h"
 #include "serve/metrics.h"
 
 #include "serve/anthropic_schema.h"
@@ -526,7 +527,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const auto generation_started = std::chrono::steady_clock::now();
     nlohmann::json body;
     try {
-        body = nlohmann::json::parse(req.body);
+        body = parse_request_body(req.body, JsonRequestProtocol::ChatCompletions);
+    } catch (const ApiException& error) {
+        emit_openai_error(res, error.error());
+        return;
     } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;
@@ -747,7 +751,10 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     metrics_.observe_token_count(MetricsProtocol::AnthropicMessages);
     nlohmann::json body;
     try {
-        body = nlohmann::json::parse(req.body);
+        body = parse_request_body(req.body, JsonRequestProtocol::AnthropicMessages);
+    } catch (const ApiException& error) {
+        emit_messages_error(res, error.error());
+        return;
     } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;
@@ -777,7 +784,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const auto generation_started = std::chrono::steady_clock::now();
     nlohmann::json body;
     try {
-        body = nlohmann::json::parse(req.body);
+        body = parse_request_body(req.body, JsonRequestProtocol::AnthropicMessages);
+    } catch (const ApiException& error) {
+        emit_messages_error(res, error.error());
+        return;
     } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;

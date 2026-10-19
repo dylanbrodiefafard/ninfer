@@ -400,3 +400,7 @@ answer in the prompt; the schema is not added to the conversation. Tools and out
 cannot be combined. Stops, cancellation, or output/context limits may truncate a valid prefix;
 complete JSON validity requires finishing the grammar. See the constrained-output contract in
 `docs/serving.md` for the supported schema subset and HTTP triggers.
+
+Schema assertion numbers must preserve their decimal source value when parsed. The CLI rejects
+inexact values in a messages file's tool schemas and in `--json-schema` input, reporting the
+schema location; exact integer literals are retained.

@@ -359,6 +359,9 @@ set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 # Product protocol contracts.
+ninfer_add_test(ninfer_json_input_test
+  SOURCES test_json_input.cpp
+  LIBRARIES ninfer_serve ninfer_text ninfer_product_prompt_input)
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES test_openai_schema.cpp
   LIBRARIES ninfer_serve)
