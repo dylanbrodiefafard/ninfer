@@ -72,13 +72,14 @@ struct BenchOptions {
     std::optional<std::uint32_t> max_context;
     std::uint32_t prefill_chunk = kDefaultPrefillChunk;
     // Explicit prefill-first control; product Engine/server defaults enable mixing.
-    std::uint32_t mixed_forward        = 0;
-    std::uint32_t mixed_forward_rounds = 1;
-    KvCacheStorage kv_cache            = KvCacheStorage::Nvfp4;
-    bool sage_attn                     = false;
-    float keep_frac                    = 1.0f;
-    float xattn_tau                    = 1.0f;
-    std::uint32_t concurrency          = 1;
+    std::uint32_t mixed_forward            = 0;
+    std::uint32_t mixed_forward_rounds     = 12;
+    std::uint32_t mixed_forward_min_tokens = 4096;
+    KvCacheStorage kv_cache                = KvCacheStorage::Nvfp4;
+    bool sage_attn                         = false;
+    float keep_frac                        = 1.0f;
+    float xattn_tau                        = 1.0f;
+    std::uint32_t concurrency              = 1;
     // Contention mode (--contention P,R): R prompts of P tokens prefill back to back while
     // contention_lanes requests of contention_context prompt tokens decode.
     std::optional<std::pair<int, int>> contention;
@@ -166,7 +167,8 @@ struct BenchEnvironment {
     std::uint32_t max_context                      = 0;
     std::uint32_t prefill_chunk                    = kDefaultPrefillChunk;
     std::uint32_t mixed_forward                    = 0;
-    std::uint32_t mixed_forward_rounds             = 1;
+    std::uint32_t mixed_forward_rounds             = 12;
+    std::uint32_t mixed_forward_min_tokens         = 4096;
     KvCacheStorage kv_cache                        = KvCacheStorage::Nvfp4;
     bool sage_attn                                 = false;
     float keep_frac                                = 1.0f;

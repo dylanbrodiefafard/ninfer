@@ -1189,6 +1189,41 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t l
     return advance_prefill(sequences[lane], requests[lane], pace);
 }
 
+std::uint32_t ProgramImplCore::prefill_remaining_tokens(std::uint32_t lane) const {
+    if (lane >= max_concurrency) { throw std::out_of_range("prefill lane is out of range"); }
+    const auto& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
+        throw std::logic_error("prefill frontier requires a prefilling lane");
+    }
+    return request.prefill->prompt_tokens - request.prefill->cursor;
+}
+
+bool ProgramImplCore::prefill_suspendable(std::uint32_t lane) const {
+    if (lane >= max_concurrency) { return false; }
+    const auto& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { return false; }
+    const auto& staged = *request.prefill;
+    return staged.transient.size == 0 && !staged.vision && !staged.vision_plan &&
+           !staged.prompt.has_media();
+}
+
+void ProgramImplCore::resume_prefill_lane(std::uint32_t lane) {
+    if (!prefill_suspendable(lane)) {
+        throw std::logic_error("prefill resume requires a text owner without transient storage");
+    }
+    const auto& sequence = sequences[lane];
+    if (!sequence.kv || sequence.kv->text.bound_row() < 0 ||
+        (sequence.kv->backend && sequence.kv->backend->bound_row() < 0)) {
+        throw std::logic_error("suspended prefill lost its bound KV allocations");
+    }
+    set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
+    set_device_i32(io.backend_kv_table_row,
+                   sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
+    bind_prefill_sampling(sequence, requests[lane]);
+    set_device_i32(io.prefill_logprobs.row_enabled, requests[lane].token_logprobs ? 1 : 0);
+    set_device_i32(io.rope_delta, sequences[lane].rope_delta);
+}
+
 bool ProgramImplCore::prefill_mixable(std::uint32_t lane) const {
     if (speculative_backend != SpeculativeBackend::DFlash || mixed_forward == 0 ||
         lane >= max_concurrency) {

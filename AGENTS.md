@@ -76,8 +76,11 @@ compiled for `sm_120a` and tuned on an NVIDIA GeForce RTX 5090. The only support
 `qwen3.8-27b/nvfp4`; its default artifact, when available, is the MTP-NVFP4 or DFlash2 (NVFP4
 matrices, BF16 selector codebook) variant over the base Ostfralla NVFP4 shell. The workload is
 one GPU, one resident model instance, and a startup-fixed one to six active requests. The
-Engine forms one compact decode batch per round boundary with bounded FIFO ingress and no
-preemption. Large-scale or preemptive continuous batching, priority/QoS scheduling, additional
+Engine forms one compact decode batch per round boundary with bounded FIFO ingress. A short
+text prefill may interrupt a large prefill at a completed chunk boundary only on a genuinely
+available spare lane with its own feasible resources; the suspended owner retains its lane
+and state and must advance another chunk before another interruption. General preemptive
+continuous batching, priority/QoS scheduling, additional
 checkpoint targets, and retargeting to another execution platform are outside the current
 product. Per-request `cache_write: false` supports disposable turns that fork coherent cached
 state into independent allocations, preserve the original through initialization, suppress reuse

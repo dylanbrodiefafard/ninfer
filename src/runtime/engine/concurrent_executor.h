@@ -84,7 +84,8 @@ public:
           context_capacity_(options.max_context), load_progress_(options.load_progress),
           generation_recovery_(options.generation_recovery),
           shared_prefill_(options.mixed_forward != 0),
-          mixed_forward_rounds_(options.mixed_forward_rounds) {
+          mixed_forward_rounds_(options.mixed_forward_rounds),
+          mixed_forward_min_tokens_(options.mixed_forward_min_tokens) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0 ||
             mixed_forward_rounds_ == 0) {
@@ -405,7 +406,8 @@ private:
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
             published_waiting_requests_.store(snapshot.waiting_requests, std::memory_order_relaxed);
         }
-        snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
+        snapshot.prefilling_requests =
+            (prefill_lane_.has_value() ? 1U : 0U) + (suspended_prefill_lane_.has_value() ? 1U : 0U);
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
@@ -799,6 +801,7 @@ private:
     void retire_request(const std::shared_ptr<Request>& request) {
         if (request->lane) {
             const std::uint32_t lane = *request->lane;
+            if (suspended_prefill_lane_ == lane) { suspended_prefill_lane_.reset(); }
             if (slots_[lane] == request) { remove_completed_slot(lane); }
         }
         publish_runtime_stats();
@@ -1000,7 +1003,7 @@ private:
         const auto prefill_started    = Clock::now();
         const PrefillStepResult first = instance_.program->start_prefill_lane(
             lane, std::move(request->prompt), std::move(plan), instance_.request_memory.region(),
-            prefill_pace(), &request->output);
+            prefill_pace(summary.prompt_tokens - summary.reusable_prompt_tokens), &request->output);
         request->recovery.prefill_seconds +=
             std::chrono::duration<double>(Clock::now() - prefill_started).count();
         return first;
@@ -1525,10 +1528,11 @@ private:
         return have_pending;
     }
 
-    // A prefill step shares the device when another request is decode-ready and a mixed-forward
-    // width is configured; it then advances at most that width so the decode rounds interleave.
-    [[nodiscard]] PrefillPace prefill_pace() const noexcept {
-        if (!shared_prefill_) { return PrefillPace::Exclusive; }
+    // Small remaining suffixes finish without ordinary decode yields or mixed-forward staging.
+    [[nodiscard]] PrefillPace prefill_pace(std::uint32_t remaining_tokens) const noexcept {
+        if (!shared_prefill_ || remaining_tokens < mixed_forward_min_tokens_) {
+            return PrefillPace::Exclusive;
+        }
         for (const auto& request : slots_) {
             if (request != nullptr && request->decode_ready) { return PrefillPace::Shared; }
         }
@@ -1595,7 +1599,12 @@ private:
             complete_cancelled(request);
             return true;
         }
-        if (!step.complete) { return false; }
+        if (!step.complete) {
+            if (step.processed_prompt_tokens != 0 && !suspended_prefill_lane_) {
+                prefill_interruptible_ = true;
+            }
+            return false;
+        }
         if (!request->lane) { throw std::logic_error("completed prefill has no request lane"); }
         if (prefill_lane_ && *request->lane == *prefill_lane_) {
             instance_.request_memory.deactivate();
@@ -1622,9 +1631,9 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
-        const auto started = Clock::now();
-        const PrefillStepResult step =
-            instance_.program->advance_prefill_lane(lane, prefill_pace());
+        const auto started           = Clock::now();
+        const PrefillStepResult step = instance_.program->advance_prefill_lane(
+            lane, prefill_pace(instance_.program->prefill_remaining_tokens(lane)));
         if (request->recovery.attempts != 0) {
             request->recovery.prefill_seconds +=
                 std::chrono::duration<double>(Clock::now() - started).count();
@@ -2289,9 +2298,11 @@ private:
                 transient                    = instance_.request_memory.region();
             }
             end_copy_hold(request);
-            const auto prefill_started    = Clock::now();
+            const auto pace            = prefill_pace(hold.plan.summary().prompt_tokens -
+                                                      hold.plan.summary().reusable_prompt_tokens);
+            const auto prefill_started = Clock::now();
             const PrefillStepResult first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(hold.plan), transient, prefill_pace(),
+                lane, std::move(request->prompt), std::move(hold.plan), transient, pace,
                 &request->output);
             if (hold.recovery_base) {
                 request->recovery.prefill_seconds +=
@@ -2786,6 +2797,86 @@ private:
         return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
     }
 
+    // The interruption path considers only resident text plans that fit without releasing any
+    // retained allocation or restoring host state. Active owners keep all lane entitlements.
+    // Returns whether admission bound a lane, including a request-local failure after binding.
+    [[nodiscard]] bool try_interrupt_prefill() {
+        if (!prefill_lane_ || suspended_prefill_lane_ || !prefill_interruptible_ ||
+            !shared_prefill_ || mixed_forward_min_tokens_ == 0 ||
+            instance_.program->prefill_remaining_tokens(*prefill_lane_) <
+                mixed_forward_min_tokens_ ||
+            !instance_.program->prefill_suspendable(*prefill_lane_)) {
+            return false;
+        }
+        const auto queued = pending_snapshot();
+        for (const auto& request : queued) {
+            if (request->cancelled.load(std::memory_order_acquire) ||
+                (!request->cache_fallback && Clock::now() >= request->deadline)) {
+                continue;
+            }
+            if (request->prompt_summary.has_media) { return false; }
+            try {
+                ensure_base_plan(request);
+                if (request->base_plan->summary().transient_bytes != 0) { return false; }
+                std::optional<LaneChoice> selected;
+                std::uint32_t selected_reuse = 0;
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    if (slots_[lane]) { continue; }
+                    ensure_lane_plan(request, lane);
+                    const auto& plan   = request->lane_plans[lane].value();
+                    const auto summary = plan.summary();
+                    // Disposable turns must fork their cached source through ordinary admission.
+                    if ((!request->options.execution.cache_write &&
+                         summary.reusable_prompt_tokens != 0) ||
+                        (instance_.program->has_retained_lane(lane) &&
+                         summary.reusable_prompt_tokens == 0) ||
+                        summary.transient_bytes != 0 ||
+                        summary.prompt_tokens - summary.reusable_prompt_tokens >=
+                            mixed_forward_min_tokens_ ||
+                        !instance_.program->can_admit_lane(lane, plan)) {
+                        continue;
+                    }
+                    if (!selected || summary.reusable_prompt_tokens > selected_reuse) {
+                        selected       = LaneChoice{.lane = lane};
+                        selected_reuse = summary.reusable_prompt_tokens;
+                    }
+                }
+                if (!selected) { return false; }
+                suspended_decode_rounds_since_prefill_ = decode_rounds_since_prefill_;
+                suspended_prefill_lane_                = prefill_lane_;
+                prefill_lane_.reset();
+                instance_.request_memory.deactivate();
+                prefill_interruptible_ = false;
+                (void)admit_planned_request(request, *selected, BackfillClass::None, 0);
+                suspended_prefill_must_advance_ = request->lane.has_value();
+                return suspended_prefill_must_advance_;
+            } catch (...) {
+                // Once staged, failures follow the ordinary admitted-request cleanup path.
+                // Planning errors before suspension belong to this queued request alone.
+                if (suspended_prefill_lane_) { throw; }
+                if (!is_request_local_error(std::current_exception())) { throw; }
+                (void)remove_pending_error(request, std::current_exception());
+                return false;
+            }
+        }
+        return false;
+    }
+
+    void resume_suspended_prefill() {
+        if (!suspended_prefill_lane_ || prefill_lane_ || copy_hold_) { return; }
+        const auto lane = *suspended_prefill_lane_;
+        if (!slots_[lane] || slots_[lane]->decode_ready) {
+            throw std::logic_error("suspended prefill lost its occupying request");
+        }
+        instance_.program->resume_prefill_lane(lane);
+        prefill_lane_ = lane;
+        suspended_prefill_lane_.reset();
+        decode_rounds_since_prefill_    = suspended_decode_rounds_since_prefill_;
+        prefill_interruptible_          = !suspended_prefill_must_advance_;
+        suspended_prefill_must_advance_ = false;
+        publish_runtime_stats();
+    }
+
     // With `owner`, the round is mixed: the prefill owner's next step runs in the same target
     // forward (Program::decode_batch_with_prefill) and resolves after the decode rows.
     void run_decode_round(const RoundMembership& membership,
@@ -2966,6 +3057,7 @@ private:
             instance_.request_memory.deactivate();
             prefill_lane_.reset();
         }
+        suspended_prefill_lane_.reset();
         protection_.reset();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
@@ -3051,6 +3143,7 @@ private:
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
+                resume_suspended_prefill();
                 const RoundMembership membership = build_round_membership();
 
                 std::uint32_t active_slots = 0;
@@ -3098,10 +3191,20 @@ private:
                 }
 
                 if (prefill_lane_) {
+                    if (have_pending &&
+                        (membership.empty() || decode_admission_burst.allows_admission())) {
+                        if (try_interrupt_prefill()) {
+                            if (!membership.empty()) { decode_admission_burst.consume_admission(); }
+                            continue;
+                        }
+                        if (suspended_prefill_lane_) { resume_suspended_prefill(); }
+                    }
                     // A Shared-pace owner advances once per mixed_forward_rounds decode rounds:
                     // inside the last of them when the Program can mix its step into the round,
                     // otherwise as a separate step after them.
-                    if (shared_prefill_ && !membership.empty()) {
+                    if (prefill_pace(instance_.program->prefill_remaining_tokens(*prefill_lane_)) ==
+                            PrefillPace::Shared &&
+                        !membership.empty()) {
                         const auto& owner = slots_[*prefill_lane_];
                         if (owner == nullptr || owner->decode_ready) {
                             throw std::logic_error("staged prefill lane has invalid request state");
@@ -3169,6 +3272,7 @@ private:
     const bool generation_recovery_;
     const bool shared_prefill_;
     const std::uint32_t mixed_forward_rounds_;
+    const std::uint32_t mixed_forward_min_tokens_;
 
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;
@@ -3181,6 +3285,12 @@ private:
     std::uint64_t next_queue_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
+    // A suspended text owner retains its lane/KV/GDN but has no transient lease. Only one
+    // short prefill may run before it resumes; another nonzero chunk replenishes allowance.
+    std::optional<std::uint32_t> suspended_prefill_lane_;
+    bool prefill_interruptible_                          = false;
+    bool suspended_prefill_must_advance_                 = false;
+    std::uint32_t suspended_decode_rounds_since_prefill_ = 0;
     // Decode rounds run since the prefill owner's last step.
     std::uint32_t decode_rounds_since_prefill_ = 0;
     std::optional<CopyHold> copy_hold_;

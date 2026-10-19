@@ -309,7 +309,10 @@ std::string usage_text(std::string_view program) {
         << "  --mixed-forward <tokens>    prefill step width while other requests decode; a\n"
         << "                              multiple of " << kMixedForwardAlignment
         << ", at most min(--prefill-chunk, 4096) (default: 0 = prefill first)\n"
-        << "  --mixed-forward-rounds <n>  decode rounds between those prefill steps (default: 1)\n"
+        << "  --mixed-forward-rounds <n>  decode rounds between shared prefill steps (default: "
+           "12)\n"
+        << "  --mixed-forward-min-tokens <n>  shared-pace suffix threshold (default: 4096); 0 "
+           "fixes cadence\n"
         << "  --contention <P,R>          R prompts of P tokens prefill back to back while\n"
         << "                              --contention-lanes requests decode; reports decode-only\n"
         << "                              windows before and after, the contended prefill tok/s,\n"
@@ -388,6 +391,9 @@ BenchOptions parse_args(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
         } else if (arg == "--mixed-forward") {
             options.mixed_forward = parse_u32(value("--mixed-forward"), "mixed-forward", true);
+        } else if (arg == "--mixed-forward-min-tokens") {
+            options.mixed_forward_min_tokens =
+                parse_u32(value("--mixed-forward-min-tokens"), "mixed-forward-min-tokens", true);
         } else if (arg == "--mixed-forward-rounds") {
             options.mixed_forward_rounds =
                 parse_u32(value("--mixed-forward-rounds"), "mixed-forward-rounds");
@@ -769,6 +775,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
         << " mixed_forward=" << env.mixed_forward << "x" << env.mixed_forward_rounds
+        << " mixed_forward_min_tokens=" << env.mixed_forward_min_tokens
         << " kv_cache=" << kv_cache_name(env.kv_cache) << " concurrency=" << env.concurrency
         << " spec=" << speculative_backend_name(env.speculative_backend)
         << " k=" << env.draft_tokens << " proposal_head=" << proposal_head_name(env.proposal_head)
@@ -882,6 +889,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"mixed_forward\": " << env.mixed_forward << ",\n"
         << "    \"mixed_forward_rounds\": " << env.mixed_forward_rounds << ",\n"
+        << "    \"mixed_forward_min_tokens\": " << env.mixed_forward_min_tokens << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"sage_attn\": " << (env.sage_attn ? "true" : "false") << ",\n"
         << "    \"keep_frac\": " << env.keep_frac << ",\n"
@@ -1124,7 +1132,8 @@ std::string format_contention_table(const BenchEnvironment& env, const Contentio
     out << "ninfer_bench contention: " << env.gpu_name << ", C" << env.concurrency << ", "
         << speculative_backend_name(env.speculative_backend) << " k=" << env.draft_tokens
         << (env.adaptive_draft ? " adaptive" : "") << ", prefill_chunk=" << env.prefill_chunk
-        << ", mixed_forward=" << env.mixed_forward << "x" << env.mixed_forward_rounds << '\n'
+        << ", mixed_forward=" << env.mixed_forward << "x" << env.mixed_forward_rounds
+        << " mixed_forward_min_tokens=" << env.mixed_forward_min_tokens << '\n'
         << "  " << result.prompts << " prompts of " << result.prompt_tokens << " tokens against "
         << result.lanes << " decode lanes of " << result.context_tokens << " context tokens\n";
     const auto line = [&](const char* name, const ContentionWindow& window) {
@@ -1166,6 +1175,7 @@ std::string format_contention_json(const BenchEnvironment& env, const std::strin
         << ", \"prefill_chunk\": " << env.prefill_chunk
         << ", \"mixed_forward\": " << env.mixed_forward
         << ", \"mixed_forward_rounds\": " << env.mixed_forward_rounds
+        << ", \"mixed_forward_min_tokens\": " << env.mixed_forward_min_tokens
         << ", \"concurrency\": " << env.concurrency << ", \"spec\": \""
         << speculative_backend_name(env.speculative_backend)
         << "\", \"draft_tokens\": " << env.draft_tokens

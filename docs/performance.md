@@ -3424,6 +3424,582 @@ Evidence is in `profiles/bench/engine-race-resume-20261016/scoped-engine-queue-b
 The earlier independent numerical, focused Op sanitizer, full Engine numerical/memcheck and
 performance evidence above remains valid. Interrupted all-kernel attempts are not passes.
 
+### Cached chat continuation crossover (2026-10-18)
+
+RTX 5090, `sm_120a`, CUDA 13.1, revision `b3d1f64c`, the DFlash2 NVFP4 artifact
+named above, NVFP4 KV, CUDA Graphs, greedy adaptive DFlash k5 with the optimized
+proposal head. Startup capacity is D+1: D decode requests plus one cached chat owner.
+The owner has a roughly 4K-token history, generates 16 prime tokens, then receives
+three successive user additions and generates one token after each. Its actual generated
+assistant text is included in the next turn. Background requests start from 512 tokens.
+Each observation uses a fresh Engine process and primes before admitting background requests.
+Scored comparisons validate resident reuse, exact prime/turn output IDs, prompt sizes, reuse
+frontiers, and computed work against the independent phases. No size-dependent scheduler is installed.
+
+Message sizes below count corpus tokens before text decoding and chat templating. The
+computed range is the actual suffix evaluated per turn, including chat framing and rollback.
+A rewrite checkpoint can split off a final tail even when the entire suffix is smaller than
+4K. These small real chats therefore execute mixed rounds; they are not equivalent to a
+single raw-token admission step. The main matrix uses `prefill_chunk=4096` and
+`mixed_forward_rounds=1`. Width 0 is the matched prefill-first control. D3 measures every
+listed message size at widths 0/1024/2048/4096; D1/D5 measure 128/2048/8192 at widths 0/2048/4096.
+
+There are two observations per candidate, each spanning three successive turns. Exclusive
+chat phases and prefill-first controls bracket each width sweep; exclusive rates and control
+rates/shares interpolate by measurement time. Each contended observation also has its own
+one-second pure-decode calibration before and after. F is actual computed tokens divided by
+the entire chat window, including public prompt preparation and inter-turn reconstruction.
+S = F/Fexclusive + Q, with Q measured in decode rounds rather than accepted tokens. Delta
+control compares interpolated control F and Q with the same exclusive denominator. This is
+chat service-window efficiency, not isolated kernel throughput. A score above 1 alone does
+not demonstrate a mixed-execution advantage; the matched-control difference matters.
+TTFT runs from submit through the first owner token; preparation is excluded from that
+column but included in F. Decode tok/s is accepted aggregate progress across D lanes.
+The observed maximum publication gap is between nonempty text-bearing OutputDelta batches,
+including intervals crossing the chat-window boundaries; it is not a per-token latency bound.
+Ranges are two observations, not confidence intervals. Short windows also have coarse
+decode-round resolution: one completed round changes S by about 0.083 at nominal 128,
+0.042 at 1K, 0.014 at 4K, and 0.007 at 8K in representative observations. Small positive
+differences are exploratory and do not establish a precise crossover. Four W1024 windows
+(both repetitions
+at nominal 1024 and 2048) are unscored because one trajectory at each size changes its generated
+conversation; the remaining five W1024 size pairs retain exact conversation matching.
+
+Three decode lanes, selected W4096 default. Arrow columns compare the mean of the
+before/after prefill-first controls with the mixed candidate. Score differences use
+the interpolated controls defined above, rather than those rounded table means.
+
+| Message tokens | Computed tokens/turn | TTFT ms, control → mixed | Decode tok/s, control → mixed | Max text gap ms, control → mixed | S mean [range] | Delta control mean [range] |
+| ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 128 | 143–158 | 47.6 → 61.2 | 187.5 → 319.7 | 51.1 → 47.2 | 1.0702 [1.0696, 1.0709] | -0.0080 [-0.0418, +0.0257] |
+| 512 | 527–542 | 73.1 → 86.0 | 116.7 → 225.9 | 76.3 → 73.0 | 1.0546 [1.0505, 1.0587] | +0.0223 [+0.0040, +0.0407] |
+| 1024 | 1039–1054 | 105.7 → 119.5 | 85.1 → 162.3 | 114.8 → 108.5 | 1.0312 [1.0296, 1.0328] | +0.0037 [+0.0003, +0.0072] |
+| 2048 | 2063–2078 | 174.3 → 186.0 | 51.0 → 103.2 | 185.7 → 183.0 | 1.0305 [1.0199, 1.0412] | +0.0138 [+0.0011, +0.0265] |
+| 3968 | 3983–3998 | 311.8 → 323.7 | 27.5 → 59.9 | 338.2 → 335.7 | 1.0159 [1.0145, 1.0173] | +0.0083 [+0.0076, +0.0090] |
+| 4096 | 4111–4126 | 328.8 → 351.4 | 26.0 → 82.8 | 355.5 → 339.7 | 1.0349 [1.0305, 1.0394] | +0.0280 [+0.0234, +0.0327] |
+| 8192 | 8207–8222 | 688.2 → 720.8 | 12.5 → 53.3 | 784.9 → 755.9 | 1.0276 [1.0245, 1.0307] | +0.0203 [+0.0184, +0.0221] |
+
+Selected D3 alternatives for prioritizing decode progress. All widths and sizes are
+retained in the full local table; these rows show the 2K/4K/8K tradeoff.
+
+| Message tokens | W | TTFT ms | Decode tok/s | Max text gap ms | S mean [range] | Delta control mean [range] |
+| ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 2048 | 2048 | 202.5 | 138.3 | 171.8 | 1.0235 [1.0221, 1.0249] | +0.0074 [+0.0041, +0.0107] |
+| 2048 | 1024 | Not compared | — | — | — | Trajectory differs |
+| 4096 | 2048 | 373.3 | 99.7 | 342.9 | 1.0078 [1.0074, 1.0081] | +0.0010 [+0.0007, +0.0014] |
+| 4096 | 1024 | 408.2 | 135.0 | 180.4 | 0.9985 [0.9983, 0.9987] | -0.0080 [-0.0085, -0.0075] |
+| 8192 | 2048 | 775.4 | 72.7 | 392.7 | 0.9961 [0.9935, 0.9987] | -0.0109 [-0.0123, -0.0094] |
+| 8192 | 1024 | 845.2 | 112.7 | 204.6 | 0.9821 [0.9808, 0.9833] | -0.0245 [-0.0268, -0.0223] |
+
+W4096 at one and five decode lanes; startup capacity is respectively two and six.
+
+| D | Message tokens | TTFT ms, control → mixed | Decode tok/s, control → mixed | Max text gap ms, control → mixed | S mean [range] | Delta control mean [range] |
+| ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 1 | 128 | 44.5 → 56.1 | 133.9 → 212.9 | 48.3 → 50.2 | 1.1055 [1.0934, 1.1177] | +0.0215 [+0.0100, +0.0331] |
+| 1 | 2048 | 169.1 → 179.3 | 35.0 → 66.1 | 182.2 → 178.4 | 1.0478 [1.0472, 1.0484] | +0.0170 [+0.0164, +0.0175] |
+| 1 | 8192 | 685.9 → 713.9 | 11.5 → 36.1 | 782.1 → 752.8 | 1.0285 [1.0285, 1.0286] | +0.0178 [+0.0173, +0.0183] |
+| 5 | 128 | 47.6 → 62.3 | 251.0 → 362.1 | 51.6 → 48.6 | 1.0909 [1.0852, 1.0965] | +0.0076 [-0.0083, +0.0235] |
+| 5 | 2048 | 174.3 → 188.3 | 68.0 → 121.6 | 185.6 → 183.1 | 1.0322 [1.0274, 1.0370] | +0.0119 [+0.0111, +0.0126] |
+| 5 | 8192 | 691.0 → 727.7 | 21.4 → 69.4 | 787.9 → 755.0 | 1.0281 [1.0281, 1.0281] | +0.0206 [+0.0197, +0.0214] |
+
+The mixed default increases decode progress while the incoming chat waits; it does not
+speed up the chat owner's prefill or TTFT in these measurements. At D3, a nominal 128-token
+addition costs about 14 ms more TTFT, and its matched-control score difference spans zero.
+The D5 128-token difference also spans zero. At 2K and 8K, W4096 has positive observed
+control differences at all three measured lane counts, but two repetitions and discrete round
+accounting do not establish a size threshold. The 3968/4096 pair also crosses the actual 4K
+computed-work boundary, illustrating why nominal user-message length alone is insufficient.
+
+For the existing startup settings, `--mixed-forward 0` favors incoming-chat TTFT;
+`--mixed-forward 4096 --mixed-forward-rounds 1` retains the selected combined-throughput
+tradeoff. `--mixed-forward 2048 --mixed-forward-rounds 1`, or width 1024 where conversation
+matching is qualified, can favor decode progress during large prefills. At D3/8K their
+observed maximum text gaps fall from 756 ms to 393/205 ms, but TTFT rises from 721 ms to
+775/845 ms and scores fall below 1 and below their matched controls. These are measured
+tradeoffs, not automatically selected policies. The public ratio controls are described in
+`docs/serving.md`; size-dependent scheduling remains a joint design decision.
+
+A separately bracketed D3/8K follow-up tests the existing cadence control while keeping
+4K prefill steps. It uses the same conversation identities, two observations, exact generated
+output/cache-frontier matching, its own exclusive/control phases, and ten clean GPU ledgers.
+It is not a paired R1-versus-R2 experiment. With `--mixed-forward 4096 --mixed-forward-rounds 2`,
+TTFT is **765.2 ms**, accepted aggregate decode is **84.6 tok/s**,
+and the maximum observed text gap is **393.2 ms**. S is
+**1.0227 [1.0221, 1.0233]**, with a matched-control
+difference of **+0.0171 [+0.0170, +0.0172]**.
+
+This is a useful measured large-prefill option when decode continuity matters: compared with
+the earlier default observation, the gap is roughly halved and decode progress increases,
+with about 44 ms more owner TTFT. Unlike the measured 2K/1K-width options at this size, it
+retains a score above 1 and a positive difference from its own controls in both observations.
+The settings still do not guarantee a maximum publication gap, and this one D3/8K follow-up
+does not qualify a universal cadence or size cutoff. The default remains rounds1.
+Its helper/controller and strict calculation are `chat-bench-rounds.cpp`, `run-rounds.py`,
+and `analyze-rounds.py`; results are `rounds2-analysis.json` in the evidence directory below.
+
+The excluded W1024 differences are reproducible without background requests: two controlled
+public-Engine cases retain the same 4096-chunk prime, advance explicit raw prefixes in 1024-token
+segments, then evaluate the same chat input. Prime IDs and exact input IDs match through the
+first divergence; prefix reuse and rollback-capture frontiers are checked, and both decode
+counters remain zero. This reproduces the first mixed-W1024 token difference at each affected
+size without concurrent decoding. Intermediate samples are ignored and do not advance KV/GDN,
+but finalization/checkpoint effects differ from one continuous prefill. The result identifies
+segmentation/execution-profile sensitivity without isolating a particular kernel. Numerical
+criteria are unchanged, and both repetitions of each affected comparison remain unscored.
+
+The independent read-only review found no confirmed lane-selection, workspace-aliasing,
+checkpoint-restore, or stream-join defect. Added real-Engine regressions compare full greedy
+owner/background streams against their matching references: cached chat restore into mixed
+work, and cancellation of the middle D3 lane followed by D2 compact mixed execution, slot
+replacement, and a subsequent D3 mixed owner. Both normal runs also require pairwise-distinct
+reference streams to detect lane swaps. They pass, and both focused memchecks report zero errors. The compact memcheck overlapped another CUDA test despite holding the
+host GPU lock; its guard rejection is preserved and the result is correctness evidence only.
+Normal checks and the incremental memcheck have clean exclusivity ledgers. The audit also
+traced disposable forks, source preservation, owner cancellation/exception cleanup, and
+non-DFlash fallback. Fork preservation/cancellation have existing separate tests; their
+combination with mixing is source-reviewed rather than directly exercised here. This is
+finite qualification, not proof that no other workload can expose a bug. No new all-kernel
+Engine racecheck or merge-to-master qualification is claimed.
+
+An earlier shared-Engine sweep hit FullReset on the third nominal 4096-token followup after
+retaining previous benchmark conversations, even without decoding. An isolated 4096-token
+chain reused correctly. The admission policy checks lanes feasible without retained-cache
+eviction before alternatives requiring eviction; accumulated idle caches can therefore change
+which prefix is selected. Fresh Engine processes remove this cross-point cache-pressure
+variable. The final comparison requires matching cache frontiers and exact conversation IDs
+across phases. It measures controlled resident continuations, not arbitrary retained-cache
+pressure. Failed attempts and their guard records remain separate from the scored matrix.
+
+Evidence and repeat commands are in `profiles/bench/incremental-chat-20261018/`: public-Engine
+helper `chat-bench.cpp`, build recipe `compile.py`, guarded controller `run.py matrix`, score
+calculation `analyze.py`, complete `analysis.json`, and `table.md`. GPU timings use the host
+`/tmp/ninfer-gpu-queue.lock` and reject any observed foreign CUDA context. Each point's JSON and
+GPU ledger identify the explicit artifact, parameters, work, and outcome.
+
+### Mixed scheduling optimization investigation (2026-10-18)
+
+This follow-up investigates short-owner overhead, duration-based policy selection, larger
+rounds2 configurations, intermediate widths, and chunk-boundary preemption. It uses the same
+RTX 5090, CUDA 13.1, DFlash2 artifact, NVFP4 KV, adaptive k5, graphs and public-Engine cached
+chat workload as the preceding table. Production defaults and the no-preemption contract
+remain unchanged. This is investigation evidence and a proposed design, not an implemented
+automatic scheduler.
+
+Two bounded Nsight Systems profiles compare D3/128 at width 0 and width 4096/rounds1. Prime
+IDs, generated IDs and prompt/reuse/work frontiers match, and GPU exclusivity ledgers are
+clean. CUDA tracing is restricted in analysis to the three reported NVTX chat-turn windows;
+launch correlation maps GPU kernels to the corresponding host-side prefill scopes. Ordinary
+decode graphs have limited node visibility in this installation; the owner and mixed target
+work used for attribution are eager. Profiled durations are attribution evidence, not
+unprofiled performance measurements.
+
+Each chat turn has a suffix step and a checkpoint tail. The suffix's mapped GPU span is
+20.65–20.79 ms in the prefill-first profile and 20.76–20.91 ms in the mixed profile. The tail
+rises from 12.95–12.97 ms with 695 mapped kernels to 21.90–22.06 ms with 1567 kernels, including
+verification work and the owner on separate streams. GPU kernel-union time increases with
+the span, rather than a growth in uncovered gaps. This supports additional verification work
+as the dominant short-owner penalty, rather than a launch-gap explanation. These spans do
+not include every draft, checkpoint-transfer, finalization or boundary cost and do not alone
+account for the complete measured TTFT difference.
+
+A short-owner fast finish must explicitly choose exclusive service. Merely making its tiny
+tail non-mixable would run an ordinary decode round before the separate tail in the current
+fallback. Finishing the tail immediately also removes that decode opportunity; a free mix
+is not demonstrated. The rewrite capture must still snapshot persistent GDN/DFlash state at
+the exact frontier. Eliminating the split requires another correctly qualified way to produce
+that prefix state; removing the boundary is not a valid optimization.
+
+For duration-based selection, estimate uncached work from the actual selected lane and its
+reuse frontier, then account for owner context length, checkpoint boundaries, chunk count,
+finalization and the current decode batch/draft width. Whole conversation length and the
+best pre-admission reuse estimate are insufficient. In the preceding D3 points, mixing adds roughly 12 ms to prefill
+service below 4K: about 20% at 512, 13% at 1K, 8% at 2K and 4% at 3968. Crossing the actual 4K computed
+boundary increases the overhead again. A descriptive fit below that boundary is
+22.9 ms + 0.0693 ms per computed token, with 3.5 ms maximum in-sample residual; this is neither
+a validated production estimator nor evidence for extrapolation to other contexts or shapes.
+A latency budget is needed to select a short-owner cutoff. The earlier 512-token suggestion
+remains an experiment candidate, not a measured optimum. Observe separate service durations
+rather than feeding mixed/congested step time into an exclusive-work estimator unchanged.
+
+The cadence follow-up has 50 clean, independently bracketed checkpoints: D1/D5 at
+nominal 4K/8K and D3 at 4K, each with two rounds2 observations and its own exclusive/control
+phases. Another ten clean checkpoints evaluate D3/8K width 3072/rounds1. Every scored
+comparison matches exact prime/output IDs and prompt/reuse/computed frontiers. The score
+and service-window definitions are the same as above. Ranges are two observations, not
+confidence intervals; these are separately bracketed settings rather than paired R1/R2 A/Bs.
+
+| D | Added tokens | W / rounds | TTFT ms | Aggregate decode tok/s | Max text gap ms | S [range] | Delta control [range] |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 1 | 4096 | 4096 / 2 | 372.4 | 85.0 | 328.2 | 1.0434 [1.0431, 1.0437] | +0.0221 [+0.0213, +0.0230] |
+| 1 | 8192 | 4096 / 2 | 753.3 | 57.9 | 391.7 | 1.0301 [1.0298, 1.0305] | +0.0187 [+0.0187, +0.0188] |
+| 5 | 4096 | 4096 / 2 | 386.5 | 155.4 | 332.9 | 1.0367 [1.0363, 1.0371] | +0.0179 [+0.0179, +0.0180] |
+| 5 | 8192 | 4096 / 2 | 775.1 | 110.9 | 393.5 | 1.0287 [1.0273, 1.0301] | +0.0195 [+0.0190, +0.0200] |
+| 3 | 4096 | 4096 / 2 | 378.4 | 119.3 | 328.6 | 1.0332 [1.0329, 1.0335] | +0.0227 [+0.0220, +0.0234] |
+| 3 | 8192 | 3072 / 1 | 729.0 | 52.6 | 569.5 | 1.0110 [1.0085, 1.0135] | +0.0047 [+0.0044, +0.0049] |
+
+Rounds2 has positive matched-control differences in both observations at every added point.
+Together with the preceding D3/8K result, this supports a measured large-prefill decode-priority
+option across one, three and five decode lanes, not a universally optimal cadence. At 8K,
+accepted aggregate decode is 57.9/84.6/110.9 tok/s at D1/D3/D5, with maximum observed text gaps
+near 392–394 ms. Owner TTFT is 753/765/775 ms. The D3/8K numbers are from the earlier independently
+bracketed rounds2 follow-up, not an additional point in this 60-checkpoint campaign.
+
+Width 3072/rounds1 offers another latency tradeoff: D3/8K TTFT 729.0 ms and gap 569.5 ms,
+compared with the preceding W4096/rounds1 observation's 720.8 ms and 755.9 ms. Aggregate decode
+is similar at 52.6 versus 53.3 tok/s. Its own-control difference is positive in both observations,
+but small relative to discrete decode-round resolution; it does not establish a precise
+crossover. Rounds2 gives more decode progress and shorter observed gaps at higher owner TTFT.
+Smaller widths therefore cannot all be dismissed, and a policy selecting among these measured
+options by latency budget is worth implementing and qualifying. No per-step adaptive-width
+sequence has been executed here, and no maximum-gap guarantee is established.
+
+A concrete proposed policy gives a short owner a bounded exclusive-service burst, uses 4K/R1
+for the intermediate range, and chooses 4K/R2 for longer work when decode continuity matters.
+About 60 ms of estimated exclusive service is a candidate short-owner budget in this workload;
+it is approximately the measured 512-token case, not an optimal universal threshold. The
+measured 4K/8K points support testing R2 above roughly 300 ms of estimated exclusive service.
+Choose the budget with the desired latency/efficiency tradeoff and validate transitions;
+no automatic policy is installed. Width 3072/R1 is an alternative when the observed ~570 ms
+D3/8K gap is acceptable and owner TTFT matters more than the R2 decode-progress increase.
+Any per-owner/per-step width choice must also drive projected service-work accounting and
+checkpoint splitting before admission; changing only the execution width can undercount
+steps. For adaptive future choices, reserve a conservative service-work bound over the
+permitted width set at admission and reconcile remaining work/debt after realized steps
+and completion. Keep the startup maximum workspace fixed and retain explicit user-selected
+policies.
+
+Chunk-boundary suspension can preserve lane-owned KV/GDN state and staged prompt/cursor
+metadata without copying them out, but it does not free an active lane or KV entitlement.
+All measured C=D+1 setups are full. They cannot admit a second owner merely by suspending
+the first; in particular D5/C6 cannot use this strategy. A bounded initial design requires
+C>=D+2, a resource-feasible spare lane, and transient-free text owners. Live vision owners
+would stay pinned because RequestMemory is shared by the current owner.
+
+Switch only after the complete Engine step resolves decode commits/publication, owner
+progress, cancellation and accounting. Resumption needs explicit restoration of shared IO
+KV-row/logprob/sampling bindings without rebinding an existing allocation or reseeding RNG.
+Suspended owners stay admitted, resource-reserved and non-evictable. Singleton copy-hold,
+recovery, cancellation, statistics and decode-debt ownership need coherent treatment of
+multiple staged owners. A proposed bounded policy lets one eligible short FIFO head overtake
+an owner once, then resumes that owner before another overtake; it must preserve admission
+head protection and decode debt. This changes the current no-preemption contract and is not
+implemented or qualified by these measurements.
+
+If L is remaining long-owner service, C is the current chunk remainder, S is short-owner
+service and H is switching overhead, the estimated short completion changes from L+S to
+C+H+S, while the long request is delayed by roughly S+H. This is a scheduling estimate,
+not an observed preemption speedup. Correctness qualification would require resumed streams
+and cache frontiers, physical-lane/compact-row isolation, cancellation of suspended/current
+owners, pending copies, request-memory lifetime, no-capacity fallback and bounded overtaking.
+
+Evidence is in `profiles/bench/mixed-policy-20261018/`: `profile.py`, Nsight reports/SQLite,
+`analyze-profile.py`, `profile-analysis.json`, `duration.py`, `duration-analysis.json`,
+`cadence.py`, `intermediate.py`, `analyze-cadence.py`, and strict `policy-analysis.json`.
+The PC reboot interrupted the last D3/4K control. The complete D1/D5 brackets are retained;
+the entire D3 group is rerun after reboot, with its partial predecessor archived outside
+scored inputs. No score interpolation bracket crosses steady-clock epochs.
+
+### Measured scheduling tradeoff frontier (2026-10-18)
+
+This frontier snapshot precedes the rounds3 comparison below and covers 53 distinct settings
+in 15 workloads. Pareto comparisons
+are restricted to identical decode-lane counts and nominal message sizes. A setting dominates
+another only when its mean owner TTFT is no higher, aggregate accepted decode rate is no
+lower, and maximum observed text-publication gap is no higher, with at least one strict
+improvement. S and matched-control differences are reported separately. A second frontier
+first screens mixed settings for S>1 and positive own-control differences in both observations,
+then recomputes dominance among those settings and the prefill-first latency endpoint.
+This is an empirical efficiency screen, not a confidence statement or proof of optimality.
+
+All cross-campaign comparisons require the source-fixed conversation identity, exact prime
+and generated output IDs, prompt/reuse/computed frontiers and work to match. Literal input-ID
+vectors are not recorded in these ordinary timing reports. Each candidate has two observations;
+the prefill-first endpoint combines four before/after control observations. Unequal sample
+counts affect observed maxima. Separately bracketed campaigns and two-observation variation
+limit causal claims: sub-millisecond gap differences do not establish a useful setting change.
+These are observed service-window tradeoffs, not per-token rates or guaranteed gap bounds.
+Prefill-first still allows decode at boundaries outside the owner's prefill.
+
+At three decode lanes and an 8K addition, the efficiency-screened frontier is:
+
+| Setting | Owner TTFT ms | Aggregate decode tok/s | Max text gap ms | S | Delta own control range |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Prefill-first | 688.2 | 12.5 | 784.9 | Baseline | — |
+| 4096/1 | 720.8 | 53.3 | 755.9 | 1.0276 | +0.0184 to +0.0221 |
+| 3072/1 | 729.0 | 52.6 | 569.5 | 1.0110 | +0.0044 to +0.0049 |
+| 4096/2 | 765.2 | 84.6 | 393.2 | 1.0227 | +0.0170 to +0.0172 |
+
+These points support concrete choices in the measured D3/8K workload: prefill-first for
+minimum owner TTFT; W4096/R1 for the lowest mixed TTFT and strongest measured mixed S;
+W3072/R1 for about 570 ms observed gaps at about 729 ms TTFT; W4096/R2 for about 393 ms gaps
+and substantially more decode progress at about 765 ms TTFT. These are measured operating
+points, not hard gap limits or a universal automatic policy.
+
+The unscreened frontier also contains W1024/R1: TTFT 845.2 ms, decode 112.7 tok/s, gap 204.6 ms,
+S 0.9821. No measured D3/8K option meets both the efficiency screen and a 300 ms observed-gap
+budget. W2048/R1 has TTFT 775.4 ms, decode 72.7 tok/s, gap 392.7 ms and S 0.9961. Its 0.51 ms gap
+edge over W4096/R2 keeps it formally non-dominated in the unscreened point estimates; that
+edge is not evidence of a useful continuity improvement. R2 has lower TTFT, more decode and
+a higher score, with effectively the same observed gap at this sampling resolution.
+
+At D3/2K the screened frontier has three useful choices:
+
+| Setting | Owner TTFT ms | Aggregate decode tok/s | Max text gap ms | S |
+| --- | ---: | ---: | ---: | ---: |
+| prefill-first | 174.3 | 51.0 | 185.7 | Baseline |
+| 4096/1 | 186.0 | 103.2 | 183.0 | 1.0305 |
+| 2048/1 | 202.5 | 138.3 | 171.8 | 1.0235 |
+
+At D3/4K, W4096/R1 measures 351.4 ms TTFT, 82.8 decode tok/s and 339.7 ms maximum gap;
+W4096/R2 measures 378.4 ms, 119.3 tok/s and 328.6 ms. R2 buys more progress at about 27 ms
+owner cost, with a much smaller gap improvement than at 8K. This reinforces choosing by
+actual remaining work and the desired tradeoff rather than a blanket size cutoff.
+
+For short chat additions, the latency/decode endpoints are:
+
+| Message tokens | TTFT ms, prefill-first → W4096/R1 | Decode tok/s, prefill-first → mixed | Max text gap ms, prefill-first → mixed |
+| ---: | ---: | ---: | ---: |
+| 128 | 47.6 → 61.2 | 187.5 → 319.7 | 51.1 → 47.2 |
+| 512 | 73.1 → 86.0 | 116.7 → 225.9 | 76.3 → 73.0 |
+| 1024 | 105.7 → 119.5 | 85.1 → 162.3 | 114.8 → 108.5 |
+
+Mixing costs roughly 12–14 ms owner TTFT here; a free small-prefill regime is not demonstrated.
+For actual suffixes fitting every configured width, the mixed widths have the same chunk
+plan. Raw mean-point dominance among such small-work settings is not evidence that one
+width causally outperforms another. In particular, the D3/128 default's control difference
+spans zero, and discrete-round resolution limits even positive small-work score differences.
+The frontier establishes the latency/progress choice; it does not establish an optimal 512-token
+or 60 ms switching threshold.
+
+Lane count changes the operating points. At8K, W4096/R2 measures respectively 57.9, 84.6 and
+110.9 aggregate decode tok/s at D1, D3, D5, with TTFT 753.3, 765.2 and 775.1 ms. W2048/R1 at D5/8K
+is strictly dominated by W4096/R2 on all three observed service metrics and has a lower S.
+The full strict and efficiency-screened frontiers for all 15 workloads, including near-ties
+and exclusions, are `frontier-analysis.json` and `frontier-table.md` in
+`profiles/bench/mixed-policy-20261018/`; the checked calculation is `frontier.py`.
+
+No new GPU measurement is needed to compute these observed frontiers. Adaptive-tail,
+per-step-width and preemption policies remain unmeasured alternatives that could move them;
+this is not a claim that the achievable frontier is exhausted.
+
+### Rounds2/rounds3 effective-prefill comparison (2026-10-18)
+
+This follow-up measures nominal 8K cached-chat additions with three and five decode lanes,
+one owner, NVFP4 KV, the same DFlash2 artifact, adaptive k5 and CUDA Graphs. Each observation
+contains three successive continuations of the same primed chat, computing 8207–8222 tokens
+per turn. Fresh Engine processes isolate observations. Two observations per candidate use
+the order R2/repetition 0, R3/repetition 0, R3/repetition 1, R2/repetition 1. Own exclusive phases
+and prefill-first controls bracket the candidates. Prefill-first rows combine four control
+observations; each mixed row combines two. Exact prime/output IDs, prompt/reuse/computed
+frontiers, work and live decode membership match the references. The benchmark helper only
+extends its accepted cadence range to 3; production code and scheduler defaults are unchanged.
+
+Effective prefill rate is actual computed suffix tokens divided by the complete three-turn
+chat-service window, including public preparation, queue time and ordinary decode rounds
+between owner steps. Summed Program prefill-step time excludes those ordinary rounds and is
+not used as effective prefill speed. Rate loss is 100 *(1−F/Fcontrol), with control rate
+interpolated by observation time; it is not percentage latency increase. Owner TTFT is the
+mean submit-to-first-token time. Decode rate is accepted aggregate progress over the full
+chat window, not continuous progress during every prefill chunk. Publication gaps are
+observed text-bearing output-batch intervals, not guaranteed per-token latency bounds.
+S and own-control differences use the preceding F/Q method; ranges are observations, not
+confidence intervals.
+
+| D | Mode | Effective prefill tok/s | Prefill rate loss | Aggregate decode tok/s | Owner TTFT ms | Max text gap ms | S [range] | Delta control [range] |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 3 | prefill-first | 11863 | 0.0% | 12.5 | 685.2 | 784.6 | 1.0052 [1.0040, 1.0064] | — |
+| 3 | 4096/2 | 10667 | 10.1% | 84.9 | 762.7 | 392.8 | 1.0234 [1.0228, 1.0240] | +0.0182 [+0.0182, +0.0182] |
+| 3 | 4096/3 | 10066 | 15.1% | 117.7 | 809.0 | 392.6 | 1.0213 [1.0210, 1.0216] | +0.0162 [+0.0161, +0.0162] |
+| 5 | prefill-first | 11786 | 0.0% | 21.4 | 689.7 | 785.8 | 1.0108 [1.0088, 1.0131] | — |
+| 5 | 4096/2 | 10494 | 10.9% | 110.7 | 775.6 | 394.0 | 1.0267 [1.0246, 1.0288] | +0.0156 [+0.0129, +0.0182] |
+| 5 | 4096/3 | 9864 | 16.3% | 147.5 | 825.4 | 395.0 | 1.0262 [1.0234, 1.0290] | +0.0154 [+0.0125, +0.0183] |
+
+There are 24 clean timing ledgers and no conversation/cache/work mismatches. Rounds3 has
+S>1 and positive own-control differences in both observations at each lane count. Compared
+with rounds2, aggregate accepted decode increases by about 39% at D3 and 33% at D5, while
+effective prefill rate falls another 5.6–6.0% and owner TTFT increases by 46–50 ms. Relative
+to prefill-first, the effective prefill rate decreases by 10–11% with rounds2 and 15–16% with
+rounds3. The score means alone do not establish a statistically significant R2/R3 difference.
+
+The maximum observed text gap remains near 393–395 ms for both cadences. Rounds3 adds decode
+opportunities between owner steps while retaining the blocking 4K step; it improves average
+progress rather than demonstrating a shorter worst stall. It is a useful additional
+high-decode-progress operating point when its owner latency cost is acceptable. Rounds2
+remains preferable when similar gap continuity with faster owner completion is desired.
+The preceding frontier snapshot covers the configurations measured before this rounds3
+follow-up; these additional cadence points extend its measured decode-progress choices.
+No automatic policy, preemption behavior or production default changes here.
+
+Evidence is in `profiles/bench/mixed-rounds3-20261018/`: the separate helper/build recipe,
+reviewed `run.py`, 24 guarded point records, strict `analyze.py`, `analysis.json`, and `table.md`.
+All GPU runs hold `/tmp/ninfer-gpu-queue.lock`; no observed foreign CUDA context enters the
+timing samples. The completed controller releases the lock and leaves no owned runner queued.
+
+### Rounds6/rounds9 decode-share comparison (2026-10-18)
+
+This extends the preceding comparison to W4096/rounds6 and rounds9 with three/five decode
+lanes and nominal 8K cached-chat additions. The same explicit DFlash2 artifact, NVFP4 KV,
+adaptive k5, CUDA Graphs, startup capacity D+1 and three-turn observations are retained.
+Actual computed suffix work is 8207–8222 tokens per turn; each observation uses a fresh Engine.
+Candidate order is R6/repetition 0, R9/repetition 0, R9/repetition 1, R6/repetition 1. Own exclusive
+phases and prefill-first controls bracket the candidates. There are two observations per
+mixed setting and four controls per lane count. Owner prime/output IDs and prompt/reuse/computed
+frontiers match exactly. The helper only extends its diagnostic cadence limit to 9; no
+production code, scheduler default or numerical criterion changes.
+
+Effective prefill throughput uses the full three-turn service window, including preparation,
+queueing and ordinary decode rounds between steps. Rate loss uses interpolated prefill-first
+controls and measures throughput reduction rather than percentage latency increase. Accepted
+aggregate decode throughput is measured over that same window. The pure-decode column is
+the mean accepted rate from one-second decode-only calibrations immediately before/after
+each observation. Decode retained is the mean of each observation's mixed/pure accepted-rate
+ratio, not the round-based Q used in S. Adaptive acceptance and background context growth
+can change the calibration rates; pure-decode baselines are measured for each setting.
+S uses the same exclusive-F plus round-share method as above. Text-publication gaps are
+observed batch intervals, not per-token latency guarantees; two-observation ranges are not
+confidence intervals.
+
+| D | Mode | Effective prefill tok/s | Prefill rate loss | Aggregate decode tok/s | Pure decode tok/s | Decode retained | Owner TTFT ms | Max text gap ms | S [range] | Delta control [range] |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 3 | prefill-first | 11863 | 0.0% | 12.5 | 576.7 | 2.2% | 685.5 | 784.6 | 1.0058 [1.0052, 1.0063] | — |
+| 3 | 4096/6 | 8617 | 27.4% | 196.9 | 564.0 | 34.9% | 946.2 | 392.5 | 1.0190 [1.0190, 1.0191] | +0.0131 [+0.0131, +0.0132] |
+| 3 | 4096/9 | 7507 | 36.7% | 248.5 | 583.7 | 42.6% | 1087.2 | 398.4 | 1.0164 [1.0136, 1.0192] | +0.0106 [+0.0078, +0.0134] |
+| 5 | prefill-first | 11765 | 0.0% | 22.9 | 706.0 | 3.2% | 691.1 | 787.4 | 1.0109 [1.0093, 1.0129] | — |
+| 5 | 4096/6 | 8352 | 29.0% | 246.3 | 723.0 | 34.1% | 976.2 | 394.0 | 1.0311 [1.0264, 1.0359] | +0.0202 [+0.0141, +0.0262] |
+| 5 | 4096/9 | 7223 | 38.6% | 319.0 | 741.2 | 43.0% | 1130.2 | 393.5 | 1.0248 [1.0160, 1.0336] | +0.0139 [+0.0041, +0.0237] |
+
+The complete 24-point comparison has clean GPU ledgers and exact conversation/cache/work
+matching. All four mixed settings have S>1 and positive own-control differences in both
+observations. The accepted-decode fraction is about 34–35% at rounds6 and 43% at rounds9,
+versus the earlier rounds3 campaign's roughly 20–21%. These are per-run matched fractions;
+the earlier R2/R3 results are separate-campaign observations, not a paired R3/R6/R9 A/B.
+
+Increasing rounds6 to rounds9 increases accepted aggregate decode by about 26% at D3 and 30%
+at D5, with another 12.9–13.5% reduction in effective prefill rate and 141–154 ms more owner
+TTFT. Relative to matched prefill-first, rounds6 reduces effective prefill rate by 27–29%
+and rounds9 by 37–39%. The largest observed text gaps stay near 393–398 ms, so these cadences
+add average decode progress rather than establishing shorter worst stalls for the 4K step.
+The score means/ranges do not establish a universal best cadence. Production defaults remain
+W4096/rounds1; rounds6/rounds9 are measured manual throughput/latency choices for this workload.
+
+Evidence is in `profiles/bench/mixed-rounds6-9-20261018/`: separate helper/build recipe,
+balanced `run.py`, 24 guarded point records, strict `analyze.py`, `analysis.json`, and `table.md`.
+Each point holds the shared GPU lock and rejects observed foreign CUDA contexts. No kernel,
+precision path, numerical criterion or production scheduler changes. The completed campaign
+releases its lock without leaving an owned runner queued.
+
+### Rounds12 decode-share comparison (2026-10-18)
+
+This measures W4096/rounds12 with one, three and five decode lanes on the same nominal 8K
+cached-chat workload: NVFP4 KV, explicit DFlash2 artifact, adaptive k5, CUDA Graphs,
+startup capacity D+1, roughly 4K primed history and three successive continuations.
+Each observation computes 8207–8222 suffix tokens per turn in a fresh Engine process.
+Own exclusive/control phases bracket two rounds12 observations per lane count; each
+prefill-first row combines four controls. There is one candidate cadence, so no ABBA
+comparison is claimed. Earlier rounds9 results are separately bracketed, unpaired evidence.
+Owner prime/output IDs and prompt/reuse/computed frontiers match the references exactly.
+The separate benchmark helper only raises its diagnostic cadence limit to 12; production
+code, defaults and numerical criteria are unchanged.
+
+Effective prefill throughput includes preparation, queueing and ordinary decode yields
+across the full three-turn window. Prefill rate loss uses interpolated prefill-first
+controls. Pure-decode rate is the mean accepted aggregate throughput immediately before
+and after each observation; decode retained averages the per-observation mixed/pure
+accepted-rate ratios. These fractions are distinct from the round-share Q in combined S.
+Observed publication gaps are output-batch intervals, not guaranteed per-token bounds.
+Ranges are two observations, not confidence intervals.
+
+| D | Mode | Effective prefill tok/s | Prefill rate loss | Aggregate decode tok/s | Pure decode tok/s | Decode retained | Owner TTFT ms | Max text gap ms | S [range] | Delta control [range] |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 1 | prefill-first | 11893 | 0.0% | 11.6 | 366.0 | 3.2% | 683.6 | 781.4 | 1.0127 [1.0108, 1.0139] | — |
+| 1 | 4096/12 | 7051 | 40.7% | 191.2 | 367.0 | 52.1% | 1157.7 | 387.9 | 1.0239 [1.0239, 1.0239] | +0.0112 [+0.0107, +0.0118] |
+| 3 | prefill-first | 11866 | 0.0% | 12.5 | 576.7 | 2.2% | 685.4 | 783.3 | 1.0052 [1.0033, 1.0070] | — |
+| 3 | 4096/12 | 6673 | 43.8% | 291.0 | 612.7 | 47.5% | 1223.5 | 391.5 | 1.0154 [1.0154, 1.0155] | +0.0103 [+0.0102, +0.0103] |
+| 5 | prefill-first | 11774 | 0.0% | 21.9 | 707.0 | 3.1% | 690.8 | 786.0 | 1.0093 [1.0066, 1.0112] | — |
+| 5 | 4096/12 | 6336 | 46.2% | 378.7 | 749.0 | 50.6% | 1289.2 | 395.8 | 1.0218 [1.0203, 1.0233] | +0.0125 [+0.0124, +0.0125] |
+
+All 30 timing ledgers are clean: twenty D3/D5 points and ten independently bracketed D1
+points. The source-fixed owner conversation also matches across lane counts, including exact
+prime/output IDs and prompt/reuse/computed frontiers. Each group has both observed S values
+above 1 and positive own-control differences. Effective prefill is about 59%, 56% and 54% of
+matched prefill-first at D1/D3/D5, while accepted decode retains about 52%, 48% and 51% of its
+own decode-only rate. Text-publication gaps remain near 388–396 ms.
+
+Active lane count affects round cost and the prefill penalty, but these results do not require
+three different hardcoded cadence values: rounds12 is a reasonable common large-prefill
+candidate across the measured lane counts. For a timing-budget policy, use actual decode-ready
+membership and observed ordinary-round duration, plus context/draft width and remaining
+prefill service, rather than treating twelve rounds as a fixed GPU share. No decode-ready
+requests means uninterrupted prefill.
+
+The user prefers rounds12 above 4K remaining prefill. Direct rounds12 evidence here is at
+nominal 8K; the exact 4K switching boundary is not qualified. These measurements hold rounds12
+for the whole request. An automatic remaining-work policy could lower the cadence when the
+bulk work ends and only a small suffix/checkpoint tail remains, changing both owner latency
+and decode progress. That policy requires direct measurement; the fixed-cadence table does
+not establish its performance. Production defaults and scheduling remain unchanged.
+
+Evidence is in `profiles/bench/mixed-rounds12-20261018/`: separate helper/build recipe,
+`run.py`, `run-one-lane.py`, thirty guarded point records, strict `analyze.py` and
+`analyze-one-lane.py`, their individual JSON reports and `all-lanes-analysis.json`/
+`all-lanes-table.md`. Earlier rounds9 results are a separate-campaign comparison. Both
+controllers terminate and release the shared GPU lock without an owned runner queued.
+
+### Remaining-work policy and spare-lane interruption (2026-10-19)
+
+The Engine/server defaults select prefill-first below 4096 remaining uncached tokens and
+W4096/rounds12 at or above 4096. Selection uses the staged cursor after actual prefix reuse
+and is repeated after each chunk. A short FIFO head can interrupt a large text prefill at a
+completed-unit boundary only when an independently feasible spare lane already exists, with
+no retained eviction, host restore or active-state offload. The large owner retains its
+lane/state, resumes after the short prefill, and must advance another nonzero chunk before
+another interruption. The serving reference documents the threshold and explicit cadence
+controls; the concurrent-inference architecture specifies resource and cancellation semantics.
+
+The preceding rounds12 table uses fixed cadence throughout each nominal 8K prefill, including
+checkpoint tails. It is not a score table for the remaining-work policy: exclusive tails can
+change both total prefill latency and retained decode share. The 4096 threshold is selected by
+the maintainer, not established as a measured optimum.
+
+A public-Engine regression on RTX 5090/CUDA 13.1 uses the explicit DFlash2 NVFP4/BF16-codebook
+artifact, NVFP4 KV, graphs, fixed five-token drafting, C=3 and one B=1 decoding background.
+A 240-token raw-text request arrives just after the first chunk of a 12288-token raw-text
+prefill. Both foreground requests produce one token, preserving B=1 membership. Separate
+fresh Engines compare threshold zero (fixed rounds12, no interruption) with threshold 4096.
+
+| Policy | Short TTFT ms | Large TTFT ms | Effective foreground prefill tok/s | Aggregate decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed rounds12, no interruption | 894.4 | 1124.2 | 10910.9 | 78.4 |
+| Remaining-work policy, spare-lane interruption | 36.5 | 1150.8 | 10886.6 | 78.2 |
+
+This is one clean functional-test observation per mode, not a calibrated speedup or score
+campaign. Foreground throughput divides the 12528 computed tokens by submission-to-both-results
+wall time; decode counters bracket that window with a small host snapshot offset. Preparation
+precedes the window. Short arrival follows the first completed chunk; an arrival during a
+chunk must also wait for that chunk. No worst-case latency guarantee follows from this table.
+Exact foreground and complete B=1 background token streams match their references; resumed
+owner logprobs also match within the same-profile FP32 reduction criterion of 1e-4.
+
+Evidence: `profiles/bench/remaining-prefill-policy-20261019/`. Clean final GPU ledgers identify
+valid observations; earlier overlapping attempts are excluded. Six focused fast unit suites
+pass, including scripted 4095/4096/4097 remaining-token pacing, FIFO/capacity refusal,
+cancellation of either staged owner, and request-local initialization failure followed by
+mandatory owner-chunk progress before another interruption.
+The real suite passes cached resident-prefix interruption with ladder/rollback checkpoint
+state, finite same-profile logprobs, complete background streams, membership compaction and
+replacement, and fixed mixed widths at D1/D3/D5. The cached case restores two independent
+resident owners and performs no eviction or host restore to obtain the spare lane.
+
+A focused adaptive-draft suspension/resume and cancellation route passes compute-sanitizer
+memcheck with **0 errors** in 185.9 seconds. It asserts both resumed mixed steps and exact
+computed work. The broader reference-generating memcheck was stopped as unnecessary and
+remains incomplete; it is not a pass. No kernel implementation changed, so this work does not
+repeat the all-kernel racecheck or master-merge campaign. The warning-clean build, changed-line
+clang-tidy plus focused post-fix reruns, affected formatting/lint and `git diff --check` pass.
+Read-only implementation reviews found no remaining blocker. Execution evidence here is
+DFlash2 NVFP4; interrupted MTP and grammar/penalty-constrained sampling were not separately
+exercised. All owned GPU runners terminate and release the shared lock.
+
 ## Qwen3.8-27B NVFP4 mixed-phase prefill campaign
 
 The 2026-09-05 follow-up kept the preceding DFlash4/MTP4 decode implementation and targeted

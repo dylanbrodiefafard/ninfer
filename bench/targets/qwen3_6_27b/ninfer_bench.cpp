@@ -468,13 +468,14 @@ int main(int argc, char** argv) {
         engine_options.max_concurrency = options.concurrency;
         engine_options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(
             ninfer::bench::concurrent_kv_capacity_tokens(max_context, options.concurrency));
-        engine_options.prefill_chunk        = options.prefill_chunk;
-        engine_options.mixed_forward        = options.mixed_forward;
-        engine_options.mixed_forward_rounds = options.mixed_forward_rounds;
-        engine_options.kv_cache             = options.kv_cache;
-        engine_options.sage_attn            = options.sage_attn;
-        engine_options.keep_frac            = options.keep_frac;
-        engine_options.xattn_tau            = options.xattn_tau;
+        engine_options.prefill_chunk            = options.prefill_chunk;
+        engine_options.mixed_forward            = options.mixed_forward;
+        engine_options.mixed_forward_rounds     = options.mixed_forward_rounds;
+        engine_options.mixed_forward_min_tokens = options.mixed_forward_min_tokens;
+        engine_options.kv_cache                 = options.kv_cache;
+        engine_options.sage_attn                = options.sage_attn;
+        engine_options.keep_frac                = options.keep_frac;
+        engine_options.xattn_tau                = options.xattn_tau;
         engine_options.speculative.backend =
             options.draft_tokens == 0 ? ninfer::SpeculativeBackend::None : options.spec_backend;
         engine_options.speculative.draft_tokens        = options.draft_tokens;
@@ -490,6 +491,7 @@ int main(int argc, char** argv) {
         env.prefill_chunk            = options.prefill_chunk;
         env.mixed_forward            = options.mixed_forward;
         env.mixed_forward_rounds     = options.mixed_forward_rounds;
+        env.mixed_forward_min_tokens = options.mixed_forward_min_tokens;
         env.kv_cache                 = options.kv_cache;
         env.sage_attn                = options.sage_attn;
         env.keep_frac                = options.keep_frac;

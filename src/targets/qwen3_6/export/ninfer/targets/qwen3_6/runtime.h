@@ -177,6 +177,11 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    // Staged uncached suffix and whether its text-only state can yield without a transient lease.
+    [[nodiscard]] std::uint32_t prefill_remaining_tokens(std::uint32_t lane) const;
+    [[nodiscard]] bool prefill_suspendable(std::uint32_t lane) const;
+    // Restage shared bindings after another prefill, preserving all lane-owned generation state.
+    void resume_prefill_lane(std::uint32_t lane);
     [[nodiscard]] bool prefill_mixable(std::uint32_t lane) const;
     [[nodiscard]] runtime::MixedGeneratedRound
     decode_batch_with_prefill(std::span<const std::uint32_t> lanes,

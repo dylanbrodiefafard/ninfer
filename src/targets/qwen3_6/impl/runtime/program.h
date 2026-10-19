@@ -339,6 +339,13 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    // Current uncached suffix at the staged execution frontier. Requires a prefilling lane.
+    [[nodiscard]] std::uint32_t prefill_remaining_tokens(std::uint32_t lane) const;
+    // Only text owners without request-transient storage can yield to another prefill owner.
+    [[nodiscard]] bool prefill_suspendable(std::uint32_t lane) const;
+    // Restore shared sampling bindings after another owner's prefill without resetting this
+    // lane's RNG, penalties, speculative state or prompt cursor. Requires a suspendable lane.
+    void resume_prefill_lane(std::uint32_t lane);
     // Whether the prefilling request on `lane` can advance its next step inside a DFlash decode
     // round: DFlash with a mixed-forward width, a text-only prompt with tokens left, and no
     // tool-grammar sampling in that step (its root mask shares tool-mask row 0 with verify).

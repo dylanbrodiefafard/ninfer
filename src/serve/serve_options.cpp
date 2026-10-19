@@ -112,6 +112,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-concurrency N] [--no-generation-recovery] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--mixed-forward N] [--mixed-forward-rounds N] "
+           "[--mixed-forward-min-tokens N] "
            "[--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
@@ -240,6 +241,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--mixed-forward") {
             options.mixed_forward = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--mixed-forward"), "mixed-forward"));
+        } else if (arg == "--mixed-forward-min-tokens") {
+            options.mixed_forward_min_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--mixed-forward-min-tokens"), "mixed-forward-min-tokens"));
         } else if (arg == "--mixed-forward-rounds") {
             options.mixed_forward_rounds = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--mixed-forward-rounds"), "mixed-forward-rounds"));

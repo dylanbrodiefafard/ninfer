@@ -310,7 +310,6 @@ class ProbeProgram {
 public:
     ProbeProgram() { trace.reserve(32); }
 
-    // DeferProgram overrides the admission, capture, and decode members marked virtual.
     virtual ~ProbeProgram() = default;
 
     CacheCase script             = CacheCase::RecoveryRamRestoreFails;
@@ -438,7 +437,7 @@ public:
         return true;
     }
 
-    [[nodiscard]] ProbePlan
+    [[nodiscard]] virtual ProbePlan
     plan_request_base(const PreparedPrompt& prompt,
                       const ninfer::runtime::ResolvedExecutionOptions& options) {
         note("plan_base");
@@ -460,8 +459,8 @@ public:
         return plan;
     }
 
-    [[nodiscard]] ProbePlan plan_request_for_lane(std::uint32_t, const PreparedPrompt&,
-                                                  const ProbePlan& base) {
+    [[nodiscard]] virtual ProbePlan plan_request_for_lane(std::uint32_t, const PreparedPrompt&,
+                                                          const ProbePlan& base) {
         note("plan_cold");
         if (cold_plan_fails) {
             throw ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
@@ -725,8 +724,18 @@ public:
 
     [[nodiscard]] bool revert_cancelled_prefill_lane(std::uint32_t) { return true; }
 
-    [[nodiscard]] PrefillStepResult advance_prefill_lane(std::uint32_t, PrefillPace) {
+    [[nodiscard]] virtual PrefillStepResult advance_prefill_lane(std::uint32_t, PrefillPace) {
         throw std::logic_error("cold prefill did not complete in one step");
+    }
+
+    [[nodiscard]] virtual std::uint32_t prefill_remaining_tokens(std::uint32_t) const {
+        throw std::logic_error("probe prefill completes in one step");
+    }
+
+    [[nodiscard]] virtual bool prefill_suspendable(std::uint32_t) const { return false; }
+
+    virtual void resume_prefill_lane(std::uint32_t) {
+        throw std::logic_error("probe prefill cannot suspend");
     }
 
     [[nodiscard]] bool prefill_mixable(std::uint32_t) const { return false; }
@@ -2018,6 +2027,309 @@ int run_admission_defers_for_reclaim(Frontend& frontend) {
     return failures;
 }
 
+// Runs the production selector with scripted complete chunks. A gate after the first large
+// chunk freezes ingress so queue timing cannot hide an interruption or its starvation bound.
+class PrefillScheduleProgram final : public ProbeProgram {
+public:
+    [[nodiscard]] bool kv_copies_ready() const override { return true; }
+
+    std::atomic<bool> first_chunk_entered{false};
+    std::atomic<bool> release_first_chunk{false};
+    std::uint32_t lanes  = 2;
+    bool suspendable     = true;
+    bool short_fits      = true;
+    bool fail_short_once = false;
+    bool gate_small      = false;
+    bool gate_decode     = false;
+    std::atomic<bool> decode_entered{false};
+    std::atomic<bool> release_decode{false};
+    std::atomic<bool> small_entered{false};
+    std::atomic<bool> release_small{false};
+    std::vector<std::string> units;
+    std::array<std::uint32_t, ninfer::kMaximumConcurrency> remaining{};
+    std::array<std::uint32_t, ninfer::kMaximumConcurrency> lengths{};
+
+    [[nodiscard]] AdmissionResources admission_capacity() const noexcept override {
+        return {lanes, lanes, 0};
+    }
+
+    [[nodiscard]] ProbePlan
+    plan_request_base(const PreparedPrompt& prompt,
+                      const ninfer::runtime::ResolvedExecutionOptions& options) override {
+        ProbePlan plan;
+        plan.fields.prompt_tokens           = prompt.summary().prompt_tokens;
+        plan.fields.effective_output_tokens = options.requested_output_tokens;
+        plan.fields.effective_limit_reason  = FinishReason::OutputLimit;
+        plan.fields.service_work_quanta     = 8192;
+        plan.fields.admission               = {1, 1, 0};
+        plan.fields.transient_alignment     = 1;
+        plan.execution                      = options;
+        return plan;
+    }
+
+    [[nodiscard]] ProbePlan plan_request_for_lane(std::uint32_t, const PreparedPrompt&,
+                                                  const ProbePlan& base) override {
+        return base;
+    }
+
+    [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
+                                      const ProbePlan& plan) const noexcept override {
+        return short_fits || lane == 0 || plan.fields.prompt_tokens >= 4096;
+    }
+
+    [[nodiscard]] bool
+    can_admit_lane_after_retained_eviction(std::uint32_t lane,
+                                           const ProbePlan& plan) const noexcept override {
+        return can_admit_lane(lane, plan);
+    }
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
+                                                       ProbePlan, TransientRegion, PrefillPace pace,
+                                                       const OutputSession*) override {
+        remaining[lane] = lengths[lane] = prompt.summary().prompt_tokens;
+        units.push_back("start:" + std::to_string(lengths[lane]));
+        if (lengths[lane] < 4096 && std::exchange(fail_short_once, false)) {
+            throw ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
+                                       "scripted short prefill initialization failure");
+        }
+        return advance_prefill_lane(lane, pace);
+    }
+
+    [[nodiscard]] PrefillStepResult advance_prefill_lane(std::uint32_t lane,
+                                                         PrefillPace pace) override {
+        units.push_back("chunk:" + std::to_string(lengths[lane]) +
+                        (pace == PrefillPace::Exclusive ? ":exclusive" : ":shared"));
+        const auto processed = std::min(remaining[lane], 4096U);
+        remaining[lane] -= processed;
+        if (lengths[lane] >= 4096 && !first_chunk_entered.exchange(true)) {
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!release_first_chunk.load()) {
+                if (std::chrono::steady_clock::now() >= limit) {
+                    throw std::runtime_error("prefill schedule ingress gate timed out");
+                }
+                std::this_thread::yield();
+            }
+        }
+        PrefillStepResult step;
+        step.summary.prompt_tokens   = lengths[lane];
+        step.processed_prompt_tokens = processed;
+        step.complete                = remaining[lane] == 0;
+        if (lengths[lane] < 4096 && gate_small && !small_entered.exchange(true)) {
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!release_small.load()) {
+                if (std::chrono::steady_clock::now() >= limit) {
+                    throw std::runtime_error("small prefill cancellation gate timed out");
+                }
+                std::this_thread::yield();
+            }
+        }
+        if (step.complete) { step.round.tokens = {lengths[lane] == 16 ? &continue_ : &stop_, 1}; }
+        return step;
+    }
+
+    [[nodiscard]] std::uint32_t prefill_remaining_tokens(std::uint32_t lane) const override {
+        return remaining[lane];
+    }
+
+    [[nodiscard]] bool prefill_suspendable(std::uint32_t) const override { return suspendable; }
+
+    void resume_prefill_lane(std::uint32_t lane) override {
+        units.push_back("resume:" + std::to_string(lengths[lane]));
+    }
+
+    [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t> members,
+                                                     std::span<const RoundBudget>) override {
+        if (gate_decode && !decode_entered.exchange(true)) {
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!release_decode.load()) {
+                if (std::chrono::steady_clock::now() >= limit) {
+                    throw std::runtime_error("scripted decode ingress gate timed out");
+                }
+                std::this_thread::yield();
+            }
+        }
+        units.push_back("decode");
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        for (std::size_t row = 0; row < members.size(); ++row) {
+            decode_tokens_[row] = continue_;
+            decode_counts_[row] = 1;
+        }
+        return {.tokens     = std::span(decode_tokens_).first(members.size()),
+                .row_counts = std::span(decode_counts_).first(members.size()),
+                .row_stride = 1};
+    }
+
+private:
+    std::array<TokenId, ninfer::kMaximumConcurrency> decode_tokens_{};
+    std::array<std::int32_t, ninfer::kMaximumConcurrency> decode_counts_{};
+    TokenId continue_ = 1000 + 'a';
+    TokenId stop_     = kCallerStop;
+};
+
+struct PrefillSchedulePackage : ProbePackage {
+    using Program = PrefillScheduleProgram;
+};
+
+struct PrefillScheduleProbe {
+    using Package = PrefillSchedulePackage;
+    PrefillScheduleProgram* program;
+    ProbeLoaded* loaded;
+    ProbeMemory request_memory;
+};
+
+int run_prefill_interruptions(Frontend& frontend) {
+    int failures = 0;
+    for (const unsigned scenario : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U}) {
+        PrefillScheduleProgram program;
+        program.lanes           = scenario == 1 ? 1 : 2;
+        program.suspendable     = scenario != 2;
+        program.short_fits      = scenario != 3;
+        program.gate_small      = scenario == 5 || scenario == 6;
+        program.fail_short_once = scenario == 7;
+        ProbeLoaded loaded{frontend};
+        PrefillScheduleProbe instance{&program, &loaded, {}};
+        auto engine                = engine_options();
+        engine.max_concurrency     = program.lanes;
+        engine.max_context         = 32768;
+        engine.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<PrefillScheduleProbe> executor(instance, engine);
+        auto submit = [&](std::uint32_t tokens) {
+            auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(tokens, 1000 + 'a'));
+            const auto summary = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.requested_output_tokens = 1;
+            options.stop.token_ids                    = {kCallerStop};
+            return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                   ninfer::OutputDelivery::TerminalOnly);
+        };
+        auto large       = submit(16384);
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!program.first_chunk_entered.load()) {
+            if (std::chrono::steady_clock::now() >= limit) {
+                throw std::runtime_error("large scripted prefill never started");
+            }
+            std::this_thread::yield();
+        }
+        auto earlier_large = scenario == 4 ? submit(8192) : decltype(large){};
+        auto small1        = submit(128);
+        auto small2        = submit(256);
+        program.release_first_chunk.store(true);
+        const ninfer::CancellationView cancel;
+        if (scenario == 5 || scenario == 6) {
+            const auto small_limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!program.small_entered.load()) {
+                if (std::chrono::steady_clock::now() >= small_limit) {
+                    throw std::runtime_error("small prefill never reached cancellation gate");
+                }
+                std::this_thread::yield();
+            }
+            if (scenario == 5) {
+                large = {};
+            } else {
+                small1 = {};
+            }
+            program.release_small.store(true);
+        }
+        if (scenario != 5) { (void)large.wait(nullptr, cancel); }
+        if (scenario == 4) { (void)earlier_large.wait(nullptr, cancel); }
+        if (scenario == 7) {
+            bool failed = false;
+            try {
+                (void)small1.wait(nullptr, cancel);
+            } catch (const ninfer::RequestError& error) {
+                failed = error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+            }
+            failures += check(failed, "short initialization error was not request-local");
+        } else if (scenario != 6) {
+            (void)small1.wait(nullptr, cancel);
+        }
+        (void)small2.wait(nullptr, cancel);
+        const auto first_small = std::find(program.units.begin(), program.units.end(), "start:128");
+        const auto second_small =
+            std::find(program.units.begin(), program.units.end(), "start:256");
+        const auto resumed = std::find(program.units.begin(), program.units.end(), "resume:16384");
+        if (scenario == 0 || scenario == 6 || scenario == 7) {
+            failures += check(
+                first_small < resumed && resumed < second_small && resumed + 1 < second_small &&
+                    *(resumed + 1) == "chunk:16384:exclusive" &&
+                    std::count(program.units.begin(), program.units.end(), "resume:16384") == 2,
+                "short prefill interruption violated FIFO or chunk progress");
+        } else if (scenario == 5) {
+            failures +=
+                check(resumed == program.units.end(), "cancelled suspended owner was resumed");
+        } else {
+            failures +=
+                check(resumed == program.units.end() && first_small > program.units.begin() + 4,
+                      "prefill interrupted without a usable spare lane/resource lease");
+        }
+    }
+    return failures;
+}
+
+int run_prefill_thresholds(Frontend& frontend) {
+    int failures = 0;
+    for (const auto tokens : {8191U, 8192U, 8193U}) {
+        PrefillScheduleProgram program;
+        program.release_first_chunk.store(true);
+        program.gate_decode = true;
+        ProbeLoaded loaded{frontend};
+        PrefillScheduleProbe instance{&program, &loaded, {}};
+        auto options                = engine_options();
+        options.max_concurrency     = 2;
+        options.max_context         = 32768;
+        options.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<PrefillScheduleProbe> executor(instance, options);
+        auto submit = [&](std::uint32_t count, std::uint32_t outputs) {
+            auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(count, 1000 + 'a'));
+            const auto summary = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions request;
+            request.execution.allow_prefix_reuse      = false;
+            request.execution.requested_output_tokens = outputs;
+            request.stop.token_ids                    = {kCallerStop};
+            return executor.submit(std::move(prompt), summary, 0.0, std::move(request),
+                                   ninfer::OutputDelivery::TerminalOnly);
+        };
+        auto background     = submit(16, 4096);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!program.decode_entered.load()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("scripted decode background never became ready");
+            }
+            std::this_thread::yield();
+        }
+        auto owner = submit(tokens, 1);
+        program.release_decode.store(true);
+        const ninfer::CancellationView cancel;
+        (void)owner.wait(nullptr, cancel);
+        (void)background.wait(nullptr, cancel);
+        const auto start = std::find(program.units.begin(), program.units.end(),
+                                     "start:" + std::to_string(tokens));
+        if (start == program.units.end()) {
+            throw std::runtime_error("scripted owner was not executed");
+        }
+        const std::string label = "chunk:" + std::to_string(tokens);
+        std::vector<std::size_t> owner_chunks;
+        for (auto it = start; it != program.units.end(); ++it) {
+            if (it->starts_with(label + ":")) {
+                owner_chunks.push_back(static_cast<std::size_t>(it - program.units.begin()));
+            }
+        }
+        const auto expected_chunks = tokens == 8193 ? 3U : 2U;
+        if (owner_chunks.size() != expected_chunks) {
+            throw std::runtime_error("scripted owner had the wrong chunk count");
+        }
+        const auto shared =
+            std::count(program.units.begin(), program.units.end(), label + ":shared");
+        const auto final_chunk =
+            program.units.begin() + static_cast<std::ptrdiff_t>(owner_chunks.back());
+        failures += check(shared == (tokens == 8191 ? 1 : 2) &&
+                              std::count(start, final_chunk, "decode") == (tokens == 8191 ? 0 : 12),
+                          "4095/4096/4097 remaining-token pacing or tail yield suppression failed");
+    }
+    return failures;
+}
+
 int main() {
     try {
         Frontend frontend                = FrontendTestAccess::create_component(resources(), false);
@@ -2033,6 +2345,8 @@ int main() {
             CacheCase::AdmitDiskRestoreThenCold,
         };
         int failures = run_reasoning_close_sampling(frontend);
+        failures += run_prefill_interruptions(frontend);
+        failures += run_prefill_thresholds(frontend);
         for (const CacheCase script : recovery_cases) {
             failures += run_recovery(frontend, script);
         }

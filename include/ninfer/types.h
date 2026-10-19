@@ -139,15 +139,17 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 4096;
-    // Forward width (tokens) of each prefill step while other requests are decode-ready; 0 runs
-    // the owner's whole prefill before the next decode round. Otherwise the owner advances one
-    // step of at most mixed_forward tokens after every mixed_forward_rounds decode rounds of the
-    // other requests. A multiple of 256 (the activation scale tile), at most prefill_chunk, and at
-    // most 4096.
-    std::uint32_t mixed_forward        = 4096;
-    std::uint32_t mixed_forward_rounds = 1;
-    std::size_t kv_ram_capacity_bytes  = 0;
-    std::size_t kv_disk_capacity_bytes = 0;
+    // Shared prefill step width: a multiple of 256, at most min(prefill_chunk, 4096).
+    // Zero runs prefill-first. Otherwise remaining suffixes below mixed_forward_min_tokens
+    // run exclusively; larger suffixes advance after mixed_forward_rounds decode rounds.
+    // The threshold is evaluated after each chunk from the selected lane's actual frontier.
+    // Zero threshold applies the configured cadence to every suffix and disables short-job
+    // interruption. Eligible short text requests may interrupt a large owner on a spare lane.
+    std::uint32_t mixed_forward            = 4096;
+    std::uint32_t mixed_forward_rounds     = 12;
+    std::uint32_t mixed_forward_min_tokens = 4096;
+    std::size_t kv_ram_capacity_bytes      = 0;
+    std::size_t kv_disk_capacity_bytes     = 0;
     std::filesystem::path kv_disk_location;
     KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
     // Filled from the loaded artifact at Engine construction for the KV-disk fingerprint.

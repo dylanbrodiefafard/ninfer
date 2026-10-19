@@ -32,13 +32,15 @@ int main() {
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.prefill_chunk == 4096, "serving prefill chunk default is not 4096");
-    failures += check(defaults.mixed_forward == 4096 && defaults.mixed_forward_rounds == 1,
+    failures += check(defaults.mixed_forward == 4096 && defaults.mixed_forward_rounds == 12 &&
+                          defaults.mixed_forward_min_tokens == 4096,
                       "serving mixed prefill defaults mismatch");
     const ServeOptions decode_priority =
         parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "2048", "--mixed-forward", "1024",
-               "--mixed-forward-rounds", "2"});
+               "--mixed-forward-rounds", "2", "--mixed-forward-min-tokens", "0"});
     failures +=
-        check(decode_priority.mixed_forward == 1024 && decode_priority.mixed_forward_rounds == 2,
+        check(decode_priority.mixed_forward == 1024 && decode_priority.mixed_forward_rounds == 2 &&
+                  decode_priority.mixed_forward_min_tokens == 0,
               "mixed prefill ratio overrides mismatch");
     const ServeOptions prefill_first =
         parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "128", "--mixed-forward", "0"});

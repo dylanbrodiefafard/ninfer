@@ -187,6 +187,21 @@ runtime::PrefillStepResult Program<Variant>::advance_prefill_lane(std::uint32_t 
 }
 
 template <>
+std::uint32_t Program<Variant>::prefill_remaining_tokens(std::uint32_t lane) const {
+    return impl_->prefill_remaining_tokens(lane);
+}
+
+template <>
+bool Program<Variant>::prefill_suspendable(std::uint32_t lane) const {
+    return impl_->prefill_suspendable(lane);
+}
+
+template <>
+void Program<Variant>::resume_prefill_lane(std::uint32_t lane) {
+    impl_->resume_prefill_lane(lane);
+}
+
+template <>
 bool Program<Variant>::prefill_mixable(std::uint32_t lane) const {
     return impl_->prefill_mixable(lane);
 }
