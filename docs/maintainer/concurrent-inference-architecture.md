@@ -822,9 +822,12 @@ releasing image credits or device state.
 
 Live images are private and never prefix-lookup entries, optional eviction victims or disk spills.
 They share the configured RAM arena with completed/system prefixes, and take precedence over those
-optional entries. Credits include alignment, current/rewrite/checkpoint/backend state and transfer
-readers; fragmented free space cannot promise an unallocatable image. Finite backing may reduce
-residency when neither a completion claim nor a useful funded image fits. No live request falls
+optional entries. Admission selects reuse before sizing its image credit. If reserving that credit
+changes the RAM index, admission reselects the source and funds its actual image requirement at the
+same output window before claiming a source or reducing the window. This also applies when a failed
+reservation evicts optional entries. Credits include alignment, current/rewrite/checkpoint/backend
+state and transfer readers; fragmented free space cannot promise an unallocatable image. Finite
+backing may reduce residency when neither a completion claim nor a useful funded image fits. No live request falls
 back to disk or re-prefill for pressure. Short-prefill interruptions secure the same claim or credit
 and consume the same ingress fairness allowance as ordinary windowed admission.
 

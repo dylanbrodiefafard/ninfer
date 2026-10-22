@@ -2356,9 +2356,18 @@ private:
                                       .value();
                         // Imported checkpoint heads can make the winning image larger than
                         // the cold base plan. Search window sizes against both GPU and RAM.
-                        funded = joins_cohort ||
-                                 instance_.program->reserve_suspension_credit(
-                                     request->id, selected_plan.summary().suspension_bytes);
+                        const auto image_bytes = selected_plan.summary().suspension_bytes;
+                        const auto ram_version = instance_.program->kv_ram_index_version();
+                        funded = joins_cohort || instance_.program->reserve_suspension_credit(
+                                                     request->id, image_bytes);
+                        // Live credit takes precedence over optional prefixes and can evict
+                        // this unclaimed winner even when allocation fails. Reselect and fund
+                        // its actual image at the same window before admitting or shrinking.
+                        if (instance_.program->kv_ram_index_version() != ram_version) {
+                            choice = find_admission_lane(request);
+                            funded = false;
+                            continue;
+                        }
                         if (funded) break;
                     }
                     const auto previous = request->base_plan->summary().window_output_tokens;

@@ -554,7 +554,7 @@ public:
         return plan;
     }
 
-    [[nodiscard]] ProbePlan plan_ram_reuse(const PreparedPrompt&, const ProbePlan& base) {
+    [[nodiscard]] virtual ProbePlan plan_ram_reuse(const PreparedPrompt&, const ProbePlan& base) {
         note("plan_ram");
         ProbePlan plan   = fitted_plan();
         plan.force_cold  = base.force_cold;
@@ -622,13 +622,13 @@ public:
         ++abort_count;
     }
 
-    void claim_ram_entry(std::uint64_t entry_id) {
+    virtual void claim_ram_entry(std::uint64_t entry_id) {
         note("claim_ram");
         ++claim_ram_count;
         claimed_ram_entry = entry_id;
     }
 
-    void restore_ram_entry(std::uint32_t, std::uint64_t, const ProbePlan&) {
+    virtual void restore_ram_entry(std::uint32_t, std::uint64_t, const ProbePlan&) {
         note("restore_ram");
         ++restore_ram_count;
         if (restore_ram_count <= stale_failures) {
@@ -645,7 +645,7 @@ public:
         ram_timings_pending_ = true;
     }
 
-    void release_ram_entry(std::uint64_t) { note("release_ram"); }
+    virtual void release_ram_entry(std::uint64_t) { note("release_ram"); }
 
     virtual void discard_ram_capture(std::uint64_t) {
         note("discard_ram");
@@ -745,7 +745,7 @@ public:
     [[nodiscard]] bool kv_disk_restore_failed() const { return false; }
 
     // A request starts at index version zero. Zero here would skip the host lookup.
-    [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept { return 1; }
+    [[nodiscard]] virtual std::uint64_t kv_ram_index_version() const noexcept { return 1; }
 
     [[nodiscard]] std::uint64_t kv_disk_index_version() const noexcept { return 1; }
 
@@ -851,7 +851,7 @@ public:
         }
     }
 
-    void finish_ram_restore(std::uint64_t, ninfer::runtime::CacheReadIntent intent) {
+    virtual void finish_ram_restore(std::uint64_t, ninfer::runtime::CacheReadIntent intent) {
         if (intent == ninfer::runtime::CacheReadIntent::Fork) {
             note("release_ram_restored");
         } else {
@@ -3537,7 +3537,7 @@ int run_prefill_thresholds(Frontend& frontend) {
 // Each request starts with three output tokens funded, has a six-token lifetime, and requires
 // seven pages to finish. Two initial four-page reservations fit an eight-page shared pool;
 // neither can grow beside its peer. The per-lane cursor represents committed continuation.
-class ChunkedProgram final : public ProbeProgram {
+class ChunkedProgram : public ProbeProgram {
 public:
     enum class HoldPhase { None, Capture, Restore, Parked };
     HoldPhase hold_phase = HoldPhase::None;
@@ -3986,6 +3986,174 @@ struct ChunkedProbe {
     ProbeLoaded* loaded     = nullptr;
     ProbeMemory request_memory;
 };
+
+// Models the shared RAM arena's FIFO eviction during live-credit allocation. The first
+// request owns the completion cohort; its queued peer must fund credit after choosing reuse.
+class AdmissionEvictionProgram final : public ChunkedProgram {
+public:
+    enum class Eviction { All, Longest, FailedReservation };
+
+    explicit AdmissionEvictionProgram(Eviction eviction) : eviction_(eviction) {
+        wait_for_queue = true;
+    }
+
+    std::uint32_t replans          = 0;
+    std::uint32_t restores         = 0;
+    std::uint32_t funding_attempts = 0;
+    std::uint32_t admitted_window  = 0;
+    bool evicted                   = false;
+
+    [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept override { return version_; }
+
+    [[nodiscard]] ProbePlan plan_ram_reuse(const PreparedPrompt&, const ProbePlan& base) override {
+        ++replans;
+        auto plan = base;
+        if (!available_) { return plan; }
+        plan.fields.ram_entry_id           = available_;
+        plan.fields.reuse_source           = PrefixReuseSource::HostRam;
+        plan.fields.reusable_prompt_tokens = available_ == 1 ? 32 : 16;
+        // A shorter prefix can retain more checkpoint heads and require larger backing.
+        plan.fields.suspension_bytes =
+            available_ == 1 && eviction_ != Eviction::FailedReservation ? 4 : 6;
+        return plan;
+    }
+
+    [[nodiscard]] bool reserve_suspension_credit(std::uint64_t owner, std::size_t bytes) override {
+        if (owner == 2) {
+            ++funding_attempts;
+            if (!evicted) {
+                if (claimed_) { throw std::logic_error("eviction probe source is claimed"); }
+                evicted    = true;
+                available_ = eviction_ == Eviction::Longest ? 2 : 0;
+                ++version_;
+                if (eviction_ == Eviction::FailedReservation) { return false; }
+            }
+        }
+        return ChunkedProgram::reserve_suspension_credit(owner, bytes);
+    }
+
+    void claim_ram_entry(std::uint64_t id) override {
+        if (id != available_ || id == 0) {
+            throw std::logic_error("RAM cache entry id is unknown");
+        }
+        if (claimed_) { throw std::logic_error("eviction probe source is already claimed"); }
+        claimed_ = true;
+    }
+
+    void release_ram_entry(std::uint64_t id) override {
+        if (id != available_ || !claimed_) {
+            throw std::logic_error("eviction probe released an unowned source");
+        }
+        claimed_ = false;
+    }
+
+    void restore_ram_entry(std::uint32_t, std::uint64_t id, const ProbePlan&) override {
+        if (id != available_ || !claimed_) {
+            throw std::logic_error("eviction probe restored an unowned source");
+        }
+        ++restores;
+    }
+
+    void finish_ram_restore(std::uint64_t id, ninfer::runtime::CacheReadIntent intent) override {
+        release_ram_entry(id);
+        if (intent == ninfer::runtime::CacheReadIntent::Consume) {
+            available_ = 0;
+            ++version_;
+        }
+    }
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
+                                                       ProbePlan plan, TransientRegion region,
+                                                       PrefillPace pace,
+                                                       const OutputSession* output) override {
+        if (starts == 1) {
+            if (live_credits.at(2) < plan.fields.suspension_bytes) {
+                throw std::logic_error("replanned admission has insufficient RAM backing");
+            }
+            admitted_window = plan.fields.window_output_tokens;
+        }
+        return ChunkedProgram::start_prefill_lane(lane, std::move(prompt), plan, region, pace,
+                                                  output);
+    }
+
+private:
+    Eviction eviction_;
+    std::uint64_t version_   = 1;
+    std::uint64_t available_ = 1;
+    bool claimed_            = false;
+};
+
+struct AdmissionEvictionPackage : ProbePackage {
+    using Program = AdmissionEvictionProgram;
+};
+
+struct AdmissionEvictionProbe {
+    using Package                     = AdmissionEvictionPackage;
+    AdmissionEvictionProgram* program = nullptr;
+    ProbeLoaded* loaded               = nullptr;
+    ProbeMemory request_memory;
+};
+
+int run_admission_credit_eviction(Frontend& frontend) {
+    int failures = 0;
+    for (const auto eviction :
+         {AdmissionEvictionProgram::Eviction::All, AdmissionEvictionProgram::Eviction::Longest,
+          AdmissionEvictionProgram::Eviction::FailedReservation}) {
+        for (const bool cache_write : {false, true}) {
+            AdmissionEvictionProgram program(eviction);
+            ProbeLoaded loaded{frontend};
+            AdmissionEvictionProbe instance{.program = &program, .loaded = &loaded};
+            auto engine                = engine_options();
+            engine.max_concurrency     = 2;
+            engine.generation_recovery = false;
+            ninfer::runtime::ConcurrentExecutor<AdmissionEvictionProbe> executor(instance, engine);
+            const auto submit = [&](bool reuse) {
+                auto input                    = thinking_input();
+                input.options.enable_thinking = false;
+                auto prompt                   = frontend.prepare(std::move(input));
+                const auto summary            = prompt.summary();
+                ninfer::runtime::ResolvedRequestOptions options;
+                options.execution.allow_prefix_reuse      = reuse;
+                options.execution.cache_write             = cache_write;
+                options.execution.requested_output_tokens = 6;
+                options.output.raw                        = true;
+                return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                       ninfer::OutputDelivery::TerminalOnly);
+            };
+            auto first  = submit(false);
+            auto second = submit(true);
+            program.peer_submitted.store(true);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            ninfer::CancellationView cancel(
+                [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+            const auto a = first.wait(nullptr, cancel);
+            const auto b = second.wait(nullptr, cancel);
+            if (!program.evicted || program.replans < 2 || program.funding_attempts < 2 ||
+                program.admitted_window != 3) {
+                std::cerr << "admission eviction case=" << static_cast<int>(eviction)
+                          << " cache_write=" << cache_write << " evicted=" << program.evicted
+                          << " replans=" << program.replans
+                          << " funding=" << program.funding_attempts
+                          << " window=" << program.admitted_window
+                          << " restores=" << program.restores << '\n';
+            }
+            failures += check(a.generated_token_ids == ChunkedProgram::expected() &&
+                                  b.generated_token_ids == ChunkedProgram::expected(),
+                              "RAM credit eviction lost or replayed a continuation");
+            failures +=
+                check(program.evicted && program.replans >= 2 && program.funding_attempts >= 2 &&
+                          program.admitted_window == 3 &&
+                          program.restores ==
+                              (eviction == AdmissionEvictionProgram::Eviction::Longest ? 1U : 0U),
+                      "RAM credit eviction did not reselect and fund the surviving plan");
+            auto subsequent = submit(false);
+            failures += check(subsequent.wait(nullptr, cancel).generated_token_ids ==
+                                  ChunkedProgram::expected(),
+                              "RAM credit eviction left the Engine unavailable");
+        }
+    }
+    return failures;
+}
 
 int run_eight_32k_windows(Frontend& frontend) {
     ChunkedProgram program;
@@ -4575,6 +4743,7 @@ int main() {
         failures += run_chunked_continuation(frontend, false);
         failures += run_chunked_continuation(frontend, true);
         failures += run_chunked_continuation(frontend, true, true);
+        failures += run_admission_credit_eviction(frontend);
         failures += run_reasoning_budget_close(frontend);
         failures += run_limited_recovery_policy(frontend);
         failures += run_reasoning_budget_retry(frontend);

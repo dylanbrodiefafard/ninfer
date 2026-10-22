@@ -6021,6 +6021,45 @@ int test_oversized_capture_preserves_fifo(ninfer::DeviceContext& ctx, ninfer::Pa
     return 0;
 }
 
+int test_live_credit_invalidates_unclaimed_match(ninfer::DeviceContext& ctx,
+                                                 ninfer::PagedKVPool& pool) {
+    namespace q36                  = ninfer::targets::qwen3_6;
+    constexpr std::size_t capacity = 1ULL << 20;
+    auto alloc                     = pool.reserve(1);
+    alloc.materialize_pages(1, ctx.stream);
+    fill_logical_pages(pool, alloc, 37);
+    ctx.synchronize_all();
+    const auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 17));
+    const auto hashes = q36::detail::prefix_hash_chain(prompt);
+    for (const bool claimed : {false, true}) {
+        for (const bool fits : {false, true}) {
+            q36::detail::KVRamCache cache(capacity);
+            if (capture_text_entry(cache, pool, alloc, prompt, ctx.copy_stream)) {
+                return fail("live credit capture fixture failed");
+            }
+            cache.wait_pending_copies();
+            const auto match = cache.plan_match(prompt, hashes);
+            if (!match) { return fail("live credit fixture has no reuse match"); }
+            if (claimed) { cache.claim(match->entry_id); }
+            const auto version  = cache.index_version();
+            const bool reserved = cache.reserve_live_credit(1, capacity + (fits ? 0 : 256));
+            if (reserved != (fits && !claimed)) {
+                return fail("live credit reservation violated contiguous capacity or claim");
+            }
+            if (claimed) {
+                if (cache.index_version() != version || !cache.is_claimed(match->entry_id)) {
+                    return fail("live credit reservation retired a claimed source");
+                }
+                cache.release(match->entry_id);
+            } else if (cache.index_version() == version || cache.plan_match(prompt, hashes)) {
+                return fail("live credit reservation did not invalidate the evicted match");
+            }
+            cache.release_live_credit(1);
+        }
+    }
+    return 0;
+}
+
 int test_claimed_capacity_capture_preserves_fifo(ninfer::DeviceContext& ctx,
                                                  ninfer::PagedKVPool& pool) {
     namespace q36 = ninfer::targets::qwen3_6;
@@ -6382,6 +6421,7 @@ int main(int argc, char** argv) {
     failures += test_bounded_ram_lifecycle(ctx, paged_pool);
     failures += test_oversized_capture_preserves_fifo(ctx, paged_pool);
     failures += test_claimed_capacity_capture_preserves_fifo(ctx, paged_pool);
+    failures += test_live_credit_invalidates_unclaimed_match(ctx, paged_pool);
     failures += test_ram_copy_sync_does_not_hold_io_mutex(ctx, paged_pool);
 
     return failures == 0 ? 0 : fail("kv ram cache core test failed");
