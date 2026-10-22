@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -233,7 +235,7 @@ void exercise_decoded_retries(execution::ProgramImplCore& program, family::Front
         const auto prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
         const auto insert        = recovery->recovery_insert({}, attempt);
         auto prepared_retry =
-            frontend.splice_recovery_prompt(prompt.token_ids, input, insert, recovery);
+            frontend.splice_recovery_prompt(prompt.token_ids, input, insert, recovery, true);
         require(prepared_retry.has_value(), "decoded retry splice was rejected");
         auto retry = family::PreparedPromptAccess::take(std::move(prepared_retry).value());
 
@@ -354,7 +356,146 @@ void exercise_full_original_preservation(execution::ProgramImplCore& program,
     program.discard_ram_capture(full_id);
 }
 
-void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool forks_only) {
+// Compare exact represented continuation bytes and the next target tokens/logprobs against
+// a cold run at the same execution profile. The transfer run leaves GDN history deferred until
+// start_suspend, so an omitted materialization cannot be hidden by the snapshot helper.
+void exercise_live_continuation(execution::ProgramImplCore& program, family::Frontend& frontend) {
+    using ninfer::TokenId;
+
+    struct Snapshot {
+        CommittedState state;
+        std::vector<TokenId> ledger;
+        std::vector<std::byte> text, backend, cyclic, features, counts;
+        std::uint32_t frontier                 = 0;
+        bool operator==(const Snapshot&) const = default;
+    };
+
+    const auto read_tensor = [&](const ninfer::Tensor& tensor) {
+        std::vector<std::byte> bytes(tensor.bytes());
+        CUDA_CHECK(cudaMemcpyAsync(bytes.data(), tensor.data, bytes.size(), cudaMemcpyDeviceToHost,
+                                   program.device.stream));
+        program.device.synchronize();
+        return bytes;
+    };
+    const auto snapshot = [&](std::uint32_t lane) {
+        const auto& sequence = program.sequences[lane];
+        Snapshot value;
+        value.state    = committed_state(program, lane);
+        value.ledger   = sequence.ledger;
+        value.frontier = sequence.execution_frontier;
+        value.text = kv_prefix_image(program, sequence.kv->text, program.decoder->text_kv.pool(),
+                                     sequence.kv->text.mapped_page_count());
+        if (sequence.kv->backend) {
+            value.backend =
+                kv_prefix_image(program, *sequence.kv->backend, program.dflash->full->pool(),
+                                sequence.kv->backend->mapped_page_count());
+        }
+        if (program.dflash) {
+            value.cyclic.resize(program.dflash->local.lane_host_bytes());
+            program.dflash->local.copy_lane_to_host(static_cast<std::int32_t>(lane),
+                                                    value.cyclic.data(), program.device.stream);
+            program.device.synchronize();
+            value.features = read_tensor(
+                program.dflash->pending_features.slice(2, static_cast<std::int32_t>(lane), 1));
+        }
+        value.counts =
+            read_tensor(program.token_counts.slice(1, static_cast<std::int32_t>(lane), 1));
+        return value;
+    };
+    const auto start = [&](std::uint32_t lane, bool sampled) {
+        auto prepared = frontend.prepare_tokens(std::vector<TokenId>(129, 1000), false);
+        auto prompt   = family::PreparedPromptAccess::take(std::move(prepared));
+        ninfer::runtime::ResolvedExecutionOptions options;
+        options.requested_output_tokens    = 256;
+        options.reservation_window_tokens  = 256;
+        options.allow_prefix_reuse         = false;
+        options.cache_write                = false;
+        options.token_logprobs             = true;
+        options.sampling.temperature       = sampled ? 0.7F : 0.0F;
+        options.sampling.presence_penalty  = sampled ? 0.2F : 0.0F;
+        options.sampling.frequency_penalty = sampled ? 0.1F : 0.0F;
+        options.sampling.seed              = 17;
+        auto base                          = program.plan_request_base(prompt, options);
+        auto plan                          = program.plan_request_for_lane(lane, prompt, base);
+        auto step = program.start_prefill_lane(lane, std::move(prompt), std::move(plan), {},
+                                               ninfer::runtime::PrefillPace::Exclusive);
+        while (!step.complete) {
+            step = program.advance_prefill_lane(lane, ninfer::runtime::PrefillPace::Exclusive);
+        }
+        program.resolve_prefill_lane(lane, false);
+    };
+    const auto rounds = [&](std::uint32_t lane, int count) {
+        std::vector<std::pair<TokenId, std::uint32_t>> result;
+        const std::array lanes{lane};
+        const std::array<ninfer::runtime::RoundBudget, 1> budgets{{{8}}};
+        const std::array<std::uint8_t, 1> flags{0};
+        for (int round_index = 0; round_index < count; ++round_index) {
+            const auto round = program.decode_batch(lanes, budgets);
+            require(!round.tokens.empty() &&
+                        (round.row_counts.empty() || round.row_counts[0] > 0) &&
+                        !round.logprobs.empty(),
+                    "live continuation lost target tokens/logprobs");
+            // Verify the full speculative panel but commit one token. Three rounds leave
+            // deferred GDN history, and the dirty destination leaves a distinct one-token tail.
+            const std::array<std::uint32_t, 1> accepted{1};
+            for (std::uint32_t token = 0; token < accepted[0]; ++token) {
+                require(std::isfinite(round.logprobs.token_logprobs[token]),
+                        "live continuation logprob is nonfinite");
+                result.emplace_back(round.tokens[token], std::bit_cast<std::uint32_t>(
+                                                             round.logprobs.token_logprobs[token]));
+            }
+            program.resolve_pending_batch(lanes, accepted, flags, flags);
+        }
+        return result;
+    };
+    for (const bool sampled : {false, true}) {
+        start(0, sampled);
+        const auto prefix   = rounds(0, 3);
+        const auto baseline = snapshot(0);
+        const auto next     = rounds(0, 3);
+        program.abort_lane(0);
+        start(0, sampled);
+        require(rounds(0, 3) == prefix, "cold continuation prefix is nondeterministic");
+        const auto original_window = program.plan_window(0, 256);
+        const auto consumed =
+            program.sequences[0].ledger_frontier - program.requests[0].prompt_tokens;
+        const auto small = program.plan_window(0, consumed + 1);
+        require(program.shrink_window(0, small), "live continuation could not shrink unused KV");
+        const std::uint64_t owner = sampled ? 2 : 1;
+        require(program.reserve_suspension_credit(owner, small.suspension_bytes),
+                "live continuation could not secure RAM");
+        require(program.start_suspend(0, owner), "live continuation could not start capture");
+        program.device.synchronize_all();
+        require(program.suspension_ready(owner), "live capture did not settle");
+        const auto expected = snapshot(0);
+        require(expected.state == baseline.state, "cold GDN continuation is nondeterministic");
+        program.finish_suspend(0, owner);
+        // Dirty the destination's lane-owned state before rebinding the saved continuation.
+        start(1, sampled);
+        (void)rounds(1, 1);
+        program.abort_lane(1);
+        const auto restore = program.plan_suspended_window(owner, consumed + 1);
+        require(program.start_resume(1, owner, restore),
+                "live continuation could not start restore");
+        program.device.synchronize_all();
+        require(program.resume_ready(owner), "live restore did not settle");
+        program.finish_resume(1, owner);
+        require(snapshot(1) == expected,
+                "live resume changed exact represented continuation state");
+        const auto full = program.plan_window(1, original_window.output_tokens);
+        require(program.grant_window(1, full), "live continuation could not regrow KV");
+        require(rounds(1, 3) == next, "live resume changed next tokens or raw target logprobs");
+        program.abort_lane(1);
+        program.release_suspension_credit(owner);
+        require(program.kv_ram_snapshot().used_bytes == 0,
+                "live continuation leaked RAM image credit");
+        std::cout << "live continuation: exact state/tokens/logprobs, lane 0 -> 1, sampled="
+                  << sampled << '\n';
+    }
+}
+
+void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool forks_only,
+              bool live_only = false) {
     ninfer::DeviceContext device;
     ninfer::EngineOptions options;
     options.artifact_path         = artifact;
@@ -366,13 +507,15 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool for
     options.kv_cache              = ninfer::KvCacheStorage::Nvfp4;
     options.kv_ram_capacity_bytes = kRamBytes;
     options.enable_vision         = false;
-    // Decode-graph capture is measured by its own real tests. This run is the
-    // retain/copy/abort/restore sequence, and the graph allowance check is a
-    // device-wide free-memory delta that moves when another allocation lands.
-    options.use_cuda_graph            = false;
-    options.speculative.backend       = backend;
-    options.speculative.draft_tokens  = 3;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    // Live transfers exercise captured graph addresses across physical lanes. Other cases
+    // isolate retain/copy/abort/restore state from graph startup and its device-wide accounting.
+    options.use_cuda_graph      = live_only;
+    options.speculative.backend = backend;
+    options.speculative.draft_tokens =
+        backend == ninfer::SpeculativeBackend::None ? 0 : (live_only ? 7 : 3);
+    options.speculative.proposal_head = backend == ninfer::SpeculativeBackend::None
+                                            ? ninfer::ProposalHead::Full
+                                            : ninfer::ProposalHead::Optimized;
     // Fixed draft width keeps the restoration control independent of round-time
     // estimates learned during the deliberately discarded decode.
     options.speculative.adaptive_draft = false;
@@ -395,6 +538,10 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool for
                                        std::make_unique<ninfer::HostPinnedArena>(kRamBytes));
     device.synchronize();
 
+    if (live_only) {
+        exercise_live_continuation(program, frontend);
+        return;
+    }
     ninfer::PromptInput input;
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -451,7 +598,8 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool for
 
     const auto recovery = family::GenerationRecoveryContext::analyze(input);
     const auto insert   = recovery->recovery_insert({}, 1);
-    auto spliced_prompt = frontend.splice_recovery_prompt(prompt_ids, input, insert, recovery);
+    auto spliced_prompt =
+        frontend.splice_recovery_prompt(prompt_ids, input, insert, recovery, true);
     require(spliced_prompt.has_value(), "live thinking prompt refused the recovery splice");
     auto spliced = family::PreparedPromptAccess::take(std::move(spliced_prompt).value());
     const std::vector<ninfer::TokenId> spliced_ids = spliced.token_ids;
@@ -548,7 +696,8 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool for
 
 int main(int argc, char** argv) {
     const bool forks_only = argc == 2 && std::string(argv[1]) == "--fork-state";
-    if (argc != 1 && !forks_only) { return 1; }
+    const bool live_only  = argc == 2 && std::string(argv[1]) == "--live-continuation";
+    if (argc != 1 && !forks_only && !live_only) { return 1; }
     const char* nvfp4                  = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const char* group                  = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* dflash                 = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
@@ -566,7 +715,8 @@ int main(int argc, char** argv) {
         return 77;
     }
     try {
-        exercise(artifact, backend, forks_only);
+        if (live_only) { exercise(artifact, ninfer::SpeculativeBackend::None, false, true); }
+        exercise(artifact, backend, forks_only, live_only);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

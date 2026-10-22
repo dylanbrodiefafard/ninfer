@@ -1,0 +1,78 @@
+services:
+  ninfer:
+    image: ninfer:local
+    build: .
+    container_name: ninfer-5090
+    environment:
+      # CUDA 13.x supports R580 drivers through minor-version compatibility.
+      NVIDIA_REQUIRE_CUDA: "cuda>=13.0 driver>=580"
+    gpus:
+      - driver: nvidia
+        device_ids: ["0"]
+        capabilities: [gpu]
+    expose:
+      - "8002"
+    networks:
+      - proxy
+    volumes:
+      - type: bind
+        source: /ssdpool2nvme/local_llm/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16
+        target: /ssdpool2nvme/local_llm/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /ssdpool2nvme/local_llm/cache_5090
+        target: /ssdpool2nvme/local_llm/cache_5090
+        bind:
+          create_host_path: false
+    stop_signal: SIGTERM
+    stop_grace_period: 2m
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--max-time", "5", "http://127.0.0.1:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 2m
+      start_interval: 5s
+    command:
+      - ninfer-serve
+      - /ssdpool2nvme/local_llm/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8002"
+      - --model-id
+      - qwen
+      - --max-context
+      - "260000"
+      - --kv-capacity
+      - auto
+      - --max-concurrency
+      - "6"
+      - --kv-dtype
+      - nvfp4
+      - --spec
+      - dflash
+      - --draft-tokens
+      - "7"
+      - --adaptive-draft
+      - --lm-head-draft
+      - --temperature
+      - "1.5"
+      - --pending-timeout-ms
+      - "900000"
+      - --default-max-tokens
+      - "32768"
+      - --default-thinking-token-budget
+      - "16384"
+      - --kv-ram-capacity
+      - "24576"
+      - --kv-disk-capacity
+      - "100000"
+      - --kv-disk-location
+      - /ssdpool2nvme/local_llm/cache_5090
+
+networks:
+  proxy:
+    external: true

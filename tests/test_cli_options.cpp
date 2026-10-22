@@ -4,6 +4,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -24,7 +25,26 @@ ninfer::cli::Options parse(std::vector<std::string> arguments) {
 } // namespace
 
 int main() {
-    int failures      = 0;
+    int failures = 0;
+    failures += check(!parse({"ninfer", "model.ninfer", "--prompt", "hi"}).thinking_token_budget,
+                      "CLI enabled a reasoning budget by default");
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--thinking-token-budget", "16384"})
+                .thinking_token_budget == 16384,
+        "CLI lost the reasoning token budget");
+    for (const auto& args :
+         {std::vector<std::string>{"--thinking-token-budget", "0"},
+          std::vector<std::string>{"--thinking-token-budget", "4294967296"},
+          std::vector<std::string>{"--thinking-token-budget", "8", "--no-thinking"},
+          std::vector<std::string>{"--thinking-token-budget", "8", "--raw-output"}}) {
+        bool rejected = false;
+        try {
+            std::vector<std::string> arguments{"ninfer", "model.ninfer", "--prompt", "hi"};
+            arguments.insert(arguments.end(), args.begin(), args.end());
+            (void)parse(std::move(arguments));
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "CLI accepted an invalid reasoning budget configuration");
+    }
     bool mtp_rejected = false;
     try {
         (void)parse({"ninfer", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"});

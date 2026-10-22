@@ -24,6 +24,7 @@ struct RequestCapacity;
 struct MediaInputCapacity;
 
 struct GenerationMetrics {
+    ninfer::ReasoningLimitStats reasoning_limit;
     ninfer::GenerationRecoveryStats recovery;
     double prepare_seconds       = 0.0;
     double ttft_seconds          = 0.0;
@@ -106,14 +107,15 @@ void reject_unavailable_context_checkpoint_capture(bool capture_requested, bool 
 struct PreparedRequest {
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
-    double prepare_seconds                 = 0.0;
-    double prepare_cpu_seconds             = 0.0;
-    double media_wait_seconds              = 0.0;
-    double media_fetch_seconds             = 0.0;
-    int prompt_tokens                      = 0;
-    bool include_usage                     = false;
-    bool tool_capable                      = false;
-    std::size_t tool_name_max_length       = 64;
+    double prepare_seconds           = 0.0;
+    double prepare_cpu_seconds       = 0.0;
+    double media_wait_seconds        = 0.0;
+    double media_fetch_seconds       = 0.0;
+    int prompt_tokens                = 0;
+    bool include_usage               = false;
+    bool tool_capable                = false;
+    std::size_t tool_name_max_length = 64;
+    std::optional<std::uint32_t> thinking_token_budget;
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;

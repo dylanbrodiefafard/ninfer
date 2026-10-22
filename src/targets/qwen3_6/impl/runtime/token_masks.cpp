@@ -9,7 +9,37 @@
 namespace ninfer::targets::qwen3_6 {
 namespace {
 constexpr std::size_t kWords = (kTokenDomain + 31) / 32;
+
+// Grammar and recovery exclusions share one eligibility domain. A budget close
+// must not become an empty domain after those independent exclusions compose.
+void validate_budget_domain(const OutputSession& output, const ops::SamplingConfig& config,
+                            const std::uint32_t* words, std::size_t nodes) {
+    if (output.reasoning_limit_stats().budget_tokens == 0) { return; }
+    for (std::size_t node = 0; node < nodes; ++node) {
+        bool eligible = false;
+        for (std::size_t index = 0; index < kWords && !eligible; ++index) {
+            std::uint32_t word = words[node * kWords + index];
+            if (index + 1 == kWords && kTokenDomain % 32 != 0) {
+                word &= (std::uint32_t{1} << (kTokenDomain % 32)) - 1U;
+            }
+            for (std::int32_t i = 0; i < std::min(config.suppressed_token_count,
+                                                  ops::SamplingConfig::kMaximumSuppressedTokens);
+                 ++i) {
+                const auto token = config.suppressed_tokens[i];
+                if (token >= 0 && static_cast<std::size_t>(token) / 32 == index) {
+                    word &= ~(std::uint32_t{1} << (static_cast<unsigned>(token) % 32));
+                }
+            }
+            eligible = word != 0;
+        }
+        if (!eligible) {
+            throw RequestError(RequestErrorKind::InvalidOutputConstraint,
+                               "reasoning-limit intervention has no eligible target token");
+        }
+    }
 }
+
+} // namespace
 
 TokenMaskExchange::TokenMaskExchange(Tensor masks, Tensor sampling, Tensor nodes,
                                      cudaStream_t compute)
@@ -65,10 +95,11 @@ ops::SamplingConfig TokenMaskExchange::root(std::size_t row, cudaStream_t stream
     auto config                        = configs_.at(row);
     config.allowed_token_words         = nullptr;
     config.allowed_token_column_stride = 0;
-    if (outputs_[row] && outputs_[row]->has_token_grammar()) {
+    if (outputs_[row] && outputs_[row]->has_token_masks()) {
         const std::array<TokenId, 1> token{0};
         const std::array<std::int32_t, 1> parent{-1};
         outputs_[row]->fill_token_masks(token, parent, {host_mask(row), kWords});
+        validate_budget_domain(*outputs_[row], config, host_mask(row), 1);
         CUDA_CHECK(cudaMemcpyAsync(const_cast<std::uint32_t*>(device_mask(row)), host_mask(row),
                                    kWords * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream));
         config.allowed_token_words = device_mask(row);
@@ -169,7 +200,7 @@ void TokenMaskExchange::fill() {
         configs[row]                             = configs_[row];
         configs[row].allowed_token_words         = nullptr;
         configs[row].allowed_token_column_stride = 0;
-        if (!outputs_[row] || !outputs_[row]->has_token_grammar()) { continue; }
+        if (!outputs_[row] || !outputs_[row]->has_token_masks()) { continue; }
         if (counts[row] < 1 || static_cast<std::size_t>(counts[row]) > width_) {
             throw std::logic_error("invalid token grammar verification node count");
         }
@@ -183,6 +214,7 @@ void TokenMaskExchange::fill() {
         outputs_[row]->fill_token_masks({ids + row * width_, count},
                                         {parents + row * width_, count},
                                         {host_mask(row), count * kWords});
+        validate_budget_domain(*outputs_[row], configs[row], host_mask(row), count);
         configs[row].allowed_token_words         = device_mask(row);
         configs[row].allowed_token_column_stride = kWords;
     }

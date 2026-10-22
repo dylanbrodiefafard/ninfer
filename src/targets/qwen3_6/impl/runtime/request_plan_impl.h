@@ -111,6 +111,10 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     validate_sampling(options.sampling);
+    if (chunked_execution_enabled() && options.requested_output_tokens != 0 &&
+        options.reservation_window_tokens == 0) {
+        throw std::invalid_argument("chunked admission needs a positive output reservation");
+    }
 
     auto base                             = std::make_unique<RequestBasePlanImpl>();
     base->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -153,38 +157,29 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         throw std::invalid_argument(
             "capture_context_checkpoint requires prefix reuse and a speculative backend");
     }
-    const std::uint32_t reserved_context_tokens =
-        base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
-                                           ? 0U
-                                           : base->summary.effective_output_tokens - 1U);
-    std::uint32_t main_kv_tokens = reserved_context_tokens;
-    if (speculative_backend == SpeculativeBackend::DFlash) {
-        // Decode always materializes up to execution_frontier + dflash_verify_width (see
-        // decode_dflash_batch). Tree verify needs that headroom for unique packed slots;
-        // chain verify (e.g. live k=5 W=6) still materializes the same extent, so Main KV
-        // entitlement must cover verify_width in both modes or the last rounds / short
-        // max_tokens requests throw "materialize extent is outside entitlement" and poison
-        // the executor.
-        main_kv_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            capacity, static_cast<std::uint64_t>(reserved_context_tokens) + dflash_verify_width));
-    }
-    base->text_kv_page_entitlement = pages_for_tokens(main_kv_tokens);
-    if (speculative_backend == SpeculativeBackend::Mtp) {
-        const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
-        base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        if constexpr (DFlashConfig::full_layers > 0) {
-            base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
-        } else {
-            base->backend_kv_page_entitlement = 0;
-        }
-    }
-    base->summary.admission = runtime::AdmissionResources{
-        .active_lanes     = 1,
-        .main_kv_pages    = base->text_kv_page_entitlement,
-        .backend_kv_pages = base->backend_kv_page_entitlement,
-    };
+    qwen3_6::detail::ResidentPrefixIdentity initial_identity;
+    initial_identity.assign(prompt);
+    const std::size_t identity_extra =
+        initial_identity.packed_bytes() - 13ULL * initial_identity.size();
+    const std::size_t checkpoint_bound =
+        1 + static_cast<std::size_t>(std::upper_bound(context_marks.begin(), context_marks.end(),
+                                                      base->summary.prompt_tokens) -
+                                     context_marks.begin());
+    const auto lifetime =
+        execution_window(base->summary.prompt_tokens, base->summary.effective_output_tokens,
+                         identity_extra, checkpoint_bound);
+    const auto window = execution_window(base->summary.prompt_tokens,
+                                         chunked_execution_enabled()
+                                             ? std::min({8192U, options.reservation_window_tokens,
+                                                         base->summary.effective_output_tokens})
+                                             : base->summary.effective_output_tokens,
+                                         identity_extra, checkpoint_bound);
+    base->summary.lifetime_admission   = lifetime.admission;
+    base->summary.window_output_tokens = window.output_tokens;
+    base->summary.suspension_bytes     = window.suspension_bytes;
+    base->summary.admission            = window.admission;
+    base->text_kv_page_entitlement     = window.admission.main_kv_pages;
+    base->backend_kv_page_entitlement  = window.admission.backend_kv_pages;
     std::vector<VisionUseSpan> cold_vision_uses;
     if (prompt.has_media()) {
         auto control =
@@ -228,6 +223,9 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         base->summary, prompt, 0, prefill_step_tokens(runtime::PrefillPace::Shared),
         cold_vision_uses, base->rewrite_checkpoint,
         kv_ram_system_prompts != 0 && base->cache_write && base->allow_prefix_reuse);
+    const auto reserved_context_tokens =
+        base->summary.prompt_tokens +
+        (base->summary.effective_output_tokens ? base->summary.effective_output_tokens - 1U : 0U);
     if (prompt.generation_recovery && base->sampling.p_less) {
         base->summary.service_work_quanta +=
             qwen3_6::GenerationRecoveryContext::maximum_attempts *

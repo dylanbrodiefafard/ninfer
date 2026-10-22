@@ -403,6 +403,7 @@ int main(int argc, char** argv) {
         request.execution.capture_context_checkpoint = cli.capture_context_checkpoint;
         request.stop.token_ids                       = cli.stop_token_ids;
         request.stop.strings                         = cli.stop_strings;
+        request.output.thinking_token_budget         = cli.thinking_token_budget;
         request.output.raw                           = cli.raw_output;
 
         std::cerr << "phase       detail                      elapsed/progress\n";

@@ -61,7 +61,8 @@ private:
     void log_request_start(const RequestLogContext& context);
     void log_request_rejected(const RequestRejectionLogContext& context);
     void log_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
-    void log_request_error(const RequestLogContext& context, const std::string& message);
+    void log_request_error(const RequestLogContext& context, const std::string& message,
+                           const ninfer::ReasoningLimitStats* reasoning_limit = nullptr);
     void log_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();

@@ -44,6 +44,11 @@ std::vector<std::string_view> words(std::string_view text) {
     return result;
 }
 
+bool same_reasoning(std::string_view a, std::string_view b) {
+    const auto x = words(a), y = words(b);
+    return x.size() >= 64 && x == y;
+}
+
 bool repeated_reasoning(std::string_view a, std::string_view b) {
     constexpr std::size_t window = 64;
     const auto x = words(a), y = words(b);
@@ -66,6 +71,18 @@ bool repeated_reasoning(std::string_view a, std::string_view b) {
 
 } // namespace
 
+ResolvedSamplingParameters replay_recovery_sampling(ResolvedSamplingParameters original) {
+    if (!original.p_less || original.temperature <= 0.0F) { return original; }
+    return ResolvedSamplingParameters{.temperature       = 1.0F,
+                                      .top_k             = 20,
+                                      .top_p             = 0.95F,
+                                      .min_p             = 0.0F,
+                                      .presence_penalty  = 0.0F,
+                                      .frequency_penalty = 0.0F,
+                                      .seed              = original.seed,
+                                      .p_less            = false};
+}
+
 std::shared_ptr<const GenerationRecoveryContext>
 GenerationRecoveryContext::analyze(const PromptInput& input) {
     if (!input.options.enable_thinking || !input.options.add_generation_prompt) { return {}; }
@@ -76,37 +93,87 @@ GenerationRecoveryContext::analyze(const PromptInput& input) {
     }
     auto result    = std::make_shared<GenerationRecoveryContext>();
     result->input_ = input;
-    if (input.options.tool_jsons.empty() || input.messages.size() < 4) { return result; }
-    const auto n              = input.messages.size();
-    const auto& first         = input.messages[n - 4];
-    const auto& first_result  = input.messages[n - 3];
-    const auto& second        = input.messages[n - 2];
-    const auto& second_result = input.messages[n - 1];
-    if (first.role != ChatRole::Assistant || second.role != ChatRole::Assistant ||
-        first_result.role != ChatRole::Tool || second_result.role != ChatRole::Tool ||
-        first.tool_calls.size() != 1 || second.tool_calls.size() != 1 ||
-        first_result.tool_call_id != first.tool_calls[0].id ||
-        second_result.tool_call_id != second.tool_calls[0].id ||
-        !same_call(first.tool_calls[0], second.tool_calls[0]) ||
-        !same_result(first_result, second_result) ||
-        !repeated_reasoning(first.reasoning_content, second.reasoning_content)) {
-        return result;
+    if (input.options.tool_jsons.empty()) { return result; }
+
+    // Inspect only complete trailing rounds. A user message, unfinished call,
+    // non-tool assistant turn or media cannot be crossed as unchanged evidence.
+    struct Round {
+        const ChatMessage* assistant;
+        std::vector<const ChatMessage*> results;
+    };
+
+    constexpr std::size_t maximum_period = 4;
+    std::vector<Round> rounds;
+    std::size_t end = input.messages.size();
+    while (end != 0 && rounds.size() < 2 * maximum_period) {
+        const auto tool_end = end;
+        while (end != 0 && input.messages[end - 1].role == ChatRole::Tool) { --end; }
+        if (end == 0 || end == tool_end) { break; }
+        const auto& assistant = input.messages[end - 1];
+        if (assistant.role != ChatRole::Assistant || assistant.tool_calls.empty() ||
+            assistant.tool_calls.size() != tool_end - end) {
+            break;
+        }
+        Round round{&assistant, {}};
+        for (const auto& call : assistant.tool_calls) {
+            const ChatMessage* matched = nullptr;
+            for (std::size_t i = end; i < tool_end; ++i) {
+                if (input.messages[i].tool_call_id == call.id) {
+                    if (matched != nullptr) { return result; }
+                    matched = &input.messages[i];
+                }
+            }
+            if (matched == nullptr || std::find(round.results.begin(), round.results.end(),
+                                                matched) != round.results.end()) {
+                return result;
+            }
+            round.results.push_back(matched);
+        }
+        rounds.push_back(std::move(round));
+        --end;
     }
-    result->repeated_call_      = second.tool_calls[0];
-    result->repeated_reasoning_ = second.reasoning_content;
+    // Reverse-chronological rounds: after two identical cycles, the next
+    // proposal must repeat the oldest phase of the most recent cycle.
+    for (std::size_t period = 1; 2 * period <= rounds.size(); ++period) {
+        bool repeated = true;
+        for (std::size_t phase = 0; phase < period && repeated; ++phase) {
+            const auto& first          = rounds[phase + period];
+            const auto& second         = rounds[phase];
+            const auto& x              = first.assistant->tool_calls;
+            const auto& y              = second.assistant->tool_calls;
+            const bool exact_reasoning = period > 1 || x.size() > 1;
+            repeated = x.size() == y.size() &&
+                       (exact_reasoning ? same_reasoning(first.assistant->reasoning_content,
+                                                         second.assistant->reasoning_content)
+                                        : repeated_reasoning(first.assistant->reasoning_content,
+                                                             second.assistant->reasoning_content));
+            for (std::size_t call = 0; call < x.size() && repeated; ++call) {
+                repeated = same_call(x[call], y[call]) &&
+                           same_result(*first.results[call], *second.results[call]);
+            }
+        }
+        if (repeated) {
+            const auto& next            = *rounds[period - 1].assistant;
+            result->exact_reasoning_    = period > 1 || next.tool_calls.size() > 1;
+            result->repeated_calls_     = next.tool_calls;
+            result->repeated_reasoning_ = next.reasoning_content;
+            break;
+        }
+    }
     return result;
 }
 
 bool GenerationRecoveryContext::repeats(std::span<const ToolCall> calls,
                                         std::string_view reasoning) const {
-    return has_repeated_tool_history() &&
-           std::any_of(calls.begin(), calls.end(),
-                       [&](const ToolCall& call) { return same_call(call, repeated_call_); }) &&
-           repeated_reasoning(reasoning, repeated_reasoning_);
+    return has_repeated_tool_history() && calls.size() == repeated_calls_.size() &&
+           std::equal(calls.begin(), calls.end(), repeated_calls_.begin(), same_call) &&
+           (exact_reasoning_ ? same_reasoning(reasoning, repeated_reasoning_)
+                             : repeated_reasoning(reasoning, repeated_reasoning_));
 }
 
-std::vector<ChatMessage> GenerationRecoveryContext::recovery_insert(std::span<const ToolCall> calls,
-                                                                    std::uint32_t attempt) const {
+std::vector<ChatMessage>
+GenerationRecoveryContext::recovery_insert(std::span<const ToolCall> calls, std::uint32_t attempt,
+                                           GenerationRecoveryNotice reason) const {
     if (attempt == 0 || attempt > maximum_attempts) {
         throw std::invalid_argument("invalid bounded generation recovery attempt");
     }
@@ -118,8 +185,24 @@ std::vector<ChatMessage> GenerationRecoveryContext::recovery_insert(std::span<co
             .kind = MessagePartKind::Text,
             .text =
                 "NInfer engine recovery notice, attempt " + std::to_string(attempt) +
-                ": the previous generation repeated its reasoning without reaching an answer "
-                "or tool call. That failed reasoning is omitted from this internal retry. "
+                (reason == GenerationRecoveryNotice::ReasoningLimit
+                     ? ": the request reasoning-token allowance was reached. The capped "
+                       "generated attempt is omitted from this internal retry. Continue directly "
+                       "with the next relevant tool call or the completed answer using the "
+                       "remaining original output budget. "
+                 : reason == GenerationRecoveryNotice::ReasoningReplay
+                     ? ": a framing replay was confirmed earlier in this request: generated "
+                       "reasoning was copied into the answer channel and followed by an extra "
+                       "reasoning close. An unpublished exact replay or empty continuation caused "
+                       "this recovery. The rejected output is omitted from this internal retry. "
+                       "Proceed directly to an answer or relevant tool call. "
+                 : reason == GenerationRecoveryNotice::RepeatedContent
+                     ? ": the previous replacement repeated its answer text extensively. "
+                       "That unpublished answer is omitted from this internal retry. "
+                     : ": the previous generation repeated its reasoning without reaching an "
+                       "answer "
+                       "or tool call. That failed reasoning is omitted from this internal "
+                       "retry. ") +
                 "No tool was executed by this recovery. The original user task and actual tool "
                 "results above are unchanged. This is a continuation, not a fresh session. "
                 "Continue from the current task state instead of restarting initial orientation. "
@@ -132,7 +215,14 @@ std::vector<ChatMessage> GenerationRecoveryContext::recovery_insert(std::span<co
     }
     ChatMessage candidate;
     candidate.role = ChatRole::Assistant;
-    candidate.tool_calls.assign(calls.begin(), calls.end());
+    if (calls.size() != repeated_calls_.size() || calls.empty() ||
+        !std::equal(calls.begin(), calls.end(), repeated_calls_.begin(), same_call)) {
+        throw std::invalid_argument(
+            "rejected tool feedback requires the known repeated call batch");
+    }
+    // The proof already matched represented argument values. Reuse its fixed ordered
+    // batch rather than copying arbitrary generated JSON formatting into the suffix.
+    candidate.tool_calls = repeated_calls_;
     for (std::size_t i = 0; i < candidate.tool_calls.size(); ++i) {
         candidate.tool_calls[i].id =
             "ninfer_rejected_" + std::to_string(attempt) + "_" + std::to_string(i);
@@ -147,14 +237,29 @@ std::vector<ChatMessage> GenerationRecoveryContext::recovery_insert(std::span<co
             .kind = MessagePartKind::Text,
             .text =
                 "NInfer did not execute this proposed call. It detected repeated reasoning and "
-                "the same completed call twice with unchanged results. This is engine recovery "
+                "the same completed tool cycle twice with unchanged results. This is engine "
+                "recovery "
                 "feedback, not a new tool result. Use the results already in the conversation "
-                "and take a substantive next step toward the user's task. Changing only a "
-                "read limit or rephrasing the same operation is not progress. If a repeat is "
+                "and take a substantive next step toward the user's task. The proposed batch "
+                "matches the observed completed cycle. If a repeat is "
                 "genuinely necessary, identify what changed or what new information it obtains."});
         inserted.push_back(std::move(message));
     }
     return inserted;
+}
+
+std::vector<std::vector<ChatMessage>>
+GenerationRecoveryContext::recovery_insert_variants(std::uint32_t attempt) const {
+    std::vector<std::vector<ChatMessage>> variants;
+    for (const auto notice :
+         {GenerationRecoveryNotice::ReasoningLimit, GenerationRecoveryNotice::RepeatedReasoning,
+          GenerationRecoveryNotice::ReasoningReplay, GenerationRecoveryNotice::RepeatedContent}) {
+        variants.push_back(recovery_insert({}, attempt, notice));
+    }
+    if (has_repeated_tool_history()) {
+        variants.push_back(recovery_insert(repeated_calls_, attempt));
+    }
+    return variants;
 }
 
 bool recovery_suffix_tokens_ok(std::span<const TokenId> prefix, std::span<const TokenId> prologue,

@@ -666,3 +666,15 @@ set_property(TEST
     ninfer_speculative_round_test
     ninfer_attn_input_proj_test
   APPEND PROPERTY LABELS slow)
+
+add_test(NAME ninfer_qwen3_8_27b_live_continuation_real_test
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_qwen3_6_27b_recovery_kv_real_test>
+    --live-continuation)
+set_tests_properties(ninfer_qwen3_8_27b_live_continuation_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_kv_pressure_policy_test SOURCES test_kv_pressure_policy.cpp)
+
+add_test(NAME ninfer_qwen3_8_27b_eight_windows_real_test
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_qwen3_6_27b_cache_admission_real_test>
+    --eight-windows)
+set_tests_properties(ninfer_qwen3_8_27b_eight_windows_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)

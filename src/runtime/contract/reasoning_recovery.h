@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
+#include <vector>
 #include <unordered_map>
 
 namespace ninfer::runtime {
@@ -31,14 +33,14 @@ namespace ninfer::runtime {
     return false;
 }
 
-// Three non-overlapping occurrences of the same 256-token reasoning passage,
+// Three non-overlapping occurrences of the same 256-token passage,
 // plus >=4096 distinct generated tokens covered by repeat passages. Overlapping
 // windows count their covered tokens only once. This leaves room for shorter
 // loops to escape naturally without paying for a full-context retry.
 // Unlike a fixed-period square, this survives small insertions/deletions elsewhere
 // in a multi-paragraph loop. Hashes only locate candidates; exact IDs prove identity.
-// Runtime supplies only the current generated thinking attempt, never prompt tokens.
-class RepeatedReasoningSpan {
+// Callers supply one current generated span, never prompt tokens.
+class RepeatedTokenSpan {
 public:
     static constexpr std::size_t window                  = 256;
     static constexpr std::size_t minimum_repeated_tokens = 4096;
@@ -95,6 +97,34 @@ private:
     bool has_three_     = false;
     std::uint64_t hash_ = 0;
     std::unordered_multimap<std::uint64_t, Occurrence> occurrences_;
+};
+
+// Only genuine contiguous tokens of the selected channel are evidence. Other
+// channels, tool arguments and framing gaps cannot manufacture a repeated span.
+// A proved repeat stays latched even if the same decode round later reaches EOS.
+class RepeatedChannelSpan {
+public:
+    void observe(std::span<const TokenId> tokens,
+                 std::span<const std::optional<OutputChannel>> channels, OutputChannel channel) {
+        if (tokens.size() != channels.size()) {
+            throw std::logic_error("repetition attribution size mismatch");
+        }
+        for (std::size_t i = 0; i < tokens.size() && !detected_; ++i) {
+            if (channels[i] != channel) {
+                tokens_.clear();
+                detector_ = {};
+                continue;
+            }
+            tokens_.push_back(tokens[i]);
+            detected_ = detector_.observe(tokens_);
+        }
+    }
+
+    [[nodiscard]] bool detected() const noexcept { return detected_; }
+private:
+    std::vector<TokenId> tokens_;
+    RepeatedTokenSpan detector_;
+    bool detected_ = false;
 };
 
 } // namespace ninfer::runtime

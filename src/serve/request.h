@@ -33,6 +33,7 @@ struct ApiError {
     std::string code;  // optional
     // Engine recovery totals when this error ended a generation. Empty otherwise.
     ninfer::GenerationRecoveryStats recovery;
+    ninfer::ReasoningLimitStats reasoning_limit;
 };
 
 class ApiException : public std::runtime_error {
@@ -54,6 +55,7 @@ struct RequestLimits {
 struct CompletionUsage {
     int prompt_tokens     = 0;
     int completion_tokens = 0;
+    ninfer::ReasoningLimitStats reasoning_limit{};
 };
 
 // Prefill emits the first generated token (counted in prefill.ms / TTFT). Decode
@@ -243,6 +245,10 @@ struct GenerationRequest {
     bool max_tokens_set = false;
     bool stream         = false;
     bool include_usage  = false;
+    // Presence belongs to the exact budget leaf: explicit null disables the server default.
+    bool thinking_token_budget_specified = false;
+    std::optional<std::uint32_t> thinking_token_budget;
+    std::string thinking_token_budget_param = "thinking_token_budget";
     std::optional<bool> enable_thinking; // non-standard extension; falls back to server default
     std::optional<RequestedReasoningEffort> reasoning_effort;
     std::string reasoning_effort_param = "reasoning_effort";

@@ -131,7 +131,7 @@ std::string usage_text(const char* argv0) {
            "       [--no-p-less-sampling]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--json-object|--json-schema FILE|--grammar FILE]\n"
-           "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
+           "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-token-budget N]\n"
            "       [--reasoning-effort low|medium|xhigh]\n"
            "       [--vision] [--no-cuda-graph] [--capture-context-checkpoint]\n"
            "       [--context-checkpoints off|a,b,c]\n"
@@ -147,7 +147,8 @@ std::string usage_text(const char* argv0) {
            "--kv-capacity-headroom MiB (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); raise it when other processes, such as a desktop, share the GPU.\n"
-           "--kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default off).\n"
+           "--kv-ram-capacity sets pinned host prefix/live-state capacity in MiB (default off).\n"
+           "Enabling RAM reserves output in windows of at most 8192 tokens.\n"
            "--kv-ram-system-prompts N retains up to N system prefixes in that budget (default 0).\n"
            "--kv-disk-capacity sets SSD KV prefix-cache pack-file capacity in MiB (default "
            "off).\n"
@@ -233,6 +234,8 @@ Options parse_options(int argc, char** argv) {
                 parse_float(value(arg), "dflash-p-less-draft-temperature", 0.0F, 2.0F);
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (arg == "--thinking-token-budget") {
+            options.thinking_token_budget = parse_u32(value(arg), "thinking-token-budget");
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {
@@ -332,6 +335,9 @@ Options parse_options(int argc, char** argv) {
     validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
                                options.xattn_tau);
     product::validate_speculative_cli_options(options.speculative);
+    if (options.thinking_token_budget && (!options.enable_thinking || options.raw_output)) {
+        throw std::invalid_argument("--thinking-token-budget requires thinking and parsed output");
+    }
     if (!options.enable_thinking && options.reasoning_effort) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
     }

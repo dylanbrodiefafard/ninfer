@@ -156,18 +156,31 @@ constexpr const char* kPrefixPaths[]   = {
 constexpr const char* kPrefixSources[] = {"none", "vram_resident", "host_ram", "host_disk",
                                           "unknown"};
 constexpr const char* kRecoveryKinds[] = {
-    "cycle_exclusion",        "retry_triggered", "retry_started",
-    "retry_prefill_complete", "finished",        "exhausted",
+    "cycle_exclusion",  "retry_triggered", "retry_started", "retry_prefill_complete",
+    "replay_discarded", "finished",        "exhausted",
 };
-// Direct causes carried verbatim by non-exhausted events.
+// Direct causes carried verbatim by recovery events.
 constexpr const char* kDirectRecoveryCauses[] = {
-    "reasoning_cycle", "repeated_reasoning", "duplicate_tool_call", "cancelled",
-    "tool_calls",      "output_limit",       "context_capacity",    "stop",
-};
-constexpr const char* kRecoveryCauses[] = {
+    "reasoning_limit",
     "reasoning_cycle",
     "repeated_reasoning",
     "duplicate_tool_call",
+    "reasoning_replay",
+    "repeated_content",
+    "cancelled",
+    "tool_calls",
+    "output_limit",
+    "context_capacity",
+    "stop",
+};
+constexpr const char* kRecoveryCauses[] = {
+    "reasoning_limit",
+    "reasoning_cycle",
+    "repeated_reasoning",
+    "duplicate_tool_call",
+    "repeated_content",
+    "reasoning_replay",
+
     "cancelled",
     "tool_calls",
     "output_limit",
@@ -311,12 +324,14 @@ template <std::size_t N>
         return 2;
     case ninfer::RecoveryEventKind::RetryPrefillComplete:
         return 3;
-    case ninfer::RecoveryEventKind::Finished:
+    case ninfer::RecoveryEventKind::ReplayDiscarded:
         return 4;
-    case ninfer::RecoveryEventKind::Exhausted:
+    case ninfer::RecoveryEventKind::Finished:
         return 5;
+    case ninfer::RecoveryEventKind::Exhausted:
+        return 6;
     }
-    return 5;
+    return 6;
 }
 
 [[nodiscard]] const char* yn(bool value) { return value ? "true" : "false"; }
@@ -367,6 +382,11 @@ struct Series {
     TokenHistogram prompt_tokens;
     TokenHistogram completion_tokens;
     TokenHistogram reasoning_tokens;
+    std::uint64_t reasoning_limit_requests      = 0;
+    std::uint64_t reasoning_limit_tokens        = 0;
+    std::uint64_t reasoning_limit_reached       = 0;
+    std::uint64_t reasoning_limit_forced_closes = 0;
+    std::uint64_t reasoning_limit_retries       = 0;
     TokenHistogram computed_prefill_tokens;
     DecodeRateHistogram output_tokens_per_second;
     PrefillRateHistogram prefill_tokens_per_second;
@@ -397,11 +417,24 @@ struct Series {
     std::uint64_t recovery_cycle_exclusions           = 0;
     std::uint64_t recovery_discarded_reasoning_tokens = 0;
     std::uint64_t recovery_discarded_tool_calls       = 0;
+    std::uint64_t recovery_framing_repairs            = 0;
+    std::uint64_t recovery_discarded_content_tokens   = 0;
     CountHistogram recovery_attempts;
 };
 
+void observe_reasoning_limit(Series& series, const ninfer::ReasoningLimitStats& stats) {
+    if (stats.budget_tokens == 0) { return; }
+    ++series.reasoning_limit_requests;
+    series.reasoning_limit_tokens += stats.used_tokens;
+    series.reasoning_limit_reached += stats.limit_reached ? 1 : 0;
+    series.reasoning_limit_forced_closes += stats.forced_closes;
+    series.reasoning_limit_retries += stats.retries;
+}
+
 void observe_terminal_recovery(Series& series, const ninfer::GenerationRecoveryStats& stats) {
     series.recovery_cycle_exclusions += stats.cycle_exclusions;
+    series.recovery_framing_repairs += stats.framing_repairs;
+    series.recovery_discarded_content_tokens += stats.discarded_content_tokens;
     series.recovery_discarded_reasoning_tokens += stats.discarded_reasoning_tokens;
     series.recovery_discarded_tool_calls += stats.discarded_tool_calls;
     if (stats.attempts > 0) {
@@ -755,6 +788,16 @@ std::string render_text(const MetricsSnapshotData& data) {
     w.histogram("ninfer_generation_prompt_tokens", "Prompt tokens.", series.prompt_tokens);
     w.histogram("ninfer_generation_completion_tokens", "Completion tokens.",
                 series.completion_tokens);
+    w.counter("ninfer_reasoning_limit_requests_total", "Requests with reasoning limits.",
+              series.reasoning_limit_requests);
+    w.counter("ninfer_reasoning_limit_tokens_total", "Policy charged reasoning tokens.",
+              series.reasoning_limit_tokens);
+    w.counter("ninfer_reasoning_limit_reached_total", "Requests reaching the reasoning limit.",
+              series.reasoning_limit_reached);
+    w.counter("ninfer_reasoning_limit_forced_closes_total", "Policy forced reasoning closes.",
+              series.reasoning_limit_forced_closes);
+    w.counter("ninfer_reasoning_limit_retries_total", "Reasoning budget retries.",
+              series.reasoning_limit_retries);
     w.histogram("ninfer_generation_reasoning_tokens", "Reasoning tokens.", series.reasoning_tokens);
     w.histogram("ninfer_generation_computed_prefill_tokens", "Prompt tokens excluding prefix hits.",
                 series.computed_prefill_tokens);
@@ -784,6 +827,18 @@ std::string render_text(const MetricsSnapshotData& data) {
             std::uint64_t{stats.decode_ready_requests});
     w.gauge("ninfer_scheduler_waiting_requests", "Requests in the pending FIFO.",
             std::uint64_t{stats.waiting_requests});
+    w.gauge("ninfer_kv_execution_window_tokens",
+            "Maximum chunked output reservation; zero disables.",
+            std::uint64_t{stats.kv_execution_window_tokens});
+    w.gauge("ninfer_kv_growth_blocked_requests", "Resident requests waiting for KV growth.",
+            std::uint64_t{stats.kv_growth_blocked_requests});
+    w.gauge("ninfer_kv_suspended_requests", "Admitted requests parked in RAM.",
+            std::uint64_t{stats.kv_suspended_requests});
+    w.counter("ninfer_kv_window_extensions_total", "Committed output window extensions.",
+              stats.kv_window_extensions);
+    w.counter("ninfer_kv_live_suspensions_total", "Completed live RAM suspensions.",
+              stats.kv_live_suspensions);
+    w.counter("ninfer_kv_live_resumes_total", "Completed live RAM resumes.", stats.kv_live_resumes);
     w.counter("ninfer_engine_computed_prefill_tokens_total", "Prompt tokens evaluated by prefill.",
               stats.computed_prefill_tokens);
     w.counter("ninfer_engine_committed_decode_tokens_total", "Tokens committed by decode rounds.",
@@ -923,6 +978,11 @@ std::string render_text(const MetricsSnapshotData& data) {
               series.recovery_discarded_reasoning_tokens);
     w.counter("ninfer_recovery_discarded_tool_calls_total", "Tool calls discarded by recovery.",
               series.recovery_discarded_tool_calls);
+    w.counter("ninfer_recovery_framing_repairs_total", "Consumed reasoning-replay closing frames.",
+              series.recovery_framing_repairs);
+    w.counter("ninfer_recovery_discarded_content_tokens_total",
+              "Corroborated replay tokens withheld from answer publication.",
+              series.recovery_discarded_content_tokens);
     w.histogram("ninfer_recovery_attempts", "Recovery attempts on terminal requests.",
                 series.recovery_attempts);
 
@@ -1052,6 +1112,13 @@ Json render_json(const MetricsSnapshotData& data) {
           {"decode_row_rounds", stats.decode_row_rounds}}},
         {"http", {{"in_flight", data.inputs.http_in_flight}}},
         {"gpu_kv", std::move(gpu_kv)},
+        {"kv_execution",
+         {{"window_tokens", stats.kv_execution_window_tokens},
+          {"growth_blocked_requests", stats.kv_growth_blocked_requests},
+          {"suspended_requests", stats.kv_suspended_requests},
+          {"window_extensions", stats.kv_window_extensions},
+          {"suspensions", stats.kv_live_suspensions},
+          {"resumes", stats.kv_live_resumes}}},
         {"kv_ram",
          {{"capacity_bytes", stats.kv_ram_capacity_bytes},
           {"used_bytes", stats.kv_ram_used_bytes},
@@ -1101,11 +1168,19 @@ Json render_json(const MetricsSnapshotData& data) {
           {"accepted_by_position", series.speculative_accepted_by_position},
           {"rounds_by_k", series.speculative_rounds_by_k},
           {"live_k", summary(series.speculative_live_k)}}},
+        {"reasoning_limit",
+         {{"requests", series.reasoning_limit_requests},
+          {"used_tokens", series.reasoning_limit_tokens},
+          {"limit_reached", series.reasoning_limit_reached},
+          {"forced_closes", series.reasoning_limit_forced_closes},
+          {"retries", series.reasoning_limit_retries}}},
         {"recovery",
          {{"events", std::move(events)},
           {"cycle_exclusions", series.recovery_cycle_exclusions},
           {"discarded_reasoning_tokens", series.recovery_discarded_reasoning_tokens},
           {"discarded_tool_calls", series.recovery_discarded_tool_calls},
+          {"framing_repairs", series.recovery_framing_repairs},
+          {"discarded_content_tokens", series.recovery_discarded_content_tokens},
           {"attempts", summary(series.recovery_attempts)}}},
         {"generation",
          {{"requests_total", requests_total},
@@ -1220,8 +1295,12 @@ void ServeMetrics::observe_generation(const GenerationObservation& observation) 
     if (observation.result == GenerationResult::Rejected) { return; }
     if (observation.outcome != nullptr) {
         observe_terminal_recovery(series, observation.outcome->metrics.recovery);
+        observe_reasoning_limit(series, observation.outcome->metrics.reasoning_limit);
     } else if (observation.recovery != nullptr) {
         observe_terminal_recovery(series, *observation.recovery);
+    }
+    if (observation.outcome == nullptr && observation.reasoning_limit != nullptr) {
+        observe_reasoning_limit(series, *observation.reasoning_limit);
     }
     if (observation.result == GenerationResult::Success && observation.outcome != nullptr) {
         observe_success(series, protocol, *observation.outcome);

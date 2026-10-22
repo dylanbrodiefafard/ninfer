@@ -67,6 +67,12 @@ ninfer::PromptCapabilities effort_capabilities() {
     return capabilities;
 }
 
+ninfer::RequestOptions test_request_options(const GenerationRequest& request,
+                                            const ServeOptions& server) {
+    return to_request_options(request, server,
+                              resolve_request_semantics(request, server, effort_capabilities()));
+}
+
 ninfer::OwnedMedia fake_media(const ContentPart& part) {
     ninfer::OwnedMedia media;
     media.kind =
@@ -78,7 +84,7 @@ ninfer::OwnedMedia fake_media(const ContentPart& part) {
 
 ninfer::PromptInput translate(const GenerationRequest& req, std::string_view system_prepend = {}) {
     const ServeOptions server = default_server();
-    return to_prompt_input(req, resolve_prompt_semantics(req, server, effort_capabilities()),
+    return to_prompt_input(req, resolve_request_semantics(req, server, effort_capabilities()),
                            fake_media, system_prepend);
 }
 
@@ -366,7 +372,7 @@ int test_tools_and_choice() {
     failures += check(req.tools[0].name == "get_weather", "tool name parsed");
     failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "auto -> Auto");
     failures += check(req.uses_tools(), "uses_tools true");
-    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(test_request_options(req, default_server()).output.preserve_special_tokens,
                       "active tools preserve special tokens in Engine output");
     // definition_json must be a normalized OpenAI function-tool object for the
     // Qwen <tools> renderer.
@@ -496,9 +502,13 @@ int test_thinking_and_sampling() {
     failures += check(req.stop_strings.size() == 2 && req.stop_strings[0] == "STOP",
                       "stop_sequences parsed");
     failures += check(req.enable_thinking.has_value() && *req.enable_thinking, "thinking enabled");
+    failures +=
+        check(req.thinking_token_budget == 1024 &&
+                  test_request_options(req, default_server()).output.thinking_token_budget == 1024,
+              "Anthropic native thinking budget was not enforced as a cap");
     failures += check(!req.preserve_thinking.has_value(),
                       "Anthropic thinking.type unexpectedly enabled history preservation");
-    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    const ninfer::RequestOptions options = test_request_options(req, default_server());
     failures +=
         check(options.execution.requested_output_tokens == 8, "max_tokens reaches Engine options");
     failures += check(options.execution.sampling.temperature == 0.3F &&
@@ -571,8 +581,8 @@ int test_reasoning_effort() {
     high["output_config"]                = Json{{"effort", "high"}};
     const GenerationRequest high_request = parse_messages_request(high, default_limits());
     failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
+                          (void)resolve_request_semantics(high_request, default_server(),
+                                                          effort_capabilities());
                       }) == "reasoning_effort_not_supported",
                       "Anthropic high effort bypassed template capability validation");
 
@@ -581,8 +591,8 @@ int test_reasoning_effort() {
     const GenerationRequest conflicting_request =
         parse_messages_request(conflict, default_limits());
     failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(conflicting_request, default_server(),
-                                                         effort_capabilities());
+                          (void)resolve_request_semantics(conflicting_request, default_server(),
+                                                          effort_capabilities());
                       }) == "conflicting_template_option",
                       "Anthropic disabled thinking and effort were accepted together");
 
@@ -718,7 +728,12 @@ int test_streaming_events() {
     const Json stop = parse_sse(make_content_block_stop(2), &type);
     failures += check(type == "content_block_stop" && stop.at("index") == 2, "content_block_stop");
 
-    const Json mdelta = parse_sse(make_message_delta("tool_use", 5), &type);
+    const ninfer::ReasoningLimitStats cap{
+        .budget_tokens = 4096, .used_tokens = 4096, .forced_closes = 1, .limit_reached = true};
+    const Json mdelta = parse_sse(make_message_delta("tool_use", 5, cap), &type);
+    failures +=
+        check(mdelta.at("usage").at("ninfer").at("reasoning_limit").at("forced_closes") == 1,
+              "Anthropic streaming reasoning cap usage missing");
     failures +=
         check(type == "message_delta" && mdelta.at("delta").at("stop_reason") == "tool_use" &&
                   mdelta.at("delta").at("stop_sequence").is_null() &&

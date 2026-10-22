@@ -464,6 +464,39 @@ void* HostPinnedArena::try_alloc(std::size_t bytes, std::size_t align) {
     return nullptr;
 }
 
+bool HostPinnedArena::try_grow(void* block, std::size_t bytes) {
+    const auto allocation = live_.find(block);
+    if (allocation == live_.end() || bytes < allocation->second.size) {
+        throw std::invalid_argument("invalid pinned arena growth");
+    }
+    const auto extra = bytes - allocation->second.size;
+    if (extra == 0) { return true; }
+    const auto end = allocation->second.offset + allocation->second.size;
+    for (auto it = free_.begin(); it != free_.end(); ++it) {
+        if (it->offset != end || it->size < extra) { continue; }
+        it->offset += extra;
+        it->size -= extra;
+        if (it->size == 0) { free_.erase(it); }
+        allocation->second.size = bytes;
+        used_ += extra;
+        return true;
+    }
+    return false;
+}
+
+void HostPinnedArena::shrink(void* block, std::size_t bytes) {
+    const auto it = live_.find(block);
+    if (it == live_.end() || bytes == 0 || bytes > it->second.size) {
+        throw std::invalid_argument("invalid pinned arena shrink");
+    }
+    const auto old = it->second.size;
+    if (bytes == old) { return; }
+    it->second.size = bytes;
+    used_ -= old - bytes;
+    // Allocation reserved free-list capacity for release, so shortening cannot allocate.
+    insert_free(it->second.offset + bytes, old - bytes);
+}
+
 void HostPinnedArena::free(void* block) {
     if (block == nullptr) { throw std::invalid_argument("HostPinnedArena free of null"); }
     const auto it = live_.find(block);

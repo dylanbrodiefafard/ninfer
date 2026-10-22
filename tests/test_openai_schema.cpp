@@ -4,6 +4,8 @@
 // consumed by external OpenAI clients.
 
 #include "serve/openai_schema.h"
+#include "serve/anthropic_schema.h"
+#include "serve/responses_schema.h"
 #include "serve/request.h"
 #include "serve/translate.h"
 
@@ -69,6 +71,12 @@ ninfer::PromptCapabilities effort_capabilities() {
     return capabilities;
 }
 
+ninfer::RequestOptions test_request_options(const GenerationRequest& request,
+                                            const ServeOptions& server) {
+    return to_request_options(request, server,
+                              resolve_request_semantics(request, server, effort_capabilities()));
+}
+
 ninfer::OwnedMedia fake_media(const ContentPart& part) {
     ninfer::OwnedMedia media;
     media.kind =
@@ -80,7 +88,7 @@ ninfer::OwnedMedia fake_media(const ContentPart& part) {
 
 ninfer::PromptInput translate(const GenerationRequest& req, std::string_view system_prepend = {}) {
     const ServeOptions server = default_server();
-    return to_prompt_input(req, resolve_prompt_semantics(req, server, effort_capabilities()),
+    return to_prompt_input(req, resolve_request_semantics(req, server, effort_capabilities()),
                            fake_media, system_prepend);
 }
 
@@ -135,7 +143,7 @@ int test_ninfer_capture_object() {
         unpinned["ninfer"] = vendor;
         const auto parsed  = parse_chat_completion_request(unpinned, default_limits());
         failures += check(
-            !to_request_options(parsed, default_server()).execution.capture_context_checkpoint &&
+            !test_request_options(parsed, default_server()).execution.capture_context_checkpoint &&
                 parsed.cache_write,
             "empty or explicit false vendor options preserve ordinary execution");
     }
@@ -147,7 +155,7 @@ int test_ninfer_capture_object() {
         disposable["ninfer"] = Json{{"cache_write", false}};
         const auto parsed    = parse_chat_completion_request(disposable, default_limits());
         failures += check(!parsed.cache_write &&
-                              !to_request_options(parsed, default_server()).execution.cache_write,
+                              !test_request_options(parsed, default_server()).execution.cache_write,
                           "disposable option reaches Engine for both response modes");
         disposable["ninfer"]["capture_context_checkpoint"] = true;
         try {
@@ -170,7 +178,7 @@ int test_ninfer_capture_object() {
     const GenerationRequest pinned = parse_chat_completion_request(pin, default_limits());
     failures += check(pinned.capture_context_checkpoint, "ninfer capture flag parsed");
     failures +=
-        check(to_request_options(pinned, default_server()).execution.capture_context_checkpoint,
+        check(test_request_options(pinned, default_server()).execution.capture_context_checkpoint,
               "ninfer capture flag reached ExecutionOptions");
     Json unknown      = base;
     unknown["ninfer"] = Json{{"capture_context_checkpoint", true}, {"foo", 1}};
@@ -255,12 +263,182 @@ int test_preserve_thinking_options() {
     return failures;
 }
 
+int test_default_thinking_budget() {
+    int failures = 0;
+    enum class Protocol { Chat, Responses, Anthropic };
+    for (const auto protocol : {Protocol::Chat, Protocol::Responses, Protocol::Anthropic}) {
+        const Json base =
+            protocol == Protocol::Responses
+                ? Json{{"model", "m"}, {"input", "hello"}}
+                : Json{{"model", "m"},
+                       {"max_tokens", 512},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
+        const auto parse = [&](const Json& body) {
+            if (protocol == Protocol::Chat)
+                return parse_chat_completion_request(body, default_limits());
+            if (protocol == Protocol::Responses)
+                return parse_responses_request(body, default_limits()).generation;
+            return parse_messages_request(body, default_limits());
+        };
+        const auto set_budget = [&](Json& body, const Json& value) {
+            if (protocol == Protocol::Chat)
+                body["thinking_token_budget"] = value;
+            else if (protocol == Protocol::Responses)
+                body["ninfer"]["thinking_token_budget"] = value;
+            else
+                body["thinking"] = Json{{"type", "adaptive"}, {"budget_tokens", value}};
+        };
+        const auto disable = [&](Json& body) {
+            if (protocol == Protocol::Chat)
+                body["enable_thinking"] = false;
+            else if (protocol == Protocol::Responses)
+                body["reasoning"] = Json{{"effort", "none"}};
+            else {
+                if (!body.contains("thinking")) body["thinking"] = Json::object();
+                body["thinking"]["type"] = "disabled";
+            }
+        };
+        const auto set_low = [&](Json& body) {
+            if (protocol == Protocol::Chat)
+                body["reasoning_effort"] = "low";
+            else if (protocol == Protocol::Responses)
+                body["reasoning"] = Json{{"effort", "low"}};
+            else
+                body["output_config"] = Json{{"effort", "low"}};
+        };
+        for (const std::optional<std::uint32_t> default_budget :
+             {std::optional<std::uint32_t>{}, std::optional<std::uint32_t>{16384}}) {
+            ServeOptions server;
+            server.default_thinking_token_budget = default_budget;
+            const auto resolve                   = [&](const Json& body) {
+                const auto request = parse(body);
+                const auto semantics =
+                    resolve_request_semantics(request, server, effort_capabilities());
+                const auto options = to_request_options(request, server, semantics);
+                failures +=
+                    check(options.output.thinking_token_budget == semantics.thinking_token_budget,
+                          "resolved reasoning cap changed entering Engine options");
+                return semantics;
+            };
+            failures += check(!parse(base).thinking_token_budget_specified &&
+                                  resolve(base).thinking_token_budget == default_budget,
+                              "omitted reasoning cap did not inherit the server default");
+            Json null_wrapper = base;
+            if (protocol == Protocol::Responses)
+                null_wrapper["ninfer"] = nullptr;
+            else if (protocol == Protocol::Anthropic)
+                null_wrapper["thinking"] = nullptr;
+            failures += check(!parse(null_wrapper).thinking_token_budget_specified &&
+                                  resolve(null_wrapper).thinking_token_budget == default_budget,
+                              "null wrapper was mistaken for an explicit budget opt-out");
+            if (protocol == Protocol::Anthropic) {
+                Json adaptive        = base;
+                adaptive["thinking"] = Json{{"type", "adaptive"}};
+                failures += check(resolve(adaptive).thinking_token_budget == default_budget,
+                                  "adaptive thinking without budget did not inherit default");
+            }
+            Json explicit_null = base;
+            set_budget(explicit_null, nullptr);
+            failures += check(parse(explicit_null).thinking_token_budget_specified &&
+                                  !resolve(explicit_null).thinking_token_budget,
+                              "explicit null did not disable the server reasoning cap");
+            for (const std::uint32_t budget : {4096U, 4294967295U}) {
+                Json positive = base;
+                set_budget(positive, budget);
+                failures += check(parse(positive).thinking_token_budget_specified &&
+                                      resolve(positive).thinking_token_budget == budget,
+                                  "explicit positive reasoning cap did not override the default");
+                disable(positive);
+                failures += check(throws_api([&] { (void)resolve(positive); }),
+                                  "positive reasoning cap with disabled thinking was accepted");
+            }
+            Json disabled = base;
+            disable(disabled);
+            failures += check(!resolve(disabled).enable_thinking &&
+                                  !resolve(disabled).thinking_token_budget,
+                              "inherited reasoning cap remained active with thinking disabled");
+            disable(explicit_null);
+            failures += check(!resolve(explicit_null).thinking_token_budget,
+                              "disabled thinking rejected explicit unlimited reasoning");
+            server.enable_thinking = false;
+            Json low               = base;
+            set_low(low);
+            failures += check(resolve(low).enable_thinking &&
+                                  resolve(low).thinking_token_budget == default_budget,
+                              "effort-enabled thinking did not inherit the server cap");
+        }
+        for (const Json& value : {Json(0), Json(-1), Json(1.5), Json(4294967296ULL), Json(true)}) {
+            Json invalid = base;
+            set_budget(invalid, value);
+            failures += check(throws_api([&] { (void)parse(invalid); }),
+                              "protocol accepted an invalid reasoning cap");
+        }
+    }
+    return failures;
+}
+
 int test_reasoning_effort() {
     const Json base = {
         {"model", "m"},
         {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
     };
     int failures = 0;
+
+    Json capped                     = base;
+    capped["thinking_token_budget"] = 4096;
+    const auto capped_request       = parse_chat_completion_request(capped, default_limits());
+    failures += check(
+        capped_request.thinking_token_budget == 4096 &&
+            test_request_options(capped_request, default_server()).output.thinking_token_budget ==
+                4096,
+        "Chat reasoning cap did not reach Engine options");
+    for (const Json& value : {Json(0), Json(-1), Json(1.5), Json(4294967296ULL), Json(true)}) {
+        capped["thinking_token_budget"] = value;
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(capped, default_limits()); }),
+            "Chat accepted invalid reasoning cap");
+    }
+    capped["thinking_token_budget"] = nullptr;
+    failures +=
+        check(!parse_chat_completion_request(capped, default_limits()).thinking_token_budget,
+              "null cap was not unlimited");
+    capped["thinking_token_budget"] = 4096;
+    capped["enable_thinking"]       = false;
+    failures += check(throws_api([&] {
+                          (void)resolve_request_semantics(
+                              parse_chat_completion_request(capped, default_limits()),
+                              default_server(), effort_capabilities());
+                      }),
+                      "disabled thinking accepted a cap");
+    CompletionUsage capped_usage{
+        1,
+        4,
+        {.budget_tokens = 4096, .used_tokens = 4096, .forced_closes = 1, .limit_reached = true}};
+    capped_usage.reasoning_limit.forced_tokens.push_back(
+        {.generated_token_index = 3, .token = 42, .target_logprob = -2.5F});
+    const Json capped_wire = Json::parse(
+        make_chat_completion_response("id", "m", 0, "answer", "trace", "stop", capped_usage));
+    failures +=
+        check(capped_wire.at("usage").at("ninfer").at("reasoning_limit").at("forced_closes") == 1,
+              "Chat cap diagnostics missing from usage");
+
+    const auto& forced =
+        capped_wire.at("usage").at("ninfer").at("reasoning_limit").at("forced_tokens")[0];
+    failures +=
+        check(forced.at("policy_forced") == true && forced.at("generated_token_index") == 3 &&
+                  forced.at("target_logprob") == -2.5F,
+              "forced framing provenance missing");
+    ApiError failed;
+    failed.code            = "recovery_exhausted";
+    failed.reasoning_limit = capped_usage.reasoning_limit;
+    const Json failed_wire = Json::parse(make_error_body(failed));
+    failures +=
+        check(failed_wire.at("error").at("ninfer").at("reasoning_limit").at("used_tokens") == 4096,
+              "failed request lost reasoning policy ledger");
+    ninfer::RequestError request_error(ninfer::RequestErrorKind::RecoveryExhausted, "capped");
+    request_error.set_reasoning_limit(capped_usage.reasoning_limit);
+    failures += check(request_error.reasoning_limit().forced_tokens.size() == 1,
+                      "RequestError lost forced framing provenance");
 
     Json low                            = base;
     low["reasoning_effort"]             = "low";
@@ -298,16 +476,16 @@ int test_reasoning_effort() {
     high["reasoning_effort"]             = "high";
     const GenerationRequest high_request = parse_chat_completion_request(high, default_limits());
     failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
+                          (void)resolve_request_semantics(high_request, default_server(),
+                                                          effort_capabilities());
                       }) == "reasoning_effort_not_supported",
                       "protocol-valid high effort was not rejected by template capability");
 
     ninfer::PromptCapabilities toggle_capabilities;
     toggle_capabilities.enable_thinking = true;
     failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(low_request, default_server(),
-                                                         toggle_capabilities);
+                          (void)resolve_request_semantics(low_request, default_server(),
+                                                          toggle_capabilities);
                       }) == "reasoning_effort_not_supported",
                       "reasoning effort was accepted without template support");
 
@@ -316,8 +494,8 @@ int test_reasoning_effort() {
     const GenerationRequest conflicting_request =
         parse_chat_completion_request(conflict, default_limits());
     failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(conflicting_request, default_server(),
-                                                         effort_capabilities());
+                          (void)resolve_request_semantics(conflicting_request, default_server(),
+                                                          effort_capabilities());
                       }) == "conflicting_template_option",
                       "conflicting enable_thinking and reasoning_effort were accepted");
 
@@ -524,7 +702,7 @@ int test_parse_function_tools_and_choices() {
                       "tool definition json carried");
     failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "default tool choice is auto");
     failures += check(req.uses_tools(), "tools enabled by default");
-    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(test_request_options(req, default_server()).output.preserve_special_tokens,
                       "active tools preserve special tokens in Engine output");
 
     Json none           = base;
@@ -532,7 +710,7 @@ int test_parse_function_tools_and_choices() {
     req                 = parse_chat_completion_request(none, default_limits());
     failures += check(req.tool_choice.mode == ToolChoiceMode::None, "tool_choice none parsed");
     failures += check(!req.uses_tools(), "tool_choice none disables tools");
-    failures += check(!to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(!test_request_options(req, default_server()).output.preserve_special_tokens,
                       "disabled tools do not preserve special tokens");
 
     Json required           = base;
@@ -581,7 +759,7 @@ int test_parse_tool_history_messages() {
     failures += check(req.messages[2].tool_call_id == "call_1", "tool_call_id parsed");
     failures +=
         check(req.messages[2].content.at(0).text == R"({"temp":20})", "tool content parsed");
-    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(test_request_options(req, default_server()).output.preserve_special_tokens,
                       "tool history preserves special tokens in Engine output");
 
     Json text_parts                      = body;
@@ -622,7 +800,7 @@ int test_parse_stop_and_max_tokens() {
     failures += check(req.stop_strings.size() == 2, "two stop strings");
     failures += check(req.stop_strings[0] == "</s>", "stop string 0");
     failures += check(req.max_tokens == 42 && req.max_tokens_set, "max_completion_tokens alias");
-    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    const ninfer::RequestOptions options = test_request_options(req, default_server());
     failures += check(options.execution.requested_output_tokens == 42,
                       "max_completion_tokens reaches Engine options");
     failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "</s>" &&
@@ -655,7 +833,7 @@ int test_parse_sampling_carried() {
     failures +=
         check(req.sampling.logit_bias.count(5) == 1 && req.sampling.logit_bias.at(5) == -1.5,
               "logit_bias carried");
-    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    const ninfer::RequestOptions options = test_request_options(req, default_server());
     failures += check(options.execution.sampling.temperature == 0.7F,
                       "temperature reaches Engine overrides");
     failures += check(options.execution.sampling.top_p == 0.9F, "top_p reaches Engine overrides");
@@ -934,6 +1112,19 @@ int test_response_serialization() {
                                   .at("recovery")
                                   .at("discarded_reasoning_tokens") == 5,
                       "reasoning-only recovery lost accounting without a discarded tool");
+    recovery.discarded_reasoning_tokens = 0;
+    recovery.framing_repairs            = 1;
+    recovery.discarded_content_tokens   = 570;
+    recovered = make_completion_timings(10, 800, 0.25, 1.0, 0, 0, 0, 0, 0, recovery);
+    const auto replay_recovered =
+        Json::parse(make_chat_completion_response("replay-recovered", "m", 111, "answer", "thought",
+                                                  "stop", CompletionUsage{10, 800}, &recovered));
+    const auto& replay_usage = replay_recovered.at("usage");
+    const auto& replay_stats = replay_usage.at("prompt_tokens_details").at("ninfer").at("recovery");
+    failures += check(replay_usage.at("completion_tokens") == 800 &&
+                          replay_stats.at("discarded_content_tokens") == 570 &&
+                          replay_stats.at("framing_repairs") == 1,
+                      "withheld replay lost accounting or changed completion usage");
     failures += check(prefill_eval_tokens(10, 6) == 4 && prefill_eval_tokens(4, 6) == 0,
                       "prefill_eval_tokens clamps reused to the prompt");
     CompletionTimings one_token = make_completion_timings(10, 1, 0.25, 1.0);
@@ -1044,11 +1235,11 @@ int test_logprobs() {
                       "logprobs=true without top_logprobs reports no alternatives");
     const GenerationRequest five = parse_with(Json{{"logprobs", true}, {"top_logprobs", 5}});
     failures += check(five.top_logprobs == 5, "top_logprobs carried");
-    failures += check(to_request_options(five, default_server()).output.top_logprobs == 5U,
+    failures += check(test_request_options(five, default_server()).output.top_logprobs == 5U,
                       "top_logprobs reaches Engine output options");
-    failures +=
-        check(!to_request_options(parse_with(Json::object()), default_server()).output.top_logprobs,
-              "no logprobs requested from the Engine by default");
+    failures += check(
+        !test_request_options(parse_with(Json::object()), default_server()).output.top_logprobs,
+        "no logprobs requested from the Engine by default");
     failures += check(parse_with(Json{{"logprobs", true}, {"top_logprobs", 20}}).top_logprobs == 20,
                       "top_logprobs maximum accepted");
     failures += check(throws_api([&] { (void)parse_with(Json{{"top_logprobs", 3}}); }),
@@ -1526,6 +1717,7 @@ int main() {
     failures += test_ninfer_capture_object();
     failures += test_preserve_thinking_options();
     failures += test_reasoning_effort();
+    failures += test_default_thinking_budget();
     failures += test_parse_parts_and_flatten();
     failures += test_instruction_roles_preserved();
     failures += test_parse_media_in_translate();

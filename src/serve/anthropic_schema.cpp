@@ -1,4 +1,5 @@
 #include "serve/anthropic_schema.h"
+#include "serve/openai_schema.h"
 
 #include <array>
 #include <cctype>
@@ -461,6 +462,12 @@ void parse_thinking(const Json& body, GenerationRequest& out) {
     // adapter tolerates Claude Code's evolving thinking vocabulary.
     const std::string type = thinking.at("type").get<std::string>();
     out.enable_thinking    = (type != "disabled");
+    if (thinking.contains("budget_tokens")) {
+        out.thinking_token_budget_specified = true;
+        out.thinking_token_budget_param     = "thinking.budget_tokens";
+        out.thinking_token_budget = parse_thinking_token_budget(thinking.at("budget_tokens"),
+                                                                out.thinking_token_budget_param);
+    }
 }
 
 void parse_output_config(const Json& body, GenerationRequest& out) {
@@ -587,15 +594,18 @@ std::string make_messages_response(const std::string& id, const std::string& mod
                               {"input", std::move(input)}});
     }
     if (blocks.empty()) { blocks.push_back(Json{{"type", "text"}, {"text", ""}}); }
-    const Json payload = {{"id", id},
-                          {"type", "message"},
-                          {"role", "assistant"},
-                          {"model", model},
-                          {"content", std::move(blocks)},
-                          {"stop_reason", stop_reason},
-                          {"stop_sequence", nullptr},
-                          {"usage", Json{{"input_tokens", usage.prompt_tokens},
-                                         {"output_tokens", usage.completion_tokens}}}};
+    Json payload = {{"id", id},
+                    {"type", "message"},
+                    {"role", "assistant"},
+                    {"model", model},
+                    {"content", std::move(blocks)},
+                    {"stop_reason", stop_reason},
+                    {"stop_sequence", nullptr},
+                    {"usage", Json{{"input_tokens", usage.prompt_tokens},
+                                   {"output_tokens", usage.completion_tokens}}}};
+    if (usage.reasoning_limit.budget_tokens != 0) {
+        payload["usage"]["ninfer"]["reasoning_limit"] = reasoning_limit_json(usage.reasoning_limit);
+    }
     return payload.dump();
 }
 
@@ -666,11 +676,16 @@ std::string make_content_block_stop(int index) {
     return sse("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}});
 }
 
-std::string make_message_delta(const char* stop_reason, int output_tokens) {
+std::string make_message_delta(const char* stop_reason, int output_tokens,
+                               const ninfer::ReasoningLimitStats& reasoning_limit) {
+    Json usage = {{"output_tokens", output_tokens}};
+    if (reasoning_limit.budget_tokens != 0) {
+        usage["ninfer"]["reasoning_limit"] = reasoning_limit_json(reasoning_limit);
+    }
     return sse("message_delta",
                Json{{"type", "message_delta"},
                     {"delta", Json{{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
-                    {"usage", Json{{"output_tokens", output_tokens}}}});
+                    {"usage", std::move(usage)}});
 }
 
 std::string make_message_stop() { return sse("message_stop", Json{{"type", "message_stop"}}); }
@@ -678,9 +693,12 @@ std::string make_message_stop() { return sse("message_stop", Json{{"type", "mess
 std::string make_messages_ping() { return sse("ping", Json{{"type", "ping"}}); }
 
 std::string make_messages_error_body(const ApiError& error) {
-    const Json payload = {
+    Json payload = {
         {"type", "error"},
         {"error", Json{{"type", anthropic_error_type(error.status)}, {"message", error.message}}}};
+    if (error.reasoning_limit.budget_tokens != 0) {
+        payload["error"]["ninfer"]["reasoning_limit"] = reasoning_limit_json(error.reasoning_limit);
+    }
     return payload.dump();
 }
 

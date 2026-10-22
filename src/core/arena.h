@@ -125,6 +125,10 @@ public:
 
     [[nodiscard]] void* try_alloc(std::size_t bytes, std::size_t align = 256);
     void free(void* block);
+    // Resize a live block without moving its payload. Growth needs an adjacent free span;
+    // failure leaves ownership unchanged. Invalid blocks or reversed resize directions throw.
+    void shrink(void* block, std::size_t bytes);
+    [[nodiscard]] bool try_grow(void* block, std::size_t bytes);
 
     [[nodiscard]] void* base() const noexcept;
     [[nodiscard]] std::size_t capacity() const noexcept;

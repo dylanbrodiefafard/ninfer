@@ -54,8 +54,8 @@ existing captured arms from measured throughput, without a concurrency-specific 
 
 ### 1.2 Non-goals
 
-- General request preemption, swapping or active KV offload. The sole exception is the
-  bounded spare-lane short-prefill interruption in §7.3; it keeps all active state resident.
+- General request preemption and swapping. RAM-on settled KV-pressure suspension is bounded by
+  §5.8. Spare-lane short-prefill interruption in §7.3 keeps its owner resident.
 - 多请求 batched prefill；
 - 多 GPU 或 distributed inference；
 - priority、tenant QoS 或 deadline-aware GPU scheduling；
@@ -108,9 +108,10 @@ metadata 和一份 shared executor workspace；否则该 `max_concurrency` 无�
 
 ### 2.4 Admission guarantees completion capacity
 
-Admission requires capacity for the complete prompt, declared output bound and transient growth.
-A spare-lane prefill interruption changes execution order without releasing the suspended
-request's reservations. Later arrivals never truncate or evict an active request.
+With RAM off, admission reserves the complete prompt, declared output bound and transient growth.
+With RAM on, admission funds the full prompt and a useful output window plus either a joint
+completion claim or secured live-image credit (§5.8). A short-prefill interruption preserves the
+owner's lane and reservations. Output limits are never reduced by a reservation window.
 
 ### 2.5 Executing and suspended prefill owners
 
@@ -188,10 +189,10 @@ after draft IDs/parents have arrived on the host, then upload masks for target s
 Proposal sampling does not advance the grammar. Only the accepted publication transaction
 advances committed grammar; callback failures are surfaced before publication.
 
-Every MTP and DFlash2 verify round selects its schedule from stable session grammar
+Every MTP and DFlash2 verify round selects its schedule from stable session mask-policy
 presence at the synchronized round boundary, not from the matcher's current token
-phase, draft length or startup concurrency. A compact batch with no grammar row skips
-the exchange entirely and samples from its ingress configs. A batch with any grammar
+phase, draft length or startup concurrency. A compact batch with no grammar, replay or reasoning-budget mask row skips
+the exchange entirely and samples from its ingress configs. A batch with any mask-policy
 row forks the exchange from completed proposal production onto a dedicated
 host-callback stream; target verification proceeds and joins only before target
 sampling consumes masks/configs. Uploads cover only the batch's own rows. Fixed-pitch
@@ -240,6 +241,22 @@ injection, release of a known repeated call, an engine shutdown, or a promise of
 progress. Cancellation uses the normal boundary-owned lane cleanup.
 
 ---
+
+#### Reasoning-budget ownership
+
+OutputSession owns the cumulative reasoning-body token ledger and transactional preview masks.
+A speculative path charges only accepted IDs, and mask construction forks each hypothesis from
+the committed phase. At exhaustion the canonical close is an explicit token-domain policy;
+its unmasked target logprob is retained separately from channel confidence records. Runtime
+preserves this OutputSession through KV suspension and records the forced token against the
+cumulative generated-token index. The production policy closes thinking without a clean retry;
+explicit stops, cancellation and output/context ceilings remain authoritative. The internal
+Retry comparator is available to focused policy qualification and has no request-visible selector.
+
+Replay recovery withholds a proved initial answer replay and keeps generated IDs charged.
+A repaired close cannot be replay evidence for another repair. Replacement prose is withheld
+until it is accepted, and complete tool calls retain terminal publication. Exact repeated-tool
+proof and canonical feedback use the complete ordered batch, so added novel calls remain valid.
 
 ## 3. Overall architecture
 
@@ -476,6 +493,9 @@ preparation 和 Engine admission waiting。
 priority。
 
 ### 5.2 Authoritative admission feasibility
+
+The full-lifetime donor/backfill rules in §§5.2–5.7 apply with RAM off. RAM-on uses the same
+target-authoritative pool vectors with the window and progress rules in §5.8.
 
 Scheduler 不从 token 数或显存字节重新推导请求能否进入。Target/resource layer 为每个 prepared request
 给出已经按各 pool 物理粒度取整的 authoritative entitlement vector。逻辑上至少包含：
@@ -756,6 +776,62 @@ credit、成为当前 frontier donor，或增加任何 admitted request 的 work
 
 ---
 
+### 5.8 RAM-on output windows and live continuation
+
+Enabling `--kv-ram-capacity` selects output windows of at most 8192 tokens; no separate toggle is
+required. The full prompt and target-declared speculative headroom must fit before prefill. Eight
+chats with 32768-token output limits initially reserve at most 65536 output tokens, plus prompt
+and rounded backend headroom, rather than 262144 output tokens. Lifetime output/context limits
+remain unchanged. Teacher-forced scoring reserves its complete extent because it has no scheduler
+to extend windows.
+
+At each settled boundary, the executor handles cancellation and transfer readiness, retries window
+growth, then considers resume and ingress. Decode round budgets stop at both the funded window and
+the lifetime limit. Exhausting a window blocks that lane without finishing the request; other lanes
+continue. Target planning owns every rounded Main/backend resource vector and mapped-page floor.
+Before suspension, unused future window entitlement may shrink to satisfy a concrete transaction,
+retaining all represented pages and at least one useful next output token.
+
+Each admitted identity has either secured contiguous RAM credit through its current window end or
+a completion claim. The sum of completion members' immutable target-produced lifetime envelopes
+fits every GPU pool and lane axis, including enabled native recovery suffix growth. These claims
+prove future progress and do not allocate lifetime KV. Backed peers can evacuate so the cohort
+finishes without another RAM allocation. A cohort member can become a victim only after funding
+its image and exchanging its claim with a feasible progressing successor. Restore holds its
+completion claim before transfer and keeps image backing until all readers finish. Queued
+replacement claims remain held through capture and admission.
+
+A single blocked lane waits while peers advance unless a funded queued replacement can use its
+release. Two blocked lanes, no executable work, or the finite bypass limit opens sticky drain.
+Pressure plans prove the complete post-transition resource vectors and select the minimum useful
+victim set, favoring blocked lanes and lower transfer cost. Unblocked lanes are not suspended merely
+because ingress waits. The first blocked or suspended identity freezes an incumbent epoch with at
+most `C-1` fresh admissions, without refunds; only the oldest incumbent's completion or cancellation
+resets it. Oldest suspended work precedes fresh ingress. A resumed victim must advance a useful
+chunk before resuspension unless no executable work remains. Suspended and transfer-held identities
+still count against `C + max_pending_requests` and are exempt from pre-admission queue timeout.
+
+Capture occurs only after output/state commit and GDN history materialization. It preserves exact
+KV pages/publications, GDN, hidden/rewrite/checkpoint state, DFlash cyclic state and pending features,
+ledger/prefix identity, sampling counters and request controls. GPU ownership survives until the
+copy fence settles. Restore binds independent pages on a free physical lane, resets destination GDN
+history, rebinds lane-affine sampling pointers and continues without prefill, resampling or output
+replay. The request's OutputSession, RNG, budget, recovery and event queues retain logical ownership.
+Unrelated lanes can decode during transfers. Cancellation and shutdown fence transfers before
+releasing image credits or device state.
+
+Live images are private and never prefix-lookup entries, optional eviction victims or disk spills.
+They share the configured RAM arena with completed/system prefixes, and take precedence over those
+optional entries. Credits include alignment, current/rewrite/checkpoint/backend state and transfer
+readers; fragmented free space cannot promise an unallocatable image. Finite backing may reduce
+residency when neither a completion claim nor a useful funded image fits. No live request falls
+back to disk or re-prefill for pressure. Short-prefill interruptions secure the same claim or credit
+and consume the same ingress fairness allowance as ordinary windowed admission.
+
+`RuntimeStats` reports the window ceiling, growth-blocked and suspended counts, extensions and live
+suspend/resume totals. `/metrics` and `/metrics.json` expose the same values. These counters describe
+scheduling activity, not a throughput improvement.
+
 ## 6. Shared context and state memory
 
 本节只定义 concurrent engine 使用 Sequence-State Store 的 resource contract 和 ownership
@@ -776,6 +852,8 @@ memory。Fixed recurrent/backend backing 与 current lane 绑定；这是物理�
 compact row identity绑定到 lane。
 
 ### 6.2 Completion reservation
+
+This section describes RAM-off reservation. RAM-on windows and completion claims follow §5.8.
 
 Admission 为每个 request 计算 target-specific entitlement。Main Text 的逻辑上界为：
 
@@ -1847,7 +1925,7 @@ ready requests          selected definition
 
 request identity 和 occupied slot 都不影响 graph identity。
 
-### 12.4 Shared 128K context with two slots
+### 12.4 Shared 128K context with two slots (RAM off)
 
 假设相关 shared context capacity 为 128K units：
 

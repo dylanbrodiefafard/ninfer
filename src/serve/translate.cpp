@@ -124,15 +124,28 @@ void apply_leading_system_prepend(std::vector<ninfer::ChatMessage>& messages,
 
 } // namespace
 
-ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
-                                                 const ServeOptions& server,
-                                                 const ninfer::PromptCapabilities& capabilities) {
-    ResolvedPromptSemantics result{
+ResolvedRequestSemantics resolve_request_semantics(const GenerationRequest& request,
+                                                   const ServeOptions& server,
+                                                   const ninfer::PromptCapabilities& capabilities) {
+    ResolvedRequestSemantics result{
         .enable_thinking   = request.enable_thinking.value_or(server.enable_thinking),
         .reasoning_effort  = std::nullopt,
         .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
     };
-    if (!request.reasoning_effort) { return result; }
+    const auto resolve_budget = [&] {
+        if (request.thinking_token_budget && !result.enable_thinking) {
+            invalid_prompt_option("thinking token budget requires enabled thinking",
+                                  request.thinking_token_budget_param,
+                                  "conflicting_template_option");
+        }
+        if (result.enable_thinking) {
+            result.thinking_token_budget = request.thinking_token_budget_specified
+                                               ? request.thinking_token_budget
+                                               : server.default_thinking_token_budget;
+        }
+        return result;
+    };
+    if (!request.reasoning_effort) { return resolve_budget(); }
 
     const RequestedReasoningEffort requested = *request.reasoning_effort;
     const bool enables_thinking              = requested != RequestedReasoningEffort::None;
@@ -147,7 +160,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             invalid_prompt_option("the loaded chat template cannot disable thinking",
                                   request.reasoning_effort_param, "reasoning_effort_not_supported");
         }
-        return result;
+        return resolve_budget();
     }
 
     switch (requested) {
@@ -177,11 +190,11 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
                                   "' is not supported by the loaded chat template",
                               request.reasoning_effort_param, "reasoning_effort_not_supported");
     }
-    return result;
+    return resolve_budget();
 }
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
-                                    const ResolvedPromptSemantics& semantics,
+                                    const ResolvedRequestSemantics& semantics,
                                     const MediaAcquirer& acquire_media,
                                     std::string_view system_prepend) {
     ninfer::PromptInput input;
@@ -241,13 +254,15 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
 }
 
 ninfer::RequestOptions to_request_options(const GenerationRequest& request,
-                                          const ServeOptions& server) {
+                                          const ServeOptions& server,
+                                          const ResolvedRequestSemantics& semantics) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens    = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse         = server.allow_prefix_reuse;
     options.execution.cache_write                = request.cache_write;
     options.execution.capture_context_checkpoint = request.capture_context_checkpoint;
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
+    options.output.thinking_token_budget   = semantics.thinking_token_budget;
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
     if (request.top_logprobs) {

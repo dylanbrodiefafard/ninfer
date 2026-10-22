@@ -43,8 +43,8 @@ ninfer::OwnedMedia unused_media(const ContentPart&) {
     throw std::logic_error("media acquisition was not expected");
 }
 
-ResolvedPromptSemantics prompt_semantics() {
-    ResolvedPromptSemantics semantics;
+ResolvedRequestSemantics prompt_semantics() {
+    ResolvedRequestSemantics semantics;
     semantics.enable_thinking   = true;
     semantics.preserve_thinking = false;
     semantics.reasoning_effort  = std::nullopt;

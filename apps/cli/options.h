@@ -45,6 +45,7 @@ struct Options {
     bool capture_context_checkpoint = false;
     std::optional<std::vector<std::uint32_t>> context_checkpoint_marks;
 
+    std::optional<std::uint32_t> thinking_token_budget;
     bool raw_output      = false;
     bool print_token_ids = false;
     bool enable_thinking = true;

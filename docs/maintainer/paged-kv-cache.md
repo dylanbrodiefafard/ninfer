@@ -31,9 +31,8 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 
 ### 1.1 Non-goals
 
-- request preemption, swap, **active** KV offload, or cross-GPU storage; a completed retained
-  bundle may be kept in pinned host memory under `--kv-ram-capacity`, but that is not
-  active-request offload;
+- general request preemption, swapping or cross-GPU storage; settled RAM-on pressure
+  suspension follows §5.8 of `concurrent-inference-architecture.md`;
 - active requests 之间共享可写 prefix、page reference counting 或 copy-on-write branching；
 - arbitrary longest-common-prefix reuse；
 - 用一个 universal raw-byte allocator 在 serving 期间动态重分不同 KV layouts 的显存；
@@ -652,8 +651,11 @@ blocks；其 Full pool 使用 §4.3 的 head-major page-run order。两者保留
 
 ## 8. Vector reservation and admission
 
-NInfer 不支持 preemption，因此 admission 必须为 sequence 的最大物理 KV extent 建立完整 reservation
-vector。Target 根据 request 和 fixed Engine mode 计算：
+With RAM off, admission reserves the maximum physical extent for the full effective output
+lifetime. With RAM on, it reserves the full prompt plus at most 8192 output tokens and target-owned
+speculative headroom. The executor extends windows at settled boundaries without reducing output
+limits. Completion claims and secured live images guarantee progress as described in §5.8 of
+`concurrent-inference-architecture.md`. Target computes the same typed vector for each window:
 
 ```text
 KVReservation(request) = {
@@ -665,7 +667,7 @@ KVReservation(request) = {
 计算包含：
 
 - prompt 尚未 materialize 的 main/backend positions；
-- maximum permitted generated output；
+- full effective output with RAM off, or the funded output window with RAM on;
 - selected backend 可能触及的 bounded provisional tail；
 - 每个 pool 自己的 page rounding；
 - retained bundle 已经持有的 mapped pages；
@@ -710,6 +712,12 @@ pages: the pinned host image is an independent copy in logical-page order, and G
 and mapped counts still describe device allocations only.
 
 ---
+
+Live RAM continuations borrow secured contiguous arena credits. They are excluded from prefix
+lookup, optional eviction and disk spill. RAM occupancy includes credits and live images once,
+including transfer-held capacity. Suspension retains GPU pages until capture completion; resume
+restores the exact mapped-page floor into independent pages and can select another physical lane.
+Window shrink releases only unused entitlement, preserving mapped pages and speculative headroom.
 
 ## 9. KV lifecycle
 

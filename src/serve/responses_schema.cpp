@@ -935,6 +935,10 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
              {"output_tokens", outcome.completion_tokens},
              {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
              {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
+    if (outcome.metrics.reasoning_limit.budget_tokens != 0) {
+        response["usage"]["ninfer"]["reasoning_limit"] =
+            reasoning_limit_json(outcome.metrics.reasoning_limit);
+    }
     built.body = std::move(response);
     return built;
 }
@@ -1305,6 +1309,10 @@ std::string ResponsesEventStream::failed(const ApiError& error) {
     response["completed_at"] = completion_time_now();
     response["error"]        = Json{{"code", error.code.empty() ? Json(nullptr) : Json(error.code)},
                                     {"message", error.message}};
+    if (error.reasoning_limit.budget_tokens != 0) {
+        response["error"]["ninfer"]["reasoning_limit"] =
+            reasoning_limit_json(error.reasoning_limit);
+    }
     return sse(impl_->event("response.failed", Json{{"response", response}}));
 }
 

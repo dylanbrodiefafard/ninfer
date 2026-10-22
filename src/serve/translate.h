@@ -16,18 +16,19 @@ namespace ninfer::serve {
 // target frontend sees it.
 using MediaAcquirer = std::function<ninfer::OwnedMedia(const ContentPart&)>;
 
-struct ResolvedPromptSemantics {
+struct ResolvedRequestSemantics {
     bool enable_thinking = true;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
     bool preserve_thinking = false;
+    std::optional<std::uint32_t> thinking_token_budget;
 };
 
-ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
-                                                 const ServeOptions& server,
-                                                 const ninfer::PromptCapabilities& capabilities);
+ResolvedRequestSemantics resolve_request_semantics(const GenerationRequest& request,
+                                                   const ServeOptions& server,
+                                                   const ninfer::PromptCapabilities& capabilities);
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
-                                    const ResolvedPromptSemantics& semantics,
+                                    const ResolvedRequestSemantics& semantics,
                                     const MediaAcquirer& acquire_media,
                                     std::string_view system_prepend = {});
 
@@ -35,7 +36,8 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
 // sampler is resolved from the request's SamplingParams over the server defaults;
 // --greedy on the server forces exact argmax regardless of the request.
 ninfer::RequestOptions to_request_options(const GenerationRequest& request,
-                                          const ServeOptions& server);
+                                          const ServeOptions& server,
+                                          const ResolvedRequestSemantics& semantics);
 
 // Map an internal finish reason onto the OpenAI wire value. Cancelled maps to
 // "stop" (a disconnected client is not an error state on the wire).

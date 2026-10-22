@@ -83,6 +83,8 @@ struct RamLadderImage {
 
 struct RamCaptureSource {
     bool system_prompt                    = false;
+    std::uint64_t live_owner              = 0;
+    std::size_t live_reserved_tail_bytes  = 0;
     std::uint32_t execution_frontier      = 0;
     std::uint32_t ledger_frontier         = 0;
     std::int32_t rope_delta               = 0;
@@ -217,6 +219,19 @@ public:
     void discard(std::uint64_t entry_id);
     [[nodiscard]] bool is_claimed(std::uint64_t entry_id) const;
 
+    // Credits own real contiguous arena blocks; live images borrow them and are never indexed.
+    [[nodiscard]] bool reserve_live_credit(std::uint64_t owner, std::size_t bytes);
+    void release_live_credit(std::uint64_t owner);
+    [[nodiscard]] std::pair<void*, std::size_t> live_credit_view(std::uint64_t owner) const;
+    void retire_live_image(std::uint64_t id);
+    void wait_live_image(std::uint64_t id);
+    [[nodiscard]] bool live_image_ready(std::uint64_t id) const;
+    [[nodiscard]] static std::size_t
+    live_image_budget(const PagedKVPool& text, const PagedKVPool* backend, std::uint32_t text_pages,
+                      std::uint32_t backend_pages, std::size_t ledger_tokens,
+                      std::size_t identity_bytes, std::size_t conv_bytes,
+                      std::size_t recurrent_bytes, std::size_t hidden_bytes,
+                      std::size_t cyclic_bytes, std::size_t checkpoint_count);
     [[nodiscard]] RamCaptureResult capture(const RamCaptureSource& source);
     [[nodiscard]] bool is_system_prompt(std::uint64_t entry_id) const;
     [[nodiscard]] bool has_system_prompt(const PreparedPromptData& prompt,
@@ -367,9 +382,10 @@ private:
     };
 
     struct Record {
-        std::uint64_t id        = 0;
-        bool system_prompt      = false;
-        std::uint64_t last_used = 0;
+        std::uint64_t id         = 0;
+        bool system_prompt       = false;
+        std::uint64_t live_owner = 0;
+        std::uint64_t last_used  = 0;
         PrefixHash128 hash_f{};
         PrefixHash128 hash_c{};
         bool hash_c_valid                 = false;
@@ -430,6 +446,12 @@ private:
 
     void bump_version() noexcept { ++index_version_; }
 
+    struct LiveCredit {
+        void* block       = nullptr;
+        std::size_t bytes = 0;
+    };
+
+    std::unordered_map<std::uint64_t, LiveCredit> live_credits_;
     HostPinnedArena arena_;
     // Rewrite and ladder image copies into and out of entry blocks. Destroyed (drained) before
     // the arena its callbacks write.

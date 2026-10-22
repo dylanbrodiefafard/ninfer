@@ -224,9 +224,10 @@ void HttpServer::log_request_done(const RequestLogContext& context,
     write_request_done_logs(request_jsonl_, context, outcome);
 }
 
-void HttpServer::log_request_error(const RequestLogContext& context, const std::string& message) {
+void HttpServer::log_request_error(const RequestLogContext& context, const std::string& message,
+                                   const ninfer::ReasoningLimitStats* reasoning_limit) {
     log_line(format_request_error(context, message));
-    request_jsonl_.write_request_error(context, message);
+    request_jsonl_.write_request_error(context, message, reasoning_limit);
 }
 
 void HttpServer::emit_openai_error(httplib::Response& response, const ApiError& error) {
@@ -278,7 +279,7 @@ void HttpServer::record_rejection(const RequestRejectionLogContext& context,
 void HttpServer::record_failure(const RequestLogContext& context, bool tools, bool capture,
                                 bool media, const std::string& message, const ApiError* error,
                                 bool count_api_error) {
-    log_request_error(context, message);
+    log_request_error(context, message, error ? &error->reasoning_limit : nullptr);
     if (count_api_error && error != nullptr) { metrics_.observe_api_error(error->code); }
     GenerationObservation observation;
     observation.protocol          = metrics_protocol(context.protocol);
@@ -290,7 +291,10 @@ void HttpServer::record_failure(const RequestLogContext& context, bool tools, bo
     observation.tools             = tools;
     observation.capture_requested = capture;
     observation.has_media         = media;
-    if (error != nullptr) { observation.recovery = &error->recovery; }
+    if (error != nullptr) {
+        observation.recovery        = &error->recovery;
+        observation.reasoning_limit = &error->reasoning_limit;
+    }
     metrics_.observe_generation(observation);
 }
 
@@ -601,7 +605,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 prepared, log_context.id, nullptr,
                 [&req] { return req.is_connection_alive && !req.is_connection_alive(); },
                 recovery_callback(log_context.id));
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens,
+                                        outcome.metrics.reasoning_limit};
             const CompletionTimings timings = completion_timings_from_outcome(outcome);
             std::string response_body;
             const std::vector<TokenLogprobEntry>* logprobs =
@@ -688,7 +693,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_tool_calls(
                                           id, model, created, outcome.tool_calls, include_usage));
-                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens,
+                                                outcome.metrics.reasoning_limit};
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_final(id, model, created, "tool_calls",
                                                             include_usage, &timings, &usage));
@@ -696,7 +702,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     if (tool_capable && !remaining.empty()) {
                         write_stream_item(sink, *stream, content_chunk(std::string(remaining), {}));
                     }
-                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens,
+                                                outcome.metrics.reasoning_limit};
                     write_stream_item(
                         sink, *stream,
                         make_chat_chunk_final(id, model, created,
@@ -706,7 +713,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 // Always emit usage+timings trailer (llama.cpp timings_per_token style) so
                 // Open WebUI/LiteLLM can populate the info bubble without include_usage.
                 {
-                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens,
+                                                outcome.metrics.reasoning_limit};
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_usage(id, model, created, usage, &timings));
                 }
@@ -863,7 +871,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 prepared, log_context.id, nullptr,
                 [&req] { return req.is_connection_alive && !req.is_connection_alive(); },
                 recovery_callback(log_context.id));
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens,
+                                        outcome.metrics.reasoning_limit};
             const char* stop_reason =
                 messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
             const std::string response_body = make_messages_response(
@@ -988,7 +997,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 const char* stop_reason =
                     messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
                 write_stream_item(sink, *stream,
-                                  make_message_delta(stop_reason, outcome.completion_tokens));
+                                  make_message_delta(stop_reason, outcome.completion_tokens,
+                                                     outcome.metrics.reasoning_limit));
                 write_stream_item(sink, *stream, make_message_stop());
                 record_generation(log_context, std::move(outcome), generation_tools,
                                   generation_capture, generation_media, generation_started);

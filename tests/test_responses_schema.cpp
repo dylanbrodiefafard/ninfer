@@ -164,8 +164,16 @@ int test_instruction_message_order() {
 }
 
 int test_reasoning_effort() {
+    int budget_failures = 0;
+    const Json capped   = {
+        {"model", "m"}, {"input", "hello"}, {"ninfer", {{"thinking_token_budget", 16384}}}};
+    const auto capped_request = parse_responses_request(capped, limits());
+    budget_failures += check(capped_request.generation.thinking_token_budget == 16384 &&
+                                 capped_request.generation.thinking_token_budget_param ==
+                                     "ninfer.thinking_token_budget",
+                             "Responses cap or source parameter missing");
     const Json base = {{"model", "m"}, {"input", "hello"}, {"max_output_tokens", 32}};
-    int failures    = 0;
+    int failures    = budget_failures;
 
     for (const auto& [wire, expected] :
          std::array<std::pair<const char*, RequestedReasoningEffort>, 7>{
@@ -186,15 +194,15 @@ int test_reasoning_effort() {
     Json low                            = base;
     low["reasoning"]                    = Json{{"effort", "low"}};
     const GenerationRequest low_request = parse_responses_request(low, limits()).generation;
-    const ResolvedPromptSemantics low_semantics =
-        resolve_prompt_semantics(low_request, ServeOptions{}, effort_capabilities());
+    const ResolvedRequestSemantics low_semantics =
+        resolve_request_semantics(low_request, ServeOptions{}, effort_capabilities());
     failures += check(low_semantics.enable_thinking &&
                           low_semantics.reasoning_effort == ninfer::ReasoningEffort::Low,
                       "Responses low effort did not resolve through template capabilities");
 
-    Json none                                    = base;
-    none["reasoning"]                            = Json{{"effort", "none"}};
-    const ResolvedPromptSemantics none_semantics = resolve_prompt_semantics(
+    Json none                                     = base;
+    none["reasoning"]                             = Json{{"effort", "none"}};
+    const ResolvedRequestSemantics none_semantics = resolve_request_semantics(
         parse_responses_request(none, limits()).generation, ServeOptions{}, effort_capabilities());
     failures += check(!none_semantics.enable_thinking && !none_semantics.reasoning_effort,
                       "Responses none effort did not disable thinking");
@@ -203,8 +211,8 @@ int test_reasoning_effort() {
     high["reasoning"]                    = Json{{"effort", "high"}};
     const GenerationRequest high_request = parse_responses_request(high, limits()).generation;
     failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, ServeOptions{},
-                                                         effort_capabilities());
+                          (void)resolve_request_semantics(high_request, ServeOptions{},
+                                                          effort_capabilities());
                       }) == "reasoning_effort_not_supported",
                       "Responses high effort bypassed template capability validation");
 
@@ -439,12 +447,17 @@ int test_response_object() {
                                                             {"store", false}},
                                                        limits());
     ResponsesRuntimeValues runtime;
-    runtime.temperature = 0.6F;
-    runtime.top_p       = 0.95F;
-    const BuiltResponse built =
-        make_response_object("resp_test", 123, request, runtime, sample_outcome());
-    const Json& response = built.body;
-    int failures         = 0;
+    runtime.temperature             = 0.6F;
+    runtime.top_p                   = 0.95F;
+    auto outcome                    = sample_outcome();
+    outcome.metrics.reasoning_limit = {
+        .budget_tokens = 4096, .used_tokens = 4096, .forced_closes = 1, .limit_reached = true};
+    const BuiltResponse built = make_response_object("resp_test", 123, request, runtime, outcome);
+    const Json& response      = built.body;
+    int failures              = 0;
+    failures +=
+        check(response.at("usage").at("ninfer").at("reasoning_limit").at("used_tokens") == 4096,
+              "Responses reasoning cap usage missing");
     failures += check(response.at("object") == "response" && response.at("status") == "completed",
                       "completed response envelope");
     failures += check(response.at("output").size() == 2 &&
@@ -701,7 +714,7 @@ int test_system_prepend() {
                       "instructions did not compose as Developer");
     const ninfer::PromptInput merged = to_prompt_input(
         instructed.generation,
-        resolve_prompt_semantics(instructed.generation, server, effort_capabilities()),
+        resolve_request_semantics(instructed.generation, server, effort_capabilities()),
         unused_media, "P");
     failures += check(merged.messages[0].role == ninfer::ChatRole::Developer &&
                           joined_text(merged.messages[0]) == "P\n\nbe concise",
@@ -727,7 +740,7 @@ int test_system_prepend() {
     compose_responses_generation_messages(follow, {previous_user, previous_assistant});
     const ninfer::PromptInput inserted =
         to_prompt_input(follow.generation,
-                        resolve_prompt_semantics(follow.generation, server, effort_capabilities()),
+                        resolve_request_semantics(follow.generation, server, effort_capabilities()),
                         unused_media, "P");
     failures += check(inserted.messages[0].role == ninfer::ChatRole::System &&
                           joined_text(inserted.messages[0]) == "P",

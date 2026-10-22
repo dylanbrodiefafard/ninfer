@@ -243,11 +243,11 @@ int detector_new_long_periods() {
 }
 
 int persistent_recovery_evidence() {
-    using ninfer::runtime::RepeatedReasoningSpan;
+    using ninfer::runtime::RepeatedTokenSpan;
     int failures = 0;
     std::vector<TokenId> paragraph(256);
     for (std::size_t i = 0; i < paragraph.size(); ++i) { paragraph[i] = 10000 + i; }
-    RepeatedReasoningSpan detector;
+    RepeatedTokenSpan detector;
     failures += check(!detector.observe(repeat_block(paragraph, 2)),
                       "two paragraphs triggered a retry without persistence evidence");
     auto three = repeat_block(paragraph, 3);
@@ -295,6 +295,29 @@ int persistent_recovery_evidence() {
     long_copies.insert(long_copies.end(), paragraph.begin(), paragraph.begin() + 256);
     failures += check(detector.observe(long_copies),
                       "a multi-paragraph cycle above the square ceiling escaped recovery");
+    // Channel gaps are real boundaries, not whitespace to concatenate away.
+    ninfer::runtime::RepeatedChannelSpan content;
+    std::vector<std::optional<ninfer::OutputChannel>> channels(4352,
+                                                               ninfer::OutputChannel::Content);
+    content.observe(uniform, channels, ninfer::OutputChannel::Content);
+    failures += check(content.detected(), "answer repetition did not detect the exact boundary");
+    content        = {};
+    channels[2176] = std::nullopt; // tool framing/arguments cannot join two spans
+    content.observe(uniform, channels, ninfer::OutputChannel::Content);
+    failures += check(!content.detected(), "answer evidence crossed a tool/framing gap");
+    channels.assign(4352, ninfer::OutputChannel::Reasoning);
+    content.observe(uniform, channels, ninfer::OutputChannel::Content);
+    failures += check(!content.detected(), "reasoning was counted as repetitive answer text");
+    content = {};
+    channels.assign(4352, ninfer::OutputChannel::Content);
+    content.observe(std::span(uniform).first(4000), std::span(channels).first(4000),
+                    ninfer::OutputChannel::Content);
+    content.observe(std::span(uniform).subspan(4000), std::span(channels).subspan(4000),
+                    ninfer::OutputChannel::Content);
+    const std::vector<TokenId> eos{6};
+    const std::vector<std::optional<ninfer::OutputChannel>> silent{std::nullopt};
+    content.observe(eos, silent, ninfer::OutputChannel::Content);
+    failures += check(content.detected(), "EOS forgot repetition proved earlier in the round");
     return failures;
 }
 

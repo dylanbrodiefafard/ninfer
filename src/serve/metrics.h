@@ -56,6 +56,11 @@ inline constexpr std::string_view kMetricFamilies[] = {
     "ninfer_generation_prompt_tokens",
     "ninfer_generation_completion_tokens",
     "ninfer_generation_reasoning_tokens",
+    "ninfer_reasoning_limit_requests_total",
+    "ninfer_reasoning_limit_tokens_total",
+    "ninfer_reasoning_limit_reached_total",
+    "ninfer_reasoning_limit_forced_closes_total",
+    "ninfer_reasoning_limit_retries_total",
     "ninfer_generation_computed_prefill_tokens",
     "ninfer_generation_output_tokens_per_second",
     "ninfer_generation_prefill_tokens_per_second",
@@ -68,6 +73,12 @@ inline constexpr std::string_view kMetricFamilies[] = {
     "ninfer_scheduler_prefilling_requests",
     "ninfer_scheduler_decode_ready_requests",
     "ninfer_scheduler_waiting_requests",
+    "ninfer_kv_execution_window_tokens",
+    "ninfer_kv_growth_blocked_requests",
+    "ninfer_kv_suspended_requests",
+    "ninfer_kv_window_extensions_total",
+    "ninfer_kv_live_suspensions_total",
+    "ninfer_kv_live_resumes_total",
     "ninfer_engine_computed_prefill_tokens_total",
     "ninfer_engine_committed_decode_tokens_total",
     "ninfer_engine_decode_rounds_total",
@@ -122,6 +133,8 @@ inline constexpr std::string_view kMetricFamilies[] = {
     "ninfer_recovery_cycle_exclusions_total",
     "ninfer_recovery_discarded_reasoning_tokens_total",
     "ninfer_recovery_discarded_tool_calls_total",
+    "ninfer_recovery_framing_repairs_total",
+    "ninfer_recovery_discarded_content_tokens_total",
     "ninfer_recovery_attempts",
     "ninfer_response_store_records",
     "ninfer_response_store_bytes",
@@ -158,15 +171,16 @@ struct ScrapeInputs {
 // One HTTP generation terminal or reject. `outcome` is set for a finished run.
 // `recovery` is set when the error path has stats and no outcome.
 struct GenerationObservation {
-    MetricsProtocol protocol                        = MetricsProtocol::OpenAiChat;
-    bool stream                                     = false;
-    GenerationResult result                         = GenerationResult::Success;
-    bool thinking                                   = false;
-    bool tools                                      = false;
-    bool capture_requested                          = false;
-    bool has_media                                  = false;
-    const GenerationOutcome* outcome                = nullptr;
-    const ninfer::GenerationRecoveryStats* recovery = nullptr;
+    MetricsProtocol protocol                           = MetricsProtocol::OpenAiChat;
+    bool stream                                        = false;
+    GenerationResult result                            = GenerationResult::Success;
+    bool thinking                                      = false;
+    bool tools                                         = false;
+    bool capture_requested                             = false;
+    bool has_media                                     = false;
+    const GenerationOutcome* outcome                   = nullptr;
+    const ninfer::GenerationRecoveryStats* recovery    = nullptr;
+    const ninfer::ReasoningLimitStats* reasoning_limit = nullptr;
 };
 
 struct MetricsSnapshotData;

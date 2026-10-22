@@ -61,20 +61,22 @@ GenerationOutcome success_outcome() {
     outcome.reasoning_tokens  = 0;
     outcome.finish_reason     = ninfer::FinishReason::StopToken;
     outcome.tool_calls.resize(2);
-    outcome.metrics.speculative_backend         = ninfer::SpeculativeBackend::Mtp;
-    outcome.metrics.speculative_accepted_tokens = 6;
-    outcome.metrics.speculative_draft_tokens    = 12;
-    outcome.metrics.speculative_rounds          = 3;
-    outcome.metrics.prefix_cache_hit_tokens     = 40;
-    outcome.metrics.prefix_reuse_path           = ninfer::PrefixReusePath::AppendAtFrontier;
-    outcome.metrics.prefix_reuse_source         = ninfer::PrefixReuseSource::HostRam;
-    outcome.metrics.recovery.cycle_exclusions   = 4;
-    outcome.metrics.queued_seconds              = 0.2;
-    outcome.metrics.copy_hold_seconds           = 0.05;
-    outcome.metrics.decode_seconds              = 1.0;
-    outcome.metrics.ttft_seconds                = 0.3;
-    outcome.metrics.total_seconds               = 1.4;
-    outcome.metrics.prefill_seconds             = 0.1;
+    outcome.metrics.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
+    outcome.metrics.speculative_accepted_tokens       = 6;
+    outcome.metrics.speculative_draft_tokens          = 12;
+    outcome.metrics.speculative_rounds                = 3;
+    outcome.metrics.prefix_cache_hit_tokens           = 40;
+    outcome.metrics.prefix_reuse_path                 = ninfer::PrefixReusePath::AppendAtFrontier;
+    outcome.metrics.prefix_reuse_source               = ninfer::PrefixReuseSource::HostRam;
+    outcome.metrics.recovery.cycle_exclusions         = 4;
+    outcome.metrics.recovery.framing_repairs          = 1;
+    outcome.metrics.recovery.discarded_content_tokens = 570;
+    outcome.metrics.queued_seconds                    = 0.2;
+    outcome.metrics.copy_hold_seconds                 = 0.05;
+    outcome.metrics.decode_seconds                    = 1.0;
+    outcome.metrics.ttft_seconds                      = 0.3;
+    outcome.metrics.total_seconds                     = 1.4;
+    outcome.metrics.prefill_seconds                   = 0.1;
     return outcome;
 }
 
@@ -101,14 +103,28 @@ int main() {
     inputs.stats.kv_ram_system_prompt_restores   = 7;
     inputs.stats.kv_ram_system_prompt_evictions  = 3;
     inputs.stats.kv_ram_used_bytes               = 4096;
-    inputs.stats.kv_disk_spill_active            = true;
-    inputs.stats.kv_disk_defrag_active           = true;
-    inputs.stats.kv_disk_storage_bytes           = 8388608;
-    inputs.stats.kv_disk_restore_active          = true;
-    inputs.stats.kv_disk_pending_jobs            = 3;
-    inputs.stats.kv_disk_spill_elapsed_seconds   = 12.165;
-    const auto snapshot                          = metrics.snapshot(inputs);
-    const std::string text                       = snapshot.prometheus_text();
+    inputs.stats.kv_execution_window_tokens      = 8192;
+    inputs.stats.kv_growth_blocked_requests      = 2;
+    inputs.stats.kv_suspended_requests           = 3;
+    inputs.stats.kv_window_extensions            = 17;
+    inputs.stats.kv_live_suspensions             = 11;
+    inputs.stats.kv_live_resumes                 = 8;
+
+    inputs.stats.kv_disk_spill_active          = true;
+    inputs.stats.kv_disk_defrag_active         = true;
+    inputs.stats.kv_disk_storage_bytes         = 8388608;
+    inputs.stats.kv_disk_restore_active        = true;
+    inputs.stats.kv_disk_pending_jobs          = 3;
+    inputs.stats.kv_disk_spill_elapsed_seconds = 12.165;
+    const auto snapshot                        = metrics.snapshot(inputs);
+    const std::string text                     = snapshot.prometheus_text();
+    failures += check(contains(text, "ninfer_kv_execution_window_tokens 8192\n") &&
+                          contains(text, "ninfer_kv_growth_blocked_requests 2\n") &&
+                          contains(text, "ninfer_kv_suspended_requests 3\n") &&
+                          contains(text, "ninfer_kv_window_extensions_total 17\n") &&
+                          contains(text, "ninfer_kv_live_suspensions_total 11\n") &&
+                          contains(text, "ninfer_kv_live_resumes_total 8\n"),
+                      "Prometheus lost live execution occupancy or lifetime counters");
     failures += check(contains(text, "ninfer_kv_disk_spill_active 1\n") &&
                           contains(text, "ninfer_kv_disk_defrag_active 1\n") &&
                           contains(text, "ninfer_kv_disk_storage_bytes 8388608\n") &&
@@ -137,15 +153,20 @@ int main() {
                           contains(text, "ninfer_kv_ram_system_prompt_restores_total 7\n") &&
                           contains(text, "ninfer_kv_ram_system_prompt_evictions_total 3\n"),
                       "system prefix occupancy/LRU counters were lost");
-    inputs.stats.kv_cache_fallbacks = 10;
-    const std::string first         = metrics.snapshot(inputs).prometheus_text();
-    inputs.stats.kv_cache_fallbacks = 20;
-    const std::string second        = metrics.snapshot(inputs).prometheus_text();
+    inputs.stats.kv_cache_fallbacks   = 10;
+    const std::string first           = metrics.snapshot(inputs).prometheus_text();
+    inputs.stats.kv_cache_fallbacks   = 20;
+    inputs.stats.kv_window_extensions = 19;
+    const std::string second          = metrics.snapshot(inputs).prometheus_text();
     failures += check(contains(second, "ninfer_kv_cache_fallbacks_total 20\n") &&
                           !contains(second, "ninfer_kv_cache_fallbacks_total 30"),
                       "absolute counter accumulated across scrapes");
     failures += check(contains(first, "ninfer_kv_cache_fallbacks_total 10\n"),
                       "first absolute counter scrape lost its value");
+    failures += check(contains(first, "ninfer_kv_window_extensions_total 17\n") &&
+                          contains(second, "ninfer_kv_window_extensions_total 19\n") &&
+                          !contains(second, "ninfer_kv_window_extensions_total 36\n"),
+                      "window-extension absolute counter accumulated across scrapes");
 
     std::set<std::string> rendered;
     std::string::size_type cursor = 0;
@@ -183,7 +204,17 @@ int main() {
     observation.result   = GenerationResult::Success;
     observation.outcome  = &outcome;
     metrics.observe_generation(observation);
+    const ninfer::ReasoningLimitStats failed_cap{
+        .budget_tokens = 4096, .used_tokens = 4096, .limit_reached = true};
+    GenerationObservation capped_failure;
+    capped_failure.protocol        = MetricsProtocol::OpenAiChat;
+    capped_failure.result          = GenerationResult::Error;
+    capped_failure.reasoning_limit = &failed_cap;
+    metrics.observe_generation(capped_failure);
     const std::string observed = metrics.snapshot(inputs).prometheus_text();
+    failures += check(contains(observed, "ninfer_reasoning_limit_tokens_total 4096\n") &&
+                          contains(observed, "ninfer_reasoning_limit_reached_total 1\n"),
+                      "failed request lost reasoning cap accounting");
     failures += check(contains(observed, "ninfer_speculative_accepted_tokens_total 6\n"),
                       "accepted tokens were not recorded");
     failures +=
@@ -225,20 +256,44 @@ int main() {
     failures += check(contains(recovery, "ninfer_recovery_cycle_exclusions_total 8\n"),
                       "terminal cycle exclusions did not add the true total");
 
-    const auto cause = [](std::string_view detail) {
-        return std::string(ninfer::serve::prometheus_recovery_cause("exhausted", detail));
+    ninfer::RecoveryEvent replay_event;
+    replay_event.kind  = ninfer::RecoveryEventKind::ReplayDiscarded;
+    replay_event.cause = "reasoning_replay";
+    metrics.observe_recovery_event(replay_event);
+    ninfer::RecoveryEvent limit_event;
+    limit_event.kind  = ninfer::RecoveryEventKind::RetryTriggered;
+    limit_event.cause = "reasoning_limit";
+    metrics.observe_recovery_event(limit_event);
+    const auto replay_metrics = metrics.snapshot(inputs);
+    failures += check(
+        contains(
+            replay_metrics.prometheus_text(),
+            "ninfer_recovery_events_total{cause=\"reasoning_limit\",kind=\"retry_triggered\"} 1\n"),
+        "reasoning-limit cause lost its metric label");
+    failures += check(contains(replay_metrics.prometheus_text(),
+                               "ninfer_recovery_events_total{cause=\"reasoning_"
+                               "replay\",kind=\"replay_discarded\"} 1\n") &&
+                          contains(replay_metrics.prometheus_text(),
+                                   "ninfer_recovery_framing_repairs_total 2\n") &&
+                          contains(replay_metrics.prometheus_text(),
+                                   "ninfer_recovery_discarded_content_tokens_total 1140\n"),
+                      "replay event or terminal discard counters were lost");
+    const auto cause = [](std::string_view kind, std::string_view detail) {
+        return std::string(ninfer::serve::prometheus_recovery_cause(kind, detail));
     };
     namespace qwen = ninfer::targets::qwen3_6;
     // Every detail the executor publishes on an exhausted event.
     failures += check(
-        cause("persistent reasoning exhausted its retry or output-token budget") ==
+        cause("exhausted", "persistent reasoning exhausted its retry or output-token budget") ==
                 "retry_budget" &&
-            cause("no retry or output-token budget remains") == "retry_budget" &&
-            cause(qwen::kRecoveryBudgetExhausted) == "output_budget" &&
-            cause(qwen::kRecoveryPrologueExhausted) == "prologue" &&
-            cause(qwen::kRecoveryLaneExhausted) == "lane_rebuild" && cause("garbage") == "other" &&
-            std::string(ninfer::serve::prometheus_recovery_cause("finished", "tool_calls")) ==
-                "tool_calls",
+            cause("exhausted", "no retry or output-token budget remains") == "retry_budget" &&
+            cause("exhausted", qwen::kRecoveryBudgetExhausted) == "output_budget" &&
+            cause("exhausted", qwen::kRecoveryPrologueExhausted) == "prologue" &&
+            cause("exhausted", qwen::kRecoveryLaneExhausted) == "lane_rebuild" &&
+            cause("retry_triggered", "repeated_reasoning") == "repeated_reasoning" &&
+            cause("exhausted", "repeated_content") == "repeated_content" &&
+            cause("finished", "tool_calls") == "tool_calls" &&
+            cause("exhausted", "garbage") == "other",
         "exhausted causes did not map to the closed set");
 
     GenerationOutcome skipped;
@@ -262,6 +317,23 @@ int main() {
 
     const std::string json_text = metrics.snapshot(inputs).json();
     const auto json             = nlohmann::json::parse(json_text);
+    failures += check(json.at("kv_execution") == nlohmann::json{{"window_tokens", 8192},
+                                                                {"growth_blocked_requests", 2},
+                                                                {"suspended_requests", 3},
+                                                                {"window_extensions", 19},
+                                                                {"suspensions", 11},
+                                                                {"resumes", 8}},
+                      "JSON live execution schema drifted from the RuntimeStats snapshot");
+    const auto no_windows = nlohmann::json::parse(metrics.snapshot({}).json());
+    failures +=
+        check(no_windows.at("kv_execution") == nlohmann::json{{"window_tokens", 0},
+                                                              {"growth_blocked_requests", 0},
+                                                              {"suspended_requests", 0},
+                                                              {"window_extensions", 0},
+                                                              {"suspensions", 0},
+                                                              {"resumes", 0}},
+              "RAM-off snapshot fabricated live execution activity");
+
     for (const char* key : {"engine", "build", "scheduler", "http", "gpu_kv", "kv_ram", "kv_disk",
                             "prefix_reuse", "speculative", "recovery", "generation", "phases",
                             "response_store", "start_time_unix_s"}) {

@@ -217,6 +217,23 @@ int main() {
             std::cerr << "second host allocation is not 256-aligned after the first block\n";
         }
         failures += expect_size(host.used(), 96, "host arena used after second");
+        std::memset(first, 0x5a, 32);
+        host.shrink(first, 32);
+        failures += expect_size(host.used(), 64, "host arena used after shrink");
+        if (!host.try_grow(first, 128) || host.try_grow(first, 300)) {
+            failures +=
+                fail("pinned credit growth crossed a live neighbor or failed adjacent growth");
+        }
+        failures += expect_size(host.used(), 160, "host arena used after credit growth");
+        const auto* payload = static_cast<const unsigned char*>(first);
+        for (std::size_t i = 0; i < 32; ++i) {
+            if (payload[i] != 0x5a) {
+                failures += fail("pinned credit resize moved or corrupted its live payload");
+                break;
+            }
+        }
+        host.shrink(first, 64);
+
         host.free(first);
         failures += expect_size(host.used(), 32, "host arena used after free first");
         void* reuse = host.try_alloc(64, 256);

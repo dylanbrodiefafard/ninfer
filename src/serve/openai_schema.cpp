@@ -642,6 +642,9 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
     Json out = {{"prompt_tokens", usage.prompt_tokens},
                 {"completion_tokens", usage.completion_tokens},
                 {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
+    if (usage.reasoning_limit.budget_tokens != 0) {
+        out["ninfer"]["reasoning_limit"] = reasoning_limit_json(usage.reasoning_limit);
+    }
     if (timings == nullptr) { return out; }
 
     // Downstream proxies normalize OpenAI usage (e.g. LiteLLM drops unknown top-level
@@ -673,11 +676,14 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
           {"tok_s", json_decimal3(timings->predicted_per_second)},
           {"ms_per_token", json_decimal3(timings->predicted_per_token_ms)}}}};
     if (timings->recovery.discarded_tool_calls != 0 ||
-        timings->recovery.discarded_reasoning_tokens != 0) {
+        timings->recovery.discarded_reasoning_tokens != 0 ||
+        timings->recovery.discarded_content_tokens != 0 || timings->recovery.framing_repairs != 0) {
         const auto& recovery = timings->recovery;
         ninfer["recovery"]   = {{"attempts", recovery.attempts},
                                 {"discarded_tool_calls", recovery.discarded_tool_calls},
                                 {"discarded_reasoning_tokens", recovery.discarded_reasoning_tokens},
+                                {"framing_repairs", recovery.framing_repairs},
+                                {"discarded_content_tokens", recovery.discarded_content_tokens},
                                 {"prefill_tokens", recovery.prefill_tokens},
                                 {"prefill_samples", recovery.prefill_samples},
                                 {"prepare_ms", json_decimal3(recovery.prepare_seconds * 1000.0)},
@@ -879,10 +885,44 @@ void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
     out.reasoning_effort_param = "reasoning_effort";
 }
 
+std::optional<std::uint32_t> parse_thinking_token_budget(const Json& value,
+                                                         std::string_view param) {
+    if (value.is_null()) { return std::nullopt; }
+    if (!value.is_number_integer() ||
+        (value.is_number_unsigned() ? value.get<std::uint64_t>() == 0
+                                    : value.get<std::int64_t>() <= 0)) {
+        bad_request("thinking token budget must be a positive integer or null", std::string(param));
+    }
+    const auto budget = value.get<std::uint64_t>();
+    if (budget > std::numeric_limits<std::uint32_t>::max()) {
+        bad_request("thinking token budget exceeds uint32 range", std::string(param));
+    }
+    return static_cast<std::uint32_t>(budget);
+}
+
+Json reasoning_limit_json(const ninfer::ReasoningLimitStats& stats) {
+    Json forced = Json::array();
+    for (const auto& token : stats.forced_tokens) {
+        forced.push_back({{"generated_token_index", token.generated_token_index},
+                          {"token", token.token},
+                          {"policy_forced", true},
+                          {"target_logprob",
+                           token.target_logprob ? Json(*token.target_logprob) : Json(nullptr)}});
+    }
+    return Json{
+        {"budget_tokens", stats.budget_tokens == 0 ? Json(nullptr) : Json(stats.budget_tokens)},
+        {"used_tokens", stats.used_tokens},
+        {"forced_closes", stats.forced_closes},
+        {"budget_retries", stats.retries},
+        {"limit_reached", stats.limit_reached},
+        {"forced_tokens", std::move(forced)}};
+}
+
 void apply_ninfer_object(const Json& ninfer, GenerationRequest& out) {
     if (!ninfer.is_object()) { bad_request("ninfer must be an object", "ninfer"); }
     for (auto it = ninfer.begin(); it != ninfer.end(); ++it) {
-        if (it.key() != "capture_context_checkpoint" && it.key() != "cache_write") {
+        if (it.key() != "capture_context_checkpoint" && it.key() != "cache_write" &&
+            it.key() != "thinking_token_budget") {
             bad_request("ninfer." + it.key() + " is not supported", "ninfer",
                         "ninfer_option_not_supported");
         }
@@ -891,6 +931,12 @@ void apply_ninfer_object(const Json& ninfer, GenerationRequest& out) {
         if (ninfer.contains(key) && !ninfer.at(key).is_boolean()) {
             bad_request(std::string("ninfer.") + key + " must be a boolean", "ninfer");
         }
+    }
+    if (ninfer.contains("thinking_token_budget")) {
+        out.thinking_token_budget_specified = true;
+        out.thinking_token_budget_param     = "ninfer.thinking_token_budget";
+        out.thinking_token_budget = parse_thinking_token_budget(ninfer.at("thinking_token_budget"),
+                                                                out.thinking_token_budget_param);
     }
     out.cache_write                = ninfer.value("cache_write", true);
     out.capture_context_checkpoint = ninfer.value("capture_context_checkpoint", false);
@@ -950,9 +996,20 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (const std::optional<bool> enable_thinking = parse_openai_enable_thinking(body)) {
         out.enable_thinking = enable_thinking;
     }
+    if (body.contains("thinking_token_budget")) {
+        out.thinking_token_budget_specified = true;
+        out.thinking_token_budget =
+            parse_thinking_token_budget(body.at("thinking_token_budget"), "thinking_token_budget");
+    }
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
-    if (body.contains("ninfer")) { apply_ninfer_object(body.at("ninfer"), out); }
+    if (body.contains("ninfer")) {
+        if (body.at("ninfer").is_object() && body.at("ninfer").contains("thinking_token_budget")) {
+            bad_request("Chat uses top-level thinking_token_budget",
+                        "ninfer.thinking_token_budget");
+        }
+        apply_ninfer_object(body.at("ninfer"), out);
+    }
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }
@@ -1121,6 +1178,9 @@ std::string make_error_body(const ApiError& error) {
     Json err     = {{"message", error.message}, {"type", error.type}};
     err["param"] = error.param.empty() ? Json(nullptr) : Json(error.param);
     err["code"]  = error.code.empty() ? Json(nullptr) : Json(error.code);
+    if (error.reasoning_limit.budget_tokens != 0) {
+        err["ninfer"]["reasoning_limit"] = reasoning_limit_json(error.reasoning_limit);
+    }
     return Json{{"error", err}}.dump();
 }
 

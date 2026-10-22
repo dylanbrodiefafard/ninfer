@@ -13,13 +13,16 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -100,7 +103,10 @@ std::string byte_level_symbol(std::uint8_t target) {
 constexpr std::string_view kFragmentOpen  = "<|im_start|>system\n";
 constexpr std::string_view kFragmentClose = "<|im_end|>\n";
 
-std::string recovery_notice(std::uint32_t attempt = 1) {
+std::string
+recovery_notice(std::uint32_t attempt = 1,
+                ninfer::targets::qwen3_6::GenerationRecoveryNotice reason =
+                    ninfer::targets::qwen3_6::GenerationRecoveryNotice::RepeatedReasoning) {
     ninfer::PromptInput input;
     input.options.enable_thinking       = true;
     input.options.add_generation_prompt = true;
@@ -111,7 +117,7 @@ std::string recovery_notice(std::uint32_t attempt = 1) {
     input.messages.push_back(std::move(user));
     const auto recovery = ninfer::targets::qwen3_6::GenerationRecoveryContext::analyze(input);
     if (!recovery) { throw std::runtime_error("probe input is not eligible for recovery"); }
-    const auto insert = recovery->recovery_insert({}, attempt);
+    const auto insert = recovery->recovery_insert({}, attempt, reason);
     if (insert.size() != 1 || insert[0].parts.size() != 1 ||
         insert[0].parts[0].kind != ninfer::MessagePartKind::Text) {
         throw std::runtime_error("probe recovery insert was not one system notice");
@@ -322,6 +328,62 @@ public:
     std::atomic<std::uint32_t> idle_true_count{0};
 
     virtual ~ProbeProgram() = default;
+
+    [[nodiscard]] virtual bool chunked_execution_enabled() const noexcept { return false; }
+
+    [[nodiscard]] virtual AdmissionResources completion_resources(const ProbePlan& base,
+                                                                  std::uint32_t) const {
+        return base.summary().lifetime_admission;
+    }
+
+    [[nodiscard]] virtual bool shrink_window(std::uint32_t,
+                                             const ninfer::runtime::ExecutionWindow&) {
+        return false;
+    }
+
+    [[nodiscard]] virtual ninfer::runtime::ExecutionWindow plan_window(std::uint32_t,
+                                                                       std::uint32_t) const {
+        throw std::logic_error("RAM-off probe planned a live window");
+    }
+
+    [[nodiscard]] virtual ninfer::runtime::ExecutionWindow
+    plan_suspended_window(std::uint64_t, std::uint32_t) const {
+        throw std::logic_error("RAM-off probe planned a suspended window");
+    }
+
+    [[nodiscard]] virtual bool grant_window(std::uint32_t,
+                                            const ninfer::runtime::ExecutionWindow&) {
+        throw std::logic_error("RAM-off probe granted a live window");
+    }
+
+    [[nodiscard]] virtual bool reserve_suspension_credit(std::uint64_t, std::size_t) {
+        throw std::logic_error("RAM-off probe reserved suspension storage");
+    }
+
+    virtual void release_suspension_credit(std::uint64_t) {}
+
+    [[nodiscard]] virtual bool start_suspend(std::uint32_t, std::uint64_t) {
+        throw std::logic_error("RAM-off probe suspended a request");
+    }
+
+    [[nodiscard]] virtual bool suspension_ready(std::uint64_t) const { return true; }
+
+    virtual void finish_suspend(std::uint32_t, std::uint64_t) {
+        throw std::logic_error("RAM-off probe finished a suspension");
+    }
+
+    [[nodiscard]] virtual bool start_resume(std::uint32_t, std::uint64_t,
+                                            const ninfer::runtime::ExecutionWindow&) {
+        throw std::logic_error("RAM-off probe resumed a request");
+    }
+
+    [[nodiscard]] virtual bool resume_ready(std::uint64_t) const { return true; }
+
+    virtual void finish_resume(std::uint32_t, std::uint64_t) {
+        throw std::logic_error("RAM-off probe finished a resume");
+    }
+
+    virtual void discard_suspended(std::uint64_t) {}
 
     CacheCase script             = CacheCase::RecoveryRamRestoreFails;
     std::uint32_t stale_failures = 0;
@@ -555,7 +617,7 @@ public:
         return 0;
     }
 
-    void abort_lane(std::uint32_t) noexcept {
+    virtual void abort_lane(std::uint32_t) noexcept {
         note("abort");
         ++abort_count;
     }
@@ -604,7 +666,7 @@ public:
         return decodes_since_cancel >= settle_after_decodes;
     }
 
-    void synchronize_all() { note("sync"); }
+    virtual void synchronize_all() { note("sync"); }
 
     [[nodiscard]] virtual PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                PreparedPrompt prompt,
@@ -1820,6 +1882,7 @@ struct DeferProbe {
 class ReasoningCloseProgram final : public ProbeProgram {
 public:
     bool speculative                   = false;
+    bool capture_logprobs              = false;
     bool close_in_prefill              = false;
     bool initial_close_excluded        = false;
     bool continued_with_close_excluded = false;
@@ -1828,6 +1891,7 @@ public:
     [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t, PreparedPrompt prompt,
                                                        ProbePlan plan, TransientRegion, PrefillPace,
                                                        const OutputSession* output) override {
+        output_ = output;
         excluded_.assign(plan.execution.suppressed_token_ids.begin(),
                          plan.execution.suppressed_token_ids.begin() +
                              plan.execution.suppressed_token_count);
@@ -1839,6 +1903,7 @@ public:
         result.complete                  = true;
         result.processed_prompt_tokens   = 1;
         result.round.tokens              = std::span<const TokenId>(tokens_.data(), 1);
+        result.round.logprobs            = logprobs();
         result.summary.prompt_tokens     = prompt.summary().prompt_tokens;
         result.summary.prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
         return result;
@@ -1862,6 +1927,7 @@ public:
             count_                        = 1;
         }
         return {.tokens     = std::span<const TokenId>(tokens_.data(), count_),
+                .logprobs   = logprobs(),
                 .row_counts = std::span<const std::int32_t>(&count_, 1),
                 .row_stride = static_cast<std::uint32_t>(count_)};
     }
@@ -1880,10 +1946,28 @@ public:
     }
 
 private:
+    ninfer::runtime::RoundLogprobs logprobs() {
+        if (!capture_logprobs) { return {}; }
+        logprob_values_.fill(-0.25F);
+        top_values_.fill(-0.5F);
+        return {logprob_values_, top_ids_, top_values_};
+    }
+
     bool close_excluded() const {
+        if (output_ && output_->has_token_masks()) {
+            const std::array<TokenId, 1> root{0};
+            const std::array<std::int32_t, 1> parents{-1};
+            std::vector<std::uint32_t> mask((248077 + 31) / 32);
+            output_->fill_token_masks(root, parents, mask);
+            if ((mask[248069 / 32] & (1U << (248069 % 32))) == 0) { return true; }
+        }
         return std::find(excluded_.begin(), excluded_.end(), 248069) != excluded_.end();
     }
 
+    const OutputSession* output_ = nullptr;
+    std::array<float, 3> logprob_values_{};
+    std::array<TokenId, std::size_t{3} * ninfer::kMaximumTopLogprobs> top_ids_{};
+    std::array<float, std::size_t{3} * ninfer::kMaximumTopLogprobs> top_values_{};
     std::vector<TokenId> excluded_;
     std::array<TokenId, 3> tokens_{};
     std::int32_t count_  = 1;
@@ -1936,6 +2020,914 @@ int run_reasoning_close_sampling(Frontend& frontend) {
                                       program.committed_prefixes.front() == 1,
                                   "executor committed a repeated close from speculative columns");
             }
+        }
+    }
+    return failures;
+}
+
+int run_reasoning_budget_close(Frontend& frontend) {
+    int failures = 0;
+    for (const bool speculative : {false, true}) {
+        ReasoningCloseProgram program;
+        program.lifecycle_retries = true;
+        program.script            = CacheCase::AdmitRamHit;
+        program.speculative       = speculative;
+        program.capture_logprobs  = true;
+        ProbeLoaded loaded{frontend};
+        RecoveryProbe instance{.program = &program, .loaded = &loaded};
+        auto engine                = engine_options();
+        engine.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine);
+        auto prompt        = frontend.prepare(thinking_input());
+        const auto summary = prompt.summary();
+        ninfer::runtime::ResolvedRequestOptions options;
+        options.execution.allow_prefix_reuse      = false;
+        options.execution.requested_output_tokens = 8;
+        options.output.thinking_token_budget      = 1;
+        options.output.top_logprobs               = 1;
+        auto submission     = executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                              ninfer::OutputDelivery::TerminalOnly);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        const auto result   = submission.wait(nullptr, ninfer::CancellationView([deadline] {
+                                                return std::chrono::steady_clock::now() >= deadline;
+                                              }));
+        failures += check(result.content == "answer" && result.reasoning_limit.used_tokens == 1 &&
+                              result.reasoning_limit.forced_closes == 1 &&
+                              result.reasoning_limit.forced_tokens.size() == 1,
+                          "forced reasoning close lost its independent intervention provenance");
+        if (!result.reasoning_limit.forced_tokens.empty()) {
+            const auto& forced = result.reasoning_limit.forced_tokens.front();
+            failures += check(forced.generated_token_index == 1 && forced.token == 248069 &&
+                                  forced.target_logprob == -0.25F,
+                              "forced close reported masked confidence instead of target logprob");
+        }
+        failures += check(
+            result.reasoning_logprobs.size() == 1 && result.reasoning_logprobs.front().token == 0 &&
+                result.content_logprobs.size() == 1 && result.content_logprobs.front().token == 15,
+            "forced close leaked policy framing into channel logprob records");
+    }
+    return failures;
+}
+
+// Real output policy and executor publication, with deterministic licensed tokens.
+// The last row reaches the evidence threshold and natural EOS in the same round.
+class RepeatedAnswerProgram final : public ProbeProgram {
+public:
+    std::size_t repeat_tokens = 4352;
+    std::vector<TokenId> script_tokens;
+    bool pause_for_cancel = false;
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t, PreparedPrompt prompt,
+                                                       ProbePlan, TransientRegion, PrefillPace,
+                                                       const OutputSession*) override {
+        emitted_   = 1;
+        tokens_[0] = script_tokens.empty() ? 15 : script_tokens.front();
+        PrefillStepResult result;
+        result.complete                = true;
+        result.processed_prompt_tokens = 1;
+        result.round.tokens            = std::span<const TokenId>(tokens_.data(), 1);
+        result.summary.prompt_tokens   = prompt.summary().prompt_tokens;
+        return result;
+    }
+
+    [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t>,
+                                                     std::span<const RoundBudget>) override {
+        // Cancellation is polled by the waiting client every10ms. Let it be
+        // observed before this scripted program can finish in under10ms.
+        if (pause_for_cancel) { std::this_thread::sleep_for(std::chrono::milliseconds(30)); }
+        if (!script_tokens.empty()) {
+            before_ = emitted_;
+            count_  = static_cast<std::int32_t>(
+                std::min<std::size_t>(64, script_tokens.size() - emitted_));
+            std::copy_n(script_tokens.begin() + emitted_, count_, tokens_.begin());
+        } else {
+            const auto count = std::min<std::size_t>(64, repeat_tokens - emitted_);
+            std::fill_n(tokens_.begin(), count, 15);
+            emitted_ += count;
+            count_ = static_cast<std::int32_t>(count);
+            if (emitted_ == repeat_tokens) { tokens_[count_++] = 6; }
+        }
+        return {.tokens     = std::span<const TokenId>(tokens_.data(), count_),
+                .row_counts = std::span<const std::int32_t>(&count_, 1),
+                .row_stride = static_cast<std::uint32_t>(count_)};
+    }
+
+    void resolve_pending_batch(std::span<const std::uint32_t>,
+                               std::span<const std::uint32_t> accepted,
+                               std::span<const std::uint8_t>, std::span<const std::uint8_t>,
+                               std::span<const std::uint8_t>) override {
+        if (!script_tokens.empty()) { emitted_ = before_ + accepted.front(); }
+    }
+private:
+    std::size_t emitted_ = 0;
+    std::size_t before_  = 0;
+    std::array<TokenId, 65> tokens_{};
+    std::int32_t count_ = 0;
+};
+
+int run_repeated_answer(Frontend& frontend) {
+    class Sink final : public ninfer::OutputSink {
+    public:
+        std::string text;
+
+        void publish(ninfer::OutputDelta delta) override { text += delta.text; }
+    };
+
+    int failures = 0;
+    enum class Mode {
+        Guarded,
+        Standard,
+        Runaway,
+        Disabled,
+        Raw,
+        Constrained,
+        ToolArgument,
+        CallerToken,
+        CallerString,
+        Cancelled
+    };
+    for (const auto mode : {Mode::Guarded, Mode::Standard, Mode::Runaway, Mode::Disabled, Mode::Raw,
+                            Mode::Constrained, Mode::ToolArgument, Mode::CallerToken,
+                            Mode::CallerString, Mode::Cancelled}) {
+        for (const auto delivery :
+             {ninfer::OutputDelivery::TerminalOnly, ninfer::OutputDelivery::Streaming}) {
+            RepeatedAnswerProgram program;
+            program.pause_for_cancel = mode == Mode::Cancelled;
+            if (mode == Mode::Runaway) { program.repeat_tokens = 5000; }
+            const bool should_fail =
+                mode == Mode::Guarded || mode == Mode::Standard || mode == Mode::Runaway;
+            program.lifecycle_retries = true;
+            program.script            = CacheCase::AdmitRamHit;
+            ProbeLoaded loaded{frontend};
+            RecoveryProbe instance{.program = &program, .loaded = &loaded};
+            auto engine                = engine_options();
+            engine.max_context         = 16384;
+            engine.generation_recovery = mode != Mode::Disabled;
+            ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine);
+            auto input                    = thinking_input();
+            input.options.enable_thinking = false;
+            if (mode == Mode::Constrained) {
+                std::string literal;
+                for (int i = 0; i < 4352; ++i) { literal += "answer"; }
+                input.options.output_constraint = ninfer::OutputConstraint{
+                    .kind   = ninfer::OutputConstraintKind::Grammar,
+                    .source = "root ::= " + nlohmann::json(literal).dump()};
+            }
+            if (mode == Mode::ToolArgument) {
+                std::string value = "</tool_call>";
+                for (int i = 0; i < 4352; ++i) { value += "answer"; }
+                input.options.tool_jsons.push_back(nlohmann::json{
+                    {"type", "function"},
+                    {"function",
+                     {{"name", "f"},
+                      {"parameters",
+                       {{"type", "object"},
+                        {"properties", {{"value", {{"const", value}}}}},
+                        {"required", {"value"}},
+                        {"additionalProperties",
+                         false}}}}}}.dump());
+                const auto add_text = [&](std::string_view text) {
+                    for (const unsigned char byte : text) {
+                        program.script_tokens.push_back(byte == '\n' ? 32 : 1000 + byte);
+                    }
+                };
+                add_text("<tool_call>\n<function=f>\n<parameter=value>\n</tool_call>");
+                program.script_tokens.insert(program.script_tokens.end(), 4352, 15);
+                add_text("\n</parameter>\n</function>\n</tool_call>");
+                program.script_tokens.push_back(6);
+            }
+            auto prompt        = frontend.prepare(std::move(input));
+            const auto summary = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.sampling.p_less         = mode != Mode::Standard;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.requested_output_tokens = 6000;
+            options.output.raw                        = mode == Mode::Raw;
+            if (mode == Mode::CallerToken) { options.stop.token_ids = {6}; }
+            if (mode == Mode::CallerString) {
+                options.stop.strings.push_back({.text = "answeranswer"});
+            }
+            auto submission =
+                executor.submit(std::move(prompt), summary, 0.0, std::move(options), delivery);
+            Sink sink;
+            bool rejected = false;
+            try {
+                const auto result = submission.wait(
+                    &sink, ninfer::CancellationView([mode] { return mode == Mode::Cancelled; }));
+                failures += check(!should_fail, "repetitive answer returned normal success");
+                if (mode == Mode::ToolArgument) {
+                    failures += check(result.tool_calls.size() == 1 && result.content.empty(),
+                                      "repeated tool argument failed or leaked into prose");
+                }
+                if (mode == Mode::Cancelled) {
+                    failures += check(result.finish_reason == FinishReason::Cancelled,
+                                      "answer guard bypassed cancellation");
+                } else if (mode == Mode::CallerString) {
+                    failures += check(result.finish_reason == FinishReason::StopString,
+                                      "answer guard bypassed caller string stop");
+                } else {
+                    failures += check(result.finish_reason == FinishReason::StopToken,
+                                      "excluded answer route lost its natural/caller stop");
+                }
+            } catch (const ninfer::RequestError& error) {
+                rejected = error.kind() == ninfer::RequestErrorKind::RecoveryExhausted &&
+                           std::string_view(error.what()).find("repeated answer text") !=
+                               std::string_view::npos;
+            }
+            if (rejected != should_fail) {
+                std::cerr << "answer mode=" << static_cast<int>(mode)
+                          << " delivery=" << static_cast<int>(delivery) << '\n';
+            }
+            failures +=
+                check(rejected == should_fail, "repetitive-answer error scope is incorrect");
+            if (should_fail && delivery == ninfer::OutputDelivery::Streaming) {
+                std::string expected;
+                const int published = mode == Mode::Runaway ? 4353 : 4352;
+                for (int i = 0; i < published; ++i) { expected += "answer"; }
+                failures += check(sink.text == expected,
+                                  "answer failure lost/rewrote its published prefix");
+            }
+        }
+    }
+    return failures;
+}
+
+// The last licensed round contains the proof and a reasoning close, optionally
+// followed by answer/tool output. The retry must not publish that abandoned tail.
+class ReasoningBoundaryProgram final : public ProbeProgram {
+public:
+    std::vector<TokenId> first_attempt;
+    bool pause_for_cancel = false;
+    bool repeat_on_retry  = false;
+    std::vector<std::vector<TokenId>> retry_attempts;
+    std::vector<ninfer::ResolvedSamplingParameters> attempt_sampling;
+    std::atomic<std::uint32_t> active_attempt{0};
+    std::uint32_t retry_batch_limit = 0;
+    std::atomic<std::size_t> committed_tokens{0};
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t, PreparedPrompt prompt,
+                                                       ProbePlan plan, TransientRegion, PrefillPace,
+                                                       const OutputSession*) override {
+        ++prefill_count;
+        attempt_sampling.push_back(plan.execution.sampling);
+        prefilled_prompts.push_back(FrontendTestAccess::inspect(prompt).token_ids);
+        current_ = (prefill_count == 1 || repeat_on_retry) ? first_attempt
+                   : FrontendTestAccess::inspect(prompt).starts_in_reasoning
+                       ? std::vector<TokenId>{0, 248069, 15, 6}
+                       : std::vector<TokenId>{15, 6};
+        if (prefill_count > 1 && !retry_attempts.empty()) {
+            current_ = retry_attempts.at(
+                std::min<std::size_t>(prefill_count - 2, retry_attempts.size() - 1));
+        }
+        emitted_ = 1;
+        committed_tokens.store(emitted_);
+        active_attempt.store(prefill_count);
+        tokens_[0] = current_.front();
+        PrefillStepResult result;
+        result.complete                = true;
+        result.processed_prompt_tokens = 1;
+        result.round.tokens            = std::span<const TokenId>(tokens_.data(), 1);
+        result.summary.prompt_tokens   = prompt.summary().prompt_tokens;
+        return result;
+    }
+
+    [[nodiscard]] BatchedGeneratedRound
+    decode_batch(std::span<const std::uint32_t>, std::span<const RoundBudget> budgets) override {
+        if (pause_for_cancel || (retry_batch_limit != 0 && prefill_count > 1)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+        const auto remaining = current_.size() - emitted_;
+        auto batch           = remaining <= 192 ? remaining : 64;
+        if (retry_batch_limit != 0 && prefill_count > 1) {
+            batch = std::min<std::size_t>(batch, retry_batch_limit);
+        }
+        count_ = static_cast<std::int32_t>(
+            std::min<std::size_t>(batch, budgets.front().generated_tokens_remaining));
+        std::copy_n(current_.begin() + emitted_, count_, tokens_.begin());
+        return {.tokens     = std::span<const TokenId>(tokens_.data(), count_),
+                .row_counts = std::span<const std::int32_t>(&count_, 1),
+                .row_stride = static_cast<std::uint32_t>(count_)};
+    }
+
+    void resolve_pending_batch(std::span<const std::uint32_t>,
+                               std::span<const std::uint32_t> accepted,
+                               std::span<const std::uint8_t>, std::span<const std::uint8_t>,
+                               std::span<const std::uint8_t>) override {
+        emitted_ += accepted.front();
+        committed_tokens.store(emitted_);
+    }
+private:
+    std::vector<TokenId> current_;
+    std::size_t emitted_ = 0;
+    std::array<TokenId, 192> tokens_{};
+    std::int32_t count_ = 0;
+};
+
+int run_reasoning_budget_retry(Frontend& frontend) {
+    enum class Mode { Useful, CappedNonempty, EmptyReplacement, NaturalClose, CallerStop };
+
+    class Sink final : public ninfer::OutputSink {
+    public:
+        std::string content;
+
+        void publish(ninfer::OutputDelta delta) override {
+            if (delta.channel == ninfer::OutputChannel::Content) { content += delta.text; }
+        }
+    };
+
+    int failures = 0;
+    for (const auto mode : {Mode::Useful, Mode::CappedNonempty, Mode::EmptyReplacement,
+                            Mode::NaturalClose, Mode::CallerStop}) {
+        for (const auto delivery :
+             {ninfer::OutputDelivery::TerminalOnly, ninfer::OutputDelivery::Streaming}) {
+            ReasoningBoundaryProgram program;
+            program.lifecycle_retries = true;
+            program.script            = CacheCase::AdmitRamHit;
+            program.first_attempt = mode == Mode::NaturalClose ? std::vector<TokenId>{248069, 15, 6}
+                                                               : std::vector<TokenId>{0};
+            program.retry_attempts = {mode == Mode::EmptyReplacement ? std::vector<TokenId>{6}
+                                      : mode == Mode::CappedNonempty ? std::vector<TokenId>{15, 15}
+                                                                     : std::vector<TokenId>{15, 6}};
+            ProbeLoaded loaded{frontend};
+            RecoveryProbe instance{.program = &program, .loaded = &loaded};
+            auto engine                = engine_options();
+            engine.max_context         = 16384;
+            engine.generation_recovery = false;
+            ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(
+                instance, engine, ninfer::runtime::ReasoningLimitAction::Retry);
+            auto prompt        = frontend.prepare(thinking_input());
+            const auto summary = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.requested_output_tokens = mode == Mode::CappedNonempty ? 3 : 8;
+            options.output.thinking_token_budget      = 1;
+            if (mode == Mode::CallerStop) { options.stop.token_ids = {0}; }
+            auto submission =
+                executor.submit(std::move(prompt), summary, 0.0, std::move(options), delivery);
+            const bool should_fail = mode == Mode::CappedNonempty || mode == Mode::EmptyReplacement;
+            Sink sink;
+            bool failed         = false;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            try {
+                const auto result = submission.wait(&sink, ninfer::CancellationView([deadline] {
+                    return std::chrono::steady_clock::now() >= deadline;
+                }));
+                failures += check(!should_fail && result.finish_reason == FinishReason::StopToken,
+                                  "reasoning budget retry accepted an invalid replacement");
+                if (mode == Mode::Useful) {
+                    failures += check(
+                        result.content == "answer" && result.reasoning_limit.used_tokens == 1 &&
+                            result.reasoning_limit.retries == 1 &&
+                            result.generated_token_ids.size() == 3 && result.recovery.attempts == 1,
+                        "independent budget retry lost output/accounting state");
+                } else {
+                    failures += check(result.reasoning_limit.retries == 0,
+                                      "budget policy retried natural or caller-terminated output");
+                }
+            } catch (const ninfer::RequestError& error) {
+                failed = error.kind() == ninfer::RequestErrorKind::RecoveryExhausted;
+            }
+            failures += check(failed == should_fail,
+                              "budget replacement failure did not retain explicit error semantics");
+            failures +=
+                check(program.prefill_count ==
+                          (mode == Mode::NaturalClose || mode == Mode::CallerStop ? 1U : 2U),
+                      "disabled general recovery allowed an additional clean retry");
+            if (should_fail) {
+                failures += check(sink.content.empty(),
+                                  "failed budget replacement published held answer text");
+            }
+        }
+    }
+    return failures;
+}
+
+int run_reasoning_repetition_boundaries(Frontend& frontend) {
+    class Sink final : public ninfer::OutputSink {
+    public:
+        std::string content;
+
+        void publish(ninfer::OutputDelta delta) override {
+            if (delta.channel == ninfer::OutputChannel::Content) { content += delta.text; }
+        }
+    };
+    enum class Mode {
+        Close,
+        NaturalStop,
+        Tool,
+        Budget,
+        Media,
+        Greedy,
+        CallerToken,
+        CallerString,
+        Cancelled,
+        Disabled,
+        Legitimate
+    };
+    int failures        = 0;
+    auto media_frontend = FrontendTestAccess::create_component(resources(), true);
+    for (const auto mode : {Mode::Close, Mode::NaturalStop, Mode::Tool, Mode::Budget, Mode::Media,
+                            Mode::Greedy, Mode::CallerToken, Mode::CallerString, Mode::Cancelled,
+                            Mode::Disabled, Mode::Legitimate}) {
+        for (const auto delivery :
+             {ninfer::OutputDelivery::TerminalOnly, ninfer::OutputDelivery::Streaming}) {
+            ReasoningBoundaryProgram program;
+            program.lifecycle_retries = true;
+            program.script            = CacheCase::AdmitRamHit;
+            program.pause_for_cancel  = mode == Mode::Cancelled;
+            program.first_attempt.assign(mode == Mode::Legitimate ? 512 : 4352, 0);
+            program.first_attempt.push_back(248069);
+            auto input = thinking_input();
+            // Grammar-managed transitions may license answer/EOS or a complete
+            // tool in the same round as the reasoning proof.
+            if (mode != Mode::Close && mode != Mode::Budget && mode != Mode::Media) {
+                input.options.tool_jsons.push_back(
+                    R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{},"additionalProperties":false}}})");
+            }
+            if (mode == Mode::Tool) {
+                for (const unsigned char byte :
+                     std::string_view("<tool_call>\n<function=f>\n\n</function>\n</tool_call>")) {
+                    program.first_attempt.push_back(byte == '\n' ? 32 : 1000 + byte);
+                }
+            } else if (mode != Mode::Budget) {
+                program.first_attempt.push_back(15);
+            }
+            if (mode != Mode::Budget) { program.first_attempt.push_back(6); }
+            if (mode == Mode::Media) {
+                ninfer::MessagePart image;
+                image.kind               = ninfer::MessagePartKind::Media;
+                image.media.kind         = ninfer::MediaKind::Image;
+                const std::string header = "P6\n64 64\n255\n";
+                image.media.bytes.assign(header.begin(), header.end());
+                image.media.bytes.resize(header.size() + 64 * 64 * 3, 128);
+                image.media.media_type  = "image/x-portable-pixmap";
+                image.media.source_name = "repetition.ppm";
+                input.messages.front().parts.push_back(std::move(image));
+            }
+            auto& selected_frontend = mode == Mode::Media ? media_frontend : frontend;
+            ProbeLoaded loaded{selected_frontend};
+            RecoveryProbe instance{.program = &program, .loaded = &loaded};
+            auto engine                = engine_options();
+            engine.max_context         = 16384;
+            engine.generation_recovery = mode != Mode::Disabled;
+            ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine);
+            auto prompt        = selected_frontend.prepare(std::move(input));
+            const auto summary = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            // Standard and greedy sampling share the output-integrity guard.
+            options.execution.sampling.p_less         = false;
+            options.execution.sampling.temperature    = mode == Mode::Greedy ? 0.0F : 1.0F;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.requested_output_tokens = mode == Mode::Budget ? 4353 : 6000;
+            if (mode == Mode::CallerToken) { options.stop.token_ids = {6}; }
+            if (mode == Mode::CallerString) { options.stop.strings.push_back({.text = "answer"}); }
+            const bool should_fail  = mode == Mode::Budget || mode == Mode::Media;
+            const bool should_retry = mode == Mode::Close || mode == Mode::NaturalStop ||
+                                      mode == Mode::Tool || mode == Mode::Greedy;
+            auto submission =
+                executor.submit(std::move(prompt), summary, 0.0, std::move(options), delivery);
+            Sink sink;
+            bool rejected       = false;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            try {
+                const auto result =
+                    submission.wait(&sink, ninfer::CancellationView([mode, deadline] {
+                        return mode == Mode::Cancelled ||
+                               std::chrono::steady_clock::now() >= deadline;
+                    }));
+                failures += check(!should_fail, "proved reasoning returned normal success");
+                failures += check(result.recovery.attempts == (should_retry ? 1U : 0U),
+                                  "reasoning boundary used the wrong retry count");
+                failures += check(result.tool_calls.empty(), "abandoned reasoning leaked a tool");
+                if (should_retry) {
+                    failures +=
+                        check(result.content == "answer" &&
+                                  result.finish_reason == FinishReason::StopToken,
+                              "reasoning retry leaked or concatenated its abandoned answer");
+                    if (delivery == ninfer::OutputDelivery::Streaming) {
+                        failures += check(sink.content == "answer",
+                                          "reasoning retry streamed its abandoned tail");
+                    }
+                    std::string retry_prompt;
+                    for (const auto token : program.prefilled_prompts.back()) {
+                        retry_prompt += selected_frontend.token_bytes(token);
+                    }
+                    failures +=
+                        check(retry_prompt.find(recovery_notice()) != std::string::npos &&
+                                  retry_prompt.find("NInfer did not execute this proposed call") ==
+                                      std::string::npos,
+                              "reasoning proof fabricated duplicate-call feedback");
+                }
+                if (mode == Mode::CallerToken || mode == Mode::CallerString) {
+                    failures += check(result.finish_reason == (mode == Mode::CallerToken
+                                                                   ? FinishReason::StopToken
+                                                                   : FinishReason::StopString),
+                                      "reasoning proof bypassed an explicit caller stop");
+                }
+                if (mode == Mode::Cancelled) {
+                    failures += check(result.finish_reason == FinishReason::Cancelled,
+                                      "reasoning proof bypassed cancellation");
+                }
+            } catch (const ninfer::RequestError& error) {
+                rejected = error.kind() == ninfer::RequestErrorKind::RecoveryExhausted;
+                failures += check(rejected, "unexpected reasoning boundary request error");
+            }
+            if (rejected != should_fail) {
+                std::cerr << "reasoning boundary mode=" << static_cast<int>(mode)
+                          << " delivery=" << static_cast<int>(delivery) << '\n';
+            }
+            failures += check(rejected == should_fail, "reasoning failure scope is incorrect");
+            if (should_fail) {
+                failures += check(program.prefill_count == 1 && sink.content.empty(),
+                                  "unsupported reasoning recovery published or retried its tail");
+            }
+        }
+    }
+    return failures;
+}
+
+// A public Close budget preserves reasoning instead of silently selecting clean retry.
+int run_limited_recovery_policy(Frontend& frontend) {
+    int failures = 0;
+    for (const bool replay_failure : {false, true}) {
+        ReasoningBoundaryProgram program;
+        program.lifecycle_retries = true;
+        program.script            = CacheCase::AdmitRamHit;
+        if (replay_failure) {
+            program.first_attempt.assign(256, 0);
+            program.first_attempt.push_back(248069);
+            program.first_attempt.insert(program.first_attempt.end(), 256, 0);
+            program.first_attempt.push_back(248069);
+            program.first_attempt.insert(program.first_attempt.end(), 256, 0);
+            program.first_attempt.push_back(6);
+        } else {
+            program.first_attempt.assign(4352, 0);
+            program.first_attempt.insert(program.first_attempt.end(), {248069, 15, 6});
+        }
+        ProbeLoaded loaded{frontend};
+        RecoveryProbe instance{.program = &program, .loaded = &loaded};
+        auto engine        = engine_options();
+        engine.max_context = 32768;
+        ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine);
+        auto prompt        = frontend.prepare(thinking_input());
+        const auto summary = prompt.summary();
+        ninfer::runtime::ResolvedRequestOptions options;
+        options.execution.allow_prefix_reuse      = false;
+        options.execution.requested_output_tokens = 10000;
+        options.output.thinking_token_budget      = 5000;
+        auto submission = executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                          ninfer::OutputDelivery::TerminalOnly);
+        try {
+            const auto result = submission.wait(nullptr, {});
+            failures += check(!replay_failure && result.content == "answer" &&
+                                  result.reasoning_limit.used_tokens == 4352 &&
+                                  result.recovery.attempts == 0 && program.prefill_count == 1,
+                              "capped Close discarded repeated reasoning in an automatic retry");
+        } catch (const ninfer::RequestError& error) {
+            failures += check(
+                replay_failure && error.kind() == ninfer::RequestErrorKind::RecoveryExhausted &&
+                    error.recovery().attempts == 0 && program.prefill_count == 1 &&
+                    error.reasoning_limit().budget_tokens == 5000,
+                "capped Close failed replay validation without preserving no-retry policy");
+        }
+    }
+    return failures;
+}
+
+int run_replay_replacement_publication(Frontend& frontend) {
+    enum class Mode {
+        Release,
+        ContentRetry,
+        Exhaust,
+        Cancel,
+        Standard,
+        Greedy,
+        InheritedCopy,
+        Empty,
+        Tool,
+        BudgetEmpty,
+        BudgetTool
+    };
+    int failures = 0;
+    for (const auto mode : {Mode::Release, Mode::ContentRetry, Mode::Exhaust, Mode::Cancel,
+                            Mode::Standard, Mode::Greedy, Mode::InheritedCopy, Mode::Empty,
+                            Mode::Tool, Mode::BudgetEmpty, Mode::BudgetTool}) {
+        for (const auto delivery :
+             {ninfer::OutputDelivery::Streaming, ninfer::OutputDelivery::TerminalOnly}) {
+            ReasoningBoundaryProgram program;
+            program.lifecycle_retries = true;
+            program.script            = CacheCase::AdmitRamHit;
+            auto input                = thinking_input();
+            if (mode == Mode::Tool || mode == Mode::BudgetTool) {
+                input.options.tool_jsons.push_back(
+                    R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{},"additionalProperties":false}}})");
+            }
+            std::vector<TokenId> reference(256, 0);
+            program.first_attempt = reference;
+            program.first_attempt.push_back(248069);
+            program.first_attempt.insert(program.first_attempt.end(), reference.begin(),
+                                         reference.end());
+            program.first_attempt.push_back(248069);
+            program.first_attempt.insert(program.first_attempt.end(), reference.begin(),
+                                         reference.end());
+            program.first_attempt.push_back(6);
+            const std::vector<TokenId> accepted{15, 6};
+            if (mode == Mode::ContentRetry || mode == Mode::Exhaust) {
+                std::vector<TokenId> repeated;
+                repeated.insert(repeated.end(), 4608, 15);
+                repeated.push_back(6);
+                program.retry_attempts = {repeated, mode == Mode::Exhaust ? repeated : accepted};
+            } else if (mode == Mode::InheritedCopy) {
+                auto copied = reference;
+                copied.push_back(248069);
+                copied.push_back(6);
+                program.retry_attempts = {copied, accepted};
+            } else if (mode == Mode::Empty) {
+                program.retry_attempts = {{6}, accepted};
+            } else if (mode == Mode::BudgetEmpty) {
+                program.retry_attempts = {std::vector<TokenId>(128, 14)};
+            } else if (mode == Mode::Tool || mode == Mode::BudgetTool) {
+                std::vector<TokenId> tool;
+                for (const unsigned char byte :
+                     (mode == Mode::BudgetTool
+                          ? std::string_view("<tool_call>\n<function=f>\n")
+                          : std::string_view(
+                                "<tool_call>\n<function=f>\n\n</function>\n</tool_call>"))) {
+                    tool.push_back(byte == '\n' ? 32 : 1000 + byte);
+                }
+                if (mode == Mode::Tool) { tool.push_back(6); }
+                program.retry_attempts = {tool};
+            } else if (mode == Mode::Cancel) {
+                std::vector<TokenId> partial;
+                partial.insert(partial.end(), 32, 15);
+                partial.push_back(6);
+                program.retry_attempts    = {partial};
+                program.retry_batch_limit = 1;
+            } else {
+                program.retry_attempts = {accepted};
+            }
+
+            class Sink final : public ninfer::OutputSink {
+            public:
+                std::string content;
+                std::vector<ninfer::RecoveryEvent> recovery;
+
+                void publish(ninfer::OutputDelta delta) override {
+                    if (delta.channel == ninfer::OutputChannel::Content) { content += delta.text; }
+                }
+
+                void recovery_event(const ninfer::RecoveryEvent& event) override {
+                    recovery.push_back(event);
+                }
+            } sink;
+
+            ProbeLoaded loaded{frontend};
+            RecoveryProbe instance{.program = &program, .loaded = &loaded};
+            auto engine        = engine_options();
+            engine.max_context = 32768;
+            ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine);
+            auto prompt        = frontend.prepare(std::move(input));
+            const auto summary = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.allow_prefix_reuse = false;
+            options.execution.requested_output_tokens =
+                mode == Mode::BudgetEmpty ? 778
+                : mode == Mode::BudgetTool
+                    ? 770U + static_cast<std::uint32_t>(program.retry_attempts.front().size())
+                    : 20000;
+            auto& sampling               = options.execution.sampling;
+            sampling                     = {.temperature       = mode == Mode::Greedy ? 0.0F : 1.5F,
+                                            .top_k             = 19,
+                                            .top_p             = 0.7F,
+                                            .min_p             = 0.02F,
+                                            .presence_penalty  = 0.4F,
+                                            .frequency_penalty = 0.2F,
+                                            .seed              = 20261020,
+                                            .p_less            = mode != Mode::Standard};
+            const auto original_sampling = sampling;
+            auto submission =
+                executor.submit(std::move(prompt), summary, 0.0, std::move(options), delivery);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            bool exhausted      = false;
+            try {
+                const auto result = submission.wait(&sink, ninfer::CancellationView([&] {
+                    return (mode == Mode::Cancel && program.active_attempt.load() == 2 &&
+                            program.committed_tokens.load() >= 6) ||
+                           std::chrono::steady_clock::now() >= deadline;
+                }));
+                failures += check(mode != Mode::Exhaust && mode != Mode::BudgetEmpty &&
+                                      mode != Mode::BudgetTool,
+                                  "failed replacement returned success");
+                if (mode == Mode::Cancel) {
+                    failures += check(result.finish_reason == FinishReason::Cancelled &&
+                                          !result.content.empty(),
+                                      "cancelled replacement did not flush text");
+                } else {
+                    failures += check(result.content == (mode == Mode::Tool ? "" : "answer"),
+                                      "rejected replacement leaked into accepted content");
+                }
+                failures += check(result.tool_calls.size() == (mode == Mode::Tool ? 1U : 0U),
+                                  "replacement tool acceptance changed");
+                failures += check(result.recovery.attempts ==
+                                      (mode == Mode::ContentRetry || mode == Mode::InheritedCopy ||
+                                               mode == Mode::Empty
+                                           ? 2U
+                                           : 1U),
+                                  "replacement retry count changed");
+                if (mode == Mode::ContentRetry) {
+                    failures += check(result.recovery.discarded_content_tokens > 4500,
+                                      "failed replacement content was not charged as discarded");
+                    std::string notice;
+                    for (const auto token : program.prefilled_prompts.back()) {
+                        notice += frontend.token_bytes(token);
+                    }
+                    failures +=
+                        check(notice.find("previous replacement repeated its answer text") !=
+                                  std::string::npos,
+                              "answer-repeat retry notice misstates the cause");
+                }
+                if (delivery == ninfer::OutputDelivery::Streaming) {
+                    failures += check(sink.content == result.content,
+                                      "replacement stream differs from accepted terminal output");
+                }
+            } catch (const ninfer::RequestError& error) {
+                exhausted = error.kind() == ninfer::RequestErrorKind::RecoveryExhausted;
+                failures += check(
+                    (mode == Mode::Exhaust || mode == Mode::BudgetEmpty ||
+                     mode == Mode::BudgetTool) &&
+                        exhausted && error.recovery().attempts == (mode == Mode::Exhaust ? 2U : 1U),
+                    "replacement exhaustion ignored its bounds");
+                failures +=
+                    check(sink.content.empty(), "failed replacement leaked into the stream");
+            }
+            failures += check(exhausted == (mode == Mode::Exhaust || mode == Mode::BudgetEmpty ||
+                                            mode == Mode::BudgetTool),
+                              "replacement error scope changed");
+            for (std::size_t attempt = 1; attempt < program.attempt_sampling.size(); ++attempt) {
+                const auto& actual  = program.attempt_sampling[attempt];
+                const bool fallback = mode != Mode::Standard && mode != Mode::Greedy;
+                failures += check(
+                    actual.seed == original_sampling.seed &&
+                        actual.temperature == (fallback ? 1.0F : original_sampling.temperature) &&
+                        actual.p_less == (fallback ? false : original_sampling.p_less) &&
+                        actual.top_k == (fallback ? 20 : original_sampling.top_k) &&
+                        actual.top_p == (fallback ? 0.95F : original_sampling.top_p) &&
+                        actual.min_p == (fallback ? 0.0F : original_sampling.min_p) &&
+                        actual.presence_penalty ==
+                            (fallback ? 0.0F : original_sampling.presence_penalty) &&
+                        actual.frequency_penalty ==
+                            (fallback ? 0.0F : original_sampling.frequency_penalty),
+                    "replacement used an unintended sampling profile");
+            }
+            for (const auto& event : sink.recovery) {
+                if (event.kind == ninfer::RecoveryEventKind::RetryStarted) {
+                    failures +=
+                        check(event.enable_thinking == false && event.sampling.has_value() &&
+                                  event.sampling->temperature ==
+                                      program.attempt_sampling.at(event.attempts).temperature,
+                              "retry event omitted its actual sampling profile");
+                }
+            }
+        }
+    }
+    return failures;
+}
+
+int run_withheld_reasoning_replay(Frontend& frontend) {
+    class Sink final : public ninfer::OutputSink {
+    public:
+        std::string content;
+        std::vector<ninfer::RecoveryEvent> recovery;
+
+        void publish(ninfer::OutputDelta delta) override {
+            if (delta.channel == ninfer::OutputChannel::Content) { content += delta.text; }
+        }
+
+        void recovery_event(const ninfer::RecoveryEvent& event) override {
+            recovery.push_back(event);
+        }
+    };
+    enum class Mode { Continue, Retry, Empty, Exhaust, Budget, Legitimate, Diverge, Tool, Cancel };
+    int failures = 0;
+    for (const auto mode : {Mode::Continue, Mode::Retry, Mode::Empty, Mode::Exhaust, Mode::Budget,
+                            Mode::Legitimate, Mode::Diverge, Mode::Tool, Mode::Cancel}) {
+        for (const auto delivery :
+             {ninfer::OutputDelivery::TerminalOnly, ninfer::OutputDelivery::Streaming}) {
+            ReasoningBoundaryProgram program;
+            program.lifecycle_retries = true;
+            program.script            = CacheCase::AdmitRamHit;
+            program.repeat_on_retry   = mode == Mode::Exhaust;
+            program.pause_for_cancel  = mode == Mode::Cancel;
+            program.first_attempt.assign(256, 0);
+            program.first_attempt.push_back(248069);
+            const auto first_copy = mode == Mode::Diverge ? 128U : 256U;
+            program.first_attempt.insert(program.first_attempt.end(), first_copy, 0);
+            const bool repair =
+                mode != Mode::Legitimate && mode != Mode::Diverge && mode != Mode::Cancel;
+            if (repair) { program.first_attempt.push_back(248069); }
+            const bool second =
+                mode == Mode::Retry || mode == Mode::Exhaust || mode == Mode::Budget;
+            if (second) {
+                program.first_attempt.insert(program.first_attempt.end(), 256, 0);
+            } else if (mode == Mode::Tool) {
+                for (const unsigned char byte :
+                     std::string_view("<tool_call>\n<function=f>\n\n</function>\n</tool_call>")) {
+                    program.first_attempt.push_back(byte == '\n' ? 32 : 1000 + byte);
+                }
+            } else if (mode == Mode::Continue || mode == Mode::Diverge) {
+                program.first_attempt.push_back(15);
+            }
+            program.first_attempt.push_back(6);
+            auto input = thinking_input();
+            if (mode == Mode::Tool) {
+                input.options.tool_jsons.push_back(
+                    R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{},"additionalProperties":false}}})");
+            }
+            ProbeLoaded loaded{frontend};
+            RecoveryProbe instance{.program = &program, .loaded = &loaded};
+            auto engine        = engine_options();
+            engine.max_context = 16384;
+            ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine);
+            auto prompt        = frontend.prepare(std::move(input));
+            const auto summary = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.requested_output_tokens = mode == Mode::Budget ? 770 : 4096;
+            // Exercise the same publication/recovery rule with standard and greedy sampling.
+            options.execution.sampling.p_less      = false;
+            options.execution.sampling.temperature = mode == Mode::Continue ? 0.0F : 1.0F;
+            if (mode == Mode::Legitimate) { options.stop.token_ids = {6}; }
+            // Exposed stop framing must not turn the empty first attempt into an answer.
+            if (mode == Mode::Empty) {
+                options.output.preserve_special_tokens = true;
+                options.stop.publish_stop_token        = true;
+            }
+            auto submission =
+                executor.submit(std::move(prompt), summary, 0.0, std::move(options), delivery);
+            Sink sink;
+            const auto deadline    = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            bool exhausted         = false;
+            const bool should_fail = mode == Mode::Exhaust || mode == Mode::Budget;
+            try {
+                const auto result = submission.wait(&sink, ninfer::CancellationView([&] {
+                    return (mode == Mode::Cancel && program.committed_tokens.load() >= 300) ||
+                           std::chrono::steady_clock::now() >= deadline;
+                }));
+                failures += check(!should_fail, "unrecovered replay returned success");
+                const bool retry = mode == Mode::Retry || mode == Mode::Empty;
+                failures += check(result.recovery.attempts == (retry ? 1U : 0U),
+                                  "replay used the wrong retry count");
+                failures += check(result.recovery.framing_repairs == (repair ? 1U : 0U),
+                                  "replay lost the actual framing-repair count");
+                const auto discarded = mode == Mode::Retry ? 512U : repair ? 256U : 0U;
+                failures += check(result.recovery.discarded_content_tokens == discarded,
+                                  "withheld tokens were not accounted separately");
+                std::string expected;
+                if (mode == Mode::Legitimate) {
+                    expected.assign(256, 'x');
+                } else if (mode == Mode::Diverge) {
+                    expected = std::string(128, 'x') + "answer";
+                } else if (mode == Mode::Cancel) {
+                    const auto close = std::find(result.generated_token_ids.begin(),
+                                                 result.generated_token_ids.end(), 248069);
+                    expected.assign(static_cast<std::size_t>(
+                                        std::count(close + 1, result.generated_token_ids.end(), 0)),
+                                    'x');
+                    failures +=
+                        check(!expected.empty() && result.finish_reason == FinishReason::Cancelled,
+                              "cancellation did not reach a quarantined candidate");
+                } else if (mode != Mode::Tool) {
+                    expected = mode == Mode::Empty ? "answer<eos>" : "answer";
+                }
+                failures += check(result.content == expected,
+                                  "terminal result leaked/erased replay content");
+                if (delivery == ninfer::OutputDelivery::Streaming) {
+                    failures += check(sink.content == expected,
+                                      "stream and terminal replay publication differ");
+                }
+                failures += check(result.tool_calls.size() == (mode == Mode::Tool ? 1U : 0U),
+                                  "framing repair lost or invented a tool call");
+                if (retry) {
+                    std::string notice;
+                    for (const auto token : program.prefilled_prompts.back()) {
+                        notice += frontend.token_bytes(token);
+                    }
+                    failures +=
+                        check(notice.find("framing replay was confirmed earlier in this request") !=
+                                      std::string::npos &&
+                                  notice.find("NInfer did not execute this proposed call") ==
+                                      std::string::npos,
+                              "replay recovery did not use honest cause-specific feedback");
+                }
+            } catch (const ninfer::RequestError& error) {
+                exhausted = error.kind() == ninfer::RequestErrorKind::RecoveryExhausted;
+                failures += check(should_fail && exhausted, "unexpected replay request error");
+                failures += check(error.recovery().attempts == (mode == Mode::Exhaust ? 2U : 0U),
+                                  "replay exhaustion exceeded its attempt budget");
+                failures +=
+                    check(sink.content.empty(), "exhausted replay streamed abandoned output");
+            }
+            failures += check(exhausted == should_fail, "replay exhaustion scope mismatch");
         }
     }
     return failures;
@@ -2115,6 +3107,18 @@ int run_cache_maintenance_idle(Frontend& frontend) {
 // chunk freezes ingress so queue timing cannot hide an interruption or its starvation bound.
 class PrefillScheduleProgram : public ProbeProgram {
 public:
+    bool windowed = false;
+    std::array<bool, ninfer::kMaximumConcurrency + 8> credits{};
+
+    [[nodiscard]] bool chunked_execution_enabled() const noexcept override { return windowed; }
+
+    [[nodiscard]] bool reserve_suspension_credit(std::uint64_t owner, std::size_t) override {
+        credits.at(owner) = true;
+        return true;
+    }
+
+    void release_suspension_credit(std::uint64_t owner) override { credits.at(owner) = false; }
+
     [[nodiscard]] bool kv_copies_ready() const override { return true; }
 
     std::atomic<bool> first_chunk_entered{false};
@@ -2146,6 +3150,9 @@ public:
         plan.fields.effective_limit_reason  = FinishReason::OutputLimit;
         plan.fields.service_work_quanta     = 8192;
         plan.fields.admission               = {1, 1, 0};
+        plan.fields.lifetime_admission      = {1, lanes, 0};
+        plan.fields.window_output_tokens    = options.requested_output_tokens;
+        plan.fields.suspension_bytes        = 1;
         plan.fields.transient_alignment     = 1;
         plan.execution                      = options;
         return plan;
@@ -2170,6 +3177,13 @@ public:
     [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
                                                        ProbePlan, TransientRegion, PrefillPace pace,
                                                        const OutputSession*) override {
+        if (windowed && prompt.summary().prompt_tokens < 4096 &&
+            std::any_of(
+                remaining.begin(), remaining.end(),
+                [](std::uint32_t tokens) { return tokens >= 4096; }) &&
+            !std::any_of(credits.begin(), credits.end(), [](bool credit) { return credit; })) {
+            throw std::logic_error("RAM-on short interruption has no secured backing");
+        }
         remaining[lane] = lengths[lane] = prompt.summary().prompt_tokens;
         units.push_back("start:" + std::to_string(lengths[lane]));
         if (lengths[lane] < 4096 && std::exchange(fail_short_once, false)) {
@@ -2367,8 +3381,9 @@ int run_full_batch_compaction(Frontend& frontend) {
 
 int run_prefill_interruptions(Frontend& frontend) {
     int failures = 0;
-    for (const unsigned scenario : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U}) {
+    for (const unsigned scenario : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U}) {
         PrefillScheduleProgram program;
+        program.windowed        = scenario == 8;
         program.lanes           = scenario == 1 ? 1 : 2;
         program.suspendable     = scenario != 2;
         program.short_fits      = scenario != 3;
@@ -2437,7 +3452,7 @@ int run_prefill_interruptions(Frontend& frontend) {
         const auto second_small =
             std::find(program.units.begin(), program.units.end(), "start:256");
         const auto resumed = std::find(program.units.begin(), program.units.end(), "resume:16384");
-        if (scenario == 0 || scenario == 6 || scenario == 7) {
+        if (scenario == 0 || scenario == 6 || scenario == 7 || scenario == 8) {
             failures += check(
                 first_small < resumed && resumed < second_small && resumed + 1 < second_small &&
                     *(resumed + 1) == "chunk:16384:exclusive" &&
@@ -2518,6 +3533,1029 @@ int run_prefill_thresholds(Frontend& frontend) {
     return failures;
 }
 
+// A tiny exact cache geometry exercises real executor pressure transitions without GPU state.
+// Each request starts with three output tokens funded, has a six-token lifetime, and requires
+// seven pages to finish. Two initial four-page reservations fit an eight-page shared pool;
+// neither can grow beside its peer. The per-lane cursor represents committed continuation.
+class ChunkedProgram final : public ProbeProgram {
+public:
+    enum class HoldPhase { None, Capture, Restore, Parked };
+    HoldPhase hold_phase = HoldPhase::None;
+    enum class MetricHold { None, Extension, SingleBlocked };
+    MetricHold metric_hold = MetricHold::None;
+
+    void release_held_decode() {
+        std::lock_guard lock(phase_mutex_);
+        release_transfer.store(true);
+        phase_cv_.notify_all();
+    }
+
+    bool fail_held_transfer     = false;
+    std::uint32_t unsafe_aborts = 0;
+    std::atomic<bool> release_transfer{false};
+    std::array<std::size_t, 32> live_credits{};
+    std::array<std::uint32_t, 32> credit_releases{};
+    std::uint32_t discarded_images           = 0;
+    std::uint32_t credit_releases_at_capture = 0;
+
+    [[nodiscard]] bool wait_for_held_phase() {
+        std::unique_lock lock(phase_mutex_);
+        return phase_cv_.wait_until(lock,
+                                    std::chrono::steady_clock::now() + std::chrono::seconds(5),
+                                    [&] { return phase_entered_; });
+    }
+
+    [[nodiscard]] bool no_live_image() const { return !saved_; }
+
+    bool thinking_budget_probe             = false;
+    bool c8_admission_probe                = false;
+    bool require_peer                      = false;
+    bool wait_for_queue                    = false;
+    std::uint32_t physical_concurrency     = 2;
+    std::uint32_t physical_pages           = 8;
+    std::uint32_t initial_window           = 3;
+    bool allow_shrink                      = false;
+    std::uint32_t shrinks                  = 0;
+    std::uint32_t peak_residents           = 0;
+    bool resumed_on_different_lane         = false;
+    std::size_t ram_credit_ceiling         = 0;
+    std::size_t total_ram_credit_ceiling   = 0;
+    std::uint64_t single_token_window_seed = 0;
+    bool replacement_started_beside_peer   = false;
+    std::array<std::uint32_t, 32> credit_attempts{};
+    std::atomic<bool> peer_submitted{false};
+    std::uint32_t starts                   = 0;
+    std::uint32_t suspensions              = 0;
+    std::uint32_t resumes                  = 0;
+    std::uint32_t extensions               = 0;
+    std::uint32_t blocked_single_rounds    = 0;
+    std::uint32_t paired_rounds            = 0;
+    std::uint32_t credit_rejections        = 0;
+    std::uint32_t smallest_admitted_window = std::numeric_limits<std::uint32_t>::max();
+
+    [[nodiscard]] bool chunked_execution_enabled() const noexcept override { return true; }
+
+    [[nodiscard]] AdmissionResources admission_capacity() const noexcept override {
+        return {physical_concurrency, physical_pages, 0};
+    }
+
+    [[nodiscard]] bool kv_copies_ready() const override { return true; }
+
+    [[nodiscard]] ProbePlan
+    plan_request_base(const PreparedPrompt& prompt,
+                      const ninfer::runtime::ResolvedExecutionOptions& options) override {
+        auto plan                           = fitted_plan();
+        plan.execution                      = options;
+        plan.fields.prompt_tokens           = prompt.summary().prompt_tokens;
+        plan.fields.effective_output_tokens = options.requested_output_tokens;
+        plan.fields.window_output_tokens =
+            std::min(options.requested_output_tokens,
+                     options.reservation_window_tokens == 0
+                         ? initial_window
+                         : std::min(initial_window, options.reservation_window_tokens));
+        if (single_token_window_seed != 0 && options.sampling.seed == single_token_window_seed)
+            plan.fields.window_output_tokens = 1;
+        plan.fields.admission           = {1, plan.fields.window_output_tokens + 1, 0};
+        plan.fields.lifetime_admission  = {1, options.requested_output_tokens + 1, 0};
+        plan.fields.suspension_bytes    = plan.fields.window_output_tokens + 1;
+        plan.fields.service_work_quanta = options.requested_output_tokens + 1;
+        return plan;
+    }
+
+    [[nodiscard]] ProbePlan plan_request_for_lane(std::uint32_t, const PreparedPrompt&,
+                                                  const ProbePlan& base) override {
+        return base;
+    }
+
+    [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
+                                      const ProbePlan& plan) const noexcept override {
+        // Stagger the initial physical bind by one decode advance, so one blocked request
+        // must coexist with a still-runnable peer instead of exhausting both windows together.
+        if (require_peer && starts == 1 && cursor_[0] + cursor_[1] < 2) { return false; }
+        return (pages_[lane] == 0 || retained_[lane]) &&
+               used_pages() - pages_[lane] + plan.fields.admission.main_kv_pages <= physical_pages;
+    }
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
+                                                       ProbePlan plan, TransientRegion, PrefillPace,
+                                                       const OutputSession* output) override {
+        ++starts;
+        if (starts == 3) {
+            for (std::size_t at = 0; at < pages_.size(); ++at)
+                replacement_started_beside_peer = replacement_started_beside_peer ||
+                                                  (at != lane && pages_[at] != 0 && !retained_[at]);
+        }
+        smallest_admitted_window =
+            std::min(smallest_admitted_window, plan.fields.window_output_tokens);
+        retained_[lane]              = false;
+        pages_[lane]                 = plan.fields.admission.main_kv_pages;
+        std::uint32_t resident_count = 0;
+        for (std::size_t at = 0; at < pages_.size(); ++at) {
+            if (pages_[at] != 0 && !retained_[at]) ++resident_count;
+        }
+        peak_residents  = std::max(peak_residents, resident_count);
+        cursor_[lane]   = 1;
+        lifetime_[lane] = plan.fields.effective_output_tokens;
+        output_[lane]   = output;
+        answered_[lane] = false;
+        tokens_[0]      = thinking_budget_probe ? 0 : sequence_[0];
+        PrefillStepResult result;
+        result.complete                = true;
+        result.processed_prompt_tokens = prompt.summary().prompt_tokens;
+        result.round.tokens            = std::span<const TokenId>(tokens_.data(), 1);
+        if (thinking_budget_probe) result.round.logprobs = logprobs();
+        result.summary.prompt_tokens = prompt.summary().prompt_tokens;
+        return result;
+    }
+
+    [[nodiscard]] ninfer::runtime::ExecutionWindow plan_window(std::uint32_t,
+                                                               std::uint32_t end) const override {
+        return {{1, end + 1, 0}, end, end + 1};
+    }
+
+    [[nodiscard]] ninfer::runtime::ExecutionWindow
+    plan_suspended_window(std::uint64_t, std::uint32_t end) const override {
+        return plan_window(0, end);
+    }
+
+    [[nodiscard]] bool grant_window(std::uint32_t lane,
+                                    const ninfer::runtime::ExecutionWindow& window) override {
+        // Keep the first completed window blocked long enough to admit its already queued
+        // peer. This reproduces the pressure geometry independently of host scheduling speed.
+        if (require_peer && starts < 2) { return false; }
+        if (used_pages() - pages_[lane] + window.admission.main_kv_pages > physical_pages) {
+            return false;
+        }
+        pages_[lane] = window.admission.main_kv_pages;
+        ++extensions;
+        return true;
+    }
+
+    [[nodiscard]] AdmissionResources completion_resources(const ProbePlan& base,
+                                                          std::uint32_t) const override {
+        auto resources = base.fields.lifetime_admission;
+        return resources;
+    }
+
+    [[nodiscard]] bool shrink_window(std::uint32_t lane,
+                                     const ninfer::runtime::ExecutionWindow& window) override {
+        if (!allow_shrink) return false;
+        if (window.output_tokens <= cursor_[lane] ||
+            window.admission.main_kv_pages < cursor_[lane] + 1 ||
+            window.admission.main_kv_pages >= pages_[lane]) {
+            throw std::logic_error(
+                "chunked probe shrink discarded current state or useful execution");
+        }
+        pages_[lane] = window.admission.main_kv_pages;
+        ++shrinks;
+        return true;
+    }
+
+    [[nodiscard]] bool reserve_suspension_credit(std::uint64_t owner, std::size_t bytes) override {
+        ++credit_attempts.at(owner);
+        std::size_t total = bytes;
+        for (std::size_t at = 0; at < live_credits.size(); ++at)
+            if (at != owner) total += live_credits[at];
+        if ((ram_credit_ceiling != 0 && bytes > ram_credit_ceiling) ||
+            (total_ram_credit_ceiling != 0 && total > total_ram_credit_ceiling)) {
+            ++credit_rejections;
+            return false;
+        }
+        live_credits.at(owner) = bytes;
+        return true;
+    }
+
+    void release_suspension_credit(std::uint64_t owner) override {
+        if (saved_ && saved_->id == owner) {
+            throw std::logic_error(
+                "chunked probe released RAM while its live image still owned it");
+        }
+        if (live_credits.at(owner) != 0) {
+            live_credits[owner] = 0;
+            ++credit_releases.at(owner);
+        }
+    }
+
+    [[nodiscard]] bool suspension_ready(std::uint64_t) const override {
+        if (fail_held_transfer && hold_phase == HoldPhase::Capture && release_transfer.load()) {
+            throw std::runtime_error("probe shared transfer failure");
+        }
+        return hold_phase != HoldPhase::Capture || release_transfer.load();
+    }
+
+    [[nodiscard]] bool resume_ready(std::uint64_t) const override {
+        if (fail_held_transfer && hold_phase == HoldPhase::Restore && release_transfer.load()) {
+            throw std::runtime_error("probe shared transfer failure");
+        }
+        return hold_phase != HoldPhase::Restore || release_transfer.load();
+    }
+
+    [[nodiscard]] bool start_suspend(std::uint32_t lane, std::uint64_t id) override {
+        if (saved_) { throw std::logic_error("chunked probe overwrote a live suspension"); }
+        if (live_credits.at(id) == 0) {
+            throw std::logic_error("chunked probe captured without secured RAM");
+        }
+        credit_releases_at_capture = credit_releases.at(id);
+        saved_ = Saved{id, cursor_[lane], lane, lifetime_[lane], output_[lane], answered_[lane]};
+        if (hold_phase == HoldPhase::Capture) { signal_held_phase(); }
+        return true;
+    }
+
+    void finish_suspend(std::uint32_t lane, std::uint64_t id) override {
+        if (!saved_ || saved_->id != id) {
+            throw std::logic_error("chunked probe finished the wrong suspension");
+        }
+        pages_[lane]  = 0;
+        cursor_[lane] = 0;
+        saved_->phase = Saved::Phase::Parked;
+        ++suspensions;
+    }
+
+    [[nodiscard]] bool start_resume(std::uint32_t lane, std::uint64_t id,
+                                    const ninfer::runtime::ExecutionWindow& window) override {
+        if (!saved_ || saved_->id != id || pages_[lane] != 0 ||
+            used_pages() + window.admission.main_kv_pages > physical_pages) {
+            return false;
+        }
+        if (hold_phase == HoldPhase::Parked && !release_transfer.load()) {
+            signal_held_phase();
+            return false;
+        }
+        if (fail_held_transfer && hold_phase == HoldPhase::Parked) {
+            throw std::runtime_error("probe shared transfer failure");
+        }
+        cursor_[lane]             = saved_->cursor;
+        lifetime_[lane]           = saved_->lifetime;
+        output_[lane]             = saved_->output;
+        answered_[lane]           = saved_->answered;
+        resumed_on_different_lane = resumed_on_different_lane || lane != saved_->lane;
+        pages_[lane]              = window.admission.main_kv_pages;
+        saved_->phase             = Saved::Phase::Restoring;
+        saved_->restore_lane      = lane;
+        if (hold_phase == HoldPhase::Restore) { signal_held_phase(); }
+        return true;
+    }
+
+    void finish_resume(std::uint32_t, std::uint64_t id) override {
+        if (!saved_ || saved_->id != id) {
+            throw std::logic_error("chunked probe resumed the wrong identity");
+        }
+        saved_.reset();
+        ++resumes;
+    }
+
+    void discard_suspended(std::uint64_t id) override {
+        if (saved_ && saved_->id == id) {
+            if (fail_held_transfer) { throw std::runtime_error("probe discard fence failure"); }
+            if (saved_->phase == Saved::Phase::Restoring) {
+                pages_[saved_->restore_lane]  = 0;
+                cursor_[saved_->restore_lane] = 0;
+            }
+            saved_.reset();
+            ++discarded_images;
+        }
+    }
+
+    [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept override {
+        return retained_[lane];
+    }
+
+    void evict_retained_lane(std::uint32_t lane) noexcept override {
+        pages_[lane]    = 0;
+        cursor_[lane]   = 0;
+        retained_[lane] = false;
+    }
+
+    void resolve_pending_batch(std::span<const std::uint32_t> lanes, std::span<const std::uint32_t>,
+                               std::span<const std::uint8_t> terminal,
+                               std::span<const std::uint8_t> cancelled,
+                               std::span<const std::uint8_t>) override {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (terminal[row] || cancelled[row]) { retained_[lanes[row]] = true; }
+        }
+    }
+
+    void abort_lane(std::uint32_t lane) noexcept override {
+        if (saved_ && ((saved_->phase == Saved::Phase::Restoring && saved_->restore_lane == lane) ||
+                       (saved_->phase == Saved::Phase::Capturing && saved_->lane == lane))) {
+            ++unsafe_aborts;
+        }
+        pages_[lane]    = 0;
+        cursor_[lane]   = 0;
+        retained_[lane] = false;
+    }
+
+    [[nodiscard]] BatchedGeneratedRound
+    decode_batch(std::span<const std::uint32_t> lanes,
+                 std::span<const RoundBudget> budgets) override {
+        if ((require_peer || wait_for_queue) && starts == 1) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!peer_submitted.load()) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    throw std::runtime_error("chunked probe peer was not submitted");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        if (c8_admission_probe && starts == 8 && !metric_hold_entered_) {
+            std::unique_lock lock(phase_mutex_);
+            metric_hold_entered_ = true;
+            phase_entered_       = true;
+            phase_cv_.notify_all();
+            if (!phase_cv_.wait_for(lock, std::chrono::seconds(5),
+                                    [&] { return release_transfer.load(); })) {
+                throw std::runtime_error("C8 window observation did not release decode");
+            }
+        }
+        if (lanes.size() == 2) { ++paired_rounds; }
+        if (require_peer && starts == 2 && lanes.size() == 1 && suspensions == 0) {
+            ++blocked_single_rounds;
+        }
+        if (!metric_hold_entered_ &&
+            ((metric_hold == MetricHold::Extension && extensions != 0) ||
+             (metric_hold == MetricHold::SingleBlocked && blocked_single_rounds != 0))) {
+            std::unique_lock lock(phase_mutex_);
+            metric_hold_entered_ = true;
+            phase_entered_       = true;
+            phase_cv_.notify_all();
+            if (!phase_cv_.wait_until(lock,
+                                      std::chrono::steady_clock::now() + std::chrono::seconds(5),
+                                      [&] { return release_transfer.load(); })) {
+                throw std::runtime_error("chunked metric observation did not release decode");
+            }
+        }
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const auto lane = lanes[row];
+            if (budgets[row].generated_tokens_remaining == 0 || cursor_[lane] >= lifetime_[lane] ||
+                (!c8_admission_probe &&
+                 (!thinking_budget_probe && cursor_[lane] >= sequence_.size()))) {
+                throw std::logic_error("chunked probe decoded outside funded lifetime");
+            }
+            if (thinking_budget_probe) {
+                if (output_[lane]->in_reasoning()) {
+                    const std::array<TokenId, 1> root{0};
+                    const std::array<std::int32_t, 1> parents{-1};
+                    std::vector<std::uint32_t> mask((248077 + 31) / 32);
+                    output_[lane]->fill_token_masks(root, parents, mask);
+                    const bool reason_allowed = (mask[0] & 1U) != 0;
+                    const bool close_allowed  = (mask[248069 / 32] & (1U << (248069 % 32))) != 0;
+                    if (!reason_allowed && !close_allowed)
+                        throw std::logic_error("joint probe lost reasoning and forced close");
+                    tokens_[row] = reason_allowed ? 0 : 248069;
+                } else if (!answered_[lane]) {
+                    tokens_[row]    = 15;
+                    answered_[lane] = true;
+                } else {
+                    tokens_[row] = 6;
+                }
+                ++cursor_[lane];
+            } else {
+                tokens_[row] = sequence_[cursor_[lane]++ % sequence_.size()];
+            }
+            counts_[row] = 1;
+        }
+        return {.tokens     = std::span<const TokenId>(tokens_.data(), lanes.size()),
+                .logprobs   = thinking_budget_probe ? logprobs() : ninfer::runtime::RoundLogprobs{},
+                .row_counts = std::span<const std::int32_t>(counts_.data(), lanes.size()),
+                .row_stride = 1};
+    }
+
+    [[nodiscard]] static std::vector<TokenId> expected() {
+        return {sequence_.begin(), sequence_.end()};
+    }
+
+private:
+    struct Saved {
+        std::uint64_t id;
+        std::size_t cursor;
+        std::uint32_t lane;
+        std::uint32_t lifetime;
+        const OutputSession* output;
+        bool answered;
+        enum class Phase { Capturing, Parked, Restoring } phase = Phase::Capturing;
+        std::uint32_t restore_lane                              = 0;
+    };
+
+    void signal_held_phase() {
+        std::lock_guard lock(phase_mutex_);
+        phase_entered_ = true;
+        phase_cv_.notify_one();
+    }
+
+    std::mutex phase_mutex_;
+    std::condition_variable phase_cv_;
+    bool phase_entered_       = false;
+    bool metric_hold_entered_ = false;
+
+    ninfer::runtime::RoundLogprobs logprobs() {
+        logprob_values_.fill(-0.25F);
+        top_values_.fill(-0.5F);
+        return {logprob_values_, top_ids_, top_values_};
+    }
+
+    [[nodiscard]] std::uint32_t used_pages() const noexcept {
+        return std::accumulate(pages_.begin(), pages_.end(), 0U);
+    }
+
+    static constexpr std::array<TokenId, 6> sequence_{15, 22, 23, 15, 22, 23};
+    std::array<std::uint32_t, ninfer::kMaximumConcurrency> pages_{};
+    std::array<bool, ninfer::kMaximumConcurrency> retained_{};
+    std::array<std::size_t, ninfer::kMaximumConcurrency> cursor_{};
+    std::array<std::uint32_t, ninfer::kMaximumConcurrency> lifetime_{};
+    std::array<const OutputSession*, ninfer::kMaximumConcurrency> output_{};
+    std::array<bool, ninfer::kMaximumConcurrency> answered_{};
+    std::array<float, ninfer::kMaximumConcurrency> logprob_values_{};
+    std::array<TokenId, std::size_t{ninfer::kMaximumConcurrency} * ninfer::kMaximumTopLogprobs>
+        top_ids_{};
+    std::array<float, std::size_t{ninfer::kMaximumConcurrency} * ninfer::kMaximumTopLogprobs>
+        top_values_{};
+    std::optional<Saved> saved_;
+    std::array<TokenId, ninfer::kMaximumConcurrency> tokens_{};
+    std::array<std::int32_t, ninfer::kMaximumConcurrency> counts_{};
+};
+
+struct ChunkedPackage {
+    using Program         = ChunkedProgram;
+    using RequestBasePlan = ProbePlan;
+    using RequestPlan     = ProbePlan;
+};
+
+struct ChunkedProbe {
+    using Package           = ChunkedPackage;
+    ChunkedProgram* program = nullptr;
+    ProbeLoaded* loaded     = nullptr;
+    ProbeMemory request_memory;
+};
+
+int run_eight_32k_windows(Frontend& frontend) {
+    ChunkedProgram program;
+    program.c8_admission_probe   = true;
+    program.wait_for_queue       = true;
+    program.physical_concurrency = 8;
+    program.physical_pages       = 8 * (8192 + 1);
+    program.initial_window       = 8192;
+    ProbeLoaded loaded{frontend};
+    ChunkedProbe instance{.program = &program, .loaded = &loaded};
+    auto engine                = engine_options();
+    engine.max_concurrency     = 8;
+    engine.max_context         = 65536;
+    engine.generation_recovery = false;
+    ninfer::runtime::ConcurrentExecutor<ChunkedProbe> executor(instance, engine);
+    const auto submit = [&] {
+        auto prompt        = frontend.prepare_tokens({15});
+        const auto summary = prompt.summary();
+        ninfer::runtime::ResolvedRequestOptions options;
+        options.execution.requested_output_tokens = 32768;
+        options.execution.allow_prefix_reuse      = false;
+        options.execution.cache_write             = false;
+        options.output.raw                        = true;
+        return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                               ninfer::OutputDelivery::TerminalOnly);
+    };
+    std::array<decltype(submit()), 8> requests;
+    for (auto& request : requests) { request = submit(); }
+    program.peer_submitted.store(true);
+    const bool reached = program.wait_for_held_phase();
+    int failures = check(reached && program.starts == 8 && program.peak_residents == 8 &&
+                             program.smallest_admitted_window == 8192 && program.suspensions == 0,
+                         "eight 32K limits charged lifetime output instead of 8K windows");
+    for (auto& request : requests) { request = {}; }
+    program.release_held_decode();
+    return failures;
+}
+
+int run_chunked_continuation(Frontend& frontend, bool paired, bool initial_ram_pressure = false) {
+    ChunkedProgram program;
+    program.require_peer       = paired;
+    program.ram_credit_ceiling = initial_ram_pressure ? 3 : 0;
+    ProbeLoaded loaded{frontend};
+    ChunkedProbe instance{.program = &program, .loaded = &loaded};
+    auto engine                = engine_options();
+    engine.max_concurrency     = 2;
+    engine.generation_recovery = false;
+    ninfer::runtime::ConcurrentExecutor<ChunkedProbe> executor(instance, engine);
+    const auto submit = [&] {
+        auto input                    = thinking_input();
+        input.options.enable_thinking = false;
+        auto prompt                   = frontend.prepare(std::move(input));
+        const auto summary            = prompt.summary();
+        ninfer::runtime::ResolvedRequestOptions options;
+        options.execution.allow_prefix_reuse      = false;
+        options.execution.cache_write             = false;
+        options.execution.requested_output_tokens = 6;
+        options.output.raw                        = true;
+        return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                               ninfer::OutputDelivery::Streaming);
+    };
+    auto first = submit();
+    std::optional<decltype(first)> second;
+    if (paired) { second.emplace(submit()); }
+    program.peer_submitted.store(true);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    ninfer::CancellationView cancellation(
+        [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+    const auto a = first.wait(nullptr, cancellation);
+    int failures = check(a.finish_reason == FinishReason::OutputLimit &&
+                             a.generated_token_ids == ChunkedProgram::expected(),
+                         "chunked: reservation window truncated or replayed first output");
+    if (second) {
+        const auto b = second->wait(nullptr, cancellation);
+        if (b.finish_reason != FinishReason::OutputLimit ||
+            b.generated_token_ids != ChunkedProgram::expected() || program.suspensions != 1 ||
+            program.resumes != 1 || program.blocked_single_rounds == 0) {
+            std::cerr << "chunked diagnostic ram_pressure=" << initial_ram_pressure
+                      << " starts=" << program.starts << " suspended=" << program.suspensions
+                      << " resumed=" << program.resumes << " extensions=" << program.extensions
+                      << " paired=" << program.paired_rounds
+                      << " blocked_peer=" << program.blocked_single_rounds
+                      << " second_tokens=" << b.generated_token_ids.size()
+                      << " second_finish=" << static_cast<int>(b.finish_reason) << '\n';
+        }
+        failures += check(b.finish_reason == FinishReason::OutputLimit &&
+                              b.generated_token_ids == ChunkedProgram::expected(),
+                          "chunked: resumed continuation lost or replayed output");
+        failures += check(program.suspensions == 1 && program.resumes == 1 && program.starts == 2,
+                          "chunked: pressure did not suspend/resume directly without prefill");
+        failures += check(program.blocked_single_rounds != 0,
+                          "chunked: a single blocked lane prevented its peer from advancing");
+        if (initial_ram_pressure) {
+            failures +=
+                check(program.credit_rejections != 0 && program.smallest_admitted_window == 1,
+                      "chunked: GPU-fit initial window never shrank to secured RAM fit");
+        }
+    } else {
+        failures += check(program.extensions != 0 && program.starts == 1 &&
+                              program.suspensions == 0 && program.resumes == 0,
+                          "chunked: solitary growth unnecessarily suspended or repeated prefill");
+    }
+    return failures;
+}
+
+int run_chunked_transfer_failure(Frontend& frontend) {
+    int failures = 0;
+    for (const auto phase : {ChunkedProgram::HoldPhase::Capture, ChunkedProgram::HoldPhase::Restore,
+                             ChunkedProgram::HoldPhase::Parked}) {
+        ChunkedProgram program;
+        program.require_peer       = true;
+        program.hold_phase         = phase;
+        program.fail_held_transfer = true;
+        ProbeLoaded loaded{frontend};
+        ChunkedProbe instance{.program = &program, .loaded = &loaded};
+        auto engine                = engine_options();
+        engine.max_concurrency     = 2;
+        engine.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<ChunkedProbe> executor(instance, engine);
+        const auto submit = [&] {
+            auto input                    = thinking_input();
+            input.options.enable_thinking = false;
+            auto prompt                   = frontend.prepare(std::move(input));
+            const auto summary            = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.cache_write             = false;
+            options.execution.requested_output_tokens = 6;
+            options.output.raw                        = true;
+            return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                   ninfer::OutputDelivery::Streaming);
+        };
+        auto peer   = submit();
+        auto victim = submit();
+        program.peer_submitted.store(true);
+        const bool reached = program.wait_for_held_phase();
+        program.release_transfer.store(true);
+        std::uint32_t published_failures = 0;
+        for (auto* request : {&peer, &victim}) {
+            try {
+                (void)request->wait(nullptr, {});
+            } catch (const std::runtime_error& error) {
+                if (std::string_view(error.what()) == "probe shared transfer failure") {
+                    ++published_failures;
+                } else {
+                    throw;
+                }
+            }
+        }
+        // The peer may finish before a parked/restore fault; the suspended owner must fail.
+        failures += check(reached && published_failures >= 1 && program.unsafe_aborts == 0 &&
+                              !program.no_live_image(),
+                          "failed live cleanup lost primary error or released an unfenced lane");
+    }
+    return failures;
+}
+
+int run_chunked_reasoning_boundary(Frontend& frontend) {
+    int failures = 0;
+    for (const std::uint32_t cap : {2U, 3U, 4U}) {
+        ChunkedProgram program;
+        program.require_peer          = true;
+        program.thinking_budget_probe = true;
+        ProbeLoaded loaded{frontend};
+        ChunkedProbe instance{.program = &program, .loaded = &loaded};
+        auto engine                = engine_options();
+        engine.max_concurrency     = 2;
+        engine.generation_recovery = true;
+        ninfer::runtime::ConcurrentExecutor<ChunkedProbe> executor(instance, engine);
+        const auto submit = [&] {
+            auto prompt        = frontend.prepare(thinking_input());
+            const auto summary = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.cache_write             = false;
+            options.execution.requested_output_tokens = 7;
+            options.output.thinking_token_budget      = cap;
+            options.output.top_logprobs               = 1;
+            return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                   ninfer::OutputDelivery::Streaming);
+        };
+        auto first  = submit();
+        auto second = submit();
+        program.peer_submitted.store(true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        ninfer::CancellationView cancellation(
+            [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+        const auto a = first.wait(nullptr, cancellation);
+        const auto b = second.wait(nullptr, cancellation);
+        std::vector<TokenId> expected(cap, 0);
+        expected.insert(expected.end(), {248069, 15, 6});
+        for (const auto* result : {&a, &b}) {
+            failures +=
+                check(result->generated_token_ids == expected && result->content == "answer",
+                      "joint chunk/cap: suspend or boundary replayed/dropped generation");
+            failures +=
+                check(result->reasoning_limit.used_tokens == cap &&
+                          result->reasoning_limit.forced_closes == 1 &&
+                          result->reasoning_limit.forced_tokens.size() == 1 &&
+                          result->recovery.attempts == 0,
+                      "joint chunk/cap: parser budget or intervention state was not preserved");
+            if (!result->reasoning_limit.forced_tokens.empty()) {
+                const auto& forced = result->reasoning_limit.forced_tokens.front();
+                failures +=
+                    check(forced.generated_token_index == cap && forced.token == 248069 &&
+                              forced.target_logprob == -0.25F,
+                          "joint chunk/cap: forced-close provenance changed across suspension");
+            }
+            failures += check(result->reasoning_logprobs.size() == cap &&
+                                  result->content_logprobs.size() == 1 &&
+                                  result->content_logprobs.front().token == 15,
+                              "joint chunk/cap: framing leaked into channel logprob records");
+        }
+        failures +=
+            check(program.starts == 2 && program.suspensions == 1 && program.resumes == 1 &&
+                      program.resumed_on_different_lane && program.blocked_single_rounds != 0,
+                  "joint chunk/cap: did not preserve live continuation through a different "
+                  "physical lane");
+    }
+    return failures;
+}
+
+int run_chunked_lifecycle(Frontend& frontend) {
+    int failures = 0;
+    for (const auto phase : {ChunkedProgram::HoldPhase::Capture, ChunkedProgram::HoldPhase::Restore,
+                             ChunkedProgram::HoldPhase::Parked}) {
+        ChunkedProgram program;
+        program.require_peer = true;
+        program.hold_phase   = phase;
+        ProbeLoaded loaded{frontend};
+        ChunkedProbe instance{.program = &program, .loaded = &loaded};
+        auto engine                = engine_options();
+        engine.max_concurrency     = 2;
+        engine.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<ChunkedProbe> executor(instance, engine);
+        const auto submit = [&](std::uint32_t output_tokens) {
+            auto input                    = thinking_input();
+            input.options.enable_thinking = false;
+            auto prompt                   = frontend.prepare(std::move(input));
+            const auto summary            = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.cache_write             = false;
+            options.execution.requested_output_tokens = output_tokens;
+            options.output.raw                        = true;
+            return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                   ninfer::OutputDelivery::Streaming);
+        };
+        auto peer = submit(6);
+        std::optional<decltype(peer)> victim(submit(6));
+        program.peer_submitted.store(true);
+        const bool reached = program.wait_for_held_phase();
+        // Submission destruction synchronously publishes disconnect cancellation. The phase
+        // gate remains closed until that store has happened; no timing sleep races a fence.
+        victim.reset();
+        // Parked work has no in-flight transfer to release. Keep restoration unavailable
+        // until the scheduler observes cancellation, including retries already in progress.
+        if (phase != ChunkedProgram::HoldPhase::Parked) { program.release_transfer.store(true); }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        ninfer::CancellationView cancellation(
+            [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+        const auto peer_result  = peer.wait(nullptr, cancellation);
+        auto after              = submit(2);
+        const auto after_result = after.wait(nullptr, cancellation);
+        failures +=
+            check(reached && peer_result.generated_token_ids == ChunkedProgram::expected() &&
+                      peer_result.finish_reason == FinishReason::OutputLimit &&
+                      after_result.generated_token_ids == std::vector<TokenId>({15, 22}),
+                  "chunked cancellation: transfer gate or surviving/new request lost progress");
+        if (program.starts != 3 || !program.no_live_image() ||
+            program.credit_releases[2] != program.credit_releases_at_capture + 1 ||
+            std::any_of(program.live_credits.begin(), program.live_credits.end(),
+                        [](auto n) { return n != 0; })) {
+            std::cerr << "lifecycle diagnostic phase=" << static_cast<int>(phase)
+                      << " starts=" << program.starts << " image=" << !program.no_live_image()
+                      << " release2=" << program.credit_releases[2] << " credits=";
+            for (auto credit : program.live_credits) { std::cerr << credit << ','; }
+            std::cerr << '\n';
+        }
+        failures +=
+            check(program.starts == 3 && program.no_live_image() &&
+                      std::all_of(program.live_credits.begin(), program.live_credits.end(),
+                                  [](auto bytes) { return bytes == 0; }) &&
+                      program.credit_releases[2] == program.credit_releases_at_capture + 1,
+                  "chunked cancellation: live image/credit ownership leaked or released twice");
+        const auto stats = executor.runtime_stats();
+        failures += check(stats.running_requests == 0 && stats.kv_suspended_requests == 0 &&
+                              stats.kv_growth_blocked_requests == 0,
+                          "chunked cancellation: cancelled continuation remained admitted");
+        if (phase == ChunkedProgram::HoldPhase::Restore) {
+            failures += check(
+                program.suspensions == 1 && program.resumes == 1 && program.discarded_images == 0,
+                "chunked cancellation: restore was not settled exactly once before lane cleanup");
+        } else {
+            failures += check(
+                program.suspensions == 1 && program.resumes == 0 && program.discarded_images == 1,
+                "chunked cancellation: captured/parked image was not discarded exactly once");
+        }
+    }
+    return failures;
+}
+
+int run_chunked_finite_ram_and_replacement(Frontend& frontend) {
+    int failures = 0;
+    for (const bool no_credit_fits : {false, true}) {
+        ChunkedProgram program;
+        program.require_peer       = !no_credit_fits;
+        program.ram_credit_ceiling = no_credit_fits ? 1 : 0;
+        ProbeLoaded loaded{frontend};
+        ChunkedProbe instance{.program = &program, .loaded = &loaded};
+        auto engine                = engine_options();
+        engine.max_concurrency     = 2;
+        engine.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<ChunkedProbe> executor(instance, engine);
+        const auto submit = [&](std::uint32_t output_tokens) {
+            auto input                    = thinking_input();
+            input.options.enable_thinking = false;
+            auto prompt                   = frontend.prepare(std::move(input));
+            const auto summary            = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.cache_write             = false;
+            options.execution.requested_output_tokens = output_tokens;
+            options.output.raw                        = true;
+            return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                   ninfer::OutputDelivery::Streaming);
+        };
+        auto first  = submit(6);
+        auto second = submit(6);
+        std::optional<decltype(first)> replacement;
+        if (!no_credit_fits) { replacement.emplace(submit(2)); }
+        program.peer_submitted.store(true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        ninfer::CancellationView cancellation(
+            [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+        const auto a = first.wait(nullptr, cancellation);
+        const auto b = second.wait(nullptr, cancellation);
+        failures += check(a.generated_token_ids == ChunkedProgram::expected() &&
+                              b.generated_token_ids == ChunkedProgram::expected(),
+                          "chunked finite RAM: escape drain lost a request or its continuation");
+        if (replacement) {
+            const auto c = replacement->wait(nullptr, cancellation);
+            failures += check(
+                c.generated_token_ids == std::vector<TokenId>({15, 22}) && program.starts == 3 &&
+                    program.suspensions == 1 && program.resumes == 1,
+                "chunked replacement: queued short request did not use pressure-released lane");
+        } else {
+            failures += check(
+                program.starts == 2 && program.credit_rejections != 0 && program.suspensions == 0 &&
+                    program.resumes == 0 && program.paired_rounds == 0,
+                "chunked finite RAM: unfunded peer was admitted or escape did not drain serially");
+        }
+        failures += check(program.no_live_image() &&
+                              std::all_of(program.live_credits.begin(), program.live_credits.end(),
+                                          [](auto bytes) { return bytes == 0; }),
+                          "chunked finite RAM: final live image/credit ownership leaked");
+    }
+    return failures;
+}
+
+int run_cohort_replacement_without_spare_ram(Frontend& frontend) {
+    ChunkedProgram program;
+    program.wait_for_queue           = true;
+    program.physical_pages           = 10;
+    program.total_ram_credit_ceiling = 2;
+    program.single_token_window_seed = 2;
+    ProbeLoaded loaded{frontend};
+    ChunkedProbe instance{.program = &program, .loaded = &loaded};
+    auto engine                = engine_options();
+    engine.max_concurrency     = 2;
+    engine.generation_recovery = false;
+    ninfer::runtime::ConcurrentExecutor<ChunkedProbe> executor(instance, engine);
+    const auto submit = [&](std::uint32_t output_tokens, std::uint64_t seed) {
+        auto input                    = thinking_input();
+        input.options.enable_thinking = false;
+        auto prompt                   = frontend.prepare(std::move(input));
+        const auto summary            = prompt.summary();
+        ninfer::runtime::ResolvedRequestOptions options;
+        options.execution.allow_prefix_reuse      = false;
+        options.execution.cache_write             = false;
+        options.execution.requested_output_tokens = output_tokens;
+        options.execution.sampling.seed           = seed;
+        options.output.raw                        = true;
+        return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                               ninfer::OutputDelivery::Streaming);
+    };
+    auto first       = submit(6, 1);
+    auto blocked     = submit(6, 2);
+    auto replacement = submit(2, 3);
+    program.peer_submitted.store(true);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    ninfer::CancellationView cancellation(
+        [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+    const auto a = first.wait(nullptr, cancellation);
+    const auto b = blocked.wait(nullptr, cancellation);
+    const auto c = replacement.wait(nullptr, cancellation);
+    return check(a.generated_token_ids == ChunkedProgram::expected() &&
+                     b.generated_token_ids == ChunkedProgram::expected() &&
+                     c.generated_token_ids == std::vector<TokenId>({15, 22}) &&
+                     program.replacement_started_beside_peer && program.suspensions == 1 &&
+                     program.resumes == 1 && program.credit_attempts[3] == 0 &&
+                     program.no_live_image() &&
+                     std::all_of(program.live_credits.begin(), program.live_credits.end(),
+                                 [](auto bytes) { return bytes == 0; }),
+                 "cohort replacement: spare RAM was required despite reserved completion capacity");
+}
+
+int run_chunked_active_window_metrics(Frontend& frontend) {
+    int failures = 0;
+    for (const bool paired : {false, true}) {
+        ChunkedProgram program;
+        program.require_peer = paired;
+        program.metric_hold  = paired ? ChunkedProgram::MetricHold::SingleBlocked
+                                      : ChunkedProgram::MetricHold::Extension;
+        ProbeLoaded loaded{frontend};
+        ChunkedProbe instance{.program = &program, .loaded = &loaded};
+        auto engine                = engine_options();
+        engine.max_concurrency     = 2;
+        engine.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<ChunkedProbe> executor(instance, engine);
+        const auto submit = [&] {
+            auto input                    = thinking_input();
+            input.options.enable_thinking = false;
+            auto prompt                   = frontend.prepare(std::move(input));
+            const auto summary            = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.cache_write             = false;
+            options.execution.requested_output_tokens = 6;
+            options.output.raw                        = true;
+            return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                   ninfer::OutputDelivery::Streaming);
+        };
+        auto first = submit();
+        std::optional<decltype(first)> second;
+        if (paired) { second.emplace(submit()); }
+        program.peer_submitted.store(true);
+        const bool reached            = program.wait_for_held_phase();
+        const auto active             = executor.runtime_stats();
+        const auto granted_extensions = program.extensions;
+        program.release_held_decode();
+        failures += check(reached && active.running_requests == (paired ? 2U : 1U),
+                          "chunked metrics: observation did not hold an active continuation");
+        if (paired) {
+            failures += check(
+                active.kv_growth_blocked_requests == 1 && active.decode_ready_requests == 1 &&
+                    active.kv_live_suspensions == 0,
+                "chunked metrics: growth-blocked transition was stale while a peer still decoded");
+        } else {
+            failures += check(
+                active.kv_window_extensions == granted_extensions &&
+                    active.kv_window_extensions != 0 && active.kv_growth_blocked_requests == 0,
+                "chunked metrics: successful window grant was invisible until completion");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        ninfer::CancellationView cancellation(
+            [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+        const auto a = first.wait(nullptr, cancellation);
+        failures += check(a.generated_token_ids == ChunkedProgram::expected(),
+                          "chunked metrics: observing active counters prevented request progress");
+        if (second) {
+            const auto b = second->wait(nullptr, cancellation);
+            failures += check(b.generated_token_ids == ChunkedProgram::expected(),
+                              "chunked metrics: blocked peer did not resume after observation");
+        }
+    }
+    return failures;
+}
+
+int run_completion_cohort(Frontend& frontend) {
+    int failures = 0;
+    // With no allocatable RAM credit, four requests can still run together when their
+    // target-produced completion envelopes fit. A smaller pool permits three unbacked
+    // members plus one backed peer, using only current windows for actual GPU ownership.
+    for (const bool backed_peer : {false, true}) {
+        ChunkedProgram program;
+        program.physical_concurrency = 4;
+        program.physical_pages       = backed_peer ? 25 : 28;
+        program.ram_credit_ceiling   = backed_peer ? 4 : 1;
+        program.wait_for_queue       = true;
+        ProbeLoaded loaded{frontend};
+        ChunkedProbe instance{.program = &program, .loaded = &loaded};
+        auto engine                = engine_options();
+        engine.max_concurrency     = 4;
+        engine.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<ChunkedProbe> executor(instance, engine);
+        std::vector<decltype(executor.submit({}, {}, 0.0, {}, ninfer::OutputDelivery::Streaming))>
+            requests;
+        for (std::uint32_t i = 0; i < 4; ++i) {
+            auto input                    = thinking_input();
+            input.options.enable_thinking = false;
+            auto prompt                   = frontend.prepare(std::move(input));
+            const auto summary            = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.cache_write             = false;
+            options.execution.requested_output_tokens = 6;
+            options.output.raw                        = true;
+            requests.push_back(executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                               ninfer::OutputDelivery::Streaming));
+        }
+        program.peer_submitted.store(true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        ninfer::CancellationView cancellation(
+            [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+        for (auto& request : requests) {
+            const auto result = request.wait(nullptr, cancellation);
+            failures += check(
+                result.generated_token_ids == ChunkedProgram::expected() &&
+                    result.finish_reason == FinishReason::OutputLimit,
+                "completion cohort: future proof lost progress or changed the output allowance");
+        }
+        failures +=
+            check(program.peak_residents == 4 && program.starts == 4 && program.no_live_image() &&
+                      std::all_of(program.live_credits.begin(), program.live_credits.end(),
+                                  [](auto n) { return n == 0; }),
+                  "completion cohort: unnecessary backing reduced residency or leaked ownership");
+        if (!backed_peer) {
+            failures += check(
+                program.credit_rejections == 0 && program.suspensions == 0,
+                "completion cohort: jointly feasible members requested unnecessary RAM backing");
+        }
+    }
+    return failures;
+}
+
+int run_unused_window_reclamation(Frontend& frontend) {
+    ChunkedProgram program;
+    program.physical_pages = 10;
+    program.initial_window = 5;
+    program.allow_shrink   = true;
+    program.wait_for_queue = true;
+    ProbeLoaded loaded{frontend};
+    ChunkedProbe instance{.program = &program, .loaded = &loaded};
+    auto engine                = engine_options();
+    engine.max_concurrency     = 2;
+    engine.generation_recovery = false;
+    ninfer::runtime::ConcurrentExecutor<ChunkedProbe> executor(instance, engine);
+    const auto submit = [&] {
+        auto input                    = thinking_input();
+        input.options.enable_thinking = false;
+        auto prompt                   = frontend.prepare(std::move(input));
+        const auto summary            = prompt.summary();
+        ninfer::runtime::ResolvedRequestOptions options;
+        options.execution.allow_prefix_reuse      = false;
+        options.execution.cache_write             = false;
+        options.execution.requested_output_tokens = 6;
+        options.output.raw                        = true;
+        return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                               ninfer::OutputDelivery::Streaming);
+    };
+    auto first  = submit();
+    auto second = submit();
+    program.peer_submitted.store(true);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    ninfer::CancellationView cancellation(
+        [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+    const auto a = first.wait(nullptr, cancellation);
+    const auto b = second.wait(nullptr, cancellation);
+    int failures =
+        check(a.generated_token_ids == ChunkedProgram::expected() &&
+                  b.generated_token_ids == ChunkedProgram::expected(),
+              "window reclaim: reducing future entitlement lost current state or lifetime output");
+    failures += check(
+        program.shrinks != 0 && program.peak_residents == 2 &&
+            program.smallest_admitted_window == 5 && program.starts == 2,
+        "window reclaim: queued work reduced its own window instead of reclaiming unused slack");
+    return failures;
+}
+
 int main() {
     try {
         Frontend frontend                = FrontendTestAccess::create_component(resources(), false);
@@ -2533,6 +4571,25 @@ int main() {
             CacheCase::AdmitDiskRestoreThenCold,
         };
         int failures = run_reasoning_close_sampling(frontend);
+        failures += run_eight_32k_windows(frontend);
+        failures += run_chunked_continuation(frontend, false);
+        failures += run_chunked_continuation(frontend, true);
+        failures += run_chunked_continuation(frontend, true, true);
+        failures += run_reasoning_budget_close(frontend);
+        failures += run_limited_recovery_policy(frontend);
+        failures += run_reasoning_budget_retry(frontend);
+        failures += run_repeated_answer(frontend);
+        failures += run_reasoning_repetition_boundaries(frontend);
+        failures += run_withheld_reasoning_replay(frontend);
+        failures += run_replay_replacement_publication(frontend);
+        failures += run_chunked_reasoning_boundary(frontend);
+        failures += run_chunked_lifecycle(frontend);
+        failures += run_chunked_transfer_failure(frontend);
+        failures += run_chunked_finite_ram_and_replacement(frontend);
+        failures += run_cohort_replacement_without_spare_ram(frontend);
+        failures += run_chunked_active_window_metrics(frontend);
+        failures += run_completion_cohort(frontend);
+        failures += run_unused_window_reclamation(frontend);
         failures += run_prefill_interruptions(frontend);
         failures += run_prefill_thresholds(frontend);
         failures += run_full_batch_compaction(frontend);

@@ -468,7 +468,7 @@ void KVRamCache::free_block_locked(Record& record) {
     }
     record.copies_timed = false;
     if (record.block != nullptr) {
-        arena_.free(record.block);
+        if (record.live_owner == 0) { arena_.free(record.block); }
         record.block = nullptr;
     }
 }
@@ -1103,12 +1103,13 @@ KvRamSnapshot KVRamCache::snapshot() const noexcept {
     std::lock_guard lock(io_mutex_);
     std::size_t used = 0, system_entries = 0, system_bytes = 0;
     for (const auto& [id, record] : records_) {
-        used += record.bytes;
+        if (record.live_owner == 0) { used += record.bytes; }
         if (!record.retired && record.system_prompt) {
             ++system_entries;
             system_bytes += record.bytes;
         }
     }
+    for (const auto& [owner, credit] : live_credits_) { used += credit.bytes; }
     return KvRamSnapshot{
         .capacity_bytes           = arena_.capacity(),
         .used_bytes               = used,
@@ -1131,6 +1132,166 @@ void KVRamCache::record_drop() {
     std::lock_guard lock(io_mutex_);
     ++drops_;
     bump_version();
+}
+
+std::size_t KVRamCache::live_image_budget(const PagedKVPool& text, const PagedKVPool* backend,
+                                          std::uint32_t text_pages, std::uint32_t backend_pages,
+                                          std::size_t ledger_tokens, std::size_t identity_bytes,
+                                          std::size_t conv_bytes, std::size_t recurrent_bytes,
+                                          std::size_t hidden_bytes, std::size_t cyclic_bytes,
+                                          std::size_t checkpoint_count) {
+    std::size_t bytes =
+        header_bytes_for(static_cast<std::uint32_t>(text.plane_count()),
+                         backend ? static_cast<std::uint32_t>(backend->plane_count()) : 0,
+                         static_cast<std::uint32_t>(checkpoint_count));
+    const auto add = [&](std::size_t n) {
+        if (n) { bytes = align_up(bytes, kDeviceAlign) + n; }
+    };
+    add(ledger_tokens * sizeof(TokenId));
+    add(identity_bytes);
+    add(paged_kv_host_image_bytes(text, text_pages));
+    if (backend) { add(paged_kv_host_image_bytes(*backend, backend_pages)); }
+    // Both current and rewrite sets are funded, even before the latter is captured.
+    add(conv_bytes);
+    add(conv_bytes);
+    add(recurrent_bytes);
+    add(recurrent_bytes);
+    add(hidden_bytes);
+    add(hidden_bytes);
+    add(cyclic_bytes);
+    add(cyclic_bytes);
+    for (std::size_t i = 0; i < checkpoint_count; ++i) {
+        add(conv_bytes);
+        add(recurrent_bytes);
+        add(hidden_bytes);
+        add(cyclic_bytes);
+    }
+    return align_up(bytes, kDeviceAlign);
+}
+
+bool KVRamCache::reserve_live_credit(std::uint64_t owner, std::size_t bytes) {
+    if (owner == 0 || bytes == 0) { throw std::invalid_argument("invalid live RAM credit"); }
+    std::lock_guard lock(io_mutex_);
+    reap_retired_locked();
+    auto it = live_credits_.find(owner);
+    if (it != live_credits_.end() && it->second.bytes >= bytes) {
+        bool image_present = false;
+        for (const auto& [id, record] : records_) {
+            if (record.live_owner == owner) {
+                image_present = true;
+                break;
+            }
+        }
+        if (!image_present && it->second.bytes > bytes) {
+            arena_.shrink(it->second.block, bytes);
+            it->second.bytes = bytes;
+        }
+        return true;
+    }
+    // A suspended image can be relocated only after every DMA/host reader has settled.
+    for (const auto& [id, record] : records_) {
+        if (record.live_owner != owner) { continue; }
+        if (record.io_pins != 0) { return false; }
+        for (cudaEvent_t event : {record.copies_done, record.block_done}) {
+            if (!event) { continue; }
+            const auto status = cudaEventQuery(event);
+            if (status == cudaErrorNotReady) { return false; }
+            CUDA_CHECK(status);
+        }
+    }
+    if (it != live_credits_.end() && arena_.try_grow(it->second.block, bytes)) {
+        it->second.bytes = bytes;
+        return true;
+    }
+    void* block = arena_.try_alloc(bytes, kDeviceAlign);
+    while (!block) {
+        std::uint64_t victim = 0;
+        for (auto id : fifo_) {
+            const auto& r = require(id);
+            if (!r.pinned && r.io_pins == 0) {
+                victim = id;
+                break;
+            }
+        }
+        if (!victim) { return false; }
+        retire_locked(victim);
+        reap_retired_locked();
+        block = arena_.try_alloc(bytes, kDeviceAlign);
+    }
+    try {
+        if (it == live_credits_.end()) {
+            live_credits_.emplace(owner, LiveCredit{block, bytes});
+        } else {
+            // Preserve the full old credit: live sampler counters can occupy its tail.
+            // Resident credits contain no payload and do not need a host copy.
+            bool has_image = false;
+            for (auto& [id, record] : records_) {
+                if (record.live_owner == owner) {
+                    has_image    = true;
+                    record.block = block;
+                }
+            }
+            if (has_image) { std::memcpy(block, it->second.block, it->second.bytes); }
+            arena_.free(it->second.block);
+            it->second = {block, bytes};
+        }
+    } catch (...) {
+        arena_.free(block);
+        throw;
+    }
+    return true;
+}
+
+bool KVRamCache::live_image_ready(std::uint64_t id) const {
+    std::lock_guard lock(io_mutex_);
+    const auto& record = require(id);
+    if (record.live_owner == 0) { throw std::logic_error("not a live RAM image"); }
+    for (cudaEvent_t event : {record.copies_done, record.block_done}) {
+        if (!event) { continue; }
+        const auto status = cudaEventQuery(event);
+        if (status == cudaErrorNotReady) { return false; }
+        CUDA_CHECK(status);
+    }
+    return true;
+}
+
+void KVRamCache::wait_live_image(std::uint64_t id) {
+    std::lock_guard lock(io_mutex_);
+    const auto& record = require(id);
+    if (record.live_owner == 0) { throw std::logic_error("not a live RAM image"); }
+    for (cudaEvent_t event : {record.copies_done, record.block_done}) {
+        if (event) { CUDA_CHECK(cudaEventSynchronize(event)); }
+    }
+}
+
+void KVRamCache::retire_live_image(std::uint64_t id) {
+    std::lock_guard lock(io_mutex_);
+    auto& record = require(id);
+    if (record.live_owner == 0) { throw std::logic_error("not a live RAM image"); }
+    record.pinned = false;
+    retire_locked(id);
+    reap_retired_locked();
+}
+
+std::pair<void*, std::size_t> KVRamCache::live_credit_view(std::uint64_t owner) const {
+    std::lock_guard lock(io_mutex_);
+    const auto& credit = live_credits_.at(owner);
+    return {credit.block, credit.bytes};
+}
+
+void KVRamCache::release_live_credit(std::uint64_t owner) {
+    std::lock_guard lock(io_mutex_);
+    reap_retired_locked();
+    for (const auto& [id, record] : records_) {
+        if (record.live_owner == owner) {
+            throw std::logic_error("live RAM image still owns its credit");
+        }
+    }
+    auto it = live_credits_.find(owner);
+    if (it != live_credits_.end()) {
+        arena_.free(it->second.block);
+        live_credits_.erase(it);
+    }
 }
 
 RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
@@ -1297,7 +1458,21 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
         // The arena is shared with the disk worker, whose last I/O unpin frees retired blocks.
         std::lock_guard lock(io_mutex_);
         reap_retired_locked();
-        block = arena_.try_alloc(header.entry_bytes, kDeviceAlign);
+        if (source.live_owner != 0) {
+            const auto it = live_credits_.find(source.live_owner);
+            if (it == live_credits_.end() ||
+                it->second.bytes < header.entry_bytes + source.live_reserved_tail_bytes) {
+                throw std::logic_error("live capture exceeds secured RAM credit");
+            }
+            for (const auto& [id, record] : records_) {
+                if (record.live_owner == source.live_owner) {
+                    throw std::logic_error("live credit already contains a suspension image");
+                }
+            }
+            block = it->second.block;
+        } else {
+            block = arena_.try_alloc(header.entry_bytes, kDeviceAlign);
+        }
     }
     if (block == nullptr) {
         // Claimed sources and system entries protected from ordinary eviction split the arena.
@@ -1497,6 +1672,8 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
         Record record;
         record.id                  = next_id_++;
         record.system_prompt       = source.system_prompt;
+        record.live_owner          = source.live_owner;
+        record.pinned              = source.live_owner != 0;
         record.last_used           = 0;
         record.hash_f              = source.hash_f;
         record.hash_c              = source.hash_c;
@@ -1526,7 +1703,7 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
         if (!inserted) { throw std::logic_error("RAM cache entry id already exists"); }
         copies_start = nullptr;
         live_id      = record.id;
-        fifo_.push_back(record.id);
+        if (source.live_owner == 0) { fifo_.push_back(record.id); }
         record_copies(it->second, source.stream);
         pending_save_ids_.push_back(record.id);
         ++captures_;
@@ -1549,7 +1726,7 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
             retire_locked(live_id);
         } else {
             std::lock_guard lock(io_mutex_);
-            arena_.free(block);
+            if (source.live_owner == 0) { arena_.free(block); }
         }
         throw;
     }

@@ -168,6 +168,86 @@ bool Program<Variant>::can_admit_lane_after_releasing(
 }
 
 template <>
+bool Program<Variant>::chunked_execution_enabled() const noexcept {
+    return impl_->chunked_execution_enabled();
+}
+
+template <>
+runtime::AdmissionResources
+Program<Variant>::completion_resources(const RequestBasePlan<Variant>& base,
+                                       std::uint32_t prompt_token_bound) const {
+    return impl_->completion_resources(base, prompt_token_bound);
+}
+
+template <>
+bool Program<Variant>::shrink_window(std::uint32_t lane, const runtime::ExecutionWindow& window) {
+    return impl_->shrink_window(lane, window);
+}
+
+template <>
+runtime::ExecutionWindow Program<Variant>::plan_window(std::uint32_t lane,
+                                                       std::uint32_t output_tokens) const {
+    return impl_->plan_window(lane, output_tokens);
+}
+
+template <>
+runtime::ExecutionWindow
+Program<Variant>::plan_suspended_window(std::uint64_t owner, std::uint32_t output_tokens) const {
+    return impl_->plan_suspended_window(owner, output_tokens);
+}
+
+template <>
+bool Program<Variant>::grant_window(std::uint32_t lane, const runtime::ExecutionWindow& window) {
+    return impl_->grant_window(lane, window);
+}
+
+template <>
+bool Program<Variant>::reserve_suspension_credit(std::uint64_t owner, std::size_t bytes) {
+    return impl_->reserve_suspension_credit(owner, bytes);
+}
+
+template <>
+void Program<Variant>::release_suspension_credit(std::uint64_t owner) {
+    impl_->release_suspension_credit(owner);
+}
+
+template <>
+bool Program<Variant>::start_suspend(std::uint32_t lane, std::uint64_t owner) {
+    return impl_->start_suspend(lane, owner);
+}
+
+template <>
+bool Program<Variant>::suspension_ready(std::uint64_t owner) const {
+    return impl_->suspension_ready(owner);
+}
+
+template <>
+void Program<Variant>::finish_suspend(std::uint32_t lane, std::uint64_t owner) {
+    impl_->finish_suspend(lane, owner);
+}
+
+template <>
+bool Program<Variant>::start_resume(std::uint32_t lane, std::uint64_t owner,
+                                    const runtime::ExecutionWindow& window) {
+    return impl_->start_resume(lane, owner, window);
+}
+
+template <>
+bool Program<Variant>::resume_ready(std::uint64_t owner) const {
+    return impl_->resume_ready(owner);
+}
+
+template <>
+void Program<Variant>::finish_resume(std::uint32_t lane, std::uint64_t owner) {
+    impl_->finish_resume(lane, owner);
+}
+
+template <>
+void Program<Variant>::discard_suspended(std::uint64_t owner) {
+    impl_->discard_suspended(owner);
+}
+
+template <>
 runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcept {
     return impl_->admission_capacity();
 }

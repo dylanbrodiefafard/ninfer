@@ -124,6 +124,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--context-checkpoints off|a,b,c] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--system-prepend TEXT] "
+           "[--default-thinking-token-budget N|off] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--no-p-less-sampling]\n"
@@ -150,8 +151,9 @@ std::string serve_usage_text(const char* argv0) {
            "); raise it when a desktop or other process shares the GPU\n"
            "       --kv-ram-system-prompts N retains system prefixes in the RAM budget (default "
            "0)\n"
-           "       --kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default "
+           "       --kv-ram-capacity sets pinned host prefix/live-state capacity in MiB (default "
            "off)\n"
+           "       Enabling RAM reserves output in windows of at most 8192 tokens.\n"
            "       --kv-disk-capacity sets SSD KV prefix-cache pack-file capacity in MiB "
            "(default off)\n"
            "       --kv-disk-location is required iff --kv-disk-capacity is enabled\n"
@@ -161,6 +163,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --context-checkpoints off disables the automatic prefill ladder; a,b,c replaces "
            "the default marks (requires --spec dflash). Marks at or above --max-context "
            "stay unused. Advertised freeze F is the committed chunk end at or past the mark.\n"
+           "       --default-thinking-token-budget defaults omitted request caps to N (default "
+           "off); "
+           "explicit null remains unlimited\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       --system-prepend prepends TEXT to the leading system/developer instruction on "
            "every request (inserts a system turn if missing)\n"
@@ -333,6 +338,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--default-thinking-token-budget") {
+            const char* value = require_value("--default-thinking-token-budget");
+            if (std::string_view(value) == "off") {
+                options.default_thinking_token_budget.reset();
+            } else {
+                const auto budget = parse_u64(value, "default-thinking-token-budget");
+                if (budget == 0 || budget > std::numeric_limits<std::uint32_t>::max())
+                    throw std::invalid_argument(
+                        "--default-thinking-token-budget must be off or a positive uint32 integer");
+                options.default_thinking_token_budget = static_cast<std::uint32_t>(budget);
+            }
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
         } else if (arg == "--system-prepend") {

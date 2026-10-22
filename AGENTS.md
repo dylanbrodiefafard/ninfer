@@ -82,10 +82,15 @@ GPU, one resident model instance, and a startup-fixed one to eight active reques
 Engine forms one compact decode batch per round boundary with bounded FIFO ingress. A short
 text prefill may interrupt a large prefill at a completed chunk boundary only on a genuinely
 available spare lane with its own feasible resources; the suspended owner retains its lane
-and state and must advance another chunk before another interruption. General preemptive
-continuous batching, priority/QoS scheduling, additional
+and state and must advance another chunk before another interruption. With RAM caching enabled, output KV is reserved in windows of at most 8192 tokens. Settled
+active continuations may suspend to secured RAM under actual KV pressure and resume on a free lane;
+request output limits and logical identities remain unchanged. RAM-off uses completion reservation.
+General preemptive continuous batching, priority/QoS scheduling, additional
 checkpoint targets, and retargeting to another execution platform are outside the current
-product. Per-request `cache_write: false` supports disposable turns that fork coherent cached
+product. Optional reasoning-token budgets count newly committed reasoning body IDs across attempts and
+KV suspension. At the cap, sampling forces the native reasoning close; total output/context
+limits and caller stops retain precedence. Capped requests preserve analysis and disable clean
+retries, while cycle escape and framing repair remain active. Per-request `cache_write: false` supports disposable turns that fork coherent cached
 state into independent allocations, preserve the original through initialization, suppress reuse
 checkpoint captures and RAM/disk writes for the branch, and prioritize disposable idle state for
 eviction. An ordinary original may migrate to full-state RAM storage to free a lane; this is not

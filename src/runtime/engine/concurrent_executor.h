@@ -5,6 +5,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
+#include "runtime/engine/kv_pressure_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
@@ -18,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -75,7 +77,8 @@ public:
     using Plan     = typename Package::RequestPlan;
     using Clock    = std::chrono::steady_clock;
 
-    ConcurrentExecutor(Instance& instance, const EngineOptions& options)
+    ConcurrentExecutor(Instance& instance, const EngineOptions& options,
+                       ReasoningLimitAction reasoning_limit_action = ReasoningLimitAction::Close)
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
@@ -83,9 +86,12 @@ public:
           admission_capacity_(instance.program->admission_capacity()),
           context_capacity_(options.max_context), load_progress_(options.load_progress),
           generation_recovery_(options.generation_recovery),
+          reasoning_limit_action_(reasoning_limit_action),
           shared_prefill_(options.mixed_forward != 0),
           mixed_forward_rounds_(options.mixed_forward_rounds),
-          mixed_forward_min_tokens_(options.mixed_forward_min_tokens) {
+          mixed_forward_min_tokens_(options.mixed_forward_min_tokens),
+          chunked_execution_(instance.program->chunked_execution_enabled()),
+          kv_pressure_(options.max_concurrency, max_outstanding_) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0 ||
             mixed_forward_rounds_ == 0) {
@@ -95,6 +101,8 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        completion_cohort_.reserve(max_concurrency_);
+        publish_runtime_stats();
         // The worker issues all model CUDA work; bind it to the Engine device before the first
         // request so a non-zero --device never falls back to the thread-default device 0.
         std::promise<void> startup;
@@ -208,16 +216,40 @@ public:
 
         std::shared_ptr<Request> request;
         try {
-            auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
-                                                                         options.output);
+            auto output = instance_.loaded->frontend.make_output_session(
+                prompt, options.stop, options.output, generation_recovery_, nullptr,
+                reasoning_limit_action_);
             configure_output_suppression(output, options.execution,
                                          !output.model_stop_tokens_allowed());
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 delivery, pending_deadline, submitted,
                                                 std::move(host_input), generation_recovery_);
+            if (request->options.output.thinking_token_budget &&
+                reasoning_limit_action_ == ReasoningLimitAction::Retry) {
+                request->recovery_context = request->output.generation_recovery_context();
+                if (!request->recovery_context) {
+                    throw std::invalid_argument(
+                        "reasoning-limit retry requires a text-only thinking chat prompt");
+                }
+            }
             request->base_plan.emplace(
                 instance_.program->plan_request_base(request->prompt, request->options.execution));
+            if (chunked_execution_) {
+                auto prompt_bound = request->base_plan->summary().prompt_tokens;
+                const bool retry_enabled =
+                    !request->options.output.raw && request->recovery_context &&
+                    !clean_retries_forbidden(*request) &&
+                    (generation_recovery_ ||
+                     (request->options.output.thinking_token_budget &&
+                      reasoning_limit_action_ == ReasoningLimitAction::Retry));
+                if (retry_enabled) {
+                    prompt_bound = instance_.loaded->frontend.recovery_prompt_token_bound(
+                        request->prompt, *request->recovery_context);
+                }
+                request->completion_resources =
+                    instance_.program->completion_resources(*request->base_plan, prompt_bound);
+            }
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -418,8 +450,13 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
-            if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
+            if (slots_[lane]->decode_ready && !slots_[lane]->growth_blocked) {
+                ++snapshot.decode_ready_requests;
+            }
+            if (slots_[lane]->growth_blocked) { ++snapshot.kv_growth_blocked_requests; }
         }
+        snapshot.kv_suspended_requests      = static_cast<std::uint32_t>(suspended_.size());
+        snapshot.kv_execution_window_tokens = chunked_execution_ ? 8192U : 0U;
         assign_kv_ram_stats(snapshot, instance_.program->kv_ram_snapshot());
         // The disk tier's mutex can be held by its worker for file I/O; a
         // decode-loop stats publication keeps the last snapshot instead of waiting.
@@ -517,8 +554,10 @@ private:
               options(std::move(request_options)), delivery(output_delivery), deadline(limit),
               submitted(submit_time), pending_since(submit_time),
               stop_suppression_active(!output.model_stop_tokens_allowed()) {
-            if (generation_recovery && options.execution.sampling.p_less && !options.output.raw) {
-                recovery_context = output.generation_recovery_context();
+            if (generation_recovery && !options.output.raw) {
+                recovery_context         = output.generation_recovery_context();
+                guard_repeated_reasoning = true;
+                guard_repeated_content   = true;
             }
         }
 
@@ -549,6 +588,7 @@ private:
         std::string reasoning;
         std::vector<TokenLogprob> content_logprobs;
         std::vector<TokenLogprob> reasoning_logprobs;
+        std::vector<ReasoningLimitForcedToken> forced_reasoning_tokens;
         std::optional<std::uint32_t> lane;
         std::atomic<bool> cancelled{false};
         std::array<bool, kMaximumConcurrency> preservation_unavailable{};
@@ -560,10 +600,18 @@ private:
         GenerationRecoveryStats recovery;
         std::uint32_t cycle_exclusions = 0;
         std::string recovery_cause;
-        bool recovery_pending                = false;
-        std::size_t recovery_reasoning_begin = 0;
-        std::size_t recovery_generated_begin = 0;
-        RepeatedReasoningSpan reasoning_cycle;
+        std::optional<ResolvedSamplingParameters> recovery_sampling;
+        bool recovery_pending = false;
+        // Retry strategy only. Corroborated replay evidence belongs to OutputSession.
+        bool nonthinking_recovery     = false;
+        bool reasoning_limit_recovery = false;
+        targets::qwen3_6::PublishedOutput withheld_replacement;
+        std::uint32_t withheld_content_tokens = 0;
+        std::size_t recovery_reasoning_begin  = 0;
+        RepeatedChannelSpan reasoning_cycle;
+        RepeatedChannelSpan content_cycle;
+        bool guard_repeated_reasoning           = false;
+        bool guard_repeated_content             = false;
         std::uint32_t previous_reasoning_tokens = 0;
         GenerationTimings initial_timings;
         double previous_decode_seconds = 0.0;
@@ -577,14 +625,28 @@ private:
         std::optional<Plan> disk_plan;
         std::uint64_t disk_index_version = 0;
         AdmissionResources admission_resources;
-        std::uint64_t remaining_service_work = 0;
-        std::uint64_t backfill_epoch         = 0;
-        BackfillClass backfill_class         = BackfillClass::None;
-        double kv_ram_save_seconds           = 0;
-        double kv_ram_load_seconds           = 0;
-        double kv_disk_save_seconds          = 0;
-        double kv_disk_load_seconds          = 0;
-        double kv_disk_h2d_seconds           = 0;
+        AdmissionResources completion_resources;
+        bool completion_member             = false;
+        std::uint32_t window_output_tokens = 0;
+        std::uint32_t window_budget_origin = 0;
+        std::size_t suspension_bytes       = 0;
+        bool growth_blocked                = false;
+        bool recovery_waiting_resources    = false;
+        ExecutionWindow recovery_window;
+        std::uint32_t suspension_count  = 0;
+        std::uint32_t resumed_at_output = 0;
+        GenerationTimings suspended_timings;
+        SpeculativeStats suspended_speculative;
+        std::uint32_t suspended_captured_checkpoint = 0;
+        std::uint32_t suspended_restored_checkpoint = 0;
+        std::uint64_t remaining_service_work        = 0;
+        std::uint64_t backfill_epoch                = 0;
+        BackfillClass backfill_class                = BackfillClass::None;
+        double kv_ram_save_seconds                  = 0;
+        double kv_ram_load_seconds                  = 0;
+        double kv_disk_save_seconds                 = 0;
+        double kv_disk_load_seconds                 = 0;
+        double kv_disk_h2d_seconds                  = 0;
 
         std::mutex mutex;
         std::condition_variable cv;
@@ -685,6 +747,7 @@ private:
     struct ChannelLogprobs {
         std::vector<TokenLogprob> content;
         std::vector<TokenLogprob> reasoning;
+        std::optional<ReasoningLimitForcedToken> forced_reasoning_token;
     };
 
     // Builds the records of the tokens the pending preview accepted. `tokens` is the accepted
@@ -695,7 +758,20 @@ private:
                                                                 std::size_t first_slot,
                                                                 std::span<const TokenId> tokens) {
         ChannelLogprobs records;
-        if (!request.options.output.top_logprobs || tokens.empty()) { return records; }
+        if (tokens.empty()) { return records; }
+        const auto forced = request.output.reasoning_limit_forced_close_token();
+        if (forced && tokens.front() == *forced) {
+            records.forced_reasoning_token =
+                ReasoningLimitForcedToken{.generated_token_index = static_cast<std::uint32_t>(
+                                              request.generated.size() - tokens.size()),
+                                          .token          = *forced,
+                                          .target_logprob = std::nullopt};
+            if (request.options.output.top_logprobs) {
+                records.forced_reasoning_token->target_logprob =
+                    logprobs.record(first_slot, *forced, 0).logprob;
+            }
+        }
+        if (!request.options.output.top_logprobs) { return records; }
         if (logprobs.empty()) {
             throw std::logic_error("target round carries no token logprobs for a request row");
         }
@@ -712,6 +788,17 @@ private:
             channel_records.push_back(logprobs.record(first_slot + i, tokens[i], top_count));
         }
         return records;
+    }
+
+    static void commit_reasoning_limit_provenance(const std::shared_ptr<Request>& request,
+                                                  const ChannelLogprobs& records) {
+        // Caller-stop handling may have licensed the close without forcing it.
+        // Retain provenance only when the committed frontend confirms intervention.
+        if (records.forced_reasoning_token &&
+            request->output.reasoning_limit_stats().forced_closes >
+                request->forced_reasoning_tokens.size()) {
+            request->forced_reasoning_tokens.push_back(*records.forced_reasoning_token);
+        }
     }
 
     // Moves each channel's records onto that channel's delta. A channel whose tokens published no
@@ -734,7 +821,20 @@ private:
     }
 
     void append_output(const std::shared_ptr<Request>& request,
-                       targets::qwen3_6::PublishedOutput output, bool notify = true) {
+                       targets::qwen3_6::PublishedOutput output, bool notify = true,
+                       bool release_replacement = false) {
+        if (request->nonthinking_recovery && request->recovery.attempts != 0 &&
+            !release_replacement) {
+            targets::qwen3_6::PublishedOutput visible;
+            for (auto& delta : output) {
+                if (delta.channel == OutputChannel::Content) {
+                    request->withheld_replacement.push_back(std::move(delta));
+                } else {
+                    visible.push_back(std::move(delta));
+                }
+            }
+            output = std::move(visible);
+        }
         if (output.empty()) { return; }
         for (OutputDelta& delta : output) {
             const bool reasoning = delta.channel == OutputChannel::Reasoning;
@@ -744,6 +844,7 @@ private:
             logprobs.insert(logprobs.end(), delta.logprobs.begin(), delta.logprobs.end());
         }
         if (request->delivery == OutputDelivery::TerminalOnly) { return; }
+
         {
             std::lock_guard lock(request->mutex);
             for (OutputDelta& delta : output) { request->events.push_back(std::move(delta)); }
@@ -806,6 +907,19 @@ private:
     }
 
     void retire_request(const std::shared_ptr<Request>& request) {
+        if (chunked_execution_) {
+            instance_.program->discard_suspended(request->id);
+            instance_.program->release_suspension_credit(request->id);
+            std::erase(suspended_, request);
+            std::erase(pressure_victims_, request);
+            std::erase(recovery_queue_, request);
+            if (replacement_ == request) replacement_.reset();
+            if (growth_priority_ == request->id) growth_priority_ = 0;
+            request->decode_ready               = false;
+            request->recovery_pending           = false;
+            request->recovery_waiting_resources = false;
+            release_completion_claim(request);
+        }
         if (request->lane) {
             const std::uint32_t lane = *request->lane;
             if (suspended_prefill_lane_ == lane) { suspended_prefill_lane_.reset(); }
@@ -819,12 +933,28 @@ private:
     // NOLINTNEXTLINE(performance-unnecessary-value-param): the copy keeps the request alive.
     void complete_error(std::shared_ptr<Request> request, std::exception_ptr error) {
         end_copy_hold(request);
+        try {
+            retire_request(request);
+        } catch (...) {
+            // Removed ingress requests are no longer discoverable by fail_all().
+            publish_error_result(request, error);
+            throw;
+        }
+        publish_error_result(request, std::move(error));
+    }
+
+    void publish_error_result(const std::shared_ptr<Request>& request,
+                              std::exception_ptr error) noexcept {
+        discard_replacement(request);
         request->recovery.cycle_exclusions = request->cycle_exclusions;
-        error = attach_recovery_stats(std::move(error), request->recovery);
+        detail::run_secondary_cleanup([&] {
+            auto reasoning_limit          = request->output.reasoning_limit_stats();
+            reasoning_limit.forced_tokens = request->forced_reasoning_tokens;
+            error = attach_request_stats(error, request->recovery, std::move(reasoning_limit));
+        });
         release_planning_state(request);
         request->prompt = {};
         request->host_input.reset();
-        retire_request(request);
         {
             std::lock_guard lock(request->mutex);
             if (request->done) { return; }
@@ -833,6 +963,12 @@ private:
         }
         if (mark_completed(request)) { release_reserved_capacity(); }
         request->cv.notify_one();
+    }
+
+    static void discard_replacement(const std::shared_ptr<Request>& request) {
+        request->recovery.discarded_content_tokens += request->withheld_content_tokens;
+        request->withheld_content_tokens = 0;
+        request->withheld_replacement.clear();
     }
 
     void publish_recovery(const std::shared_ptr<Request>& request, RecoveryEventKind kind,
@@ -844,8 +980,14 @@ private:
                             .discarded_tool_calls = request->recovery.discarded_tool_calls,
                             .discarded_reasoning_tokens =
                                 request->recovery.discarded_reasoning_tokens,
-                            .generated_tokens = request->generated.size(),
+                            .framing_repairs          = request->recovery.framing_repairs,
+                            .discarded_content_tokens = request->recovery.discarded_content_tokens,
+                            .generated_tokens         = request->generated.size(),
                             .remaining_tokens = request->budget ? request->budget->remaining() : 0};
+        if (kind == RecoveryEventKind::RetryStarted) {
+            event.sampling        = request->recovery_sampling;
+            event.enable_thinking = request->output.in_reasoning();
+        }
         {
             std::lock_guard lock(request->mutex);
             request->recovery_events.push_back(std::move(event));
@@ -856,6 +998,10 @@ private:
     // The request is taken by value for the same slot-aliasing reason as complete_error().
     // NOLINTNEXTLINE(performance-unnecessary-value-param): the copy keeps the request alive.
     void complete_success(std::shared_ptr<Request> request, FinishReason reason) {
+        auto replacement = std::move(request->withheld_replacement);
+        request->withheld_replacement.clear();
+        request->withheld_content_tokens = 0;
+        append_output(request, std::move(replacement), false, true);
         if (request->cycle_exclusions != 0 || !request->recovery_cause.empty()) {
             publish_recovery(request, RecoveryEventKind::Finished,
                              reason == FinishReason::Cancelled         ? "cancelled"
@@ -883,8 +1029,10 @@ private:
             (reason == FinishReason::StopToken || reason == FinishReason::StopString)) {
             instance_.program->mark_turn_closed(*request->lane);
         }
-        result.recovery                  = request->recovery;
-        result.recovery.cycle_exclusions = request->cycle_exclusions;
+        result.reasoning_limit               = request->output.reasoning_limit_stats();
+        result.reasoning_limit.forced_tokens = request->forced_reasoning_tokens;
+        result.recovery                      = request->recovery;
+        result.recovery.cycle_exclusions     = request->cycle_exclusions;
         if (!request->output.has_token_grammar()) {
             result.undeclared_tool_call_names =
                 targets::qwen3_6::unconstrained_tool_call_names(result.content, 128);
@@ -908,6 +1056,9 @@ private:
                 instance_.program->captured_context_checkpoint_tokens_lane(*request->lane);
             result.restored_context_checkpoint_tokens =
                 instance_.program->restored_context_checkpoint_tokens_lane(*request->lane);
+        } else {
+            result.captured_context_checkpoint_tokens = request->suspended_captured_checkpoint;
+            result.restored_context_checkpoint_tokens = request->suspended_restored_checkpoint;
         }
         result.kv_ram_save_seconds  = request->kv_ram_save_seconds;
         result.kv_ram_load_seconds  = request->kv_ram_load_seconds;
@@ -918,6 +1069,10 @@ private:
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
+        } else {
+            result.timings                 = request->suspended_timings;
+            result.timings.prepare_seconds = request->prepare_seconds;
+            result.speculative             = request->suspended_speculative;
         }
         if (request->recovery.attempts != 0) {
             result.timings.prefill_seconds       = request->initial_timings.prefill_seconds;
@@ -952,13 +1107,17 @@ private:
     void complete_cancelled(const std::shared_ptr<Request>& request) {
         if (!request->output.terminal()) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            append_output(request, request->output.commit_preview(), false);
+            auto published = request->output.commit_preview();
+            (void)filter_reasoning_replay(request, published, FinishReason::Cancelled);
+            append_output(request, std::move(published), false);
         }
         complete_success(request, FinishReason::Cancelled);
     }
 
-    void recovery_exhausted(const std::shared_ptr<Request>& request, const std::string& detail) {
-        publish_recovery(request, RecoveryEventKind::Exhausted, detail);
+    void recovery_exhausted(const std::shared_ptr<Request>& request, const std::string& detail,
+                            std::string_view cause = {}) {
+        publish_recovery(request, RecoveryEventKind::Exhausted,
+                         cause.empty() ? detail : std::string(cause));
         const auto lane = *request->lane;
         instance_.program->abort_lane(lane);
         if (prefill_lane_ && *prefill_lane_ == lane) {
@@ -966,12 +1125,13 @@ private:
             prefill_lane_.reset();
         }
         request->recovery_pending = false;
-        complete_error(
-            request,
-            std::make_exception_ptr(RequestError(
-                RequestErrorKind::RecoveryExhausted,
-                "NInfer detected persistent repeated generation; bounded recovery exhausted: " +
-                    detail)));
+        complete_error(request, std::make_exception_ptr(RequestError(
+                                    RequestErrorKind::RecoveryExhausted,
+                                    (request->reasoning_limit_recovery
+                                         ? "NInfer reasoning-limit continuation failed: "
+                                         : "NInfer detected persistent repeated generation; "
+                                           "bounded recovery exhausted: ") +
+                                        detail)));
     }
 
     static void add_speculative(SpeculativeStats& total, const SpeculativeStats& part) {
@@ -1080,15 +1240,27 @@ private:
     // remain unpublished; reasoning retries pause an otherwise active lane.
     // The retry keeps this lane and splices onto the resident prompt.
     [[nodiscard]] bool start_generation_recovery() {
-        while (!recovery_queue_.empty()) {
+        for (auto remaining = recovery_queue_.size(); remaining != 0; --remaining) {
             auto request = std::move(recovery_queue_.front());
             recovery_queue_.pop_front();
+            if (growth_priority_ != 0 && request->id != growth_priority_) {
+                recovery_queue_.push_back(request);
+                continue;
+            }
+            if (!request->lane && request->recovery_pending) {
+                recovery_queue_.push_back(request);
+                continue;
+            }
             if (!request->lane || slots_[*request->lane] != request || !request->recovery_pending) {
                 continue;
             }
             const auto lane = *request->lane;
             try {
                 start_recovery_attempt(request, lane);
+                if (request->recovery_waiting_resources) {
+                    recovery_queue_.push_back(request);
+                    return false;
+                }
             } catch (...) {
                 // A nested admit_complete or failed-restore fallback may already have
                 // failed the request before rethrowing; only classify it then.
@@ -1111,16 +1283,21 @@ private:
     // One retry from its committed lane. The lane, prompt, and output session are mutated
     // in stages, so any exception leaves cleanup to the caller's per-request boundary.
     void start_recovery_attempt(const std::shared_ptr<Request>& request, std::uint32_t lane) {
-        const auto attempt                = request->recovery.attempts + 1;
-        auto execution                    = request->options.execution;
-        execution.requested_output_tokens = request->budget->remaining();
+        const auto attempt                  = request->recovery.attempts + 1;
+        auto execution                      = request->options.execution;
+        execution.requested_output_tokens   = request->budget->remaining();
+        execution.reservation_window_tokens = 8192;
         // Keep the request's reuse setting. capture stays off so a retry does not
         // pin its frontier as a turn rollback.
         execution.capture_context_checkpoint = false;
         execution.suppressed_token_count     = 0;
+        if (request->nonthinking_recovery && !request->reasoning_limit_recovery) {
+            execution.sampling = targets::qwen3_6::replay_recovery_sampling(execution.sampling);
+        }
 
         const bool reuse_enabled = execution.allow_prefix_reuse && !execution.force_cold_prefill;
-        const bool lane_retained = reuse_enabled && instance_.program->retain_reusable_lane(lane);
+        bool lane_retained =
+            !chunked_execution_ && reuse_enabled && instance_.program->retain_reusable_lane(lane);
         invalidate_lane_plans(lane);
         release_planning_state(request);
 
@@ -1141,11 +1318,21 @@ private:
             copied ? std::span<const TokenId>(prefix) : std::span<const TokenId>{},
             original_prefix);
         if (selected.data() != prefix.data()) { prefix = std::move(original_prefix); }
-        const auto insert =
-            request->recovery_context->recovery_insert(request->output.tool_calls(), attempt);
+        const auto calls  = request->recovery_cause == "duplicate_tool_call"
+                                ? request->output.tool_calls()
+                                : std::span<const ToolCall>{};
+        const auto insert = request->recovery_context->recovery_insert(
+            calls, attempt,
+            request->recovery_cause == "reasoning_limit"
+                ? targets::qwen3_6::GenerationRecoveryNotice::ReasoningLimit
+            : request->recovery_cause == "reasoning_replay"
+                ? targets::qwen3_6::GenerationRecoveryNotice::ReasoningReplay
+            : request->recovery_cause == "repeated_content"
+                ? targets::qwen3_6::GenerationRecoveryNotice::RepeatedContent
+                : targets::qwen3_6::GenerationRecoveryNotice::RepeatedReasoning);
         auto spliced = instance_.loaded->frontend.splice_recovery_prompt(
             std::move(prefix), request->recovery_context->input(), insert,
-            request->recovery_context);
+            request->recovery_context, !request->nonthinking_recovery);
         request->recovery.prepare_seconds +=
             std::chrono::duration<double>(Clock::now() - started).count();
 
@@ -1181,9 +1368,36 @@ private:
         }
 
         auto session = instance_.loaded->frontend.make_output_session(
-            *spliced, request->options.stop, request->options.output);
+            *spliced, request->options.stop, request->options.output, generation_recovery_,
+            &request->output, reasoning_limit_action_);
         configure_output_suppression(session, execution, !session.model_stop_tokens_allowed());
         auto base = instance_.program->plan_request_base(*spliced, execution);
+        if (chunked_execution_) {
+            const auto& summary = base.summary();
+            if (!admission_resources_fit(summary.lifetime_admission,
+                                         request->completion_resources)) {
+                throw std::logic_error(
+                    "recovery lifetime exceeds its admitted completion envelope");
+            }
+            request->recovery_window = {summary.admission, summary.window_output_tokens,
+                                        summary.suspension_bytes};
+            if (!post_release_fits(summary.admission, request.get(), {}) ||
+                (!request->completion_member && !instance_.program->reserve_suspension_credit(
+                                                    request->id, summary.suspension_bytes))) {
+                request->recovery_waiting_resources = true;
+                request->growth_blocked             = true;
+                return;
+            }
+            request->recovery_waiting_resources = false;
+            if (growth_priority_ == request->id) growth_priority_ = 0;
+            request->growth_blocked       = false;
+            request->window_output_tokens = summary.window_output_tokens;
+            request->window_budget_origin = request->budget->remaining();
+            request->resumed_at_output    = 0;
+            request->suspension_bytes     = summary.suspension_bytes;
+            request->admission_resources  = summary.admission;
+            lane_retained = reuse_enabled && instance_.program->retain_reusable_lane(lane);
+        }
         const bool pages_ok =
             admission_resources_fit(base.summary().admission, request->admission_resources) &&
             base.summary().effective_output_tokens == request->budget->remaining();
@@ -1243,6 +1457,7 @@ private:
         request->output                 = std::move(session);
         request->resident_prompt_tokens = spliced_tokens;
         request->recovery.attempts      = attempt;
+        request->recovery_sampling      = execution.sampling;
         request->recovery_pending       = false;
         publish_recovery(request, RecoveryEventKind::RetryStarted, request->recovery_cause);
         // The failed attempt may end mid-word. Keep it visible, but do not
@@ -1253,8 +1468,9 @@ private:
             append_output(request, std::move(separator));
         }
         request->recovery_reasoning_begin = request->reasoning.size();
-        request->recovery_generated_begin = request->generated.size();
         request->reasoning_cycle          = {};
+        request->content_cycle            = {};
+        request->guard_repeated_content   = generation_recovery_;
         request->stop_suppression_active  = !request->output.model_stop_tokens_allowed();
 
         using Route = targets::qwen3_6::RecoveryPrefillRoute;
@@ -1283,22 +1499,69 @@ private:
         }
     }
 
-    bool recover_persistent_reasoning(const std::shared_ptr<Request>& request) {
-        if (!request->recovery_context || !request->output.in_reasoning() ||
-            !request->content.empty() || request->options.execution.sampling.temperature <= 0) {
+    [[nodiscard]] bool clean_retries_forbidden(const Request& request) const noexcept {
+        return request.options.output.thinking_token_budget.has_value() &&
+               reasoning_limit_action_ == ReasoningLimitAction::Close;
+    }
+
+    bool recover_persistent_reasoning(const std::shared_ptr<Request>& request,
+                                      targets::qwen3_6::PublishedOutput& published,
+                                      FinishReason reason) {
+        // A capped Close request preserves this attempt's analysis until its
+        // natural or policy close. Observation/cycle escape remain enabled.
+        if (clean_retries_forbidden(*request) || !request->guard_repeated_reasoning ||
+            !request->reasoning_cycle.detected() ||
+            (reason != FinishReason::None &&
+             !generation_recovery_allowed_at_finish(reason, request->generated,
+                                                    request->options.stop))) {
             return false;
         }
-        const auto current =
-            std::span<const TokenId>(request->generated).subspan(request->recovery_generated_begin);
-        if (!request->reasoning_cycle.observe(current)) { return false; }
+        return recover_unpublished_attempt(request, published, "repeated_reasoning");
+    }
+
+    bool recover_unpublished_attempt(const std::shared_ptr<Request>& request,
+                                     targets::qwen3_6::PublishedOutput& published,
+                                     std::string_view cause) {
+        if (request->reasoning_limit_recovery && !generation_recovery_ &&
+            cause != "reasoning_limit") {
+            discard_replacement(request);
+            recovery_exhausted(request, "reasoning-limit replacement failed validation", cause);
+            return true;
+        }
+        if (cause == "reasoning_limit") { request->reasoning_limit_recovery = true; }
+        if (cause == "reasoning_replay" || cause == "reasoning_limit") {
+            request->nonthinking_recovery = true;
+        }
+        discard_replacement(request);
+        // A confirmed failed attempt cannot publish its answer/tool tail. Genuine
+        // reasoning remains visible; the next attempt is separated explicitly.
+        targets::qwen3_6::PublishedOutput reasoning;
+        for (auto& delta : published) {
+            if (delta.channel == OutputChannel::Reasoning) reasoning.push_back(std::move(delta));
+        }
+        published = std::move(reasoning);
+        append_output(request, std::move(published));
+        request->recovery.discarded_tool_calls +=
+            static_cast<std::uint32_t>(request->output.tool_calls().size());
         request->recovery.discarded_reasoning_tokens += request->output.reasoning_tokens();
-        request->recovery_cause = "repeated_reasoning";
+        request->recovery_cause = cause;
+        if (clean_retries_forbidden(*request)) {
+            recovery_exhausted(
+                request, "invalid continuation; clean retry is disabled by the reasoning limit",
+                cause);
+            return true;
+        }
         publish_recovery(request, RecoveryEventKind::RetryTriggered, request->recovery_cause);
+        if (!request->recovery_context || !request->content.empty()) {
+            recovery_exhausted(request,
+                               "generation intervention has no supported unpublished retry context",
+                               cause);
+            return true;
+        }
         if (request->recovery.attempts >=
                 targets::qwen3_6::GenerationRecoveryContext::maximum_attempts ||
             request->budget->remaining() == 0) {
-            recovery_exhausted(request,
-                               "persistent reasoning exhausted its retry or output-token budget");
+            recovery_exhausted(request, "no retry or output-token budget remains");
             return true;
         }
         request->decode_ready     = false;
@@ -1308,26 +1571,135 @@ private:
         return true;
     }
 
+    bool recover_reasoning_limit(const std::shared_ptr<Request>& request,
+                                 targets::qwen3_6::PublishedOutput& published,
+                                 FinishReason reason) {
+        // A terminal stop/output/context decision wins over a pending intervention.
+        // The output session retains this flag across funded KV-window suspension.
+        if (reason != FinishReason::None || request->cancelled.load(std::memory_order_acquire) ||
+            !request->output.reasoning_limit_retry_required()) {
+            return false;
+        }
+        if (request->output.reasoning_limit_stats().retries != 0) {
+            throw std::logic_error("reasoning limit requested a second budget retry");
+        }
+        return recover_unpublished_attempt(request, published, "reasoning_limit");
+    }
+
+    bool filter_reasoning_replay(const std::shared_ptr<Request>& request,
+                                 targets::qwen3_6::PublishedOutput& published,
+                                 FinishReason reason) {
+        const bool caller_terminated =
+            reason != FinishReason::None && !generation_recovery_allowed_at_finish(
+                                                reason, request->generated, request->options.stop);
+        auto publication = request->output.filter_reasoning_replay(std::move(published), reason,
+                                                                   caller_terminated);
+        published        = std::move(publication.output);
+        request->recovery.framing_repairs += publication.framing_repairs;
+        request->recovery.discarded_content_tokens += publication.discarded_content_tokens;
+        request->withheld_content_tokens -=
+            std::min(request->withheld_content_tokens, publication.discarded_content_tokens);
+        if (publication.discarded_content_tokens != 0) {
+            request->recovery_cause = "reasoning_replay";
+            publish_recovery(request, RecoveryEventKind::ReplayDiscarded, "reasoning_replay");
+        }
+        if (!publication.retry_required || caller_terminated) { return false; }
+        return recover_unpublished_attempt(request, published, "reasoning_replay");
+    }
+
+    static void observe_repetition(const std::shared_ptr<Request>& request,
+                                   std::span<const TokenId> tokens) {
+        const auto channels = request->output.preview_token_channels();
+        if (request->nonthinking_recovery && request->recovery.attempts != 0) {
+            request->withheld_content_tokens += static_cast<std::uint32_t>(
+                std::count(channels.begin(), channels.end(), OutputChannel::Content));
+        }
+        if (request->guard_repeated_reasoning) {
+            request->reasoning_cycle.observe(tokens, channels, OutputChannel::Reasoning);
+        }
+        if (!request->guard_repeated_content) { return; }
+        if (!request->output.preview_free_text_content()) {
+            // Native publication knows that literal closing markup is still
+            // argument data. Conservatively end answer monitoring for this response.
+            request->guard_repeated_content = false;
+            request->content_cycle          = {};
+            return;
+        }
+        request->content_cycle.observe(tokens, channels, OutputChannel::Content);
+    }
+
+    bool fail_repeated_content(const std::shared_ptr<Request>& request) {
+        if (!request->guard_repeated_content || !request->content_cycle.detected()) {
+            return false;
+        }
+        if (request->nonthinking_recovery && request->content.empty()) {
+            targets::qwen3_6::PublishedOutput unpublished;
+            return recover_unpublished_attempt(request, unpublished, "repeated_content");
+        }
+        // Prose may already be visible. Preserve it and report an explicit
+        // failure rather than concatenating a replacement or claiming success.
+        request->recovery_cause = "repeated_content";
+        recovery_exhausted(request,
+                           "persistent repeated answer text; published content cannot be retried",
+                           "repeated_content");
+        return true;
+    }
+
     void finish_generation(const std::shared_ptr<Request>& request, FinishReason reason) {
+        if (request->reasoning_limit_recovery &&
+            (reason == FinishReason::OutputLimit || reason == FinishReason::ContextCapacity)) {
+            discard_replacement(request);
+            recovery_exhausted(request,
+                               "reasoning-limit replacement exhausted its original output budget",
+                               "output_budget");
+            return;
+        }
         if (!generation_recovery_allowed_at_finish(reason, request->generated,
                                                    request->options.stop)) {
             complete_success(request, reason);
             return;
         }
-        // An explicit caller stop still wins. A budget boundary containing the
-        // third repeated passage must not silently disguise recovery exhaustion
-        // as a normal length finish merely because it is the last licensed round.
-        if ((reason == FinishReason::OutputLimit || reason == FinishReason::ContextCapacity) &&
-            recover_persistent_reasoning(request)) {
+        if (request->reasoning_limit_recovery && request->output.tool_calls().empty() &&
+            !request->output.has_answer_content()) {
+            discard_replacement(request);
+            recovery_exhausted(request,
+                               "reasoning-limit replacement ended without an answer or "
+                               "complete tool call",
+                               "reasoning_limit");
             return;
         }
+        if (request->nonthinking_recovery && request->recovery.attempts != 0 &&
+            (reason == FinishReason::OutputLimit || reason == FinishReason::ContextCapacity) &&
+            request->output.tool_calls().empty() &&
+            std::none_of(request->withheld_replacement.begin(), request->withheld_replacement.end(),
+                         [](const auto& delta) {
+                             return delta.channel == OutputChannel::Content &&
+                                    std::any_of(
+                                        delta.text.begin(), delta.text.end(),
+                                        [](unsigned char byte) { return std::isspace(byte) == 0; });
+                         })) {
+            discard_replacement(request);
+            recovery_exhausted(
+                request, "replacement exhausted its budget without answer or complete tool call",
+                "output_budget");
+            return;
+        }
+        if (fail_repeated_content(request)) { return; }
         const auto calls = request->output.tool_calls();
         const auto reasoning =
             std::string_view(request->reasoning).substr(request->recovery_reasoning_begin);
-        if (request->recovery_context && request->recovery_context->repeats(calls, reasoning)) {
+        if (generation_recovery_ && request->recovery_context &&
+            request->recovery_context->repeats(calls, reasoning)) {
+            discard_replacement(request);
             request->recovery.discarded_tool_calls += static_cast<std::uint32_t>(calls.size());
             request->recovery.discarded_reasoning_tokens += request->output.reasoning_tokens();
             request->recovery_cause = "duplicate_tool_call";
+            if (clean_retries_forbidden(*request)) {
+                recovery_exhausted(
+                    request, "repeated tool cycle; clean retry is disabled by the reasoning limit",
+                    request->recovery_cause);
+                return;
+            }
             publish_recovery(request, RecoveryEventKind::RetryTriggered, request->recovery_cause);
             if (request->recovery.attempts >=
                     targets::qwen3_6::GenerationRecoveryContext::maximum_attempts ||
@@ -1351,7 +1723,9 @@ private:
         if (cancel_at_boundary) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
             instance_.program->resolve_prefill_lane(lane, true);
-            append_output(request, request->output.commit_preview(), false);
+            auto published = request->output.commit_preview();
+            (void)filter_reasoning_replay(request, published, FinishReason::Cancelled);
+            append_output(request, std::move(published), false);
             complete_success(request, FinishReason::Cancelled);
             return true;
         }
@@ -1371,10 +1745,17 @@ private:
         request->budget->commit(1);
         ChannelLogprobs token_logprobs =
             collect_token_logprobs(*request, round.logprobs, 0, tokens);
+        observe_repetition(request, tokens);
         auto published = request->output.commit_preview();
+        commit_reasoning_limit_provenance(request, token_logprobs);
         attach_token_logprobs(published, std::move(token_logprobs));
         if (!decision.finished()) { synchronize_stop_suppression(request, lane); }
         if (!request->first_token) { request->first_token = Clock::now(); }
+        if (recover_reasoning_limit(request, published, decision.finish_reason)) { return true; }
+        if (filter_reasoning_replay(request, published, decision.finish_reason)) { return true; }
+        if (recover_persistent_reasoning(request, published, decision.finish_reason)) {
+            return true;
+        }
         append_output(request, std::move(published), !decision.finished());
         if (decision.finished()) {
             finish_generation(request, decision.finish_reason);
@@ -1464,6 +1845,7 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
+            if (live_transfer_ && live_transfer_->request == request) { continue; }
             if (copy_hold_ && copy_hold_->lane == lane && !build_round_membership().empty()) {
                 // Draining here would wait for the hold's in-flight disk reads and copies
                 // while other lanes decode; the worker loop finishes it once they settle.
@@ -1551,15 +1933,698 @@ private:
         RoundMembership membership;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
-            if (request == nullptr || !request->decode_ready) { continue; }
+            if (request == nullptr || !request->decode_ready || request->growth_blocked) {
+                continue;
+            }
             if (!request->budget) {
                 throw std::logic_error("decode-ready request has no generation budget");
             }
             membership.lanes[membership.size]   = lane;
             membership.budgets[membership.size] = request->budget->round_budget();
+            if (chunked_execution_) {
+                auto& budget = membership.budgets[membership.size];
+                budget.generated_tokens_remaining =
+                    std::min(budget.generated_tokens_remaining, window_remaining(*request));
+                if (budget.generated_tokens_remaining == 0) { continue; }
+            }
             ++membership.size;
         }
         return membership;
+    }
+
+    [[nodiscard]] static std::uint32_t window_consumed(const Request& request) noexcept {
+        return request.budget ? request.window_budget_origin - request.budget->remaining() : 0;
+    }
+
+    [[nodiscard]] static std::uint32_t window_remaining(const Request& request) noexcept {
+        const auto consumed = window_consumed(request);
+        return request.window_output_tokens > consumed ? request.window_output_tokens - consumed
+                                                       : 0;
+    }
+
+    [[nodiscard]] bool completion_fits(const std::shared_ptr<Request>& request,
+                                       const Request* excluded = nullptr) const {
+        std::uint64_t lanes   = request->completion_resources.active_lanes;
+        std::uint64_t main    = request->completion_resources.main_kv_pages;
+        std::uint64_t backend = request->completion_resources.backend_kv_pages;
+        for (const auto& member : completion_cohort_) {
+            if (member == request || member.get() == excluded) continue;
+            lanes += member->completion_resources.active_lanes;
+            main += member->completion_resources.main_kv_pages;
+            backend += member->completion_resources.backend_kv_pages;
+        }
+        return lanes <= admission_capacity_.active_lanes &&
+               main <= admission_capacity_.main_kv_pages &&
+               backend <= admission_capacity_.backend_kv_pages;
+    }
+
+    bool claim_completion(const std::shared_ptr<Request>& request) {
+        if (request->completion_member) return true;
+        if (!completion_fits(request)) return false;
+        completion_cohort_.push_back(request);
+        request->completion_member = true;
+        return true;
+    }
+
+    void release_completion_claim(const std::shared_ptr<Request>& request) {
+        if (!request->completion_member) return;
+        std::erase(completion_cohort_, request);
+        request->completion_member = false;
+    }
+
+    void select_completion_cohort() {
+        if (!chunked_execution_ || !suspended_.empty() || live_transfer_) return;
+        auto ordered = slots_;
+        std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+            if (!a) return false;
+            if (!b) return true;
+            return a->queue_order < b->queue_order;
+        });
+        for (const auto& request : ordered) {
+            if (request && !request->completion_member && claim_completion(request)) {
+                instance_.program->release_suspension_credit(request->id);
+            }
+        }
+    }
+
+    [[nodiscard]] KvPressureRequest pressure_snapshot(const Request& request) const {
+        return {.id                = request.id,
+                .queue_order       = request.queue_order,
+                .resident          = request.lane.has_value(),
+                .growth_blocked    = request.growth_blocked,
+                .completion_member = request.completion_member,
+                .suspend_ready     = (request.decode_ready || request.recovery_waiting_resources) &&
+                                     (!live_transfer_ || live_transfer_->request->id != request.id),
+                .useful_chunk_since_resume =
+                    request.suspension_count == 0 ||
+                    window_consumed(request) - request.resumed_at_output >= 8192,
+                .suspension_bytes = request.suspension_bytes,
+                .suspension_count = request.suspension_count};
+    }
+
+    [[nodiscard]] std::vector<KvPressureRequest> pressure_snapshot() const {
+        std::vector<KvPressureRequest> requests;
+        requests.reserve(max_concurrency_ + suspended_.size());
+        for (const auto& request : slots_) {
+            if (request) requests.push_back(pressure_snapshot(*request));
+        }
+        for (const auto& request : suspended_) requests.push_back(pressure_snapshot(*request));
+        return requests;
+    }
+
+    void reclaim_completed_gpu_cache() {
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (!slots_[lane] && instance_.program->has_retained_lane(lane)) {
+                instance_.program->evict_retained_lane(lane);
+                invalidate_lane_plans(lane);
+            }
+        }
+    }
+
+    // Window growth is committed before decode membership is built. Live transfer plans hold
+    // released capacity exclusively: peers may spend their existing windows, but cannot grow.
+    void refresh_execution_windows() {
+        if (!chunked_execution_ || live_transfer_ || !pressure_victims_.empty() || replacement_)
+            return;
+        select_completion_cohort();
+        if (growth_priority_ != 0 &&
+            std::any_of(slots_.begin(), slots_.end(), [&](const auto& request) {
+                return request && request->id == growth_priority_ &&
+                       request->recovery_waiting_resources;
+            }))
+            return;
+        bool changed    = false;
+        const auto grow = [&](const std::shared_ptr<Request>& request) {
+            if (!request || !request->decode_ready || request->recovery_pending) return;
+            const bool was_blocked  = request->growth_blocked;
+            request->growth_blocked = window_remaining(*request) == 0;
+            changed                 = changed || was_blocked != request->growth_blocked;
+            if (!request->growth_blocked) return;
+            const auto lane      = *request->lane;
+            const auto consumed  = window_consumed(*request);
+            const auto remaining = request->budget->remaining();
+            for (auto grant = std::min<std::uint32_t>(8192, remaining); grant != 0; grant /= 2) {
+                const auto window = instance_.program->plan_window(lane, consumed + grant);
+                if (!post_release_fits(window.admission, request.get(), {})) continue;
+                if (!request->completion_member && !instance_.program->reserve_suspension_credit(
+                                                       request->id, window.suspension_bytes)) {
+                    continue;
+                }
+                bool granted = instance_.program->grant_window(lane, window);
+                if (!granted) {
+                    reclaim_completed_gpu_cache();
+                    granted = instance_.program->grant_window(lane, window);
+                }
+                if (granted) {
+                    request->window_output_tokens = window.output_tokens;
+                    request->admission_resources  = window.admission;
+                    request->suspension_bytes     = window.suspension_bytes;
+                    request->growth_blocked       = false;
+                    ++cumulative_stats_.kv_window_extensions;
+                    changed = true;
+                    return;
+                }
+                if (!request->completion_member) {
+                    (void)instance_.program->reserve_suspension_credit(request->id,
+                                                                       request->suspension_bytes);
+                }
+            }
+        };
+        if (growth_priority_ != 0) {
+            for (const auto& request : slots_) {
+                if (request && request->id == growth_priority_) grow(request);
+            }
+            growth_priority_ = 0;
+        }
+        // Protected members consume growth first; backed peers can evacuate into secured RAM.
+        for (const auto& request : slots_) {
+            if (request && request->completion_member) grow(request);
+        }
+        for (const auto& request : slots_) {
+            if (request && !request->completion_member) grow(request);
+        }
+        // Stable decode rounds do not take the stats mutex. Publish only a window grant or
+        // blocked-state transition, before the resulting decode membership can execute.
+        if (changed) { publish_runtime_stats(); }
+    }
+
+    [[nodiscard]] bool
+    post_release_fits(const AdmissionResources& desired, const Request* replaced,
+                      std::span<const std::shared_ptr<Request>> victims,
+                      const Request* adjusted                      = nullptr,
+                      const AdmissionResources* adjusted_resources = nullptr) const {
+        std::uint64_t main    = desired.main_kv_pages;
+        std::uint64_t backend = desired.backend_kv_pages;
+        std::uint32_t lanes   = desired.active_lanes;
+        for (const auto& request : slots_) {
+            if (!request || request.get() == replaced ||
+                std::find(victims.begin(), victims.end(), request) != victims.end())
+                continue;
+            const auto& held =
+                request.get() == adjusted ? *adjusted_resources : request->admission_resources;
+            main += held.main_kv_pages;
+            backend += held.backend_kv_pages;
+            ++lanes;
+        }
+        return main <= admission_capacity_.main_kv_pages &&
+               backend <= admission_capacity_.backend_kv_pages &&
+               lanes <= admission_capacity_.active_lanes;
+    }
+
+    bool reclaim_unused_windows(const AdmissionResources& desired, const Request* replaced,
+                                std::span<const std::shared_ptr<Request>> victims = {}) {
+        if (post_release_fits(desired, replaced, victims)) return true;
+
+        struct Donor {
+            std::shared_ptr<Request> request;
+            ExecutionWindow minimum;
+            std::uint64_t slack = 0;
+        };
+
+        std::array<Donor, kMaximumConcurrency> donors;
+        std::size_t count = 0;
+        for (const auto& request : slots_) {
+            if (!request || request.get() == replaced || !request->decode_ready ||
+                request->recovery_pending || window_remaining(*request) <= 1 ||
+                std::find(victims.begin(), victims.end(), request) != victims.end())
+                continue;
+            const auto minimum =
+                instance_.program->plan_window(*request->lane, window_consumed(*request) + 1);
+            const auto& current = request->admission_resources;
+            if (minimum.admission.main_kv_pages > current.main_kv_pages ||
+                minimum.admission.backend_kv_pages > current.backend_kv_pages) {
+                throw std::logic_error("target shrink floor exceeds its current entitlement");
+            }
+            const auto slack = static_cast<std::uint64_t>(current.main_kv_pages -
+                                                          minimum.admission.main_kv_pages) +
+                               current.backend_kv_pages - minimum.admission.backend_kv_pages;
+            if (slack != 0) donors[count++] = {request, minimum, slack};
+        }
+        const auto precedes = [](const auto& a, const auto& b) {
+            if (a.slack != b.slack) return a.slack > b.slack;
+            return a.request->queue_order > b.request->queue_order;
+        };
+        for (std::size_t i = 1; i < count; ++i) {
+            for (auto at = i; at != 0 && precedes(donors[at], donors[at - 1]); --at) {
+                std::swap(donors[at], donors[at - 1]);
+            }
+        }
+        bool changed = false;
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto& donor = donors[index].request;
+            auto window       = donors[index].minimum;
+            if (post_release_fits(desired, replaced, victims, donor.get(), &window.admission)) {
+                // Keep the largest useful output end that satisfies this concrete transaction.
+                // Physical rounding and speculative floors remain entirely target-owned.
+                auto low  = window.output_tokens;
+                auto high = donor->window_output_tokens - 1;
+                while (low < high) {
+                    const auto middle    = low + (high - low + 1) / 2;
+                    const auto candidate = instance_.program->plan_window(*donor->lane, middle);
+                    if (post_release_fits(desired, replaced, victims, donor.get(),
+                                          &candidate.admission)) {
+                        low = middle;
+                    } else {
+                        high = middle - 1;
+                    }
+                }
+                window = instance_.program->plan_window(*donor->lane, low);
+            }
+            if (!instance_.program->shrink_window(*donor->lane, window)) continue;
+            donor->window_output_tokens = window.output_tokens;
+            donor->admission_resources  = window.admission;
+            donor->suspension_bytes     = window.suspension_bytes;
+            if (!donor->completion_member &&
+                !instance_.program->reserve_suspension_credit(donor->id, window.suspension_bytes)) {
+                throw std::logic_error("resident window shrink lost its secured RAM credit");
+            }
+            changed = true;
+            if (post_release_fits(desired, replaced, victims)) break;
+        }
+        if (changed) publish_runtime_stats();
+        return post_release_fits(desired, replaced, victims);
+    }
+
+    bool begin_live_suspension(const std::shared_ptr<Request>& request) {
+        if (!request->lane || slots_[*request->lane] != request ||
+            request->cancelled.load(std::memory_order_acquire) || request->completion_member ||
+            (!request->decode_ready && !request->recovery_waiting_resources))
+            return false;
+        const auto lane = *request->lane;
+        if (!instance_.program->start_suspend(lane, request->id)) return false;
+        request->suspended_timings     = instance_.program->generation_timings_lane(lane);
+        request->suspended_speculative = instance_.program->speculative_stats_lane(lane);
+        request->suspended_captured_checkpoint =
+            instance_.program->captured_context_checkpoint_tokens_lane(lane);
+        request->suspended_restored_checkpoint =
+            instance_.program->restored_context_checkpoint_tokens_lane(lane);
+        live_transfer_.emplace(LiveTransfer{request, lane, false, {}});
+        request->decode_ready = false;
+        signal_control();
+        return true;
+    }
+
+    bool advance_live_transfer() {
+        if (!live_transfer_) return false;
+        const auto transfer = *live_transfer_;
+        const auto request  = transfer.request;
+        const bool ready    = transfer.restoring ? instance_.program->resume_ready(request->id)
+                                                 : instance_.program->suspension_ready(request->id);
+        if (!ready) return false;
+        harvest_kv_copy_seconds(request);
+        if (transfer.restoring) {
+            instance_.program->finish_resume(transfer.lane, request->id);
+            if (request->completion_member)
+                instance_.program->release_suspension_credit(request->id);
+            request->window_output_tokens = transfer.window.output_tokens;
+            request->admission_resources  = transfer.window.admission;
+            request->suspension_bytes     = transfer.window.suspension_bytes;
+            request->resumed_at_output    = window_consumed(*request);
+            request->growth_blocked       = request->recovery_waiting_resources;
+            request->decode_ready         = !request->recovery_pending;
+            ++cumulative_stats_.kv_live_resumes;
+        } else {
+            instance_.program->finish_suspend(transfer.lane, request->id);
+            slots_[transfer.lane].reset();
+            invalidate_lane_plans(transfer.lane);
+            request->lane.reset();
+            ++request->suspension_count;
+            ++cumulative_stats_.kv_live_suspensions;
+            suspended_.push_back(request);
+        }
+        live_transfer_.reset();
+        if (request->cancelled.load(std::memory_order_acquire)) {
+            if (request->lane) {
+                cancel_lane(*request->lane);
+            } else {
+                complete_cancelled(request);
+            }
+        }
+        publish_runtime_stats();
+        return true;
+    }
+
+    bool try_resume_live_request() {
+        if (suspended_.empty() || live_transfer_ || copy_hold_ || prefill_lane_) return false;
+        const auto position = std::min_element(
+            suspended_.begin(), suspended_.end(),
+            [](const auto& a, const auto& b) { return a->queue_order < b->queue_order; });
+        // Keep ownership after the deque element is erased at resume commit.
+        // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
+        const auto request = *position;
+        if (request->cancelled.load(std::memory_order_acquire)) {
+            complete_cancelled(request);
+            return true;
+        }
+        const auto consumed     = window_consumed(*request);
+        const bool joins_cohort = completion_fits(request);
+        for (auto grant = std::min<std::uint32_t>(8192, request->budget->remaining()); grant != 0;
+             grant /= 2) {
+            const auto desired = request->recovery_pending
+                                     ? request->window_output_tokens
+                                     : std::max(request->window_output_tokens, consumed + grant);
+            const auto window  = instance_.program->plan_suspended_window(request->id, desired);
+            if (!post_release_fits(window.admission, nullptr, {})) continue;
+            if (!joins_cohort &&
+                !instance_.program->reserve_suspension_credit(request->id, window.suspension_bytes))
+                continue;
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane]) continue;
+                if (instance_.program->has_retained_lane(lane)) {
+                    instance_.program->evict_retained_lane(lane);
+                    invalidate_lane_plans(lane);
+                }
+                const bool claimed = joins_cohort && !request->completion_member;
+                if (claimed && !claim_completion(request)) continue;
+                if (!instance_.program->start_resume(lane, request->id, window)) {
+                    if (claimed) release_completion_claim(request);
+                    continue;
+                }
+                suspended_.erase(position);
+                request->lane = lane;
+                slots_[lane]  = request;
+                invalidate_lane_plans(lane);
+                live_transfer_.emplace(LiveTransfer{request, lane, true, window});
+                return true;
+            }
+        }
+        return false;
+    }
+
+    AdmissionProgress try_admit_windowed() {
+        if (growth_priority_ != 0) return AdmissionProgress::None;
+        const auto admitted = pressure_snapshot();
+        if (!replacement_ && !kv_pressure_.allows_ingress(admitted.size(), !suspended_.empty()))
+            return AdmissionProgress::None;
+        const auto queued = pending_snapshot();
+        if (!queued.empty() && window_head_id_ != queued.front()->id) {
+            window_head_id_     = queued.front()->id;
+            window_head_bypass_ = max_concurrency_ - 1;
+        }
+        for (const auto& request : queued) {
+            if (replacement_ && request != replacement_) continue;
+            if (!replacement_ && request->id != window_head_id_ && window_head_bypass_ == 0) break;
+            try {
+                ensure_base_plan(request);
+                if (!admission_resources_fit(request->completion_resources, admission_capacity_)) {
+                    (void)remove_pending_error(
+                        request, std::make_exception_ptr(
+                                     RequestError(RequestErrorKind::ContextLengthExceeded,
+                                                  "request exceeds Engine exclusive KV capacity")));
+                    replacement_.reset();
+                    return AdmissionProgress::ControlProgress;
+                }
+                const bool joins_cohort = completion_fits(request);
+                auto choice             = find_admission_lane(request);
+                if (!choice &&
+                    std::any_of(slots_.begin(), slots_.begin() + max_concurrency_,
+                                [](const auto& slot) { return !slot; }) &&
+                    (joins_cohort ||
+                     instance_.program->reserve_suspension_credit(
+                         request->id, request->base_plan->summary().suspension_bytes))) {
+                    (void)reclaim_unused_windows(request->base_plan->summary().admission, nullptr);
+                    choice = find_admission_lane(request);
+                }
+                bool funded = false;
+                for (;;) {
+                    if (choice) {
+                        const Plan& selected_plan =
+                            choice->ram_entry_id != 0 ? request->ram_plan.value()
+                            : choice->disk_entry_id != 0
+                                ? request->disk_plan.value()
+                                : request->lane_plans[choice->fork_source.value_or(choice->lane)]
+                                      .value();
+                        // Imported checkpoint heads can make the winning image larger than
+                        // the cold base plan. Search window sizes against both GPU and RAM.
+                        funded = joins_cohort ||
+                                 instance_.program->reserve_suspension_credit(
+                                     request->id, selected_plan.summary().suspension_bytes);
+                        if (funded) break;
+                    }
+                    const auto previous = request->base_plan->summary().window_output_tokens;
+                    if (previous <= 1) break;
+                    request->options.execution.reservation_window_tokens =
+                        std::max(1U, previous / 2);
+                    release_planning_state(request);
+                    ensure_base_plan(request);
+                    choice = find_admission_lane(request);
+                }
+                if (!funded || !choice) {
+                    // A selected replacement owns its credit across the held capture and
+                    // retries. Other unsuccessful probes must not pin live-image capacity.
+                    if (replacement_ == request) break;
+                    instance_.program->release_suspension_credit(request->id);
+                    continue;
+                }
+                const bool replacement_admission = replacement_ == request;
+                if (joins_cohort) {
+                    if (!claim_completion(request)) {
+                        throw std::logic_error("completion cohort changed during admission claim");
+                    }
+                    // A selected replacement may have secured an empty credit before a
+                    // completion departure made this request eligible for the cohort.
+                    instance_.program->release_suspension_credit(request->id);
+                }
+                const auto progress =
+                    admit_planned_request(request, *choice, BackfillClass::None, 0);
+                // A finalization token may immediately complete the request and release its
+                // lane. The original admission still spends its finite fairness allowance.
+                const bool was_admitted = request->budget.has_value() ||
+                                          request->begin.has_value() ||
+                                          (copy_hold_ && copy_hold_->request == request);
+                if (was_admitted) {
+                    if (!replacement_admission) kv_pressure_.record_ingress();
+                    if (request->id != window_head_id_ && window_head_bypass_ != 0)
+                        --window_head_bypass_;
+                    if (replacement_ == request) replacement_.reset();
+                } else {
+                    if (!replacement_admission || progress != AdmissionProgress::None)
+                        instance_.program->release_suspension_credit(request->id);
+                    if (!replacement_admission || progress != AdmissionProgress::None)
+                        release_completion_claim(request);
+                    if (replacement_admission && progress != AdmissionProgress::None &&
+                        replacement_ == request)
+                        replacement_.reset();
+                }
+                return progress;
+            } catch (...) {
+                // Shared device/state failure belongs to fail_all, including its transfer
+                // fences. Do not disguise it as one rejected queued request.
+                const auto error = std::current_exception();
+                if (!is_request_local_error(error)) throw;
+                instance_.program->release_suspension_credit(request->id);
+                release_completion_claim(request);
+                (void)remove_pending_error(request, error);
+                if (replacement_ == request) replacement_.reset();
+                return AdmissionProgress::ControlProgress;
+            }
+        }
+        if (replacement_ && std::find(queued.begin(), queued.end(), replacement_) == queued.end()) {
+            instance_.program->release_suspension_credit(replacement_->id);
+            release_completion_claim(replacement_);
+            replacement_.reset();
+        }
+        return AdmissionProgress::None;
+    }
+
+    bool plan_kv_pressure() {
+        if (!chunked_execution_ || live_transfer_ || copy_hold_ || prefill_lane_) return false;
+        while (!pressure_victims_.empty()) {
+            const auto victim = pressure_victims_.front();
+            pressure_victims_.pop_front();
+            if (begin_live_suspension(victim)) return true;
+        }
+        // A blocked cohort member may be a useful queued-replacement victim. Exchange its
+        // claim only after funding it and proving a progressing backed successor's envelope.
+        if (suspended_.empty() && !pending_snapshot().empty()) {
+            for (const auto& member : slots_) {
+                if (!member || !member->completion_member || !member->growth_blocked) continue;
+                std::shared_ptr<Request> successor;
+                for (const auto& candidate : slots_) {
+                    if (candidate && !candidate->completion_member && candidate->decode_ready &&
+                        !candidate->growth_blocked && !candidate->recovery_pending &&
+                        completion_fits(candidate, member.get()) &&
+                        (!successor || candidate->queue_order < successor->queue_order)) {
+                        successor = candidate;
+                    }
+                }
+                if (successor && instance_.program->reserve_suspension_credit(
+                                     member->id, member->suspension_bytes)) {
+                    release_completion_claim(member);
+                    if (!claim_completion(successor)) {
+                        throw std::logic_error("completion handoff lost its future capacity claim");
+                    }
+                    instance_.program->release_suspension_credit(successor->id);
+                    break;
+                }
+            }
+        }
+        const auto all = pressure_snapshot();
+        kv_pressure_.observe(all, !build_round_membership().empty());
+        if (replacement_) return false;
+        std::vector<KvPressureRequest> resident;
+        std::vector<std::shared_ptr<Request>> requests;
+        for (const auto& request : slots_) {
+            if (request) {
+                resident.push_back(pressure_snapshot(*request));
+                requests.push_back(request);
+            }
+        }
+        std::shared_ptr<Request> recipient;
+        ExecutionWindow growth;
+        for (const auto& request : requests) {
+            if (request->growth_blocked && request->completion_member) recipient = request;
+        }
+        if (!recipient) {
+            for (const auto& request : requests) {
+                if (request->growth_blocked &&
+                    (!recipient || request->queue_order < recipient->queue_order))
+                    recipient = request;
+            }
+        }
+        std::shared_ptr<Request> replacement;
+        std::vector<std::shared_ptr<Request>> replacement_options;
+        AdmissionResources needed;
+        auto reason = KvPressureReason::Growth;
+        if (recipient && kv_pressure_.pressure_needed()) {
+            growth = recipient->recovery_waiting_resources
+                         ? recipient->recovery_window
+                         : instance_.program->plan_window(
+                               *recipient->lane,
+                               window_consumed(*recipient) +
+                                   std::min<std::uint32_t>(8192, recipient->budget->remaining()));
+            needed = growth.admission;
+            if (!recipient->completion_member && !instance_.program->reserve_suspension_credit(
+                                                     recipient->id, growth.suspension_bytes)) {
+                bool funded = false;
+                if (!recipient->recovery_waiting_resources) {
+                    for (auto grant =
+                             std::min<std::uint32_t>(8192, recipient->budget->remaining()) / 2;
+                         grant != 0; grant /= 2) {
+                        growth = instance_.program->plan_window(
+                            *recipient->lane, window_consumed(*recipient) + grant);
+                        if (instance_.program->reserve_suspension_credit(recipient->id,
+                                                                         growth.suspension_bytes)) {
+                            needed = growth.admission;
+                            funded = true;
+                            break;
+                        }
+                    }
+                }
+                if (!funded) return false;
+            }
+        } else if (kv_pressure_.allows_ingress(all.size(), !suspended_.empty())) {
+            for (const auto& pending : pending_snapshot()) {
+                if (window_head_id_ != 0 && pending->id != window_head_id_ &&
+                    window_head_bypass_ == 0)
+                    break;
+                if (pending->cancelled.load(std::memory_order_acquire)) continue;
+                try {
+                    ensure_base_plan(pending);
+                } catch (...) {
+                    (void)remove_pending_error(pending, std::current_exception());
+                    continue;
+                }
+                if (!admission_resources_fit(pending->completion_resources, admission_capacity_))
+                    continue;
+                replacement_options.push_back(pending);
+            }
+            if (replacement_options.empty()) return false;
+            reason = KvPressureReason::WaitingReplacement;
+            recipient.reset();
+        } else
+            return false;
+
+        reclaim_completed_gpu_cache();
+        if (recipient && reclaim_unused_windows(needed, recipient.get())) {
+            growth_priority_ = recipient->id;
+            return true;
+        }
+        // Shrinking can change victim transfer costs, but never snapshot membership/order.
+        for (std::size_t i = 0; i < requests.size(); ++i)
+            resident[i] = pressure_snapshot(*requests[i]);
+        const auto victim_order = kv_pressure_.ranked_victims(resident, reason);
+        // A waiting replacement with no legal victim cannot make progress. Do not evict
+        // optional prefixes to fund a RAM image for an impossible transaction.
+        if (reason == KvPressureReason::WaitingReplacement && victim_order.candidates().empty()) {
+            return false;
+        }
+        if (recipient) replacement_options.push_back(nullptr);
+        for (const auto& option : replacement_options) {
+            replacement              = option;
+            bool replacement_claimed = false;
+            if (replacement) {
+                needed = replacement->base_plan->summary().admission;
+                // Hold completion capacity through capture and physical admission. A queued
+                // member does not need RAM backing, but its future must remain exclusive.
+                replacement_claimed = claim_completion(replacement);
+                if (replacement_claimed) {
+                    instance_.program->release_suspension_credit(replacement->id);
+                } else if (!instance_.program->reserve_suspension_credit(
+                               replacement->id,
+                               replacement->base_plan->summary().suspension_bytes)) {
+                    continue;
+                }
+            }
+            for (const auto& candidate : victim_order.candidates()) {
+                std::vector<std::shared_ptr<Request>> victims;
+                bool contains_recipient = false;
+                for (std::size_t i = 0; i < requests.size(); ++i) {
+                    if ((candidate.mask & (1U << i)) == 0) continue;
+                    victims.push_back(requests[i]);
+                    contains_recipient = contains_recipient || requests[i] == recipient;
+                }
+                if (contains_recipient) continue;
+                bool fits = post_release_fits(needed, recipient.get(), victims);
+                if (!fits && !recipient) {
+                    fits = reclaim_unused_windows(needed, nullptr, victims);
+                }
+                if (!fits && recipient && !recipient->recovery_waiting_resources) {
+                    for (auto grant =
+                             std::min<std::uint32_t>(8192, recipient->budget->remaining()) / 2;
+                         grant != 0; grant /= 2) {
+                        const auto smaller = instance_.program->plan_window(
+                            *recipient->lane, window_consumed(*recipient) + grant);
+                        if (!post_release_fits(smaller.admission, recipient.get(), victims))
+                            continue;
+                        if (!recipient->completion_member &&
+                            !instance_.program->reserve_suspension_credit(recipient->id,
+                                                                          smaller.suspension_bytes))
+                            continue;
+                        needed = smaller.admission;
+                        fits   = true;
+                        break;
+                    }
+                }
+                if (!fits) continue;
+                for (const auto& victim : victims) pressure_victims_.push_back(victim);
+                if (replacement) {
+                    replacement_ = std::move(replacement);
+                    kv_pressure_.record_ingress();
+                } else
+                    growth_priority_ = recipient->id;
+                const auto victim = pressure_victims_.front();
+                pressure_victims_.pop_front();
+                if (begin_live_suspension(victim)) return true;
+                pressure_victims_.clear();
+                if (replacement_) {
+                    instance_.program->release_suspension_credit(replacement_->id);
+                    release_completion_claim(replacement_);
+                    replacement_.reset();
+                }
+                growth_priority_ = 0;
+                return false;
+            }
+            if (replacement) {
+                instance_.program->release_suspension_credit(replacement->id);
+                if (replacement_claimed) release_completion_claim(replacement);
+            }
+        }
+        if (recipient && !recipient->completion_member) {
+            (void)instance_.program->reserve_suspension_credit(recipient->id,
+                                                               recipient->suspension_bytes);
+        }
+        return false;
     }
 
     [[nodiscard]] ActiveAdmissionSet active_admission_set() const {
@@ -1673,14 +2738,17 @@ private:
         request->copy_hold_started.reset();
     }
 
-    [[nodiscard]] static std::exception_ptr attach_recovery_stats(std::exception_ptr error,
-                                                                  GenerationRecoveryStats stats) {
+    // Engine errors that end an admitted request carry its recovery totals to the caller.
+    [[nodiscard]] static std::exception_ptr
+    attach_request_stats(std::exception_ptr error, const GenerationRecoveryStats& stats,
+                         ReasoningLimitStats reasoning_limit) {
         if (!error) { return error; }
         try {
             std::rethrow_exception(error);
         } catch (const RequestError& request_error) {
-            return std::make_exception_ptr(
-                RequestError(request_error.kind(), request_error.what(), stats));
+            RequestError enriched(request_error.kind(), request_error.what(), stats);
+            enriched.set_reasoning_limit(std::move(reasoning_limit));
+            return std::make_exception_ptr(std::move(enriched));
         } catch (...) { return error; }
     }
 
@@ -2208,7 +3276,11 @@ private:
         release_planning_state(request);
         request->lane.reset();
         request->budget.reset();
-        request->admission_resources    = {};
+        request->admission_resources = {};
+        if (chunked_execution_) {
+            release_completion_claim(request);
+            instance_.program->release_suspension_credit(request->id);
+        }
         request->remaining_service_work = 0;
         request->backfill_epoch         = 0;
         request->backfill_class         = BackfillClass::None;
@@ -2600,6 +3672,9 @@ private:
             request->generated.reserve(summary.effective_output_tokens);
             request->lane                   = lane;
             request->admission_resources    = summary.admission;
+            request->window_output_tokens   = summary.window_output_tokens;
+            request->window_budget_origin   = summary.effective_output_tokens;
+            request->suspension_bytes       = summary.suspension_bytes;
             request->remaining_service_work = summary.service_work_quanta;
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
@@ -2656,6 +3731,7 @@ private:
     }
 
     AdmissionProgress try_admit_one() {
+        if (chunked_execution_) { return try_admit_windowed(); }
         bool control_progress                              = false;
         const std::vector<std::shared_ptr<Request>> queued = pending_snapshot();
         if (queued.empty()) {
@@ -2786,17 +3862,18 @@ private:
                 }
                 const RequestPlanSummary& candidate_plan = selected_plan.value().summary();
 
-                BackfillClass backfill = BackfillClass::None;
-                if (persistent_backfill_is_safe(*protection_, active.span(),
+                const auto& protected_head = protection_.value();
+                BackfillClass backfill     = BackfillClass::None;
+                if (persistent_backfill_is_safe(protected_head, active.span(),
                                                 candidate_plan.admission, admission_capacity_)) {
                     backfill = BackfillClass::Persistent;
                 } else if (candidate_plan.service_work_quanta <= frontier_distance &&
-                           candidate_plan.service_work_quanta <= protection_->temporal_credit) {
+                           candidate_plan.service_work_quanta <= protected_head.temporal_credit) {
                     backfill = BackfillClass::Temporal;
                 }
                 if (backfill != BackfillClass::None) {
                     return admit_planned_request(candidate, *candidate_lane, backfill,
-                                                 protection_->epoch_id);
+                                                 protected_head.epoch_id);
                 }
             }
             return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
@@ -2814,6 +3891,11 @@ private:
             instance_.program->prefill_remaining_tokens(*prefill_lane_) <
                 mixed_forward_min_tokens_ ||
             !instance_.program->prefill_suspendable(*prefill_lane_)) {
+            return false;
+        }
+        if (chunked_execution_ &&
+            (live_transfer_ || replacement_ || growth_priority_ != 0 ||
+             !kv_pressure_.allows_ingress(pressure_snapshot().size(), !suspended_.empty()))) {
             return false;
         }
         const auto queued = pending_snapshot();
@@ -2850,12 +3932,34 @@ private:
                     }
                 }
                 if (!selected) { return false; }
+                if (chunked_execution_) {
+                    if (!admission_resources_fit(request->completion_resources,
+                                                 admission_capacity_)) {
+                        return false;
+                    }
+                    if (!claim_completion(request)) {
+                        const auto& summary = request->lane_plans[selected->lane].value().summary();
+                        if (!instance_.program->reserve_suspension_credit(
+                                request->id, summary.suspension_bytes)) {
+                            return false;
+                        }
+                    }
+                }
                 suspended_decode_rounds_since_prefill_ = decode_rounds_since_prefill_;
                 suspended_prefill_lane_                = prefill_lane_;
                 prefill_lane_.reset();
                 instance_.request_memory.deactivate();
                 prefill_interruptible_ = false;
                 (void)admit_planned_request(request, *selected, BackfillClass::None, 0);
+                if (chunked_execution_) {
+                    if (request->budget || request->begin ||
+                        (copy_hold_ && copy_hold_->request == request)) {
+                        kv_pressure_.record_ingress();
+                    } else {
+                        release_completion_claim(request);
+                        instance_.program->release_suspension_credit(request->id);
+                    }
+                }
                 suspended_prefill_must_advance_ = request->lane.has_value();
                 return suspended_prefill_must_advance_;
             } catch (...) {
@@ -3023,17 +4127,26 @@ private:
                 token_logprobs =
                     collect_token_logprobs(*request, round.logprobs, first_slot, row_tokens);
             }
+            if (!cancelled[row]) {
+                const auto row_tokens = round.tokens.subspan(
+                    row * round.row_stride, static_cast<std::size_t>(accepted[row]));
+                observe_repetition(request, row_tokens);
+            }
             auto published = request->output.commit_preview();
+            commit_reasoning_limit_provenance(request, token_logprobs);
             attach_token_logprobs(published, std::move(token_logprobs));
             if (!terminal[row]) { synchronize_stop_suppression(request, lane); }
             if (!request->first_token && accepted[row] != 0) {
                 request->first_token = Clock::now();
             }
+            if (recover_reasoning_limit(request, published, finish_reasons[row])) { continue; }
+            if (filter_reasoning_replay(request, published, finish_reasons[row])) { continue; }
+            if (recover_persistent_reasoning(request, published, finish_reasons[row])) { continue; }
             append_output(request, std::move(published), terminal[row] == 0);
             if (terminal[row]) {
                 finish_generation(request, finish_reasons[row]);
             } else {
-                recover_persistent_reasoning(request);
+                (void)fail_repeated_content(request);
             }
         }
 
@@ -3061,6 +4174,32 @@ private:
             published_waiting_requests_.store(0, std::memory_order_relaxed);
         }
         drain_copy_hold_before_abort();
+        std::optional<std::uint32_t> unsettled_lane;
+        if (live_transfer_) {
+            unsettled_lane = live_transfer_->lane;
+            detail::run_secondary_cleanup([&] {
+                instance_.program->synchronize_all();
+                instance_.program->discard_suspended(live_transfer_->request->id);
+                unsettled_lane.reset();
+            });
+            if (!unsettled_lane) { live_transfer_.reset(); }
+        }
+        const auto publish_failure = [&](const std::shared_ptr<Request>& request) {
+            end_copy_hold(request);
+            // An unsettled transfer still owns its target state until Engine teardown.
+            if (!live_transfer_ || live_transfer_->request != request) {
+                detail::run_secondary_cleanup([&] { retire_request(request); });
+            }
+            publish_error_result(request, error);
+        };
+        const auto parked = suspended_;
+        for (const auto& request : parked) { publish_failure(request); }
+        pressure_victims_.clear();
+        if (replacement_) {
+            detail::run_secondary_cleanup(
+                [&] { instance_.program->release_suspension_credit(replacement_->id); });
+            replacement_.reset();
+        }
         if (prefill_lane_) {
             instance_.request_memory.deactivate();
             prefill_lane_.reset();
@@ -3069,11 +4208,13 @@ private:
         protection_.reset();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
-                instance_.program->abort_lane(lane);
-                complete_error(slots_[lane], error);
+                // Publication outlives retirement of the slot that owns this reference.
+                const auto request = slots_[lane];
+                if (unsettled_lane != lane) { instance_.program->abort_lane(lane); }
+                publish_failure(request);
             }
         }
-        for (const auto& request : pending) { complete_error(request, error); }
+        for (const auto& request : pending) { publish_failure(request); }
     }
 
     void worker_loop() noexcept {
@@ -3086,8 +4227,13 @@ private:
             if (stable_decode_epoch && !control_changed && recovery_queue_.empty()) {
                 try {
                     std::scoped_lock execution_lock(execution_mutex_);
+                    refresh_execution_windows();
                     const RoundMembership membership = build_round_membership();
-                    if (!membership.empty()) {
+                    const bool blocked =
+                        std::any_of(slots_.begin(), slots_.end(), [](const auto& request) {
+                            return request && request->growth_blocked;
+                        });
+                    if (!membership.empty() && !blocked && !live_transfer_ && suspended_.empty()) {
                         run_decode_round(membership);
                         continue;
                     }
@@ -3101,7 +4247,7 @@ private:
             bool idle           = false;
             {
                 std::scoped_lock lock(queue_mutex_);
-                idle = !stopping_ && pending_.empty();
+                idle = !stopping_ && pending_.empty() && suspended_.empty() && !live_transfer_;
             }
             for (std::uint32_t lane = 0; idle && lane < max_concurrency_; ++lane) {
                 idle = slots_[lane] == nullptr;
@@ -3152,6 +4298,25 @@ private:
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
+                if (chunked_execution_) {
+                    const auto parked = suspended_;
+                    for (const auto& request : parked) {
+                        if (request->cancelled.load(std::memory_order_acquire))
+                            complete_cancelled(request);
+                    }
+                    if (advance_live_transfer()) { continue; }
+                    if (!live_transfer_ && !pressure_victims_.empty()) {
+                        if (plan_kv_pressure()) { continue; }
+                    }
+                    refresh_execution_windows();
+                    if (!live_transfer_ && !copy_hold_ && !prefill_lane_) {
+                        const auto snapshot = pressure_snapshot();
+                        kv_pressure_.observe(snapshot, !build_round_membership().empty());
+                        if (!replacement_ && growth_priority_ == 0 && try_resume_live_request()) {
+                            continue;
+                        }
+                    }
+                }
                 resume_suspended_prefill();
                 const RoundMembership membership = build_round_membership();
 
@@ -3238,7 +4403,20 @@ private:
                     continue;
                 }
 
-                if (start_generation_recovery()) { continue; }
+                if (!live_transfer_ && pressure_victims_.empty() && !replacement_ &&
+                    start_generation_recovery()) {
+                    continue;
+                }
+
+                if (live_transfer_) {
+                    if (!membership.empty()) {
+                        run_membership_decode();
+                    } else {
+                        std::unique_lock lock(queue_mutex_);
+                        queue_cv_.wait_for(lock, std::chrono::milliseconds(1));
+                    }
+                    continue;
+                }
 
                 if (have_pending &&
                     (membership.empty() || decode_admission_burst.allows_admission())) {
@@ -3253,9 +4431,11 @@ private:
                     }
                 }
 
+                if (plan_kv_pressure()) { continue; }
+
                 if (!membership.empty()) {
                     run_membership_decode();
-                    stable_decode_epoch = !have_pending;
+                    stable_decode_epoch = !have_pending && suspended_.empty() && !live_transfer_;
                     continue;
                 }
             } catch (...) {
@@ -3279,6 +4459,7 @@ private:
     const std::uint32_t context_capacity_;
     LoadProgress load_progress_;
     const bool generation_recovery_;
+    const ReasoningLimitAction reasoning_limit_action_;
     const bool shared_prefill_;
     const std::uint32_t mixed_forward_rounds_;
     const std::uint32_t mixed_forward_min_tokens_;
@@ -3303,6 +4484,24 @@ private:
     // Decode rounds run since the prefill owner's last step.
     std::uint32_t decode_rounds_since_prefill_ = 0;
     std::optional<CopyHold> copy_hold_;
+
+    struct LiveTransfer {
+        std::shared_ptr<Request> request;
+        std::uint32_t lane = 0;
+        bool restoring     = false;
+        ExecutionWindow window;
+    };
+
+    const bool chunked_execution_;
+    KvPressurePolicy kv_pressure_;
+    std::vector<std::shared_ptr<Request>> completion_cohort_;
+    std::deque<std::shared_ptr<Request>> suspended_;
+    std::optional<LiveTransfer> live_transfer_;
+    std::deque<std::shared_ptr<Request>> pressure_victims_;
+    std::shared_ptr<Request> replacement_;
+    std::uint64_t growth_priority_    = 0;
+    std::uint64_t window_head_id_     = 0;
+    std::uint32_t window_head_bypass_ = 0;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

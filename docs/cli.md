@@ -155,7 +155,7 @@ The RTX 5090 tree investigation is in
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or automatic sizing from remaining GPU memory | `auto` |
 | `--kv-capacity-headroom MiB` | device memory `--kv-capacity auto` leaves free; requires `auto` | `64` |
-| `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
+| `--kv-ram-capacity off\|N` | pinned host capacity in MiB for prefixes and live suspension; enables output windows up to 8192 tokens | `off` |
 | `--kv-ram-system-prompts N` | Retain up to N rendered system prefixes inside the RAM budget; nonzero requires RAM capacity | `0` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache pack-file capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
@@ -256,6 +256,14 @@ and duplicate-tool recovery share the two-retry budget.
 Raw output and media inputs do not use these internal retries. See the serving reference
 for the detector's conservative scope and recovery usage fields.
 
+`--thinking-token-budget N` sets an optional positive uint32 cap on newly committed reasoning
+body tokens. Historical input and framing do not count. The cap remains cumulative across
+attempts and KV suspension, and requires thinking with parsed output. At the cap, the sampler
+permits the native reasoning close, which consumes total output/context space. Caller stops,
+cancellation and total output/context limits retain precedence. A capped request preserves its
+analysis and disables automatic clean retries; cycle escape and framing repair remain active.
+Omitting the option leaves reasoning unlimited within the total output/context budget.
+
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
 generated token IDs in diagnostics. During structured Qwen output, registered model stop tokens
@@ -311,7 +319,16 @@ less than 4096 MiB of the host's available memory; `--context-checkpoints off` s
 one turn-rollback head per lane, and without DFlash there is no pool. With DFlash, capture copies the state into the Engine-wide device staging slot (a device-to-device copy) and drains
 it to the host image on the copy stream behind later work; a restore while staging still holds that
 image copies it back on the device, otherwise it costs one H2D before the suffix prefill.
-`--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles. It is
+
+With RAM capacity enabled, the Engine funds the complete prompt plus output windows of at most
+8192 tokens. Eight chats with 32K output limits initially reserve at most 64K output tokens plus
+prompt and speculative headroom. Each chat retains its full output limit. Windows grow as needed;
+only actual KV/backing pressure can block growth or suspend a settled continuation to secured RAM.
+Resume preserves output and sampling state without replay or prefill. Live images cannot be evicted
+or spilled to disk. A joint completion guarantee or image credit funds every admitted identity;
+finite RAM can still limit concurrency. RAM off retains full-lifetime GPU reservation.
+
+`--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles and secured live continuations. It is
 not a token capacity, does not enlarge the GPU pool, and defaults to `off`. `N` must be a positive
 decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated.
 `--kv-disk-capacity N` is a third-tier SSD pack-file budget in MiB. It requires
@@ -370,8 +387,9 @@ budget accordingly. `off` still captures live-lane GDN into the startup checkpoi
 same-lane rollback works; other-lane restore after eviction remains a miss. Startup still
 prints capacity plus `used`/`entries`. Serve `[req] done` and throughput lines print live
 host-resident `kv-ram=` used bytes plus `n=` / `restores=` / `evicts=` / `drops=` / `save=` /
-`load=`. When disk is enabled the same lines also print `kv-disk=` occupancy and counters. `kv-ram=` / `n=` exclude a chat after consume following a restore onto a KV lane; a later
-spill recaptures it as a new FIFO tail. RAM `save=` / `load=` are CUDA event elapsed for that request's
+`load=`. When disk is enabled the same lines also print `kv-disk=` occupancy and counters. `n=` counts indexed reusable prefixes and excludes consumed entries and private live images.
+`kv-ram=` counts allocator occupancy, including live-image credits and transfer-held images.
+A later optional spill recaptures a reusable prefix as a new FIFO tail. RAM `save=` / `load=` are CUDA event elapsed for that request's
 RAM-tier D2H capture and H2D unpack of the FIFO bundle (Main+backend KV, rewrite GDN, captured
 ladder GDN/cyclic images, and the restored matched head in the same copy span; restored ladder
 heads installed for later reuse copy outside it). Admission completes only after its copies land,

@@ -108,6 +108,77 @@ int main() {
     changed.messages[1].reasoning_content = "Checking status.";
     check(!GenerationRecoveryContext::analyze(changed)->has_repeated_tool_history(),
           "a brief repeated poll triggered recovery");
+    // The captured max-stack failure cycles through four distinct completed
+    // reads. Prove both full cycles, not merely two occurrences of one call.
+    auto cycle = input;
+    cycle.messages.resize(1);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        for (int phase = 0; phase < 4; ++phase) {
+            auto assistant              = input.messages[1];
+            assistant.reasoning_content = "Phase " + std::to_string(phase) + " " + reasoning;
+            assistant.tool_calls[0].id  = "cycle_" + std::to_string(repeat * 4 + phase);
+            assistant.tool_calls[0].arguments_json =
+                "{\"filePath\":\"registry.cpp\",\"offset\":" + std::to_string(phase * 100) + "}";
+            auto result          = input.messages[2];
+            result.tool_call_id  = assistant.tool_calls[0].id;
+            result.parts[0].text = "unchanged range " + std::to_string(phase);
+            cycle.messages.push_back(std::move(assistant));
+            cycle.messages.push_back(std::move(result));
+        }
+    }
+    const auto cycle_context = GenerationRecoveryContext::analyze(cycle);
+    const auto next_calls    = cycle.messages[1].tool_calls;
+    check(cycle_context->has_repeated_tool_history() &&
+              cycle_context->repeats(next_calls, cycle.messages[1].reasoning_content),
+          "four-read unchanged cycle escaped recovery");
+    check(!cycle_context->repeats(next_calls, cycle.messages[1].reasoning_content +
+                                                  " New evidence changes this decision."),
+          "new substantive reasoning was ignored by the multi-round proof");
+    auto mixed_calls = next_calls;
+    mixed_calls.push_back(ToolCall{.id = "new", .name = "edit", .arguments_json = R"({"x":1})"});
+    check(!cycle_context->repeats(mixed_calls, cycle.messages[1].reasoning_content),
+          "a novel call in the proposed batch was discarded with a repeated read");
+    check(
+        !cycle_context->repeats(cycle.messages[3].tool_calls, cycle.messages[1].reasoning_content),
+        "an out-of-phase call was mistaken for the next cycle round");
+    auto changed_cycle                       = cycle;
+    changed_cycle.messages[10].parts[0].text = "new external result";
+    check(!GenerationRecoveryContext::analyze(changed_cycle)->has_repeated_tool_history(),
+          "one changed result inside a four-round cycle was ignored");
+    changed_cycle = cycle;
+    changed_cycle.messages.insert(changed_cycle.messages.begin() + 9, user);
+    check(!GenerationRecoveryContext::analyze(changed_cycle)->has_repeated_tool_history(),
+          "a user instruction between cycles was crossed");
+    // Multiple calls in a round are matched by ID to results; result ordering
+    // does not change the batch, but every call must have exactly one result.
+    auto batch = input;
+    batch.messages.resize(1);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        auto assistant             = input.messages[1];
+        assistant.tool_calls[0].id = "a" + std::to_string(repeat);
+        assistant.tool_calls.push_back(ToolCall{.id             = "b" + std::to_string(repeat),
+                                                .name           = "read",
+                                                .arguments_json = R"({"filePath":"b.cpp"})"});
+        auto a          = input.messages[2];
+        a.tool_call_id  = assistant.tool_calls[0].id;
+        auto b          = a;
+        b.tool_call_id  = assistant.tool_calls[1].id;
+        b.parts[0].text = "unchanged second file";
+        batch.messages.push_back(std::move(assistant));
+        if (repeat == 0) {
+            batch.messages.push_back(std::move(a));
+            batch.messages.push_back(std::move(b));
+        } else {
+            batch.messages.push_back(std::move(b));
+            batch.messages.push_back(std::move(a));
+        }
+    }
+    auto batch_context = GenerationRecoveryContext::analyze(batch);
+    check(batch_context->repeats(batch.messages[1].tool_calls, reasoning),
+          "completed multi-call round or reordered associated results escaped recovery");
+    batch.messages.back().tool_call_id = "missing";
+    check(!GenerationRecoveryContext::analyze(batch)->has_repeated_tool_history(),
+          "an incomplete multi-call round established repetition");
     const auto& stored = context->input();
     check(stored.messages[0].parts[0].text == "Preserve my task." &&
               stored.messages[1].reasoning_content == reasoning &&
@@ -127,11 +198,22 @@ int main() {
           "attempt 2 did not stack a distinct system notice");
     check(notice[0].role != ChatRole::User && stored.messages.size() > notice.size(),
           "history was a prefix of the reasoning insert");
-    std::vector<ToolCall> proposed = {
-        {.id = "old0", .name = "read", .arguments_json = R"({"a":1})"},
-        {.id = "old1", .name = "read", .arguments_json = R"({"b":2})"},
-    };
-    const auto rejected = context->recovery_insert(proposed, 2);
+    const auto replay_notice = context->recovery_insert(
+        {}, 1, ninfer::targets::qwen3_6::GenerationRecoveryNotice::ReasoningReplay);
+    check(replay_notice.size() == 1 && replay_notice[0].tool_calls.empty() &&
+              replay_notice[0].role == ChatRole::System &&
+              replay_notice[0].parts[0].text.find(
+                  "framing replay was confirmed earlier in this request") != std::string::npos &&
+              replay_notice[0].parts[0].text.find("No tool was executed") != std::string::npos,
+          "replay recovery fabricated tool observations or lost its actual cause");
+    auto proposed              = batch.messages[1].tool_calls;
+    proposed[0].id             = "old0";
+    proposed[1].id             = "old1";
+    proposed[0].arguments_json = R"({ "limit" : 100, "filePath" : "a.cpp" })";
+    const auto rejected        = batch_context->recovery_insert(proposed, 2);
+    check(rejected[0].tool_calls[0].arguments_json ==
+              batch_context->input().messages[1].tool_calls[0].arguments_json,
+          "generated duplicate argument formatting changed the bounded feedback payload");
     check(rejected.size() == 3 && rejected[0].role == ChatRole::Assistant &&
               rejected[0].reasoning_content.empty() && rejected[0].parts.empty() &&
               rejected[0].tool_calls.size() == 2 &&
@@ -232,7 +314,7 @@ int main() {
     resident.pages_fit                = true;
     resident.ram_reusable_tokens      = 5000;
     resident.disk_reusable_tokens     = 9000;
-    const auto route = [](RecoveryPrefillInput routed) { return route_recovery_prefill(routed); };
+    const auto route = [](RecoveryPrefillInput query) { return route_recovery_prefill(query); };
     auto refused     = resident;
     refused.splice_accepted     = false;
     const auto refused_decision = route(refused);

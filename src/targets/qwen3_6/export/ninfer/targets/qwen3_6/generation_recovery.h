@@ -9,10 +9,24 @@
 
 namespace ninfer::targets::qwen3_6 {
 
+enum class GenerationRecoveryNotice {
+    ReasoningLimit,
+    RepeatedReasoning,
+    ReasoningReplay,
+    RepeatedContent
+};
+
+// A replacement profile for proved reasoning failure; standard/greedy inputs stay unchanged.
+[[nodiscard]] ResolvedSamplingParameters
+replay_recovery_sampling(ResolvedSamplingParameters original);
+
 // Captures text-only thinking input for bounded internal regeneration.
-// Tool evidence: two consecutive single-call rounds, identical parsed
-// arguments and tool results, and a substantial repeated reasoning passage.
-// An intervening user turn, different call/result, or media disables this proof.
+// Tool evidence: two consecutive identical cycles of one to four complete
+// rounds, identical ordered call batches and associated results, and substantial
+// repeated reasoning in each phase (whole normalized reasoning for multi-round
+// or multi-call cycles). The next proposal must repeat the whole
+// expected batch and reasoning. An intervening user turn, changed cycle or media
+// disables this proof.
 // It is not a claim to infer arbitrary external tool side effects.
 class GenerationRecoveryContext {
 public:
@@ -21,7 +35,7 @@ public:
     analyze(const PromptInput& input);
 
     [[nodiscard]] bool has_repeated_tool_history() const noexcept {
-        return !repeated_call_.name.empty();
+        return !repeated_calls_.empty();
     }
 
     [[nodiscard]] bool repeats(std::span<const ToolCall> calls, std::string_view reasoning) const;
@@ -31,18 +45,28 @@ public:
     // Only the new messages. Empty calls are one system notice. Calls are one
     // assistant message plus one tool message per call. History is not copied
     // and reasoning_content is not cleared.
-    [[nodiscard]] std::vector<ChatMessage> recovery_insert(std::span<const ToolCall> calls,
-                                                           std::uint32_t attempt) const;
+    // All supported native feedback variants at this attempt, including the known
+    // repeated-call batch when proof context exists. Used to bound suffix growth.
+    [[nodiscard]] std::vector<std::vector<ChatMessage>>
+    recovery_insert_variants(std::uint32_t attempt) const;
+
+    [[nodiscard]] std::vector<ChatMessage> recovery_insert(
+        std::span<const ToolCall> calls, std::uint32_t attempt,
+        GenerationRecoveryNotice reason = GenerationRecoveryNotice::RepeatedReasoning) const;
 
 private:
     PromptInput input_;
-    ToolCall repeated_call_;
+    std::vector<ToolCall> repeated_calls_;
     std::string repeated_reasoning_;
+    bool exact_reasoning_ = false;
 };
 
-// Open generation that recovery is allowed to close, and the empty-think close
-// that finishes it. The prologue is not repeated inside the close.
+// Exact native generation prologues and their corresponding turn closures.
+// The thinking close does not repeat its prologue.
 inline constexpr std::string_view kRecoveryThinkingPrologue = "<|im_start|>assistant\n<think>\n";
+inline constexpr std::string_view kRecoveryNonThinkingPrologue =
+    "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+inline constexpr std::string_view kRecoveryContentTurnClose = "<|im_end|>\n";
 inline constexpr std::string_view kRecoveryTurnClose        = "\n</think>\n\n<|im_end|>\n";
 
 inline constexpr std::string_view kRecoveryPrologueExhausted =

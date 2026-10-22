@@ -93,7 +93,7 @@ The endpoint supports:
   authorize a new function. Markup on a
   tools-off request stays in `content` and ninfer-serve logs a warning.
 - the top-level `reasoning_effort` field;
-- the `enable_thinking` extension;
+- the `enable_thinking` extension and optional `thinking_token_budget` cap;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
 - the vendor `ninfer` object (`cache_write`, `capture_context_checkpoint`).
 
@@ -430,6 +430,7 @@ wire response contains typed `output` Items.
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
+| `ninfer.thinking_token_budget` | positive uint32 reasoning-body cap; omitted inherits the server default, explicit null disables it |
 | `text.format` | `text`, `json_object`, or flattened `json_schema`; see constrained output above |
 | `tools` | flat Responses function definitions; see below |
 | `tool_choice` | `auto` or `none` |
@@ -836,6 +837,24 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
   }'
 ```
 
+### Per-request reasoning limit
+
+A positive uint32 cap is accepted through Chat Completions `thinking_token_budget`, Responses `ninfer.thinking_token_budget`, or Anthropic Messages `thinking.budget_tokens`. `ninfer-serve --default-thinking-token-budget N|off` sets the cap inherited when that exact request field is omitted; the built-in default is `off` (unlimited). Explicit null disables the server cap, and an explicit positive integer overrides it. Null `ninfer` or `thinking` wrappers do not opt out. Zero, fractional, negative and overflowing values are rejected; `4294967295` is supported.
+
+The cap resolves after final thinking and reasoning effort. An inherited cap is inactive when thinking is disabled, while an explicit positive cap with disabled thinking is a 400 error. A positive supported effort can enable thinking and inherit the cap even when the server defaults thinking off. Anthropic adaptive thinking without a budget inherits the server cap. Reasoning effort itself is unchanged. The resolved effective cap is passed to the Engine and request log; server-start logs record the configured default. The deployment Compose command sets this default to `16384`. No public strategy selector is provided.
+
+The policy charges newly committed reasoning body token IDs, excluding historical input and framing, cumulatively across retries. Caller stops, cancellation and total output/context ceilings retain precedence. A policy-forced native close consumes completion/context room and carries intervention provenance; it is not a naturally sampled close. A reasoning cap bounds analysis; it does not guarantee that every continuation completes a useful answer or tool call.
+
+For a request with a reasoning cap in the ordinary Close configuration, automatic clean retries
+are disabled. Confirmed reasoning repetition keeps its analysis and continues toward natural or
+capped close; cycle escape and framing repair remain active. Invalid replay continuations,
+persistent answer repetition and proved duplicate-tool cycles fail explicitly rather than discard
+the attempt and retry. The private Retry comparator remains separate and bounded.
+
+Final usage adds `ninfer.reasoning_limit` when a cap is active on all three protocols, including final streaming usage: `budget_tokens`, `used_tokens`, `forced_closes`, `budget_retries`, and `limit_reached`. This policy count is distinct from standard reasoning-token usage. Request logs record the resolved cap (null for unlimited) and source parameter; completion logs and process metrics expose intervention accounting. Proxies may discard vendor usage fields, so resolved request diagnostics establish whether forwarding worked.
+
+Reasoning-limit diagnostics also include `forced_tokens`, a separate framing provenance list with `generated_token_index`, `token`, `policy_forced=true`, and `target_logprob`. The index refers to the request's cumulative generated-token sequence, including discarded attempts. The logprob is the original unmasked target value when requested and available; otherwise it is null. These framing records do not appear as answer/reasoning channel logprobs and never report masked probability one as model confidence. Errors ending admitted requests retain the cumulative reasoning-limit ledger under `error.ninfer.reasoning_limit`, in request-error logs, and in process counters, so a failed replacement does not erase consumed reasoning or interventions.
+
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
@@ -860,7 +879,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or automatic sizing from remaining GPU memory | `auto` |
-| `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
+| `--kv-ram-capacity off\|N` | pinned host capacity in MiB for prefixes and live suspension; enables output windows up to 8192 tokens | `off` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache pack-file capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
 | `--kv-disk-compress off\|zstd` | zstd-1 on new GDN/hidden/cyclic writes; KV pages stay uncompressed | `off` |
@@ -893,6 +912,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks. Custom lists require explicit `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | default ladder |
 | `--no-thinking` | disable thinking by default | thinking on |
+| `--default-thinking-token-budget N\|off` | cap inherited by thinking requests that omit their reasoning budget | `off` |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--system-prepend TEXT` | prepend TEXT to the leading system/developer instruction on every request; inserts a system turn if none exists | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -1007,6 +1027,12 @@ Run `./build/apps/ninfer-serve --help` for the exact option contract.
 counter totals and histogram `count` / `sum`, not rates. Both stay unauthenticated. Scrape does
 not call `cudaMemGetInfo`.
 
+Windowed KV activity is exposed in `/metrics.json` under `kv_execution`: `window_tokens`,
+`growth_blocked_requests`, `suspended_requests`, `window_extensions`, `suspensions`, and `resumes`.
+Prometheus uses `ninfer_kv_execution_window_tokens`, `ninfer_kv_growth_blocked_requests`,
+`ninfer_kv_suspended_requests`, `ninfer_kv_window_extensions_total`,
+`ninfer_kv_live_suspensions_total`, and `ninfer_kv_live_resumes_total`. RAM-off values are zero.
+
 ```bash
 curl -s http://127.0.0.1:8080/metrics | head
 curl -s http://127.0.0.1:8080/metrics.json | jq .scheduler,.gpu_kv,.kv_ram,.speculative,.recovery,.phases
@@ -1074,7 +1100,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v22 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v23 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
@@ -1179,8 +1205,18 @@ after weights are loaded, leaving `--kv-capacity-headroom` MiB free (default 64;
 desktop or another process shares the GPU). Automatic sizing is the default when the option is
 omitted. The 64 MiB default margin targets a dedicated headless GPU; desktop-display and
 concurrent-load configurations have not been qualified. The shared pool is fixed at startup
-and is not divided evenly among request lanes. `--kv-ram-capacity` is a separate pinned-host budget
-in MiB for completed prefix bundles and does not change GPU pool sizing. One long DFlash chat with five
+and is not divided evenly among request lanes.
+
+With RAM capacity enabled, the Engine funds the complete prompt plus output windows of at most
+8192 tokens. Eight chats with 32K output limits initially reserve at most 64K output tokens plus
+prompt and speculative headroom. Each chat retains its full output limit. Windows grow as needed;
+only actual KV/backing pressure can block growth or suspend a settled continuation to secured RAM.
+Resume preserves output and sampling state without replay or prefill. Live images cannot be evicted
+or spilled to disk. A joint completion guarantee or image credit funds every admitted identity;
+finite RAM can still limit concurrency. RAM off retains full-lifetime GPU reservation.
+
+`--kv-ram-capacity` is a separate pinned-host budget in MiB for completed prefix bundles and
+secured live continuations; it does not change GPU pool sizing. One long DFlash chat with five
 context-checkpoint heads is about 6 GiB in that FIFO; `off` still keeps same-lane GDN rollback on
 the live pinned log, but other-lane restore after eviction needs the FIFO.
 `--kv-disk-capacity` is a third-tier SSD pack-file budget in MiB. It requires
@@ -1234,8 +1270,8 @@ periodic throughput lines print live host-resident `kv-ram=` used bytes plus `n=
 `evicts=` / `drops=` / `save=` / `load=`, plus GPU page entitlement and cache-fallback totals when
 they are non-zero. Each `[req] done` line includes `reuse_source=` and this request's copy
 milliseconds when they are non-zero. It does not print process occupancy. When
-`--kv-disk-capacity` is enabled, throughput lines also print `kv-disk=` occupancy and counters. `kv-ram=` / `n=` count chats still in the host FIFO, not chats
-already consumed after a restore onto a KV lane. RAM `save=` / `load=` are CUDA D2H/H2D elapsed for
+`--kv-disk-capacity` is enabled, throughput lines also print `kv-disk=` occupancy and counters. `n=` counts indexed reusable prefixes, excluding consumed entries and private live images.
+`kv-ram=` includes live-image credits and transfer-held images as allocator occupancy. RAM `save=` / `load=` are CUDA D2H/H2D elapsed for
 that request's admission or the throughput interval; the copies of a capture rolled back by a
 deferred or failed admission count only toward lifetime and interval totals. Disk `save=` is spill-session wall harvested onto the
 request; disk `load=` is the host wall from the first live SSD read of that restore until the last
