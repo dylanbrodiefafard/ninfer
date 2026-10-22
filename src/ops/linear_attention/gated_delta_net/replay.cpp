@@ -21,7 +21,7 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kStateDim    = detail::gated_delta_net::kStateDim;
-constexpr std::int32_t kMaximumRows = 6;
+constexpr std::int32_t kMaximumRows = 8;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -314,7 +314,7 @@ void validate_history_layer(const GdnHistoryLayer& history, std::int32_t rows, s
     constexpr const char* op = "gated_delta_net_history_record";
     const auto slots         = history.counts.ne[0];
     const auto ceiling       = history.provisional_key.ne[2];
-    if (slots < 1 || slots > 6 || width > ceiling || ceiling > 16) {
+    if (slots < 1 || slots > 8 || width > ceiling || ceiling > 16) {
         throw std::invalid_argument("GDN history layer extent is invalid");
     }
     require_tensor(history.key, DType::FP32, {128, 16, 4, slots}, 16, op, "retained keys");
@@ -334,7 +334,7 @@ void validate_history(const GdnHistory& history, const GdnReplayRecords& records
                       LinearAttentionStateAllLayersView states) {
     constexpr const char* op = "gdn_history_commit";
     const auto& spec         = history.spec;
-    if (spec.layers != 48 || spec.slots < 1 || spec.slots > 6 || spec.capacity != 4 ||
+    if (spec.layers != 48 || spec.slots < 1 || spec.slots > 8 || spec.capacity != 4 ||
         spec.qk_heads != 16 || spec.value_heads != 48 || spec.key_dim != 128 ||
         spec.value_dim != 128 || spec.width != records.spec.width ||
         spec.slots != records.spec.record_capacity || states.spec.layers != 48 ||
@@ -513,7 +513,7 @@ void gdn_history_materialize(const GdnReplayRecords& records, const GdnHistory& 
     validate_fold_states(records, states);
     require_records_disjoint_from_states(records, states);
     validate_history(history, records, states);
-    std::array<GdnReplayFoldRow, 6> rows{};
+    std::array<GdnReplayFoldRow, kMaximumRows> rows{};
     for (std::size_t index = 0; index < slots.size(); ++index) {
         if (slots[index] < 0 || slots[index] >= history.spec.slots) {
             throw std::invalid_argument("GDN history materialization slot is invalid");
@@ -538,7 +538,7 @@ void gdn_history_reset_slot(const GdnHistory& history, std::int32_t slot, cudaSt
 }
 
 void gdn_history_reset_all(const GdnHistory& history, cudaStream_t stream) {
-    if (history.spec.slots < 1 || history.spec.slots > 6 || history.counts.dtype != DType::I32 ||
+    if (history.spec.slots < 1 || history.spec.slots > 8 || history.counts.dtype != DType::I32 ||
         history.counts.ne[0] != history.spec.slots || history.counts.data == nullptr) {
         throw std::invalid_argument("GDN history reset extent is invalid");
     }

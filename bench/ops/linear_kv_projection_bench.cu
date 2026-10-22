@@ -76,7 +76,7 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--cold") {
             options.cold = true;
         } else if (argument == "--help") {
-            std::printf("Usage: %s [--widths 1,2,3,4,5,6,7,8,128,512,2048] [--batch 1..6] "
+            std::printf("Usage: %s [--widths 1,2,3,4,5,6,7,8,128,512,2048] [--batch 1..8] "
                         "[--mode graph|eager] [--cold] [--layers 1|5] [--warmup N] [--repeat N]\n",
                         argv[0]);
             std::exit(0);
@@ -84,7 +84,7 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("unknown option: " + std::string(argument));
         }
     }
-    if (options.batch < 1 || options.batch > 6 || options.warmup < 0 || options.repeat <= 0 ||
+    if (options.batch < 1 || options.batch > 8 || options.warmup < 0 || options.repeat <= 0 ||
         (options.layers != 1 && options.layers != 5)) {
         throw std::invalid_argument("invalid batch, layer or repetition count");
     }

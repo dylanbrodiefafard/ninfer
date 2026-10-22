@@ -372,13 +372,19 @@ struct AcceptedHistoryFixture {
     }
 
     void qualify_record_racecheck() {
-        const std::vector<double> state(initial_state.begin(), initial_state.end());
         std::vector<double> reference(value_elements);
-        for (int column = 0; column < width; ++column) {
-            const auto result =
-                tr::history_ref::evaluate(oracle_input(0, path(0, column), state), kScale, true);
-            std::copy(result.out.end() - kHv * kD, result.out.end(),
-                      reference.begin() + static_cast<std::size_t>(column) * kHv * kD);
+        for (int row = 0; row < batch; ++row) {
+            const auto state_begin = static_cast<std::size_t>(slot_h[row]) * state_slot_elements;
+            const std::vector<double> state(initial_state.begin() + state_begin,
+                                            initial_state.begin() + state_begin +
+                                                state_slot_elements);
+            for (int column = 0; column < width; ++column) {
+                const auto result = tr::history_ref::evaluate(
+                    oracle_input(row, path(row, column), state), kScale, true);
+                std::copy(result.out.end() - kHv * kD, result.out.end(),
+                          reference.begin() +
+                              static_cast<std::size_t>(row * width + column) * kHv * kD);
+            }
         }
         const auto record_once = [&](cudaStream_t stream) {
             CUDA_CHECK(cudaMemcpyAsync(candidate_storage.p, initial_storage.p,
@@ -1009,14 +1015,14 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--racecheck") {
             for (const bool tree : {false, true}) {
-                AcceptedHistoryFixture fixture(1, tree ? 12 : 8, tree, 4, false);
+                AcceptedHistoryFixture fixture(tree ? 1 : 8, tree ? 12 : 8, tree, 4, false);
                 fixture.qualify_record_racecheck();
             }
             return 0;
         }
         if (tr::sanitizer_scope(argc, argv)) {
             {
-                AcceptedHistoryFixture fixture(1, 8, false, 4);
+                AcceptedHistoryFixture fixture(8, 8, false, 4);
                 fixture.qualify(true, 2);
             }
             {
@@ -1033,8 +1039,9 @@ int main(int argc, char** argv) {
         const int batch = argc > 1 ? std::stoi(argv[1]) : 1;
         const int width = argc > 2 ? std::stoi(argv[2]) : 4;
         const bool tree = argc > 3 && std::stoi(argv[3]) != 0;
-        if ((batch != 1 && batch != 6) || (width != 4 && width != 8 && width != 12)) {
-            throw std::invalid_argument("usage: gdn_history_test {1|6} {4|8|12} [tree0|1]");
+        if ((batch != 1 && batch != 6 && batch != 7 && batch != 8) ||
+            (width != 4 && width != 8 && width != 12)) {
+            throw std::invalid_argument("usage: gdn_history_test {1|6|7|8} {4|8|12} [tree0|1]");
         }
         {
             AcceptedHistoryFixture fixture(batch, width, tree);
@@ -1043,6 +1050,12 @@ int main(int argc, char** argv) {
             fixture.lifecycle();
         }
         if (argc == 1) {
+            for (const int wide_batch : {7, 8}) {
+                AcceptedHistoryFixture wide(wide_batch, 8, false);
+                wide.qualify(false);
+                wide.qualify(true);
+                wide.lifecycle();
+            }
             AcceptedHistoryFixture fixture(6, 12, false, 8, false);
             fixture.stride_compaction();
         }

@@ -220,12 +220,15 @@ int main() {
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
     bool excessive_concurrency_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "7"});
+        (void)parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "9"});
     } catch (const std::invalid_argument&) { excessive_concurrency_rejected = true; }
-    failures += check(excessive_concurrency_rejected, "--max-concurrency 7 was accepted");
-    failures += check(
-        parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "6"}).max_concurrency == 6,
-        "--max-concurrency 6 was rejected");
+    failures += check(excessive_concurrency_rejected, "--max-concurrency 9 was accepted");
+    for (const auto* concurrency : {"6", "7", "8"}) {
+        failures +=
+            check(parse({"ninfer-serve", "model.ninfer", "--max-concurrency", concurrency})
+                          .max_concurrency == static_cast<std::uint32_t>(concurrency[0] - '0'),
+                  "supported --max-concurrency was rejected");
+    }
     failures += check(configured.max_context == 4096 &&
                           configured.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           configured.kv_capacity.explicit_tokens == 8192,

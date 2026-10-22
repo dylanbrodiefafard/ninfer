@@ -301,7 +301,7 @@ int run_bf16_target() {
     }
     // Packed verify W=2..8 across C=2..6 must reproduce each request's panel exactly.
     for (std::int32_t panel = 2; panel <= 8; ++panel) {
-        for (std::int32_t batch = 2; batch <= 6; ++batch) {
+        for (std::int32_t batch = 2; batch <= 8; ++batch) {
             failures += run_bf16_panels(parent, panel, panel * batch);
         }
     }
@@ -490,9 +490,9 @@ int run_nvfp4_target() {
             failures += run_nvfp4_panels(parent, panel * batch, panel);
         }
     }
-    // Every verify width uses A8; aggregates across C<=6 equal their W-panels.
+    // Every verify width uses A8; aggregates across C<=8 equal their W-panels.
     for (const std::int32_t panel : {2, 3, 4, 5, 6, 7, 8}) {
-        for (std::int32_t batch = 2; batch <= 6; ++batch) {
+        for (std::int32_t batch = 2; batch <= 8; ++batch) {
             failures += run_nvfp4_panels(parent, panel * batch, panel, ops::LinearPolicy::AllowA8);
         }
     }
@@ -500,8 +500,8 @@ int run_nvfp4_target() {
          {1, 4, 15, 36, 100, 160, 240, 255, 256, 257, 384, 385, 777, 1024, 1025, 1500}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4);
     }
-    for (const std::int32_t tokens :
-         {4, 5, 6, 8, 10, 12, 15, 16, 18, 20, 24, 25, 30, 33, 36, 42, 48}) {
+    for (const std::int32_t tokens : {4,  5,  6,  8,  10, 12, 15, 16, 18, 20,  24, 25,
+                                      30, 33, 36, 42, 48, 49, 56, 63, 64, 112, 128}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
     for (const std::int32_t tokens : {2}) { failures += run_nvfp4_packed_column0(parent, tokens); }

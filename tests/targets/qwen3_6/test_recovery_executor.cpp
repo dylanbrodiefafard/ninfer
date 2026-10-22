@@ -2108,7 +2108,7 @@ int run_cache_maintenance_idle(Frontend& frontend) {
 
 // Runs the production selector with scripted complete chunks. A gate after the first large
 // chunk freezes ingress so queue timing cannot hide an interruption or its starvation bound.
-class PrefillScheduleProgram final : public ProbeProgram {
+class PrefillScheduleProgram : public ProbeProgram {
 public:
     [[nodiscard]] bool kv_copies_ready() const override { return true; }
 
@@ -2255,6 +2255,110 @@ struct PrefillScheduleProbe {
     ProbeLoaded* loaded;
     ProbeMemory request_memory;
 };
+
+// Gates hold complete round boundaries so all eight admissions and a middle-lane cancellation
+// have deterministic membership, independent of worker/client thread timing.
+class FullBatchProgram final : public PrefillScheduleProgram {
+public:
+    std::atomic<bool> full_entered{false};
+    std::atomic<bool> release_full{false};
+    bool compact_seen = false;
+    std::vector<std::uint32_t> full_members;
+
+    [[nodiscard]] BatchedGeneratedRound
+    decode_batch(std::span<const std::uint32_t> members,
+                 std::span<const RoundBudget> budgets) override {
+        if (members.size() == 8 && !full_entered.load()) {
+            full_members.assign(members.begin(), members.end());
+            full_entered.store(true);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!release_full.load()) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    throw std::runtime_error("full batch cancellation gate timed out");
+                }
+                std::this_thread::yield();
+            }
+        }
+        if (full_entered.load() && members.size() == 7) {
+            compact_seen = std::find(members.begin(), members.end(), 3U) == members.end() &&
+                           std::find(members.begin(), members.end(), 7U) != members.end();
+        }
+        (void)PrefillScheduleProgram::decode_batch(members, budgets);
+        for (std::size_t row = 0; row < members.size(); ++row) {
+            tokens_[row] = static_cast<TokenId>(1000 + 'a' + members[row]);
+            counts_[row] = 1;
+        }
+        return {.tokens     = std::span(tokens_).first(members.size()),
+                .row_counts = std::span(counts_).first(members.size()),
+                .row_stride = 1};
+    }
+
+private:
+    std::array<TokenId, ninfer::kMaximumConcurrency> tokens_{};
+    std::array<std::int32_t, ninfer::kMaximumConcurrency> counts_{};
+};
+
+int run_full_batch_compaction(Frontend& frontend) {
+    FullBatchProgram program;
+    program.lanes       = 8;
+    program.gate_decode = true;
+    ProbeLoaded loaded{frontend};
+    PrefillScheduleProbe instance{&program, &loaded, {}};
+    auto options                = engine_options();
+    options.max_concurrency     = 8;
+    options.max_context         = 32768;
+    options.generation_recovery = false;
+    ninfer::runtime::ConcurrentExecutor<PrefillScheduleProbe> executor(instance, options);
+    auto submit = [&] {
+        auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(16, 1000 + 'a'));
+        const auto summary = prompt.summary();
+        ninfer::runtime::ResolvedRequestOptions request;
+        request.execution.allow_prefix_reuse      = false;
+        request.execution.requested_output_tokens = 128;
+        return executor.submit(std::move(prompt), summary, 0.0, std::move(request),
+                               ninfer::OutputDelivery::TerminalOnly);
+    };
+    auto wait_gate = [](const std::atomic<bool>& gate) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!gate.load()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("full batch test did not reach round boundary");
+            }
+            std::this_thread::yield();
+        }
+    };
+    using Submission = decltype(submit());
+    std::array<Submission, 8> requests;
+    requests[0] = submit();
+    wait_gate(program.decode_entered);
+    for (std::size_t lane = 1; lane < requests.size(); ++lane) { requests[lane] = submit(); }
+    program.release_decode.store(true);
+    wait_gate(program.full_entered);
+    requests[3] = {};
+    program.release_full.store(true);
+    int failures = 0;
+    const ninfer::CancellationView cancel;
+    for (std::size_t lane = 0; lane < requests.size(); ++lane) {
+        if (lane == 3) { continue; }
+        const auto result = requests[lane].wait(nullptr, cancel);
+        failures += check(result.finish_reason == FinishReason::OutputLimit &&
+                              result.generated_token_ids.size() == 128,
+                          "full batch request did not reach its output limit");
+        failures +=
+            check(result.generated_token_ids.size() == 128 &&
+                      std::all_of(result.generated_token_ids.begin() + 1,
+                                  result.generated_token_ids.end(),
+                                  [&](TokenId token) {
+                                      return token == static_cast<TokenId>(1000 + 'a' + lane);
+                                  }),
+                  "compact row output was attributed to the wrong lane");
+    }
+    failures +=
+        check(program.full_members == std::vector<std::uint32_t>({0, 1, 2, 3, 4, 5, 6, 7}) &&
+                  program.compact_seen,
+              "full C8 round or lane7 after middle-lane cancellation was lost");
+    return failures;
+}
 
 int run_prefill_interruptions(Frontend& frontend) {
     int failures = 0;
@@ -2426,6 +2530,7 @@ int main() {
         int failures = run_reasoning_close_sampling(frontend);
         failures += run_prefill_interruptions(frontend);
         failures += run_prefill_thresholds(frontend);
+        failures += run_full_batch_compaction(frontend);
         for (const CacheCase script : recovery_cases) {
             failures += run_recovery(frontend, script);
         }

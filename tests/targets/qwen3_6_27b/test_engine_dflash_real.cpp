@@ -1874,11 +1874,12 @@ int run_overlapping_requests(ninfer::Engine& engine, const IsolationTokens& prom
     // request can enter its ordinary final-token fallback while a longer control
     // still uses A4 verification. Its longer prefix is therefore not a C=1 oracle.
     // Target-only remains a separate cross-schedule diagnostic.
-    // Request A crosses the known packed/T=1 tie at generated token 21. Its strict
-    // comparison is against sequential packed DFlash, so this exercises the actual C=6
+    // The first request crosses the known packed/T=1 tie at generated token 21. Its strict
+    // comparison is against sequential packed DFlash, so this exercises the actual C=8
     // isolation contract through and beyond the diagnostic target-only flip. Staggered
-    // budgets retire requests one at a time, so the batch also passes through C=5..1.
-    constexpr std::array<std::uint32_t, kIsolationRequests> lengths{24, 13, 7, 17, 20, 11};
+    // budgets exercise request retirement and smaller compact batches.
+    constexpr auto lengths = std::to_array<std::uint32_t>({24, 13, 7, 17, 20, 11, 15, 9});
+    static_assert(lengths.size() == kIsolationRequests);
     IsolationTokens same_budget_oracles;
     for (std::size_t i = 0; i < prompts.size(); ++i) {
         if (lengths[i] == dflash_oracles[i].size()) {
@@ -1908,10 +1909,9 @@ int run_overlapping_requests(ninfer::Engine& engine, const IsolationTokens& prom
         std::cerr << label << " concurrent speculative verify threw: " << error.what() << '\n';
         return 1;
     }
-    const char* names[] = {"A", "B", "C", "D", "E", "F"};
-    int failed          = 0;
+    int failed = 0;
     for (std::size_t i = 0; i < prompts.size(); ++i) {
-        const std::string request      = std::string(label) + " request " + names[i];
+        const std::string request      = std::string(label) + " request " + std::to_string(i);
         const std::string dflash_label = request + " C=1 DFlash";
         const std::string target_label = request + " target-only";
         const std::vector<ninfer::TokenId> dflash_want =
@@ -1976,117 +1976,20 @@ int main() {
     // Packed verify is T=W (SmallT GQA at T<=8 on 24 heads). Ordinary
     // decode stays T=1 GEMV. The separately qualified floating-point schedules can flip a
     // later greedy boundary (k=1 and k=4, prompt 0, token 21). C>1 must still match saved C=1
-    // DFlash of the same k exactly (row isolation), and the C=6 run below crosses that point.
-    const IsolationTokens prompts{
-        std::vector<ninfer::TokenId>{
-            248045,
-            846,
-            198,
-            109266,
-            3709,
-            96220,
-            117443,
-            97913,
-            1710,
-            248046,
-            198,
-            248045,
-            74455,
-            198,
-            248068,
-            198,
-        },
-        std::vector<ninfer::TokenId>{
-            248045,
-            846,
-            198,
-            109266,
-            4120,
-            96220,
-            117443,
-            97913,
-            1710,
-            248046,
-            198,
-            248045,
-            74455,
-            198,
-            248068,
-            198,
-        },
-        std::vector<ninfer::TokenId>{
-            248045,
-            846,
-            198,
-            109266,
-            5200,
-            96220,
-            117443,
-            97913,
-            1710,
-            248046,
-            198,
-            248045,
-            74455,
-            198,
-            248068,
-            198,
-        },
-        std::vector<ninfer::TokenId>{
-            248045,
-            846,
-            198,
-            109266,
-            7000,
-            96220,
-            117443,
-            97913,
-            1710,
-            248046,
-            198,
-            248045,
-            74455,
-            198,
-            248068,
-            198,
-        },
-        std::vector<ninfer::TokenId>{
-            248045,
-            846,
-            198,
-            109266,
-            8100,
-            96220,
-            117443,
-            97913,
-            1710,
-            248046,
-            198,
-            248045,
-            74455,
-            198,
-            248068,
-            198,
-        },
-        std::vector<ninfer::TokenId>{
-            248045,
-            846,
-            198,
-            109266,
-            9300,
-            96220,
-            117443,
-            97913,
-            1710,
-            248046,
-            198,
-            248045,
-            74455,
-            198,
-            248068,
-            198,
-        },
-    };
+    // DFlash of the same k exactly (row isolation), and the C=8 run below crosses that point.
+    const IsolationTokens prompts = [] {
+        constexpr auto distinct_tokens =
+            std::to_array<ninfer::TokenId>({3709, 4120, 5200, 7000, 8100, 9300, 10100, 11300});
+        static_assert(distinct_tokens.size() == kIsolationRequests);
+        IsolationTokens result;
+        for (std::size_t row = 0; row < result.size(); ++row) {
+            result[row] = {248045, 846,    198,   109266, distinct_tokens[row],
+                           96220,  117443, 97913, 1710,   248046,
+                           198,    248045, 74455, 198,    248068,
+                           198};
+        }
+        return result;
+    }();
 
     if (std::getenv("NINFER_DFLASH_TEST_CALIBRATION_ONLY") != nullptr) {
         return exercise_p_less_calibration_under_graphs(artifact, prompts[0]);
@@ -2267,26 +2170,26 @@ int main() {
 
     const char* only_k = std::getenv("NINFER_DFLASH_TEST_ONLY_K");
     if (only_k == nullptr || std::string(only_k) == "1") {
-        if (const int result = run_k(1, 2, "DFlash2 k=1 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(1, 2, "DFlash2 k=1 chain C=8"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "2") {
-        if (const int result = run_k(2, 3, "DFlash2 k=2 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(2, 3, "DFlash2 k=2 chain C=8"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "3") {
-        if (const int result = run_k(3, 4, "DFlash2 k=3 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(3, 4, "DFlash2 k=3 chain C=8"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "4") {
-        if (const int result = run_k(4, 5, "DFlash2 k=4 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(4, 5, "DFlash2 k=4 chain C=8"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "5") {
-        if (const int result = run_k(5, 6, "DFlash2 k=5 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(5, 6, "DFlash2 k=5 chain C=8"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "6") {
-        if (const int result = run_k(6, 7, "DFlash2 k=6 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(6, 7, "DFlash2 k=6 chain C=8"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "7") {
-        if (const int result = run_k(7, 8, "DFlash2 k=7 chain C=6"); result != 0) { return result; }
-        if (const int result = run_k(7, 12, "DFlash2 k=7 tree W=12 C=6"); result != 0) {
+        if (const int result = run_k(7, 8, "DFlash2 k=7 chain C=8"); result != 0) { return result; }
+        if (const int result = run_k(7, 12, "DFlash2 k=7 tree W=12 C=8"); result != 0) {
             return result;
         }
     }

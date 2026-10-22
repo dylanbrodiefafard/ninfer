@@ -5,7 +5,7 @@ rejected at Engine admission. MTP algorithms and layouts below describe dormant 
 machinery, not an available product backend.
 
 本文定义 NInfer 在单 GPU、单模型实例下支持少量并发请求的执行架构。典型
-`max_concurrency` 为 1–6。
+`max_concurrency` 为 1–8。
 
 设计目标不是让多个请求轮流执行，而是让所有处于 decode 阶段的请求形成一次真正的 batched
 model execution：一次 model traversal、一次 CUDA Graph replay 和一组 batched operators 同时为
@@ -22,13 +22,35 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 ### 1.1 Supported workload
 
 - 单 GPU、单 resident model instance；
-- 启动时固定 `max_concurrency=C`，支持 `C=1..6`；
+- 启动时固定 `max_concurrency=C`，支持 `C=1..8`；
 - 运行时 `0..C` 个 admitted requests；
 - Text 与 image/video prompt；
 - ordinary decoding 与 engine-wide speculative decoding；
 - streaming 与 non-streaming output；
 - prefix reuse, plus an optional completed-bundle pinned-host RAM second tier;
 - 不同 prompt length、context length、generation limit 和 sampling configuration。
+
+### Eight-lane execution geometry
+
+Startup concurrency determines the lane pool, replay/history capacity, graph frontier, and
+per-row metadata. Compact batch rows are transient: physical state-slot identities survive
+batch growth, cancellation, and compaction. FIFO admission and one packed decode batch per
+round boundary apply through C8.
+
+Ordinary decode has at most eight rows. DFlash chain verification packs B sequences of width W
+into T=B×W columns: K7 uses W8 and reaches T64; explicit W16 reaches T128. The target aggregate
+projection/workspace budget is 128 columns, independent of the 48-column automatic-tree policy.
+Existing tiled A8 attention, residual, and SwiGLU projections cover the aggregate budget.
+The fused GDN projection/record tile remains limited to 48 columns; larger aggregates use the
+materialized FP32 projection path. Packed gating similarly retains its 48-column aggregate
+route and uses the per-sequence path above that boundary. These are dispatch boundaries rather
+than request-concurrency limits.
+
+Accepted-history and replay descriptors hold eight distinct state slots and preserve FP32
+recurrent state, BF16 convolution history, accepted-prefix semantics, and stable graph addresses.
+The shared KV budget follows actual allocations and request reservations; eight lanes do not
+imply capacity for eight maximum-length contexts. The adaptive draft controller selects its
+existing captured arms from measured throughput, without a concurrency-specific forced width.
 
 ### 1.2 Non-goals
 

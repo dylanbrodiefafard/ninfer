@@ -83,8 +83,10 @@ def run_wave(port: int, log: Path, workload: dict, output_tokens: int, seed: int
         barrier.wait()
         return post(port, payload)
 
+    wave_started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(payloads)) as pool:
         responses = list(pool.map(request, payloads))
+    wave_seconds = time.perf_counter() - wave_started
     time.sleep(0.2)
     events = read_events(log, offset)
     done = [event for event in events if event.get("event") == "request_done"]
@@ -105,6 +107,11 @@ def run_wave(port: int, log: Path, workload: dict, output_tokens: int, seed: int
     drafted = sum(event["speculative"]["drafted_tokens"] for event in done)
     accepted = sum(event["speculative"]["accepted_tokens"] for event in done)
     return {
+        "wave_seconds": wave_seconds,
+        "wave_output_tokens_per_second": sum(
+            response["usage"]["completion_tokens"] for response in responses
+        )
+        / wave_seconds,
         "requests": payloads,
         "responses": responses,
         "request_done": done,
@@ -133,13 +140,13 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18082)
     args = parser.parse_args()
     if (
-        any(not 1 <= c <= 6 for c in args.concurrency)
+        any(not 1 <= c <= 8 for c in args.concurrency)
         or args.tokens < 128
         or args.repetitions < 1
         or args.warmup < 0
     ):
         parser.error(
-            "require C=1..6, at least 128 output tokens, positive repetitions and nonnegative warmup"
+            "require C=1..8, at least 128 output tokens, positive repetitions and nonnegative warmup"
         )
     args.output.mkdir(parents=True, exist_ok=False)
     provenance = {
@@ -151,7 +158,9 @@ def main() -> None:
         },
         "manifest": json.loads(args.manifest.read_text()),
         "settings": vars(args)
-        | {"method": "full-batch decode-only periodic wall intervals; seeded prompts; p-less T1.5"},
+        | {
+            "method": "full-batch decode-only intervals and separate complete-wave wall rate; seeded prompts; p-less T1.5"
+        },
     }
     (args.output / "provenance.json").write_text(
         json.dumps(provenance, default=str, indent=2) + "\n"
@@ -186,6 +195,8 @@ def main() -> None:
             "--lm-head-draft",
             "--prefill-chunk",
             "2048",
+            "--mixed-forward",
+            "0",
             "--log-stats-interval-ms",
             "100",
             "--request-log-jsonl",
@@ -213,10 +224,13 @@ def main() -> None:
                     )
                 measured = raw[args.warmup :]
                 rates = [run["steady"]["decode_tokens_per_second"] for run in measured]
+                wave_rates = [run["wave_output_tokens_per_second"] for run in measured]
                 row = {
                     "workload": workload["name"],
                     "concurrency": c,
                     "mean_tok_s": statistics.mean(rates),
+                    "mean_wave_tok_s": statistics.mean(wave_rates),
+                    "stdev_wave_tok_s": statistics.stdev(wave_rates) if len(wave_rates) > 1 else 0,
                     "stdev_tok_s": statistics.stdev(rates) if len(rates) > 1 else 0,
                     "prompt_tokens": sorted({n for run in measured for n in run["prompt_tokens"]}),
                     "completion_tokens": [n for run in measured for n in run["completion_tokens"]],

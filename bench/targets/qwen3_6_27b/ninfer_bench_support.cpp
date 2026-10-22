@@ -281,7 +281,9 @@ std::uint32_t BenchTest::required_context(const SpeculativeOptions& spec) const 
             spec.dflash_verify_width != 0 ? spec.dflash_verify_width : spec.draft_tokens + 1U;
         margin = 2ULL * width;
     }
-    return checked_context(prompt + decode + margin, "benchmark context requirement");
+    // Concurrent pp+tg restores one emitted seed token into the decode prompt.
+    const std::uint64_t cached_seed = kind == TestKind::PrefillDecode ? 1ULL : 0ULL;
+    return checked_context(prompt + cached_seed + decode + margin, "benchmark context requirement");
 }
 
 std::string usage_text(std::string_view program) {
@@ -324,7 +326,7 @@ std::string usage_text(std::string_view program) {
         << "  --sage                    Sage3-style FP4-PV attention; requires --kv-dtype nvfp4\n"
         << "  --keep-frac <f>           Sparge keep fraction (0,1] on exact NVFP4; forbids --sage\n"
         << "  --xattn-tau <f>           XAttention mass threshold (0,1] on exact NVFP4\n"
-        << "  --concurrency <1..6>        concurrent Engine lanes (default: 1);\n"
+        << "  --concurrency <1..8>        concurrent Engine lanes (default: 1);\n"
         << "                              pp+tg at C>1 reports batched decode after a sequential\n"
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
         << "  --spec <dflash>           speculative backend (default: off); dflash requires\n"
@@ -422,7 +424,7 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--concurrency") {
             options.concurrency = parse_u32(value("--concurrency"), "concurrency");
             if (options.concurrency > kMaximumConcurrency) {
-                throw std::invalid_argument("--concurrency must be in [1,6]");
+                throw std::invalid_argument("--concurrency must be in [1,8]");
             }
         } else if (arg == "--spec") {
             const std::string selected = value("--spec");

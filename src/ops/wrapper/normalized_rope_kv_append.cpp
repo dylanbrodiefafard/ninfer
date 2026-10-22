@@ -55,7 +55,7 @@ void normalized_rope_kv_append(const Tensor& k, const Tensor& v, const Tensor& g
                                CyclicKVCacheLayerView cache, cudaStream_t stream) {
     const std::int32_t width = k.ne[2];
     const std::int32_t batch = k.ne[3];
-    if (width <= 0 || batch < 1 || batch > 6 || !(epsilon > 0.0F) || !std::isfinite(epsilon) ||
+    if (width <= 0 || batch < 1 || batch > 8 || !(epsilon > 0.0F) || !std::isfinite(epsilon) ||
         !(theta > 0.0F) || !std::isfinite(theta) || envelope.min_count > envelope.max_count ||
         envelope.max_count > static_cast<std::uint32_t>(width) || envelope.max_count > 2048) {
         throw std::invalid_argument(
@@ -65,7 +65,7 @@ void normalized_rope_kv_append(const Tensor& k, const Tensor& v, const Tensor& g
         cache.padded_capacity < cache.capacity ||
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
-        cache.lane_capacity < batch || cache.lane_capacity > 6) {
+        cache.lane_capacity < batch || cache.lane_capacity > 8) {
         throw std::invalid_argument("normalized_rope_kv_append: invalid cyclic cache geometry");
     }
     require_tensor(k, DType::BF16, {128, 8, width, batch}, "k");

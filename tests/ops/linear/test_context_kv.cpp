@@ -185,11 +185,12 @@ int main(int argc, char** argv) {
             // the M64N32, M64N64 and M64N128 prefill tiles with partial last tiles.
             for (const auto& shape :
                  {std::array{1, 1}, std::array{3, 2}, std::array{3, 6}, std::array{8, 6},
-                  std::array{100, 1}, std::array{160, 1}, std::array{300, 1}, std::array{600, 1}}) {
+                  std::array{8, 8}, std::array{16, 8}, std::array{100, 1}, std::array{160, 1},
+                  std::array{300, 1}, std::array{600, 1}}) {
                 failures += run_case(device, weight, logical, shape[0], shape[1]);
             }
         } else {
-            for (const auto batch : {1, 2, 6}) {
+            for (const auto batch : {1, 2, 6, 7, 8}) {
                 for (const auto width : {1, 2, 3, 4, 5, 6, 7, 8, 12}) {
                     failures += run_case(device, weight, logical, width, batch);
                 }
@@ -219,9 +220,10 @@ int main(int argc, char** argv) {
                 auto row_split_payload       = test::to_device(row_split.payload);
                 const auto row_split_weight  = row_split.device_weight(row_split_payload.p);
                 failures += check_admission(device, row_split_weight);
-                for (const auto& shape : {std::array{1, 1}, std::array{3, 1}, std::array{3, 6},
-                                          std::array{8, 6}, std::array{12, 1}, std::array{12, 2},
-                                          std::array{12, 6}, std::array{128, 1}}) {
+                for (const auto& shape :
+                     {std::array{1, 1}, std::array{3, 1}, std::array{3, 6}, std::array{8, 6},
+                      std::array{8, 8}, std::array{16, 8}, std::array{12, 1}, std::array{12, 2},
+                      std::array{12, 6}, std::array{128, 1}}) {
                     failures +=
                         run_case(device, row_split_weight, row_split_logical, shape[0], shape[1]);
                 }

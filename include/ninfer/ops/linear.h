@@ -164,8 +164,8 @@ void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, cuda
  *
  * Tensor and weight-plane pointers must be non-null and 16-byte aligned. Outputs cannot overlap
  * each other, the input, or the original weight payload. Inputs and weights remain unchanged. `T`
- * and `sequence_width` are positive; `T` is a multiple of `sequence_width` representing one to six
- * packed sequences. Packed requests retain their C=1 arithmetic route: NVFP4 width 1 uses
+ * and `sequence_width` are positive; `T` is a multiple of `sequence_width` representing one to
+ * eight packed sequences. Packed requests retain their C=1 arithmetic route: NVFP4 width 1 uses
  * independent GEMV panels and widths >= 2 share the qualified ascending-K A16 MMA reduction.
  * RowSplit formats retain independent per-sequence Linear calls on their valid K/V row views.
  * No workspace or internal device allocation is required.

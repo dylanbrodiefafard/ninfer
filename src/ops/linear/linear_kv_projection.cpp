@@ -86,7 +86,7 @@ void linear_kv_projection(const Tensor& x, const Weight& w, Tensor& key, Tensor&
     constexpr std::int32_t kKvRows = 1024;
     const auto tokens              = x.ne[1];
     if (w.n != 6144 || w.k != kHidden || tokens <= 0 || sequence_width <= 0 ||
-        tokens % sequence_width != 0 || tokens / sequence_width > 6) {
+        tokens % sequence_width != 0 || tokens / sequence_width > 8) {
         throw std::invalid_argument("linear_kv_projection: unsupported original or packed shape");
     }
     RowSplitGeometry row_split{};

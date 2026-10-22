@@ -350,7 +350,7 @@ void run() {
 int main() {
     try {
         run();
-        std::cout << "tool mask exchange eager/capture C1..6 and partial-fork drain passed\n";
+        std::cout << "tool mask exchange eager/capture C1..8 and partial-fork drain passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

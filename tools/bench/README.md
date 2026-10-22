@@ -31,6 +31,10 @@ Only complete 100-ms periodic intervals with no prefill and all C lanes decoding
 the rate is committed decode tokens divided by those intervals' wall time, including host
 scheduling. There is no fallback to per-request rates or prefill-inclusive makespan. C6 is
 aggregate throughput. Natural stops remain enabled; actual completion lengths are recorded.
+The runner also records `wave_seconds` and `wave_output_tokens_per_second` from concurrent
+submission through the last response, excluding prompt seeding. Summary `mean_wave_tok_s` and
+`stdev_wave_tok_s` describe that separate complete-wave metric; they include queueing, request
+initialization and HTTP transport.
 
 Reports preserve inputs, responses, per-request counters, startup settings and timing intervals.
 Each cell reports the mean and sample standard deviation of three measured waves after one

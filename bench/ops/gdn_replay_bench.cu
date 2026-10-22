@@ -36,7 +36,7 @@ namespace {
 
 constexpr std::int32_t kQkHeads        = 16;
 constexpr std::int32_t kStateDim       = 128;
-constexpr std::int32_t kRecordCapacity = 6;
+constexpr std::int32_t kRecordCapacity = 8;
 constexpr std::int32_t kStateSlots     = 11;
 constexpr std::size_t kDefaultFlush    = 256ULL << 20;
 
@@ -142,7 +142,7 @@ void print_help(const char* program) {
         "  --component fold|recurrent|history-record|all\n"
         "                              Measured component (all: fold and recurrent; default all).\n"
         "  --width T                   One physical width in [2,16].\n"
-        "  --batch B                   One active row count in [1,6].\n"
+        "  --batch B                   One active row count in [1,8].\n"
         "  --commits one|dense|mixed|all\n"
         "                              Commit policy (default all).\n"
         "  --valid dense|mixed|all     Recurrent valid-prefix policy (default all).\n"
@@ -171,7 +171,7 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--width") {
             options.exact_width = parse_i32(next("width"), "width", 2, 16);
         } else if (argument == "--batch") {
-            options.exact_batch = parse_i32(next("batch"), "batch", 1, 6);
+            options.exact_batch = parse_i32(next("batch"), "batch", 1, 8);
         } else if (argument == "--commits") {
             options.commits = parse_commits(next("commit policy"));
         } else if (argument == "--valid") {
@@ -213,7 +213,7 @@ Options parse_options(int argc, char** argv) {
 std::vector<Profile> selected_profiles(ProfileSelection selection) {
     std::vector<Profile> profiles;
     if (selection == ProfileSelection::Qwen27B || selection == ProfileSelection::All) {
-        profiles.push_back({"27b", 48, 48, 10240, {2, 3, 4, 5, 6}});
+        profiles.push_back({"27b", 48, 48, 10240, {2, 3, 4, 5, 6, 7, 8, 16}});
     }
     if (selection == ProfileSelection::Qwen35B || selection == ProfileSelection::All) {
         profiles.push_back({"35b-a3b", 30, 32, 8192, {2, 6, 16}});
@@ -275,14 +275,14 @@ const char* commit_name(CommitSelection selection) {
 
 std::vector<ops::GdnReplayFoldRow> make_rows(std::int32_t batch, std::int32_t width,
                                              CommitSelection selection) {
-    constexpr std::int32_t kSlots[kRecordCapacity] = {10, 2, 8, 0, 6, 4};
+    constexpr std::int32_t kSlots[kRecordCapacity] = {10, 2, 8, 0, 6, 4, 9, 1};
     std::vector<ops::GdnReplayFoldRow> rows(static_cast<std::size_t>(batch));
     for (std::int32_t row = 0; row < batch; ++row) {
         std::int32_t commit = 1;
         if (selection == CommitSelection::Dense) {
             commit = width;
         } else if (selection == CommitSelection::Mixed) {
-            constexpr std::int32_t kMixed[kRecordCapacity] = {0, 1, 2, 3, 16, 7};
+            constexpr std::int32_t kMixed[kRecordCapacity] = {0, 1, 2, 3, 16, 7, 15, 5};
             commit                                         = std::min(width, kMixed[row]);
         }
         rows[static_cast<std::size_t>(row)] = {kSlots[row], commit};

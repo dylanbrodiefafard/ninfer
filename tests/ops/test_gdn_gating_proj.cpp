@@ -731,7 +731,7 @@ int verify_packed_workspace_rejections() {
     expect_invalid(0, 1, 1);
     expect_invalid(5, 0, 1);
     expect_invalid(5, 3, 2);
-    expect_invalid(5, 1, 7);
+    expect_invalid(5, 1, 9);
     return failures;
 }
 
@@ -791,6 +791,14 @@ int main() {
     failures += run_norm_packed_columns_match_decode(kQwen27, 48, 0x6130u, 16);
     // W=12, B=4 falls back to panels whose split-40 scratch exceeds direct T=48 split-8.
     failures += run_norm_packed_columns_match_decode(kQwen27, 48, 0x6131u, 12);
+    for (const int batch : {7, 8}) {
+        for (const int width : {7, 8, 16}) {
+            failures +=
+                run_norm_projection_case(kQwen27, width * batch, 0x6300u + width * batch, width);
+            failures += run_norm_packed_columns_match_decode(kQwen27, width * batch,
+                                                             0x6400u + width * batch, width);
+        }
+    }
     // Every registered 35B projection route and its contiguous-parent storage contract.
     for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
         failures +=

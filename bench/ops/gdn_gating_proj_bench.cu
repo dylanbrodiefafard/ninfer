@@ -217,7 +217,7 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     if (opt.packed_width != 0 &&
         (tokens % opt.packed_width != 0 || tokens / opt.packed_width < 1 ||
          tokens / opt.packed_width > ops::detail::kBf16GdnGatingPackedMaxBatch)) {
-        throw std::invalid_argument("packed T must be W times B=1..6");
+        throw std::invalid_argument("packed T must be W times B=1..8");
     }
 
     const ops::detail::Bf16GdnGatingProblem problem{heads, hidden, tokens};

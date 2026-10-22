@@ -75,14 +75,13 @@ bool split_verify_panels(qwen3_6::TextPhase phase, std::int32_t route_tokens,
            route_tokens < aggregate_tokens;
 }
 
-// Chain (W=2..k_max+1) and packed-tree (W<=16) verify aggregate across requests while the
-// packed extent fits one M48 tile: W=8 at C=6, W=12 at C=4, W=16 at C=3. Larger extents run
-// per-request panels.
-constexpr std::int32_t kMaximumAggregateVerifyWidth  = 16;
-constexpr std::int32_t kMaximumAggregateVerifyTokens = kVerifyAggregateMaxTokens;
-static_assert(kMaximumAggregateVerifyTokens >=
-              (static_cast<std::int32_t>(kMaximumDFlashDraftTokens) + 1) *
-                  static_cast<std::int32_t>(kMaximumConcurrency));
+// Verification packs independent requests into the existing tiled A8 projections. Automatic
+// trees have a separate single-tile budget; explicit W16 at C8 spans multiple M48 tiles.
+constexpr std::int32_t kMaximumAggregateVerifyWidth = 16;
+constexpr std::int32_t kMaximumAggregateVerifyTokens =
+    kMaximumAggregateVerifyWidth * static_cast<std::int32_t>(kMaximumConcurrency);
+static_assert(kMaximumAggregateVerifyWidth >=
+              static_cast<std::int32_t>(kMaximumDFlashDraftTokens) + 1);
 
 bool aggregate_verify_extent(qwen3_6::TextPhase phase, std::int32_t route_tokens,
                              std::int32_t aggregate_tokens) {

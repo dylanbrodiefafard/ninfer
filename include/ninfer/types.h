@@ -21,7 +21,7 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency      = 6;
+inline constexpr std::uint32_t kMaximumConcurrency      = 8;
 inline constexpr std::size_t kMaxContextCheckpointMarks = 16;
 
 [[nodiscard]] inline std::vector<std::uint32_t>

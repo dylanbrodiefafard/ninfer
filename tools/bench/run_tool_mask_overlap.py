@@ -64,7 +64,7 @@ def main() -> None:
     parser.add_argument(
         "--fixture", type=Path, default=Path(__file__).parent / "fixtures/tool_mask_records.json"
     )
-    parser.add_argument("--concurrency", type=int, choices=(1, 2, 3, 4, 5, 6), required=True)
+    parser.add_argument("--concurrency", type=int, choices=(1, 2, 3, 4, 5, 6, 7, 8), required=True)
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--runs", type=int, default=5)

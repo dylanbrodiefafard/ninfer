@@ -15,7 +15,7 @@ namespace ninfer::test::normalized_append {
 inline constexpr int kHeadDim   = 128;
 inline constexpr int kHeads     = 8;
 inline constexpr int kCapacity  = 2048;
-inline constexpr int kLanes     = 6;
+inline constexpr int kLanes     = 8;
 inline constexpr float kEpsilon = 1.0e-6F;
 inline constexpr float kTheta   = 1.0e7F;
 

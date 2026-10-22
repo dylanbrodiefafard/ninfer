@@ -31,7 +31,7 @@ namespace {
 
 constexpr std::int32_t kStateDim       = 128;
 constexpr std::int32_t kQkHeads        = 16;
-constexpr std::int32_t kRecordCapacity = 6;
+constexpr std::int32_t kRecordCapacity = 8;
 constexpr std::size_t kGuardBytes      = 256;
 
 std::uint32_t mix(std::uint32_t value) {
@@ -1132,6 +1132,8 @@ int main() {
     failures += run_case({30, 32, 8192}, 2, 1, {2}, 1831U);
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
+    failures += run_case({48, 48, 10240}, 8, 7, {8, 7, 1, 5, 0, 2, 6}, 1861U);
+    failures += run_case({48, 48, 10240}, 16, 8, {16, 7, 1, 5, 0, 2, 6, 15}, 1871U);
     failures += run_record_fold_rounds();
     failures += run_path_fold_case();
     failures += run_identity_path_matches_prefix_fold();

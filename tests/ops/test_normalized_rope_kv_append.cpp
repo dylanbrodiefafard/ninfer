@@ -62,9 +62,9 @@ int main(int argc, char** argv) {
         int failures = 0;
         if (test::sanitizer_scope(argc, argv)) {
             failures += prefix_case(3, 1, device.stream);
-            failures += prefix_case(8, 6, device.stream);
+            failures += prefix_case(8, 8, device.stream);
         } else {
-            for (const int batch : std::array{1, 2, 6}) {
+            for (const int batch : std::array{1, 2, 6, 7, 8}) {
                 for (const int tokens : std::array{3, 4, 5, 6, 7, 8, 12}) {
                     failures += prefix_case(tokens, batch, device.stream);
                 }

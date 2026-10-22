@@ -1,6 +1,6 @@
 # NInfer — NVIDIA GeForce RTX 5090
 
-Run **Qwen3.8-27B on one RTX 5090**, with up to **six requests at once**.
+Run **Qwen3.8-27B on one RTX 5090**, with up to **eight requests at once**.
 NInfer is a C++/CUDA engine with kernels and CUDA Graphs tuned for `sm_120a`.
 The recommended model combines [Ostfralla’s NVFP4 weights](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer)
 with a locally converted DFlash2 companion; setup is below.
@@ -15,10 +15,10 @@ with a locally converted DFlash2 companion; setup is below.
 - Conversation caching in GPU memory, RAM and SSD; `cache_write: false` for disposable turns.
 - Sampling controls, token log probabilities, Prometheus metrics and JSON statistics.
 
-Six agents can work in parallel on one resident model. Additional requests wait in a bounded
+Eight agents can work in parallel on one resident model. Additional requests wait in a bounded
 FIFO queue; idle conversations can move to RAM and resume without processing their history
 again. A twelve-session check verified cache reuse through six active lanes. Restore cost depends
-on history size and host bandwidth; the throughput benchmarks below cover one and six requests.
+on history size and host bandwidth; the throughput benchmarks below cover one, six, seven and eight requests.
 
 Use **NVFP4 KV cache**, the default. W4A4 is used for prefill and some generation shapes;
 generation also uses A16 and W4A8, with W4A8 used for most DFlash2 verification.
@@ -28,7 +28,7 @@ Multi-GPU execution, active-context offload and preemptive scheduling are not su
 
 ## Performance and quality
 
-Measured **2026-10-18 on one RTX 5090**, Release build, CUDA Graphs, NVFP4 KV,
+Measured **2026-10-18 and 2026-10-21 on one RTX 5090**, Release build, CUDA Graphs, NVFP4 KV,
 Vision off and a 600 W power cap. The DFlash2 artifact uses NVFP4 matrices and BF16 selector
 codebooks, adaptive drafting up to seven tokens and the optimized proposal head.
 
@@ -50,24 +50,34 @@ preparation.
 
 **Answer generation with p-less sampling at temperature 1.5:**
 
-| Workload | Prompt tokens | 1 request, tokens/s | 6 requests, total tokens/s |
-|---|---:|---:|---:|
-| English story | 146 | 186 | 783 |
-| Python package | 171 | 312 | 1,057 |
-| Math reasoning | 346 | 287 | 1,000 |
-| Document summary 8K | 8,192 | 228 | 790 |
-| Document summary 32K | 32,779 | 226 | 739 |
+| Workload | Prompt tokens | 1 request, tokens/s | 6 requests, total tokens/s | 7 requests, total tokens/s | 8 requests, total tokens/s |
+|---|---:|---:|---:|---:|---:|
+| English story | 146 | 186 | 779 | 841 | 949 |
+| Python package | 171 | 312 | 1,057* | — | — |
+| Math reasoning | 346 | 287 | 970 | 1,033 | 1,150 |
+| Document summary 8K | 8,192 | 228 | 815 | 892 | 981 |
+| Document summary 32K | 32,779 | 226 | 718 | 803 | 856 |
 
 Each request generates 512 tokens, including reasoning. Both tables report means of three runs
 after one warmup. Generation rates exclude prompt processing: each prompt is cached before timing,
-and the six-request total counts only intervals with all six decoding. Divide by six for the
-average per active request.
+and each concurrent total counts only intervals with all C requests decoding. Divide by C for
+the average per active request.
+
+C6/C7/C8 use matched measurements from October 21. C1, prefill and the starred Python-package
+C6 result are from October 18. Python-package retries on October 22 at C6, C7 and C8 all
+triggered the benchmark's raw `<tool_call>` output guard; no fresh Python-package results
+are reported.
+
+Across the four matched workloads, C7 improves steady decode throughput by 6.5–11.9% over C6,
+and C8 by 18.5–21.8%. Separate complete-wave measurements, including request initialization,
+HTTP overhead and partial-batch tails, improve by 7.1–14.3% and 19.6–20.8%, respectively.
 
 Prompt content and sampling affect draft acceptance and speed. These are throughput workloads;
 the 512-token budget does not complete the long story and code tasks. Settings, variation and
-reproduction commands are in the [performance guide](docs/performance.md#readme-workload-measurements-2026-10-18).
-[Machine-readable results](bench/results/readme-benchmarks-20261018.json) preserve the measured
-means, sample standard deviations and configuration.
+reproduction commands are in the [performance guide](docs/performance.md#c7c8-aggregate-scaling-2026-10-21).
+[Historical machine-readable results](bench/results/readme-benchmarks-20261018.json) preserve the
+October 18 means, sample standard deviations and configuration; the performance guide records
+the October 21 report locations.
 
 **Historical accuracy: Ostfralla base artifact with MTP**
 
@@ -183,12 +193,12 @@ Answer text streams to stdout; reasoning, progress and statistics go to stderr. 
 or media, use `--messages FILE` instead of `--prompt`, and add `--vision` for images or video.
 [Example inputs](examples/cli/) are included.
 
-Start a server for six active agents, with a RAM prefix cache for idle conversations:
+Start a server for eight active agents, with a RAM prefix cache for idle conversations:
 
 ```bash
 build/apps/ninfer-serve models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   --host 127.0.0.1 --port 8080 \
-  --max-context 262144 --max-concurrency 6 --kv-dtype nvfp4 \
+  --max-context 262144 --max-concurrency 8 --kv-dtype nvfp4 \
   --kv-ram-capacity 8192 --pending-timeout-ms 900000
 ```
 

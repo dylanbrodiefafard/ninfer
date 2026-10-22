@@ -28,8 +28,8 @@ int main(int argc, char** argv) {
                 } else if (option == "--repeat") {
                     repeat = value;
                 } else if (option == "--batch") {
-                    if (value < 1 || value > 6) {
-                        throw std::invalid_argument("batch must be 1..6");
+                    if (value < 1 || value > 8) {
+                        throw std::invalid_argument("batch must be 1..8");
                     }
                     selected_batch = value;
                 } else if (option == "--width") {
@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
             } else if (option == "--help") {
                 std::puts(
                     "normalized_rope_kv_append_bench [--warmup N] [--repeat N] "
-                    "[--batch 1..6] [--width 1..2048] [--count -1..W]\n"
+                    "[--batch 1..8] [--width 1..2048] [--count -1..W]\n"
                     "Defaults: B=1,2,6; W=3..8; counts=0,1,mixed,full. Count -1 selects mixed.");
                 return 0;
             } else {

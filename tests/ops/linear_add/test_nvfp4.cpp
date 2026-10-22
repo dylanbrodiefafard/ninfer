@@ -126,6 +126,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool sanitizer
         Invocation{18, ops::LinearPolicy::AllowA8},   Invocation{20, ops::LinearPolicy::AllowA8},
         Invocation{24, ops::LinearPolicy::AllowA8},   Invocation{28, ops::LinearPolicy::AllowA8},
         Invocation{32, ops::LinearPolicy::AllowA8},   Invocation{42, ops::LinearPolicy::AllowA8},
+        Invocation{49, ops::LinearPolicy::AllowA8},   Invocation{56, ops::LinearPolicy::AllowA8},
+        Invocation{63, ops::LinearPolicy::AllowA8},   Invocation{64, ops::LinearPolicy::AllowA8},
+        Invocation{112, ops::LinearPolicy::AllowA8},  Invocation{128, ops::LinearPolicy::AllowA8},
         Invocation{48, ops::LinearPolicy::AllowA8},   Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{2, ops::LinearPolicy::A16Only},    Invocation{4, ops::LinearPolicy::A16Only},
         Invocation{5, ops::LinearPolicy::A16Only},    Invocation{6, ops::LinearPolicy::A16Only},
@@ -175,7 +178,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool sanitizer
     for (const Invocation invocation : invocations) {
         if (sanitizer &&
             (invocation.policy != ops::LinearPolicy::AllowA8 ||
-             (invocation.tokens != 2 && invocation.tokens != 8 && invocation.tokens != 9))) {
+             (invocation.tokens != 2 && invocation.tokens != 8 && invocation.tokens != 9 &&
+              invocation.tokens != 64 && invocation.tokens != 128))) {
             continue;
         }
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
@@ -373,7 +377,7 @@ int main(int argc, char** argv) {
     failures += run_shape(5120, 17408, 821U);
     failures += run_packed_column0(5120, 6144, 811U);
     failures += run_packed_column0(5120, 17408, 821U);
-    // Every verify width uses A8; aggregates across C<=6 equal their W-panels.
+    // Every verify width uses A8; aggregates across C<=8 equal their W-panels.
     for (const std::int32_t width : {2, 3, 4, 5, 6, 7, 8}) {
         failures += run_aggregate_matches_panels(5120, 6144, 831U + width, width,
                                                  ops::LinearPolicy::AllowA8, 6);

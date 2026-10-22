@@ -161,7 +161,7 @@ int main() {
         [&] {
             ninfer::LayoutBuilder invalid;
             (void)ninfer::plan_gdn_replay_records(invalid, {.layers          = 1,
-                                                            .record_capacity = 7,
+                                                            .record_capacity = 9,
                                                             .width           = 2,
                                                             .conv_channels   = 1,
                                                             .qk_heads        = 1,
@@ -169,7 +169,25 @@ int main() {
                                                             .key_dim         = 1,
                                                             .value_dim       = 1});
         },
-        "record capacity above six");
+        "record capacity above eight");
+
+    for (const std::int32_t capacity : {7, 8}) {
+        auto wide_spec            = spec;
+        wide_spec.record_capacity = capacity;
+        ninfer::LayoutBuilder wide_builder;
+        const auto wide_layout = ninfer::plan_gdn_replay_records(wide_builder, wide_spec);
+        const auto wide_bytes  = wide_builder.finish(256);
+        auto wide_backing      = make_backing(wide_bytes);
+        const ninfer::GdnReplayRecords wide({wide_backing.get(), wide_bytes}, wide_layout);
+        const auto last = wide.layer(2, capacity - 1, 1);
+        failures += expect_shape(last.conv, 256, 4, 1, 1, "last replay row");
+        failures += expect(static_cast<std::byte*>(last.conv.data) -
+                                   static_cast<std::byte*>(wide.conv.data) ==
+                               static_cast<std::ptrdiff_t>((3 * capacity - 1) * wide.conv.nb[2]),
+                           "last replay row offset differs");
+        failures += expect_throw([&] { (void)wide.layer(2, capacity - 1, 2); },
+                                 "last replay row window exceeds capacity");
+    }
 
     ninfer::LayoutBuilder state_builder;
     const auto state_layout = ninfer::plan_linear_attention_state_pool(

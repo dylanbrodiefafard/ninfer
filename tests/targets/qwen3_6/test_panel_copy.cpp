@@ -208,7 +208,7 @@ void check_fused_qkv(ninfer::DeviceContext& device, std::size_t columns) {
 int main() {
     try {
         ninfer::DeviceContext device;
-        for (std::int32_t batch = 1; batch <= 6; ++batch) {
+        for (std::int32_t batch = 1; batch <= 8; ++batch) {
             check_panels(device, batch);
             check_replay_records(device, batch);
             check_fused_qkv(device, 4 * static_cast<std::size_t>(batch));

@@ -915,7 +915,7 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         throw std::invalid_argument("mixed_forward_rounds must be at least 1");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("max_concurrency must be in [1,6]");
+        throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);

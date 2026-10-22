@@ -28,7 +28,7 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 5> k27Routes{{
     // A fixed split-40 reduction covers decode and compact verify batches. The narrow token
-    // tiles share identical arithmetic, including packed C=1..6 x W<=8 execution through T=48.
+    // tiles share identical arithmetic, including packed C=1..8 x W<=8 execution with T<=48.
     {{1, 48}, Bf16GdnGatingScheduleId::MmaCooperativeSplit40},
     // As token tiles double, halve SplitK. This keeps the cooperative grid near 192 CTAs instead
     // of making T a launch limit. Once the unsplit grid has enough independent work, it also

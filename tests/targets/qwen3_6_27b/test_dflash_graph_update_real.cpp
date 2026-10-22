@@ -16,8 +16,8 @@ int main() {
         ninfer::EngineOptions options;
         options.artifact_path              = artifact;
         options.max_context                = 256;
-        options.max_concurrency            = 6;
-        options.kv_capacity                = ninfer::KvCapacityPolicy::explicit_capacity(1536);
+        options.max_concurrency            = 8;
+        options.kv_capacity                = ninfer::KvCapacityPolicy::explicit_capacity(2048);
         options.kv_cache                   = ninfer::KvCacheStorage::Nvfp4;
         options.prefill_chunk              = 128;
         options.mixed_forward              = 0;
@@ -29,9 +29,9 @@ int main() {
         options.speculative.proposal_head  = ninfer::ProposalHead::Optimized;
         // Leave verify width automatic: the W=12 tree arm establishes the wide replay-record
         // destination even when B=3 uses the initial k=3 chain. Startup validates every captured
-        // context profile for B=1..6, k=3..7 and the reachable tree shapes.
+        // context profile for B=1..8, k=3..7 and the reachable tree shapes.
         ninfer::Engine engine(options);
-        const std::array<std::size_t, 3> lengths{124, 125, 127};
+        const std::array<std::size_t, 8> lengths{120, 121, 122, 123, 124, 125, 126, 127};
         std::vector<ninfer::GenerationHandle> handles;
         for (const auto length : lengths) {
             std::vector<ninfer::TokenId> tokens(length, 24);

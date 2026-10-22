@@ -191,9 +191,16 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "7"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "9"});
         },
         "unsupported concurrency");
+    for (const char* concurrency : {"7", "8"}) {
+        failures +=
+            expect_u32(parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--concurrency",
+                                       concurrency})
+                           .concurrency,
+                       static_cast<std::uint32_t>(concurrency[0] - '0'), "C7/C8 concurrency");
+    }
     return failures;
 }
 
@@ -214,14 +221,16 @@ int test_measurement_contract() {
     failures += expect_u32(pp.required_context(dflash5), 524, "DFlash pp context");
     failures += expect_u32(tg.required_context(none), 129, "tg context");
     failures += expect_u32(tg.required_context(dflash5), 141, "DFlash tg context");
-    failures += expect_u32(combined.required_context(dflash5), 2188, "DFlash combined context");
+    failures += expect_u32(combined.required_context(none), 2177,
+                           "combined context includes restored seed token");
+    failures += expect_u32(combined.required_context(dflash5), 2189, "DFlash combined context");
     failures +=
         expect_u32(qb::decode_graph_prime_output_tokens(dflash5), 13, "DFlash graph-prime outputs");
     failures += expect_u32(qb::decode_graph_prime_required_context(dflash5), 23,
                            "DFlash graph-prime context");
 
     const std::vector<qb::BenchTest> matrix = {pp, tg, combined};
-    failures += expect_u32(qb::resolve_max_context(matrix, std::nullopt, dflash5, true), 2188,
+    failures += expect_u32(qb::resolve_max_context(matrix, std::nullopt, dflash5, true), 2189,
                            "auto context");
     failures += expect_u32(
         qb::resolve_max_context(matrix, std::optional<std::uint32_t>(4096), dflash5, true), 4096,

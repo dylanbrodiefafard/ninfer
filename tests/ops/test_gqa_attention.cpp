@@ -4287,6 +4287,13 @@ int run_batch_cases(bool full) {
     failures +=
         run_batch_case(kGeometries[0], DType::BF16,
                        {7, {16, 300, 16}, {7, 7, 2}, {0, 1, 2}, MappingPattern::Identity, 516u});
+    failures += run_batch_case(kGeometries[0], DType::U8,
+                               {8,
+                                {37, 61, 127, 128, 256, 511, 1024, 2048},
+                                {8, 7, 6, 5, 4, 3, 2, 1},
+                                {7, 0, 6, 1, 5, 2, 4, 3},
+                                MappingPattern::Fragmented,
+                                519u});
     // Ragged 27B verify batches retain the long row while short rows have different valid tails.
     failures += run_batch_case(kGeometries[0], DType::U8,
                                {8,

@@ -55,7 +55,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..6>]
+          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..8>]
            [--spec <dflash>] [--draft-tokens <1..7>] [--dflash-verify-width <2..16>]
            [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
@@ -194,7 +194,7 @@ cmake --build build --parallel 4 --target ninfer_linear_kv_projection_bench \
 ```
 
 `linear_kv_projection` uses an original NVFP4 `[6144,5120]` weight and writes
-separate contiguous K/V `[1024,W*B]` outputs. `--batch` accepts 1..6;
+separate contiguous K/V `[1024,W*B]` outputs. `--batch` accepts 1..8;
 `--widths` accepts widths 1..2048. `--mode` selects eager or captured execution.
 `--cold` flushes L2 outside the event interval; otherwise buffers remain resident.
 `--layers 5` measures five distinct weights with the same output storage reused.
@@ -242,7 +242,7 @@ selects the 35B contiguous-parent form. `--candidate auto` uses production dispa
 selected route and transient workspace after a 256 MiB L2 flush.
 
 For the 27B norm/control profile, `--packed-width W` measures the public packed-independent-
-sequence entry with each listed `T` interpreted as `W*B` for B=1..6. It is valid only with
+sequence entry with each listed `T` interpreted as `W*B` for B=1..8. It is valid only with
 `--norm-control --candidate auto`; private candidate bit-exact screening remains a separate mode.
 
 ```bash
@@ -328,7 +328,7 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 
 `ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6 Q4/Q5, NVFP4, and W8
 `gdn_input_proj_conv_snapshot` forms for exact `B=1..8` and record-producing forms for the product
-domain `B=1..6`. The timed body is exactly one complete public Op call; the benchmark does not
+domain `B=1..8`. The timed body is exactly one complete public Op call; the benchmark does not
 include private launchers, candidate selection, duplicated compositions, or route labels. Its
 default `T=1..6` sweep is the dormant private MTP verification interval. NVFP4 accepts
 the public `a16` and `a4` policies; the reported profile names the caller policy, not a private

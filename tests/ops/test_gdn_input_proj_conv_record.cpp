@@ -1427,9 +1427,9 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     failures += run_shape(5, 3, {5, 3, 2}, {-1, 0, 0, 1, 1, -1, 0, 1, 1, 3, -1, 0, 0, 2, 2}, 2077U);
     failures += run_shape(5, 4, {5, 4, 3, 2},
                           {-1, 0, 0, 1, 1, -1, 0, 1, 1, 3, -1, 0, 0, 2, 2, -1, 0, 1, 2, 3}, 2081U);
-    // C=5/6 verify covers every chain width, plus ragged tree rows at the widest aggregates
+    // C=5..8 verify covers every chain width, plus ragged tree rows at the widest aggregates
     // (A8 W=8 B=6 is the 48-token single-tile boundary).
-    for (int batch : {5, 6}) {
+    for (int batch : {5, 6, 7, 8}) {
         for (int width : {2, 3, 4, 5, 6, 7, 8}) {
             failures += run_shape(width, batch, {}, {}, 2700U + width * 8 + batch);
         }
@@ -1455,8 +1455,8 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
         }
     }
     if (qtype == QType::NVFP4 && policy != ops::LinearPolicy::A16Only) {
-        for (int width : {6, 8, 16}) {
-            for (int batch : {1, 2, 3, 4}) {
+        for (int width : {6, 7, 8, 16}) {
+            for (int batch : {1, 2, 3, 4, 7, 8}) {
                 std::vector<int> valid(batch);
                 for (int b = 0; b < batch; ++b) { valid[b] = b + 1 == batch ? width - 1 : width; }
                 failures += run_shape(width, batch, valid, {}, 2300U + width * 4 + batch);
@@ -1498,7 +1498,7 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         for (int width : {3, 7, 8, 9, 10, 11, 16}) {
-            for (int batch : {1, 2, 3, 4}) {
+            for (int batch : {1, 2, 3, 4, 7, 8}) {
                 std::vector<int> valid(batch);
                 for (int b = 0; b < batch; ++b) { valid[b] = b + 1 == batch ? width - 1 : width; }
                 std::vector<int> tree(static_cast<std::size_t>(width) * batch);

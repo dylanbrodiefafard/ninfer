@@ -26,7 +26,7 @@ namespace ninfer::ops {
                                                                         std::int32_t min_tokens,
                                                                         std::int32_t max_tokens);
 
-// Transient capacity for the 27B packed-sequence form below. Batch is restricted to 1..6;
+// Transient capacity for the 27B packed-sequence form below. Batch is restricted to 1..8;
 // fallback panels reuse one workspace allocation. Packed capacity must be queried here:
 // its per-sequence reduction can require more storage than an ordinary call at T=W*B.
 [[nodiscard]] std::size_t gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
@@ -87,7 +87,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           Tensor& beta, cudaStream_t stream);
 
 /**
- * Applies gdn_norm_gating_proj to B=1..6 packed independent 27B sequences. T must be positive and
+ * Applies gdn_norm_gating_proj to B=1..8 packed independent 27B sequences. T must be positive and
  * equal to `sequence_width * B`. The execution may aggregate qualified profiles or reuse one
  * panel workspace sequentially; both are private implementation choices.
  */

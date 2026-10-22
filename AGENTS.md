@@ -78,7 +78,7 @@ selector codebook) over the base Ostfralla NVFP4 shell. CLI/server default to au
 and enable adaptive DFlash2 K7 with the optimized proposal head when that companion is present;
 base artifacts run without speculation. MTP execution is disabled; stored MTP tensors remain
 artifact-validation inputs only. NVFP4 KV is the recommended cache format. The workload is one
-GPU, one resident model instance, and a startup-fixed one to six active requests. The
+GPU, one resident model instance, and a startup-fixed one to eight active requests. The
 Engine forms one compact decode batch per round boundary with bounded FIFO ingress. A short
 text prefill may interrupt a large prefill at a completed chunk boundary only on a genuinely
 available spare lane with its own feasible resources; the suspended owner retains its lane

@@ -19,14 +19,15 @@ int main() {
         failures += run_profile(
             "rmsnorm_linear_swiglu/nvfp4-a8",
             Profile{QType::NVFP4, 34816, 5120, 17408, 0x8317U, ActivationCompute::A8, true},
-            std::array<std::int32_t, 18>{1, 3, 4, 5, 6, 8, 12, 16, 20, 24, 25, 30, 32, 33, 36, 40,
-                                         42, 48},
+            std::array<std::int32_t, 24>{1,  3,  4,  5,  6,  8,  12, 16, 20, 24, 25,  30,
+                                         32, 33, 36, 40, 42, 48, 49, 56, 63, 64, 112, 128},
             std::array<std::int32_t, 5>{4, 5, 24, 36, 48});
         failures += run_profile("LinearSwiGLU NVFP4_A8",
                                 {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A8},
-                                std::array<std::int32_t, 17>{4, 5, 6, 8, 10, 12, 15, 16, 18, 20, 24,
-                                                             25, 30, 33, 36, 42, 48});
-        // Every verify width uses A8; aggregated C=2..6 rows equal their W-panels.
+                                std::array<std::int32_t, 23>{4,  5,  6,  8,  10, 12,  15, 16,
+                                                             18, 20, 24, 25, 30, 33,  36, 42,
+                                                             48, 49, 56, 63, 64, 112, 128});
+        // Every verify width uses A8; packed rows retain their W-panel arithmetic.
         for (const bool fused_norm : {false, true}) {
             const Profile a8{QType::NVFP4,          34816,     5120, 17408, 1805U,
                              ActivationCompute::A8, fused_norm};
@@ -46,6 +47,11 @@ int main() {
                                                   std::array<std::int32_t, 5>{14, 21, 28, 35, 42});
             failures += run_packed_matches_panels(std::string(name) + " W8 panels", a8, 8,
                                                   std::array<std::int32_t, 5>{16, 24, 32, 40, 48});
+            for (const int width : {7, 8, 16}) {
+                failures +=
+                    run_packed_matches_panels(std::string(name) + " C7/C8 panels", a8, width,
+                                              std::array<std::int32_t, 2>{width * 7, width * 8});
+            }
         }
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},

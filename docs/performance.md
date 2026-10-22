@@ -21,6 +21,90 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## C7/C8 aggregate scaling (2026-10-21)
+
+Measured on one RTX 5090 with driver 580.178.04, CUDA 13.1, `sm_120a`, Release build,
+NVFP4 KV and CUDA Graphs. The artifact is
+`qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`
+(19,589,713,920 bytes), with NVFP4 DFlash2 matrices and BF16 selector codebooks.
+The host `/tmp/ninfer-gpu-queue.lock` is held for each GPU process/server's entire lifetime.
+The 600 W cap and clock settings are unchanged.
+
+The frozen README generation workloads use distinct cached lane prefixes, p-less temperature
+1.5, adaptive K7 with the optimized proposal head, 512 output tokens per request, automatic
+KV capacity, maximum context 65,536, and 2,048-token prefill chunks with `--mixed-forward 0`.
+RAM/SSD tiers and vision are disabled. Each cell has one discarded warmup and three measured
+waves. All 36 measured waves completed C requests with zero computed prefill and 512 tokens on
+every request; the selected steady intervals had exactly C decode rows. The Python-package fixture is excluded: its generated
+response triggered the existing raw-tool-call content guard; that guard remains enabled.
+Separate October 22 retries at C6, C7 and C8 each triggered the same guard, so none produced a
+complete accepted Python-package benchmark. The retained historical Python C6 result in README
+comes from October 18. Retry commands, startup configuration and logs are under
+`profiles/bench/c7-c8-python-retry-20261022/`.
+
+The primary aggregate rate is completed output tokens divided by elapsed wall time through all
+responses. This includes client thread-pool and HTTP overhead and any trailing partial batch;
+it excludes untimed prompt-cache seeding. Values below are mean ± sample standard deviation.
+
+| Workload | C6 tokens/s | C7 tokens/s | C8 tokens/s | C7 gain | C8 gain |
+|---|---:|---:|---:|---:|---:|
+| English story | 763.7 ± 3.7 | 817.9 ± 29.8 | 922.3 ± 6.7 | +7.1% | +20.8% |
+| Math reasoning | 939.0 ± 30.1 | 1012.3 ± 43.1 | 1122.7 ± 31.8 | +7.8% | +19.6% |
+| Document summary 8K | 796.6 ± 20.6 | 875.7 ± 12.9 | 953.4 ± 5.5 | +9.9% | +19.7% |
+| Document summary 32K | 692.9 ± 12.0 | 792.2 ± 11.4 | 836.8 ± 15.7 | +14.3% | +20.8% |
+
+The separate full-batch, no-prefill steady interval rates are 779.1/840.5/949.1 tokens/s
+for story, 970.1/1,033.3/1,149.6 for math, 815.4/892.5/980.9 for the 8K summary,
+and 718.0/803.4/855.7 for the 32K summary (C6/C7/C8). C8 reaches 88.9–91.4% of
+optimistic constant-round-time linear scaling from measured C6; C7 reaches 91.3–95.9%.
+This comparison is a scaling reference, not a physical performance ceiling.
+
+A separate greedy Engine benchmark (`-pg 512,512 --warmup 1 -r 3`, adaptive K7, same artifact,
+NVFP4 KV and optimized head) measures 744.4 ± 8.0, 818.3 ± 8.3 and 914.4 ± 8.5
+aggregate decode tokens/s at C6/C7/C8. Its wave and decode metrics are separate from the
+HTTP runner's whole-wave metric.
+
+A one-warmup, one-repetition screen compares ordinary decoding and fixed K3–K7 at each
+concurrency on that same greedy corpus. All 18 cases complete their exact output budgets.
+K3 is fastest at each concurrency. Repeating K3 three times gives 764.3 ± 0.51,
+833.9 ± 0.25 and 932.5 ± 0.46 decode tokens/s at C6/C7/C8. Adaptive decoding reaches
+97.4%, 98.1% and 98.1% of those best screened configurations. This supports retaining the
+adaptive default; it does not establish that a fixed K3 is optimal across serving workloads.
+Screen and repeated-policy results are in `fixed-screen.json` and `policy-comparison.json`
+under `profiles/bench/c7-c8-qualification-20261021/`.
+
+A C8 fixed-K3 Nsight Systems trace, restricted to decode after the final prefill chunk,
+shows kernel activity over 98.1% of the 4.44-second traced kernel span. The largest individual
+kernel groups are A8 gate/up projection (19.9%), A8 down projection (11.4%), A8 GDN
+projection/record (7.4%), and accepted-history record (5.9%) of kernel activity. Profiling
+shows little GPU idle time in that run; it does not establish saturation of each kernel's
+memory or instruction roof. Trace timings are used for attribution, not benchmark rates.
+The cold public-Op T32 profile reports 53.4% DRAM and 64.3% SM throughput with prominent
+math-pipeline stalls at a 1.96 GHz profiler clock. It does not establish a hardware ceiling.
+
+Qualification covers the existing independent projection oracles through T128, eight-row
+GDN record/history/replay and normalized append, the batched-attention oracle, C8 executor
+cancellation/compaction, C8 real-artifact graph startup, DFlash isolation across draft widths,
+capacity, verifier alignment, and mixed prefill/decode. An explicit C8/W8 production greedy
+licensing check passes 16 rounds and 544 committed tokens. History memcheck/racecheck, fold
+memcheck, normalized append memcheck/racecheck and attention projection initcheck report zero
+errors or race warnings. A targeted host ASan/UBSan build instruments replay materialization
+and passes its eight-row case; this is not a full AddressSanitizer merge gate.
+
+The 132 executed fast-suite tests pass, including a focused rerun after correcting a stale C7
+rejection assertion; two load-plan artifact checks remain skipped without their separate
+bindings. Python 3.11 compilation, formatter/linter checks and affected clang-tidy checks pass.
+The benchmark's automatic combined-prefill/decode context allowance includes the restored
+one-token cache seed, preventing an ordinary baseline from silently losing its last output.
+
+Reproduce the serving comparison with `tools/bench/run_readme_workloads.py`, explicitly
+selecting C6/C7/C8, the four named workloads above, `--tokens 512 --warmup 1 --repetitions 3`,
+the artifact above and `/build/apps/ninfer-serve` in the builder. Raw repetitions, commands,
+startup configuration and summaries are under
+`profiles/bench/c7-c8-qualification-20261021/serving-matched/`; the compact cross-concurrency
+summary is `profiles/bench/c7-c8-qualification-20261021/scaling-summary.json`.
+The trace and decode attribution are under `profiles/nsys/c7-c8-20261021/`.
+
 ## README workload measurements (2026-10-18)
 
 Fresh measurements on one NVIDIA GeForce RTX 5090, driver 580.178.04, CUDA 13.1 runtime and

@@ -78,7 +78,7 @@ ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
 }
 
 ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden) {
-    constexpr std::int32_t kMaximumBatch = 6;
+    constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMinimumWidth = 2;
     constexpr std::int32_t kMaximumWidth = 16;
     const std::int32_t width             = x.ne[1];
@@ -304,7 +304,7 @@ void require_snapshot_capacity_domain(std::int32_t batch_size, std::int32_t min_
 
 void require_record_capacity_domain(std::int32_t batch_size, std::int32_t min_width,
                                     std::int32_t max_width) {
-    constexpr std::int32_t kMaximumBatch = 6;
+    constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMinimumWidth = 2;
     constexpr std::int32_t kMaximumWidth = 16;
     if (batch_size <= 0 || batch_size > kMaximumBatch || min_width < kMinimumWidth ||
@@ -1151,7 +1151,7 @@ void gdn_input_proj_conv_record(const A8Activation& x, const Weight& query_key_v
     constexpr std::int32_t kZRows        = 6144;
     constexpr std::int32_t kChannels     = kQueryRows + kKeyRows + kValueRows;
     constexpr std::int32_t kParentRows   = kChannels + kZRows;
-    constexpr std::int32_t kMaximumBatch = 6;
+    constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMaximumWidth = 16;
     const Weight& weight                 = query_key_value_z_weight;
     (void)detail::validate_a8_activation(x, kHidden, "gdn_input_proj_conv_record");

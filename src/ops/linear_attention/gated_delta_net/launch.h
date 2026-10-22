@@ -20,7 +20,7 @@ struct alignas(8) GdnReplayFoldKernelRow {
 };
 
 struct alignas(16) GdnReplayFoldKernelRows {
-    GdnReplayFoldKernelRow row[6];
+    GdnReplayFoldKernelRow row[8];
 };
 
 void launch_history_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

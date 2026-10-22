@@ -9,7 +9,7 @@ namespace {
 constexpr std::size_t kAlignment = 256;
 
 std::int32_t checked_outer(const GdnHistorySpec& spec) {
-    if (spec.layers <= 0 || spec.slots <= 0 || spec.slots > 6 || spec.width <= 0 ||
+    if (spec.layers <= 0 || spec.slots <= 0 || spec.slots > 8 || spec.width <= 0 ||
         spec.width > 16 || spec.capacity <= 0 || spec.qk_heads <= 0 || spec.value_heads <= 0 ||
         spec.key_dim <= 0 || spec.value_dim <= 0 || spec.value_heads % spec.qk_heads != 0) {
         throw std::invalid_argument("GDN history physical dimensions are invalid");

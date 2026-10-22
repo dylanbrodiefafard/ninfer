@@ -52,7 +52,7 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument("Engine kv_capacity mode is invalid");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,6]");
+        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
