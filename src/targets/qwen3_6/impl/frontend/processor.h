@@ -95,6 +95,7 @@ struct ProcessedInput {
     std::vector<VisionItem> vision_items;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> turn_closure_frontiers;
+    std::optional<std::uint32_t> system_prompt_frontier;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -104,7 +105,11 @@ struct EncodedChat {
     std::vector<int> input_ids;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> turn_closure_frontiers;
+    std::optional<std::uint32_t> system_prompt_frontier;
 };
+
+void set_system_prompt_frontier(EncodedChat& encoded, const Tokenizer& tokenizer,
+                                const RenderedChat& rendered);
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
 

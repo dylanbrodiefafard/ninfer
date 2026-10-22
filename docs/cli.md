@@ -156,6 +156,7 @@ The RTX 5090 tree investigation is in
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or automatic sizing from remaining GPU memory | `auto` |
 | `--kv-capacity-headroom MiB` | device memory `--kv-capacity auto` leaves free; requires `auto` | `64` |
 | `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
+| `--kv-ram-system-prompts N` | Retain up to N rendered system prefixes inside the RAM budget; nonzero requires RAM capacity | `0` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache pack-file capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
 | `--kv-disk-compress off\|zstd` | zstd-1 on new GDN/hidden/cyclic writes; KV pages stay uncompressed | `off` |
@@ -344,7 +345,25 @@ Orderly Engine shutdown copies active chats into the host cache, saves cache ent
 yet on SSD, and finishes outstanding disk writes. When disk is enabled, the same stderr progress
 renderer prints `kv-disk` `copy active chats` / `save cache entries` / `finish disk writes`
 counts as shutdown runs.
-Host RAM is an exclusive FIFO: a bundle lives in VRAM or in this budget, not both. One long DFlash
+
+`--kv-ram-system-prompts N` optionally retains up to N system-prefix snapshots in the same RAM
+budget. Zero disables it. A snapshot ends after the leading system/developer messages and
+template-generated tool/instruction block, before the first user message; that user's content need
+not match on reuse. Exact rendered tokens, positions and media identity determine a hit. Different
+tool definitions or system instructions can create a distinct entry. A longer matching conversation
+prefix still wins.
+
+First-use prefill stops at the exact system boundary and copies Text/backend KV plus GDN and DFlash
+state. Subsequent compute waits for that capture before overwriting state or appending inside its
+last page. A system restore retains the source and updates its LRU recency. System snapshots are
+protected from ordinary FIFO/disk eviction and are not written to disk. New system captures may
+reclaim ordinary FIFO entries, then older system entries when their shared byte budget requires it.
+N is an upper bound: captures that cannot fit or would evict an in-flight source are skipped.
+Retired in-flight blocks still occupy the existing pin until their events complete.
+`--no-prefix-reuse` disables use and creation; `cache_write=false` prevents new snapshots. There is
+no separate RAM allocation or automatic disk fallback for these entries.
+
+Ordinary conversation retention in host RAM is an exclusive FIFO: a bundle lives in VRAM or in this budget, not both. One long DFlash
 or DFlash bundle with five context-checkpoint heads is about 6 GiB (Main+backend KV plus GDN and
 DFlash cyclic heads); size the
 budget accordingly. `off` still captures live-lane GDN into the startup checkpoint pool so

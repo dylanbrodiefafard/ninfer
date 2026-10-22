@@ -107,7 +107,7 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--kv-capacity-headroom MiB] "
-           "[--kv-ram-capacity off|N] "
+           "[--kv-ram-capacity off|N] [--kv-ram-system-prompts N] "
            "[--kv-disk-capacity off|N] [--kv-disk-location PATH] [--kv-disk-compress off|zstd] "
            "[--max-concurrency N] [--no-generation-recovery] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
@@ -148,6 +148,8 @@ std::string serve_usage_text(const char* argv0) {
            "MiB (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); raise it when a desktop or other process shares the GPU\n"
+           "       --kv-ram-system-prompts N retains system prefixes in the RAM budget (default "
+           "0)\n"
            "       --kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default "
            "off)\n"
            "       --kv-disk-capacity sets SSD KV prefix-cache pack-file capacity in MiB "
@@ -219,6 +221,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-ram-capacity") {
             options.kv_ram_capacity_bytes =
                 parse_kv_ram_capacity_bytes(require_value("--kv-ram-capacity"));
+        } else if (arg == "--kv-ram-system-prompts") {
+            const auto count =
+                parse_u64(require_value("--kv-ram-system-prompts"), "kv-ram-system-prompts");
+            if (count > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("--kv-ram-system-prompts overflows uint32");
+            }
+            options.kv_ram_system_prompts = static_cast<std::uint32_t>(count);
         } else if (arg == "--kv-disk-capacity") {
             options.kv_disk_capacity_bytes =
                 parse_kv_disk_capacity_bytes(require_value("--kv-disk-capacity"));
@@ -385,6 +394,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
+    validate_kv_system_prompt_options(options.kv_ram_capacity_bytes, options.kv_ram_system_prompts);
     validate_kv_disk_options(options.kv_ram_capacity_bytes, options.kv_disk_capacity_bytes,
                              options.kv_disk_location);
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {

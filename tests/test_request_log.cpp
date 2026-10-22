@@ -146,7 +146,7 @@ int main() {
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
-    failures += check(kRequestLogSchemaVersion == 21, "request-log schema is not version 21");
+    failures += check(kRequestLogSchemaVersion == 22, "request-log schema is not version 22");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
@@ -320,29 +320,35 @@ int main() {
               "human preparation rejection log is incomplete");
 
     GenerationOutcome outcome;
-    outcome.prompt_tokens                       = 401;
-    outcome.completion_tokens                   = 1024;
-    outcome.finish_reason                       = ninfer::FinishReason::OutputLimit;
-    outcome.metrics.prepare_seconds             = 0.1234567890123;
-    outcome.metrics.ttft_seconds                = 0.3580246791357;
-    outcome.metrics.vision_seconds              = 0.0;
-    outcome.metrics.prefill_seconds             = 0.2345678901234;
-    outcome.metrics.decode_seconds              = 5.3456789012345;
-    outcome.metrics.total_seconds               = 5.7037035803702;
-    outcome.metrics.prefix_cache_hit_tokens     = 101;
-    outcome.metrics.prefix_reuse_path           = ninfer::PrefixReusePath::RestoreTurnCheckpoint;
-    outcome.metrics.speculative_backend         = ninfer::SpeculativeBackend::Mtp;
-    outcome.metrics.speculative_draft_window    = 3;
-    outcome.metrics.speculative_rounds          = 300;
-    outcome.metrics.speculative_draft_tokens    = 900;
-    outcome.metrics.speculative_accepted_tokens = 720;
-    outcome.metrics.speculative_fallback_steps  = 2;
+    outcome.metrics.system_prompt_cache_hit_tokens = 101;
+    outcome.prompt_tokens                          = 401;
+    outcome.completion_tokens                      = 1024;
+    outcome.finish_reason                          = ninfer::FinishReason::OutputLimit;
+    outcome.metrics.prepare_seconds                = 0.1234567890123;
+    outcome.metrics.ttft_seconds                   = 0.3580246791357;
+    outcome.metrics.vision_seconds                 = 0.0;
+    outcome.metrics.prefill_seconds                = 0.2345678901234;
+    outcome.metrics.decode_seconds                 = 5.3456789012345;
+    outcome.metrics.total_seconds                  = 5.7037035803702;
+    outcome.metrics.prefix_cache_hit_tokens        = 101;
+    outcome.metrics.prefix_reuse_path              = ninfer::PrefixReusePath::RestoreTurnCheckpoint;
+    outcome.metrics.speculative_backend            = ninfer::SpeculativeBackend::Mtp;
+    outcome.metrics.speculative_draft_window       = 3;
+    outcome.metrics.speculative_rounds             = 300;
+    outcome.metrics.speculative_draft_tokens       = 900;
+    outcome.metrics.speculative_accepted_tokens    = 720;
+    outcome.metrics.speculative_fallback_steps     = 2;
     outcome.metrics.speculative_accepted_per_position    = {290, 240, 190};
     outcome.metrics.speculative_live_draft_tokens        = 3;
     outcome.metrics.speculative_p_less_draft_temperature = 0.5F;
     outcome.metrics.speculative_rounds_per_draft         = {0, 0, 0, 300};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
+    failures += check(done.at("result").at("system_prompt_cache_hit_tokens") == 101 &&
+                          format_request_done(context, outcome).find("system_cached=101tok") !=
+                              std::string::npos,
+                      "system-prefix cache token count missing from request logs");
+
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");

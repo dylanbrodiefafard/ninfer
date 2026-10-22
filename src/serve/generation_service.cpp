@@ -319,6 +319,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.kv_ram_capacity_bytes    = options_.kv_ram_capacity_bytes;
+    engine_options.kv_ram_system_prompts    = options_.kv_ram_system_prompts;
     engine_options.kv_disk_capacity_bytes   = options_.kv_disk_capacity_bytes;
     engine_options.kv_disk_location         = options_.kv_disk_location;
     engine_options.kv_disk_compress         = options_.kv_disk_compress;
@@ -565,6 +566,7 @@ GenerationService::run(PreparedRequest& prepared, std::uint64_t request_id, cons
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.prefix_cache_hit_tokens            = result.reused_prompt_tokens;
+    outcome.metrics.system_prompt_cache_hit_tokens     = result.system_prompt_cache_hit_tokens;
     outcome.metrics.prefix_reuse_path                  = result.prefix_reuse_path;
     outcome.metrics.prefix_reuse_source                = result.prefix_reuse_source;
     outcome.metrics.captured_context_checkpoint_tokens = result.captured_context_checkpoint_tokens;

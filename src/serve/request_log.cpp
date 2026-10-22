@@ -439,6 +439,7 @@ std::string format_request_done(const RequestLogContext& context,
     if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
         << " cache=" << metrics.prefix_cache_hit_tokens
+        << " system_cached=" << metrics.system_prompt_cache_hit_tokens << "tok"
         << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path)
         << " reuse_source=" << prefix_reuse_source_name(metrics.prefix_reuse_source)
         << format_context_checkpoint(metrics.restored_context_checkpoint_tokens,
@@ -750,6 +751,7 @@ std::string format_request_done_json(const std::string& server_instance_id,
               prefill_eval_tokens(outcome.prompt_tokens,
                                   static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
+             {"system_prompt_cache_hit_tokens", outcome.metrics.system_prompt_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"reuse_source", prefix_reuse_source_name(outcome.metrics.prefix_reuse_source)},
              {"context_checkpoint",

@@ -817,6 +817,16 @@ std::string render_text(const MetricsSnapshotData& data) {
             std::uint64_t{stats.kv_ram_used_bytes});
     w.gauge("ninfer_kv_ram_entries", "Host RAM prefix cache entries.",
             std::uint64_t{stats.kv_ram_entry_count});
+    w.gauge("ninfer_kv_ram_system_prompt_limit", "Maximum retained system prefixes.",
+            std::uint64_t{stats.kv_ram_system_prompt_limit});
+    w.gauge("ninfer_kv_ram_system_prompt_entries", "Retained system prefixes.",
+            std::uint64_t{stats.kv_ram_system_prompt_entries});
+    w.gauge("ninfer_kv_ram_system_prompt_used_bytes", "RAM budget used by system prefixes.",
+            std::uint64_t{stats.kv_ram_system_prompt_used_bytes});
+    w.counter("ninfer_kv_ram_system_prompt_restores_total", "System prefix restores.",
+              stats.kv_ram_system_prompt_restores);
+    w.counter("ninfer_kv_ram_system_prompt_evictions_total", "System prefix LRU evictions.",
+              stats.kv_ram_system_prompt_evictions);
     w.counter("ninfer_kv_ram_captures_total", "Host RAM prefix captures.", stats.kv_ram_captures);
     w.counter("ninfer_kv_ram_restores_total", "Host RAM prefix restores.", stats.kv_ram_restores);
     w.counter("ninfer_kv_ram_evictions_total", "Host RAM prefix evictions.",
@@ -1046,6 +1056,12 @@ Json render_json(const MetricsSnapshotData& data) {
          {{"capacity_bytes", stats.kv_ram_capacity_bytes},
           {"used_bytes", stats.kv_ram_used_bytes},
           {"entries", stats.kv_ram_entry_count},
+          {"system_prompts",
+           {{"limit", stats.kv_ram_system_prompt_limit},
+            {"entries", stats.kv_ram_system_prompt_entries},
+            {"used_bytes", stats.kv_ram_system_prompt_used_bytes},
+            {"restores", stats.kv_ram_system_prompt_restores},
+            {"evictions", stats.kv_ram_system_prompt_evictions}}},
           {"captures", stats.kv_ram_captures},
           {"restores", stats.kv_ram_restores},
           {"evictions", stats.kv_ram_evictions},

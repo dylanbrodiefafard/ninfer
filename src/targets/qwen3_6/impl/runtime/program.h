@@ -107,17 +107,19 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
     ops::SamplingConfig sampling;
-    std::uint32_t text_kv_page_entitlement    = 0;
-    std::uint32_t backend_kv_page_entitlement = 0;
-    PrefixReuseSource reuse_source            = PrefixReuseSource::None;
-    std::uint64_t ram_entry_id                = 0;
-    std::uint64_t disk_entry_id               = 0;
+    std::uint32_t text_kv_page_entitlement       = 0;
+    std::uint32_t backend_kv_page_entitlement    = 0;
+    PrefixReuseSource reuse_source               = PrefixReuseSource::None;
+    std::uint64_t ram_entry_id                   = 0;
+    std::uint32_t system_prompt_cache_hit_tokens = 0;
+    std::uint64_t disk_entry_id                  = 0;
     PrefixHash128 disk_hash_f{};
     std::uint32_t disk_execution_frontier      = 0;
     std::uint64_t disk_committed_generation    = 0;
     runtime::CacheReadIntent cache_read_intent = runtime::CacheReadIntent::Consume;
     bool capture_context_checkpoints           = false;
     bool capture_context_checkpoint            = false;
+    bool capture_system_prompt                 = false;
     bool token_logprobs                        = false;
     std::shared_ptr<const std::vector<PrefixHash128>> prompt_hashes;
 };
@@ -280,17 +282,19 @@ struct RequestControl {
         std::unique_ptr<schedule::VisionPrefillSession> vision;
         runtime::TransientRegion transient;
         std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
-        std::uint32_t base               = 0;
-        std::uint32_t cursor             = 0;
-        std::uint32_t prompt_tokens      = 0;
-        std::uint32_t initial_mtp_extent = 0;
-        double elapsed_seconds           = 0.0;
-        bool host_input_consumed_pending = false;
-        bool prepare_mtp                 = false;
-        ReusePath reuse                  = ReusePath::FullReset;
-        PrefixReuseSource reuse_source   = PrefixReuseSource::None;
-        MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
-        bool capture_context_checkpoints = false;
+        std::optional<std::uint32_t> system_prompt_capture;
+        std::uint32_t base                           = 0;
+        std::uint32_t cursor                         = 0;
+        std::uint32_t prompt_tokens                  = 0;
+        std::uint32_t initial_mtp_extent             = 0;
+        double elapsed_seconds                       = 0.0;
+        bool host_input_consumed_pending             = false;
+        bool prepare_mtp                             = false;
+        ReusePath reuse                              = ReusePath::FullReset;
+        PrefixReuseSource reuse_source               = PrefixReuseSource::None;
+        std::uint32_t system_prompt_cache_hit_tokens = 0;
+        MtpBridgeMode mtp_bridge                     = MtpBridgeMode::None;
+        bool capture_context_checkpoints             = false;
         // Per-chunk prefill step records (tokens processed, wall seconds) for the
         // tail-window throughput metric. One entry per advance_prefill call; the
         // finalizing call includes its sampling/bridge time.
@@ -517,6 +521,7 @@ public:
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
     const std::size_t kv_ram_capacity_bytes;
+    const std::uint32_t kv_ram_system_prompts;
     const std::size_t kv_disk_capacity_bytes;
     const std::size_t graph_allowance_bytes;
     std::size_t graph_observed_bytes = 0;
@@ -675,6 +680,7 @@ private:
                               const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
     void finish_request_plan(RequestPlanImpl& plan, const ResidentStateView* view,
                              const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
+    void capture_system_prompt(SequenceState& sequence, RequestControl::Prefill& staged);
     [[nodiscard]] bool capture_cuts_at_rewrite(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::detail::RamCaptureSource
     ram_capture_source(SequenceState& sequence,

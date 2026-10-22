@@ -273,6 +273,9 @@ EncodedChat encode_chat_with_cache(const Tokenizer& tokenizer,
         encoded = encode_rendered_chat(tokenizer, full);
     }
 
+    if (last_host_encode_observation.cache_hit) {
+        set_system_prompt_frontier(encoded, tokenizer, full);
+    }
     if (last_host_encode_observation.cache_hit && host_encode_verify_enabled()) {
         const EncodedChat cold = encode_rendered_chat(tokenizer, full);
         if (cold.input_ids != encoded.input_ids ||

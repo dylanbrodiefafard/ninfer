@@ -601,3 +601,20 @@ destination-failure cleanup, and cancelled readers beside decoding peers. The RA
 test verifies physical copies across storage layouts, source isolation, and restore/release
 followed by consuming continuation. Serving schema tests cover the strict flag and conflict
 in both response modes.
+
+### Retained system prompts
+
+`ninfer_qwen3_8_27b_system_prompt_cache_real_test` and
+`ninfer_qwen3_8_27b_dflash_system_prompt_cache_real_test` use
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` with NVFP4 KV and ordinary/DFlash execution.
+They check exact cold/warm greedy output across different first-user content, queued
+admission replanning, capture beside active decode, cancellation, disposable reuse,
+and prefix-reuse opt-out. Run them with
+`./scripts/run-unit-tests.sh --real -R 'system_prompt_cache.*real_test'`.
+The `ninfer_qwen3_8_27b_dflash_system_prompt_cache_c8_real_test` case repeats these
+checks at eight startup lanes and submits an eight-request wave sharing a retained system prefix.
+
+The frontend test checks exact token frontiers including tools and encoded-history
+cache hits. The RAM-cache test checks exact prefix page copies, repeated non-consuming
+restores, absent hidden state, LRU replacement, claimed-source preservation, exclusion
+from ordinary eviction/disk enumeration, and live versus retired system capacity.

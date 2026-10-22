@@ -1054,6 +1054,17 @@ target lane is dirty, and restore captures that lane's old bundle. `GenerationRe
 `prefix_reuse_source` for `none` / `vram_resident` / `host_ram` / `host_disk`; `prefix_reuse_path` still describes
 only frontier/checkpoint semantics.
 
+An opt-in system-prefix LRU lives in the existing RAM arena (`--kv-ram-system-prompts N`, default
+0). The family frontend emits a verified leading-system token frontier independent of the first
+user's content, including rendered tools and template instructions. A writable reusable request
+splits prefill at that frontier, captures all continuation state, and orders later compute after the
+entry's capture fence to protect active GDN/cyclic state and a partially filled last KV page.
+Restoring such an entry retains it and touches recency rather than consuming it. Its immutable
+prefix competes by the same longest-ready-prefix rules as ordinary RAM images. Count and arena-byte
+limits bound retention; normal FIFO/disk eviction cannot select system entries, and system snapshots
+are not durably spilled. Longer existing reuse is never sacrificed merely to capture an earlier
+missing system prefix. See `paged-kv-cache.md` for ownership and eviction details.
+
 `--kv-disk-capacity` adds an inclusive SSD third tier beside the RAM FIFO. Disk is considered in
 both admission passes after the RAM strictly-greater check; equal reuse keeps VRAM then RAM. C=1
 disk restore never enqueues RestoreRead until the VRAM victim is evicted. Orderly shutdown captures

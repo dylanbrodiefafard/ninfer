@@ -53,7 +53,8 @@ cap_prefill_at_frontiers(std::uint32_t begin, std::uint32_t length,
 [[nodiscard]] inline std::uint64_t
 projected_prefill_work(const PreparedPromptData& prompt, std::uint32_t reuse_base,
                        std::uint32_t maximum, std::span<const VisionUseSpan> vision_uses,
-                       std::optional<std::uint32_t> rewrite_frontier) noexcept {
+                       std::optional<std::uint32_t> rewrite_frontier,
+                       std::optional<std::uint32_t> system_frontier = std::nullopt) noexcept {
     const auto tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (tokens == reuse_base) { return 1; }
     std::uint64_t result = 0;
@@ -61,6 +62,9 @@ projected_prefill_work(const PreparedPromptData& prompt, std::uint32_t reuse_bas
         auto length = select_prefill_chunk(tokens - begin, maximum);
         if (rewrite_frontier && *rewrite_frontier > begin) {
             length = std::min(length, *rewrite_frontier - begin);
+        }
+        if (system_frontier && *system_frontier > begin) {
+            length = std::min(length, *system_frontier - begin);
         }
         if (prompt.has_media()) {
             length = cap_prefill_at_frontiers(begin, length, prompt.turn_closure_frontiers);

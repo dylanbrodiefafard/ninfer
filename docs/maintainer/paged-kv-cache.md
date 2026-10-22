@@ -887,7 +887,7 @@ original migration remains cached. See the concurrent architecture for admission
 
 ### 10.4 Host RAM second tier
 
-The optional pinned-host tier is an exclusive FIFO of completed retained SequenceState bundles
+The optional pinned-host tier holds an ordinary exclusive FIFO of completed retained SequenceState bundles
 that are not on a VRAM lane. Capture happens at the executor admission site that is about to
 destroy that bundle and appends a fresh D2H image at the FIFO tail. A capture that does not fit
 the host budget increments `drops` once and the incoming request still proceeds. Capture reports
@@ -944,10 +944,29 @@ are ready; while other lanes decode, the copy-hold polls that instead of blockin
 `dst_extent` Main `pages_for_tokens(F)` / MTP `pages_for_tokens(F-1)` / DFlash Full `pages_for_tokens(F)`. Host RAM is not a second GPU
 working set.
 
+`--kv-ram-system-prompts N` enables retained snapshots of the exact leading system-prefix frontier
+inside the same arena. The frontend marks the boundary before any first-user content, and the
+tokenizer verifies that its encoding is an exact prefix of the full prompt without changing input
+tokens. Prefill splits at the boundary; capture stores only its leading mapped KV pages and current
+GDN/backend state, with no stale later checkpoint. Ordinary and DFlash snapshots omit the tail
+hidden; their strict suffix prefill supplies it. The copy stream waits for the producing compute,
+and subsequent compute waits for that entry's D2H event before mutating its partial page or
+recurrent/cyclic state. All claims, H2D readers and retired blocks retain the existing event
+lifetime rules.
+
+A successful system restore releases its claim without retiring the source and touches LRU recency.
+Count replacement evicts the least recently restored unclaimed system entry; byte pressure first
+reclaims ordinary entries through their normal RAM/disk policy, then older system entries. Ordinary
+spill enumeration excludes system anchors, so they remain RAM-only and ordinary FIFO pressure cannot
+evict them. At most N indexed system entries are retained, with no capacity beyond the existing host
+arena. Optional capture failure preserves request progress. The planner continues
+longest-ready-prefix ranking across all retained classes. A missing system image behind an already
+longer selected frontier does not force a cold restart just to populate an auxiliary entry.
+
 ### 10.5 Inclusive SSD third tier
 
 `--kv-disk-capacity` enables an inclusive SSD store of completed bundles and requires
-`--kv-ram-capacity > 0`. Each RAM capture requests a write-behind spill on the disk worker, so
+`--kv-ram-capacity > 0`. Each ordinary RAM capture requests a write-behind spill on the disk worker, so
 entries usually become durable while other requests decode. When a capture needs RAM, the oldest
 unpinned disk-durable entry is evicted first. Without one, the in-flight write-behind spill, or
 else the oldest savable entry, is spilled first: synchronously when no other lane is decoding,

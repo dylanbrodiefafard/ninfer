@@ -106,10 +106,11 @@ struct RequestPlanSummary {
 };
 
 struct BeginSummary {
-    std::uint32_t prompt_tokens           = 0;
-    std::uint32_t reused_prompt_tokens    = 0;
-    PrefixReusePath prefix_reuse_path     = PrefixReusePath::FullReset;
-    PrefixReuseSource prefix_reuse_source = PrefixReuseSource::None;
+    std::uint32_t prompt_tokens                  = 0;
+    std::uint32_t reused_prompt_tokens           = 0;
+    PrefixReusePath prefix_reuse_path            = PrefixReusePath::FullReset;
+    PrefixReuseSource prefix_reuse_source        = PrefixReuseSource::None;
+    std::uint32_t system_prompt_cache_hit_tokens = 0;
 };
 
 // Logprob records parallel to a round's token storage: token slot s (row * row_stride + i for a

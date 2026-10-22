@@ -27,6 +27,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <new>
 #include <optional>
 #include <stdexcept>
@@ -393,6 +394,163 @@ int capture_with_hidden(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
     source.tail_hidden = &hidden;
     source.stream      = stream;
     return capture_or_evict(cache, source) ? 0 : 1;
+}
+
+// System images keep the prefix bytes independent of later writes and remain reusable.
+int test_system_prompt_retention(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    namespace q36   = ninfer::targets::qwen3_6;
+    using Cache     = q36::detail::KVRamCache;
+    using Status    = q36::detail::RamCaptureStatus;
+    auto allocation = pool.reserve(1);
+    allocation.materialize_pages(1, ctx.stream);
+    fill_logical_pages(pool, allocation, 0x31);
+    const auto first  = text_prompt({1001, 2, 3, 4, 5, 6, 70});
+    const auto second = text_prompt({2001, 2, 3, 4, 5, 6, 70});
+    const auto third  = text_prompt({3001, 2, 3, 4, 5, 6, 70});
+    q36::detail::ResidentPrefixIdentity identity;
+    const auto capture = [&](Cache& cache, const q36::PreparedPromptData& prompt, bool system) {
+        identity.assign(prompt);
+        q36::detail::RamCaptureSource source;
+        source.system_prompt      = system;
+        source.execution_frontier = 6;
+        source.ledger_frontier    = 7;
+        source.text_kv_valid      = 6;
+        source.ledger             = prompt.token_ids;
+        source.identity           = &identity;
+        source.hash_f             = q36::detail::prefix_hash_at(prompt.token_ids, identity, 6);
+        source.text               = &allocation;
+        source.text_pool          = &pool;
+        source.stream             = ctx.copy_stream;
+        return cache.capture(source);
+    };
+    Cache disabled(8ULL << 20);
+    if (capture(disabled, first, true).status != Status::Dropped) {
+        return fail("system capture was enabled without a limit");
+    }
+    Cache cache(8ULL << 20, 2);
+    const auto a = capture(cache, first, true);
+    const auto b = capture(cache, second, true);
+    if (a.status != Status::Captured || b.status != Status::Captured) {
+        return fail("system captures failed");
+    }
+    cache.wait_entry_copies_on_stream(a.entry_id, ctx.stream);
+    cache.wait_entry_copies_on_stream(b.entry_id, ctx.stream);
+    // Mutate the original allocation on the compute stream behind the capture fence.
+    for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+        const auto& tensor = pool.plane(plane);
+        CUDA_CHECK(cudaMemsetAsync(tensor.data, 0x71, tensor.bytes(), ctx.stream));
+    }
+    ctx.synchronize_all();
+    auto different_user                   = text_prompt({1001, 2, 3, 4, 5, 6, 900001, 900002});
+    different_user.system_prompt_frontier = 6;
+    auto match = cache.plan_match(different_user, q36::detail::prefix_hash_chain(different_user));
+    if (!match || match->entry_id != a.entry_id || match->reuse_base != 6) {
+        return fail("system match depended on the first user token");
+    }
+    identity.assign(first);
+    if (!cache.has_system_prompt(different_user,
+                                 q36::detail::prefix_hash_at(first.token_ids, identity, 6))) {
+        return fail("system duplicate detection depended on user content");
+    }
+    auto destination = pool.reserve(1);
+    destination.materialize_pages(1, ctx.stream);
+    ninfer::DeviceBuffer hidden(32);
+    hidden.fill(0x72);
+    ninfer::Tensor hidden_tensor(hidden.p, ninfer::DType::U8, {32});
+    q36::detail::RamRestoreTarget target;
+    target.text           = &destination;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 1;
+    target.tail_hidden    = &hidden_tensor;
+    target.reuse          = match->reuse;
+    target.reuse_base     = match->reuse_base;
+    target.stream         = ctx.copy_stream;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        cache.claim(a.entry_id);
+        const auto restored = cache.unpack_device(a.entry_id, target);
+        ctx.synchronize_all();
+        if (restored.tail_hidden_valid) { return fail("system image invented tail hidden"); }
+        cache.consume(a.entry_id);
+    }
+    int failures = expect_logical_pages(pool, destination, 0x31, "system restore");
+    std::vector<unsigned char> hidden_bytes(32);
+    CUDA_CHECK(
+        cudaMemcpy(hidden_bytes.data(), hidden.p, hidden_bytes.size(), cudaMemcpyDeviceToHost));
+    if (!std::all_of(hidden_bytes.begin(), hidden_bytes.end(),
+                     [](auto byte) { return byte == 0x72; })) {
+        return fail("system restore wrote an absent tail hidden");
+    }
+    if (cache.snapshot().system_prompt_restores != 2 ||
+        cache.snapshot().system_prompt_entries != 2) {
+        return fail("system restore consumed its retained source");
+    }
+    const auto c = capture(cache, third, true);
+    ctx.synchronize_all();
+    if (c.status != Status::Captured ||
+        !cache.plan_match(different_user, q36::detail::prefix_hash_chain(different_user)) ||
+        cache.plan_match(text_prompt({2001, 2, 3, 4, 5, 6, 99}),
+                         q36::detail::prefix_hash_chain(text_prompt({2001, 2, 3, 4, 5, 6, 99}))) ||
+        cache.snapshot().system_prompt_evictions != 1 || !cache.fifo_ids().empty() ||
+        !cache.unpinned_ids().empty()) {
+        return fail("system LRU replacement or ordinary eviction exclusion failed");
+    }
+    Cache pinned(8ULL << 20, 1);
+    const auto held = capture(pinned, first, true);
+    if (held.status != Status::Captured) { return fail("claimed system fixture capture failed"); }
+    pinned.claim(held.entry_id);
+    if (capture(pinned, second, true).status != Status::Dropped ||
+        !pinned.is_claimed(held.entry_id)) {
+        return fail("system replacement evicted a claimed source");
+    }
+    pinned.release(held.entry_id);
+
+    // Ordinary capture cannot reclaim a system image; an impossible fit preserves the FIFO.
+    const auto bytes = cache.snapshot().system_prompt_used_bytes / 2;
+    Cache bounded(2 * bytes, 1);
+    if (capture(bounded, first, true).status != Status::Captured ||
+        capture(bounded, second, false).status != Status::Captured) {
+        return fail("shared system budget fixture capture failed");
+    }
+    bounded.wait_pending_copies();
+    const auto before = bounded.snapshot();
+    if (bytes / 2 > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        return fail("system budget fixture hidden exceeds tensor geometry");
+    }
+    ninfer::DeviceBuffer extra_hidden(bytes / 2);
+    ninfer::Tensor extra_tensor(extra_hidden.p, ninfer::DType::U8,
+                                {static_cast<std::int32_t>(bytes / 2)});
+    // An ordinary image with hidden state is larger than either available arena interval.
+    identity.assign(third);
+    q36::detail::RamCaptureSource oversized;
+    oversized.execution_frontier = 6;
+    oversized.ledger_frontier    = 7;
+    oversized.text_kv_valid      = 6;
+    oversized.ledger             = third.token_ids;
+    oversized.identity           = &identity;
+    oversized.hash_f             = q36::detail::prefix_hash_at(third.token_ids, identity, 6);
+    oversized.text               = &allocation;
+    oversized.text_pool          = &pool;
+    oversized.tail_hidden        = &extra_tensor;
+    oversized.tail_hidden_valid  = true;
+    oversized.stream             = ctx.copy_stream;
+    if (bounded.capture(oversized).status != Status::Dropped ||
+        bounded.snapshot().entry_count != before.entry_count ||
+        bounded.snapshot().evictions != before.evictions) {
+        return fail("ordinary impossible capture reclaimed entries around a retained system");
+    }
+    Cache retiring(2 * bytes, 1);
+    StreamCopyGate gate;
+    gate.arm(retiring);
+    const auto pending = capture(retiring, first, true);
+    if (pending.status != Status::Captured || !retiring.evict_system_prompt() ||
+        !retiring.retired_fence_pending()) {
+        return fail("retired system fence fixture failed");
+    }
+    if (retiring.capture(oversized).status != Status::NeedsEviction) {
+        return fail("retired system image counted as permanently protected capacity");
+    }
+    gate.release();
+    return failures;
 }
 
 int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
@@ -6167,6 +6325,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    failures += test_system_prompt_retention(ctx, paged_pool);
     failures += test_kv_ram_index(ctx, paged_pool);
     failures += test_unpack_consume_and_drop(ctx, paged_pool);
     failures += test_frontier_beats_checkpoint(ctx, paged_pool);

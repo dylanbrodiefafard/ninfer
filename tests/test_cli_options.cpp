@@ -32,6 +32,23 @@ int main() {
     failures += check(mtp_rejected, "MTP execution was accepted");
 
 
+    const auto system_cache = parse({"ninfer", "model.ninfer", "--prompt", "hi",
+                                     "--kv-ram-capacity", "1024", "--kv-ram-system-prompts", "3"});
+    failures += check(system_cache.kv_ram_system_prompts == 3 &&
+                          system_cache.kv_ram_capacity_bytes == 1024ULL * 1024ULL * 1024ULL,
+                      "system prompt count did not use the RAM byte budget");
+    const auto system_off =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--kv-ram-system-prompts", "0"});
+    failures += check(system_off.kv_ram_system_prompts == 0, "zero did not disable system caching");
+    for (const char* count : {"1", "-1", "4294967296"}) {
+        bool rejected = false;
+        try {
+            (void)parse(
+                {"ninfer", "model.ninfer", "--prompt", "hi", "--kv-ram-system-prompts", count});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "system prompt limit accepted missing RAM or invalid count");
+    }
+
     const auto constrained =
         parse({"ninfer", "model.ninfer", "--prompt", "hi", "--json-schema", "schema.json"});
     failures +=

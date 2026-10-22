@@ -80,6 +80,7 @@ struct ChatMessage {
 
 struct ChatRenderOptions {
     bool add_generation_prompt = true;
+    bool mark_system_prompt    = false;
     bool enable_thinking       = true;
     std::optional<ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
@@ -102,6 +103,7 @@ struct RenderedChat {
     // preserved. Each one is a turn-closure frontier: history omits the empty think wrapper,
     // so a later cold prefill has to stop there to match the checkpoint that turn captured.
     std::vector<std::size_t> turn_closure_offsets;
+    std::optional<std::size_t> system_prompt_end;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

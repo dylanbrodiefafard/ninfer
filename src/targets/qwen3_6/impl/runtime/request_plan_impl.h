@@ -74,10 +74,12 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
                                      const PreparedPromptData& prompt, std::uint32_t reuse_base,
                                      std::uint32_t prefill_step_tokens,
                                      std::span<const VisionUseSpan> vision_uses,
-                                     const std::optional<RewriteCheckpointSpec>& rewrite) noexcept {
+                                     const std::optional<RewriteCheckpointSpec>& rewrite,
+                                     bool capture_system_prompt) noexcept {
     const std::uint64_t prefill_units = qwen3_6::detail::projected_prefill_work(
         prompt, reuse_base, prefill_step_tokens, vision_uses,
-        rewrite ? std::optional<std::uint32_t>(rewrite->frontier) : std::nullopt);
+        rewrite ? std::optional<std::uint32_t>(rewrite->frontier) : std::nullopt,
+        capture_system_prompt ? prompt.system_prompt_frontier : std::nullopt);
     const std::uint64_t decode_units =
         summary.effective_output_tokens == 0 ? 0ULL : summary.effective_output_tokens - 1ULL;
     return prefill_units + decode_units;
@@ -224,7 +226,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     // Service quanta project Shared-pace steps, the most steps the prompt can take.
     base->summary.service_work_quanta = projected_service_work(
         base->summary, prompt, 0, prefill_step_tokens(runtime::PrefillPace::Shared),
-        cold_vision_uses, base->rewrite_checkpoint);
+        cold_vision_uses, base->rewrite_checkpoint,
+        kv_ram_system_prompts != 0 && base->cache_write && base->allow_prefix_reuse);
     if (prompt.generation_recovery && base->sampling.p_less) {
         base->summary.service_work_quanta +=
             qwen3_6::GenerationRecoveryContext::maximum_attempts *
@@ -340,6 +343,8 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
         speculative_backend == SpeculativeBackend::Mtp ||
             speculative_backend == SpeculativeBackend::DFlash);
     plan.capture_context_checkpoint = base.capture_context_checkpoint;
+    plan.capture_system_prompt =
+        kv_ram_system_prompts != 0 && base.cache_write && base.allow_prefix_reuse;
 
     if (base.vision_control != nullptr) {
         VisionPrefillPlan vision;
@@ -372,7 +377,7 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
         plan.summary, prompt, plan.reuse_base, prefill_step_tokens(runtime::PrefillPace::Shared),
         plan.vision ? std::span<const VisionUseSpan>(plan.vision->uses)
                     : std::span<const VisionUseSpan>{},
-        plan.rewrite_checkpoint_capture);
+        plan.rewrite_checkpoint_capture, plan.capture_system_prompt);
     if (prompt.generation_recovery && plan.sampling.p_less) {
         plan.summary.service_work_quanta +=
             qwen3_6::GenerationRecoveryContext::maximum_attempts *
@@ -457,6 +462,7 @@ RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
     }
 
     qwen3_6::detail::RamRestoredHost host = kv_ram_cache_->load_host(match->entry_id);
+    const bool system_prompt_entry        = kv_ram_cache_->is_system_prompt(match->entry_id);
     ResidentStateView view;
     view.ledger             = &host.ledger;
     view.identity           = &host.identity;
@@ -483,6 +489,7 @@ RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
     }
     plan->reuse_source = PrefixReuseSource::HostRam;
     plan->ram_entry_id = match->entry_id;
+    if (system_prompt_entry) { plan->system_prompt_cache_hit_tokens = plan->reuse_base; }
     finish_request_plan(*plan, &view, prompt, base);
     return RequestPlan(std::move(plan));
 }

@@ -414,6 +414,7 @@ int main(int argc, char** argv) {
         engine_options.max_context              = cli.max_context;
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.kv_ram_capacity_bytes    = cli.kv_ram_capacity_bytes;
+        engine_options.kv_ram_system_prompts    = cli.kv_ram_system_prompts;
         engine_options.kv_disk_capacity_bytes   = cli.kv_disk_capacity_bytes;
         engine_options.kv_disk_location         = cli.kv_disk_location;
         engine_options.kv_disk_compress         = cli.kv_disk_compress;

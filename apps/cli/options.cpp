@@ -118,7 +118,8 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--kv-capacity-headroom MiB]\n"
-           "       [--kv-ram-capacity off|N] [--kv-disk-capacity off|N] [--kv-disk-location PATH]\n"
+           "       [--kv-ram-capacity off|N] [--kv-ram-system-prompts N] [--kv-disk-capacity "
+           "off|N] [--kv-disk-location PATH]\n"
            "       [--kv-disk-compress off|zstd] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|nvfp4] [--sage] [--keep-frac F] [--xattn-tau F]\n"
@@ -147,6 +148,7 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); raise it when other processes, such as a desktop, share the GPU.\n"
            "--kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default off).\n"
+           "--kv-ram-system-prompts N retains up to N system prefixes in that budget (default 0).\n"
            "--kv-disk-capacity sets SSD KV prefix-cache pack-file capacity in MiB (default "
            "off).\n"
            "--kv-disk-location is required iff --kv-disk-capacity is enabled.\n"
@@ -197,6 +199,8 @@ Options parse_options(int argc, char** argv) {
             kv_capacity_headroom_mib = parse_u64(value(arg), "kv-capacity-headroom");
         } else if (arg == "--kv-ram-capacity") {
             options.kv_ram_capacity_bytes = parse_kv_ram_capacity_bytes(value(arg));
+        } else if (arg == "--kv-ram-system-prompts") {
+            options.kv_ram_system_prompts = parse_u32(value(arg), "kv-ram-system-prompts", true);
         } else if (arg == "--kv-disk-capacity") {
             options.kv_disk_capacity_bytes = parse_kv_disk_capacity_bytes(value(arg));
         } else if (arg == "--kv-disk-location") {
@@ -319,6 +323,7 @@ Options parse_options(int argc, char** argv) {
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
+    validate_kv_system_prompt_options(options.kv_ram_capacity_bytes, options.kv_ram_system_prompts);
     validate_kv_disk_options(options.kv_ram_capacity_bytes, options.kv_disk_capacity_bytes,
                              options.kv_disk_location);
     if (options.sage_attn && options.kv_cache != KvCacheStorage::Nvfp4) {

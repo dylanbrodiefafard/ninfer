@@ -2929,11 +2929,74 @@ int test_official_recovery_splice() {
     return failures;
 }
 
+int test_system_prompt_frontiers() {
+    if (skip_without_official_tokenizer("system prompt frontiers")) { return 0; }
+    int failures = 0;
+    for (const auto* chat : {&thinking_toggle_template(), &reasoning_effort_template()}) {
+        fi::ChatMessage system;
+        system.role = ninfer::ChatRole::System;
+        system.parts.push_back(fi::ChatPart::text_part("Shared café instructions <|im_end|>."));
+        fi::ChatMessage extra;
+        extra.role = ninfer::ChatRole::Developer;
+        extra.parts.push_back(fi::ChatPart::text_part("Additional leading policy."));
+        fi::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(fi::ChatPart::text_part("FIRST_USER_ALPHA entirely distinct."));
+        std::vector<fi::ChatMessage> messages{system, extra, user};
+        fi::ChatRenderOptions options;
+        options.mark_system_prompt = true;
+        options.tool_jsons         = {
+            R"({"type":"function","function":{"name":"read","description":"read a file","parameters":{"type":"object","properties":{}}}})"};
+        const auto rendered = chat->render(messages, options);
+        const auto first    = fi::encode_rendered_chat(official_tokenizer(), rendered);
+        failures += check(first.system_prompt_frontier.has_value(), "system frontier missing");
+        if (!first.system_prompt_frontier) { continue; }
+        const auto frontier = *first.system_prompt_frontier;
+        const std::vector<int> prefix(first.input_ids.begin(), first.input_ids.begin() + frontier);
+        const auto text = official_tokenizer().decode(prefix);
+        failures += check(text.find("Shared") != std::string::npos &&
+                              text.find("Additional leading policy") != std::string::npos &&
+                              text.find("read a file") != std::string::npos &&
+                              text.find("FIRST_USER_ALPHA") == std::string::npos,
+                          "system boundary included user text or omitted system/tools");
+        messages.back().parts = {
+            fi::ChatPart::text_part("OTHER_USER_BETA has a different request.")};
+        fi::EncodedHistoryCache cache;
+        const auto second =
+            fi::encode_chat_with_cache(official_tokenizer(), *chat, messages, options, cache);
+        const auto hot =
+            fi::encode_chat_with_cache(official_tokenizer(), *chat, messages, options, cache);
+        failures +=
+            check(second.system_prompt_frontier == first.system_prompt_frontier &&
+                      hot.system_prompt_frontier == first.system_prompt_frontier &&
+                      std::equal(prefix.begin(), prefix.end(), second.input_ids.begin()) &&
+                      second.input_ids != first.input_ids && hot.input_ids == second.input_ids,
+                  "system identity depends on first user or host encoding cache");
+        options.tool_jsons.front().replace(options.tool_jsons.front().find("read a file"), 11,
+                                           "inspect a file");
+        const auto changed =
+            fi::encode_rendered_chat(official_tokenizer(), chat->render(messages, options));
+        failures += check(changed.system_prompt_frontier &&
+                              std::vector<int>(changed.input_ids.begin(),
+                                               changed.input_ids.begin() +
+                                                   *changed.system_prompt_frontier) != prefix,
+                          "different tool definitions reused a system identity");
+        options.mark_system_prompt = false;
+        const auto disabled =
+            fi::encode_rendered_chat(official_tokenizer(), chat->render(messages, options));
+        failures +=
+            check(!disabled.system_prompt_frontier && disabled.input_ids == changed.input_ids,
+                  "opt-out changed tokens or retained capture metadata");
+    }
+    return failures;
+}
+
 int main() {
     if (std::getenv("NINFER_BENCH_ENCODE") != nullptr) { return run_encode_bench(); }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
+    failures += test_system_prompt_frontiers();
     failures += test_official_tokenizer_merge();
     failures += test_official_chat_template();
     failures += test_literal_content_provenance();

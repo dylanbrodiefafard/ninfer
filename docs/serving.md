@@ -655,6 +655,18 @@ These diagnostics contain no prompt, reasoning, tool arguments, or token text, a
 enter HTTP model-output chunks. Tool grammar is continuously enforced rather than a
 recovery trigger; its normal operation does not emit recovery events.
 
+With `--kv-ram-system-prompts N`, the RAM cache can retain N distinct rendered system prefixes even
+when the first user message differs. The feature defaults to zero/off and shares
+`--kv-ram-capacity`; it does not enable disk caching. `/metrics.json` exposes
+`kv_ram.system_prompts` with `limit`, `entries`, `used_bytes`, `restores`, and `evictions`.
+Prometheus exposes the corresponding `ninfer_kv_ram_system_prompt_limit`, `_entries`, `_used_bytes`,
+`_restores_total`, and `_evictions_total` series. The per-request completion log includes
+`system_cached=Ntok` and structured `result.system_prompt_cache_hit_tokens`: the number restored
+specifically from a retained system-prefix entry for the initial prefill, not a sum across recovery
+attempts. A longer conversation-prefix hit can win instead and is reported in the existing `cache`
+count and `reuse_source`. These are cache observations, not a claim that every system prompt fits or
+that every restore improves latency.
+
 ### Response object and usage
 
 A terminal wire response has `object: "response"`, one of `completed`, `incomplete`, or
@@ -965,7 +977,6 @@ For the measured three-decode-lane setup:
   --mixed-forward-min-tokens 4096
 ```
 
-
 With p-less disabled, Engine selects sampling defaults from the loaded model and the request's
 resolved thinking mode.
 Qwen3.6-27B uses `1.0/0.95/20/0/0` for temperature/top-p/top-k/min-p/presence penalty in thinking
@@ -1063,7 +1074,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v21 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v22 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 

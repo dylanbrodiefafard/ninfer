@@ -344,15 +344,20 @@ private:
     }
 
     static void assign_kv_ram_stats(RuntimeStats& out, const auto& ram) noexcept {
-        out.kv_ram_captures       = ram.captures;
-        out.kv_ram_restores       = ram.restores;
-        out.kv_ram_evictions      = ram.evictions;
-        out.kv_ram_drops          = ram.drops;
-        out.kv_ram_save_seconds   = ram.save_seconds;
-        out.kv_ram_load_seconds   = ram.load_seconds;
-        out.kv_ram_capacity_bytes = ram.capacity_bytes;
-        out.kv_ram_used_bytes     = ram.used_bytes;
-        out.kv_ram_entry_count    = ram.entry_count;
+        out.kv_ram_captures                 = ram.captures;
+        out.kv_ram_restores                 = ram.restores;
+        out.kv_ram_evictions                = ram.evictions;
+        out.kv_ram_drops                    = ram.drops;
+        out.kv_ram_save_seconds             = ram.save_seconds;
+        out.kv_ram_load_seconds             = ram.load_seconds;
+        out.kv_ram_capacity_bytes           = ram.capacity_bytes;
+        out.kv_ram_used_bytes               = ram.used_bytes;
+        out.kv_ram_entry_count              = ram.entry_count;
+        out.kv_ram_system_prompt_limit      = ram.system_prompt_limit;
+        out.kv_ram_system_prompt_entries    = ram.system_prompt_entries;
+        out.kv_ram_system_prompt_used_bytes = ram.system_prompt_used_bytes;
+        out.kv_ram_system_prompt_restores   = ram.system_prompt_restores;
+        out.kv_ram_system_prompt_evictions  = ram.system_prompt_evictions;
     }
 
     static void assign_kv_disk_stats(RuntimeStats& out, const auto& disk) noexcept {
@@ -893,9 +898,10 @@ private:
         result.finish_reason           = reason;
         result.timings.prepare_seconds = request->prepare_seconds;
         if (request->begin) {
-            result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
-            result.prefix_reuse_path    = request->begin->prefix_reuse_path;
-            result.prefix_reuse_source  = request->begin->prefix_reuse_source;
+            result.reused_prompt_tokens           = request->begin->reused_prompt_tokens;
+            result.system_prompt_cache_hit_tokens = request->begin->system_prompt_cache_hit_tokens;
+            result.prefix_reuse_path              = request->begin->prefix_reuse_path;
+            result.prefix_reuse_source            = request->begin->prefix_reuse_source;
         }
         if (request->lane) {
             result.captured_context_checkpoint_tokens =

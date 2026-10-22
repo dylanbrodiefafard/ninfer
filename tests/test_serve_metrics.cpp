@@ -95,15 +95,20 @@ int main() {
     metrics.attach(options, load, {}, "id \"quoted\"\nline", "13.1", "13.1");
 
     ScrapeInputs inputs;
-    inputs.stats.kv_ram_used_bytes             = 4096;
-    inputs.stats.kv_disk_spill_active          = true;
-    inputs.stats.kv_disk_defrag_active         = true;
-    inputs.stats.kv_disk_storage_bytes         = 8388608;
-    inputs.stats.kv_disk_restore_active        = true;
-    inputs.stats.kv_disk_pending_jobs          = 3;
-    inputs.stats.kv_disk_spill_elapsed_seconds = 12.165;
-    const auto snapshot                        = metrics.snapshot(inputs);
-    const std::string text                     = snapshot.prometheus_text();
+    inputs.stats.kv_ram_system_prompt_limit      = 4;
+    inputs.stats.kv_ram_system_prompt_entries    = 2;
+    inputs.stats.kv_ram_system_prompt_used_bytes = 2048;
+    inputs.stats.kv_ram_system_prompt_restores   = 7;
+    inputs.stats.kv_ram_system_prompt_evictions  = 3;
+    inputs.stats.kv_ram_used_bytes               = 4096;
+    inputs.stats.kv_disk_spill_active            = true;
+    inputs.stats.kv_disk_defrag_active           = true;
+    inputs.stats.kv_disk_storage_bytes           = 8388608;
+    inputs.stats.kv_disk_restore_active          = true;
+    inputs.stats.kv_disk_pending_jobs            = 3;
+    inputs.stats.kv_disk_spill_elapsed_seconds   = 12.165;
+    const auto snapshot                          = metrics.snapshot(inputs);
+    const std::string text                       = snapshot.prometheus_text();
     failures += check(contains(text, "ninfer_kv_disk_spill_active 1\n") &&
                           contains(text, "ninfer_kv_disk_defrag_active 1\n") &&
                           contains(text, "ninfer_kv_disk_storage_bytes 8388608\n") &&
@@ -126,6 +131,12 @@ int main() {
     failures += check(sum_at != std::string::npos && text.find(',', sum_at) != sum_at,
                       "phase histogram sum is missing");
 
+    failures += check(contains(text, "ninfer_kv_ram_system_prompt_limit 4\n") &&
+                          contains(text, "ninfer_kv_ram_system_prompt_entries 2\n") &&
+                          contains(text, "ninfer_kv_ram_system_prompt_used_bytes 2048\n") &&
+                          contains(text, "ninfer_kv_ram_system_prompt_restores_total 7\n") &&
+                          contains(text, "ninfer_kv_ram_system_prompt_evictions_total 3\n"),
+                      "system prefix occupancy/LRU counters were lost");
     inputs.stats.kv_cache_fallbacks = 10;
     const std::string first         = metrics.snapshot(inputs).prometheus_text();
     inputs.stats.kv_cache_fallbacks = 20;
@@ -263,6 +274,11 @@ int main() {
                           json.at("kv_disk").at("pending_jobs") == 3 &&
                           json.at("kv_disk").at("spill_elapsed_seconds") == 12.165,
                       "JSON metrics snapshot lost active disk work");
+    const auto& system_prompts = json.at("kv_ram").at("system_prompts");
+    failures += check(system_prompts.at("limit") == 4 && system_prompts.at("entries") == 2 &&
+                          system_prompts.at("used_bytes") == 2048 &&
+                          system_prompts.at("restores") == 7 && system_prompts.at("evictions") == 3,
+                      "JSON metrics snapshot lost system prefix counters");
     failures += check(json.at("kv_ram").at("used_bytes") == 4096,
                       "kv_ram.used_bytes drifted from the snapshot");
     failures += check(json.at("phases").at("decode").at("count") == 1,

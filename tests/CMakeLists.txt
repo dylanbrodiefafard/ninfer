@@ -257,6 +257,19 @@ foreach(backend dflash)
   set_tests_properties(ninfer_qwen3_6_27b_${backend}_cache_interleavings_real_test PROPERTIES
     SKIP_RETURN_CODE 77 TIMEOUT 900)
 endforeach()
+ninfer_add_test(ninfer_qwen3_8_27b_system_prompt_cache_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_system_prompt_cache_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_system_prompt_cache_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME ninfer_qwen3_8_27b_dflash_system_prompt_cache_real_test
+  COMMAND ninfer_qwen3_8_27b_system_prompt_cache_real_test dflash)
+set_tests_properties(ninfer_qwen3_8_27b_dflash_system_prompt_cache_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME ninfer_qwen3_8_27b_dflash_system_prompt_cache_c8_real_test
+  COMMAND ninfer_qwen3_8_27b_system_prompt_cache_real_test dflash --c8)
+set_tests_properties(ninfer_qwen3_8_27b_dflash_system_prompt_cache_c8_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900)
 ninfer_add_test(ninfer_qwen3_6_27b_dflash_cache_cancel_real_test
   SOURCES targets/qwen3_6_27b/test_engine_dflash_cache_cancel_real.cpp
   LIBRARIES ninfer_engine)

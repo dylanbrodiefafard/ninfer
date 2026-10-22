@@ -78,6 +78,7 @@ struct PreparedPromptData {
     // Sorted absolute token indexes of turn-closure frontiers inside this prompt. A cold prefill
     // stops at each one so its state matches a checkpoint captured on an earlier turn.
     std::vector<std::uint32_t> turn_closure_frontiers;
+    std::optional<std::uint32_t> system_prompt_frontier;
     std::vector<float> patches;
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;

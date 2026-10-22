@@ -251,15 +251,20 @@ ProbePlan fitted_plan() {
 }
 
 struct RamSnapshot {
-    std::size_t capacity_bytes = 0;
-    std::size_t used_bytes     = 0;
-    std::size_t entry_count    = 0;
-    std::uint64_t captures     = 0;
-    std::uint64_t restores     = 0;
-    std::uint64_t evictions    = 0;
-    std::uint64_t drops        = 0;
-    double save_seconds        = 0;
-    double load_seconds        = 0;
+    std::uint32_t system_prompt_limit     = 0;
+    std::size_t system_prompt_entries     = 0;
+    std::size_t system_prompt_used_bytes  = 0;
+    std::uint64_t system_prompt_restores  = 0;
+    std::uint64_t system_prompt_evictions = 0;
+    std::size_t capacity_bytes            = 0;
+    std::size_t used_bytes                = 0;
+    std::size_t entry_count               = 0;
+    std::uint64_t captures                = 0;
+    std::uint64_t restores                = 0;
+    std::uint64_t evictions               = 0;
+    std::uint64_t drops                   = 0;
+    double save_seconds                   = 0;
+    double load_seconds                   = 0;
 };
 
 struct DiskSnapshot {

@@ -88,7 +88,8 @@ namespace ninfer::targets::qwen3_6 {
 class EncodedHistoryPrepare {
 public:
     [[nodiscard]] static PreparedPrompt prepare(const Frontend& frontend, PromptInput input,
-                                                frontend_internal::EncodedHistoryCache& cache);
+                                                frontend_internal::EncodedHistoryCache& cache,
+                                                bool cache_system_prompt = false);
     [[nodiscard]] static std::uint32_t count_tokens(const Frontend& frontend, PromptInput input,
                                                     frontend_internal::EncodedHistoryCache& cache);
 };

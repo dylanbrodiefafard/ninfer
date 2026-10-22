@@ -625,11 +625,27 @@ std::optional<std::size_t> checkpoint_prefix_tokens(const Tokenizer& tokenizer,
     return prefix.size();
 }
 
+void set_system_prompt_frontier(EncodedChat& encoded, const Tokenizer& tokenizer,
+                                const RenderedChat& rendered) {
+    if (!rendered.system_prompt_end) { return; }
+    const auto end = *rendered.system_prompt_end;
+    if (end == 0 || end > rendered.text.size()) { return; }
+    const auto prefix = tokenizer.encode(std::string_view(rendered.text).substr(0, end), {},
+                                         literal_spans_between(rendered.literal_spans, 0, end));
+    if (prefix.empty() || prefix.size() >= encoded.input_ids.size() ||
+        prefix.size() > std::numeric_limits<std::uint32_t>::max() ||
+        !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
+        return;
+    }
+    encoded.system_prompt_frontier = static_cast<std::uint32_t>(prefix.size());
+}
+
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
     EncodedChat encoded;
     if (!rendered.rewrite_checkpoint) {
         encoded.input_ids = tokenizer.encode(rendered.text, {}, rendered.literal_spans);
         append_turn_closure_frontiers(encoded, tokenizer, rendered);
+        set_system_prompt_frontier(encoded, tokenizer, rendered);
         return encoded;
     }
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
@@ -652,6 +668,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         .generation_opener = rendered.rewrite_checkpoint->generation_opener,
     };
     append_turn_closure_frontiers(encoded, tokenizer, rendered);
+    set_system_prompt_frontier(encoded, tokenizer, rendered);
     return encoded;
 }
 
@@ -723,6 +740,7 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
     output.input_ids              = std::move(encoded.input_ids);
     output.rewrite_checkpoint     = encoded.rewrite_checkpoint;
     output.turn_closure_frontiers = std::move(encoded.turn_closure_frontiers);
+    output.system_prompt_frontier = encoded.system_prompt_frontier;
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {
