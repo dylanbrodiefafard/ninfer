@@ -39,9 +39,19 @@
 
 // Fault only allocations on the executor thread during the explicit teardown
 // regression. CUDA callbacks and controller threads retain their normal allocator.
-thread_local bool fail_ram_teardown_allocations = false;
+thread_local bool fail_ram_teardown_allocations    = false;
+thread_local int credit_allocations_before_failure = -1;
+thread_local bool credit_allocation_failed         = false;
 
 void* operator new(std::size_t bytes) {
+    if (credit_allocations_before_failure >= 0) {
+        const bool fail_allocation = credit_allocations_before_failure == 0;
+        --credit_allocations_before_failure;
+        if (fail_allocation) {
+            credit_allocation_failed = true;
+            throw std::bad_alloc();
+        }
+    }
     if (fail_ram_teardown_allocations) { throw std::bad_alloc(); }
     if (void* memory = std::malloc(bytes == 0 ? 1 : bytes)) { return memory; }
     throw std::bad_alloc();
@@ -6021,6 +6031,77 @@ int test_oversized_capture_preserves_fifo(ninfer::DeviceContext& ctx, ninfer::Pa
     return 0;
 }
 
+int test_live_credit_allocation_failure() {
+    namespace q36                  = ninfer::targets::qwen3_6;
+    constexpr std::size_t capacity = 1ULL << 20;
+    int failures                   = 0;
+    for (const bool relocate : {false, true}) {
+        bool completed         = false;
+        bool exercised_failure = false;
+        for (int stage = 0; stage < 16 && !completed; ++stage) {
+            q36::detail::KVRamCache cache(capacity);
+            std::pair<void*, std::size_t> original;
+            std::pair<void*, std::size_t> blocker;
+            if (relocate) {
+                if (!cache.reserve_live_credit(1, 256) || !cache.reserve_live_credit(2, 256)) {
+                    return fail("credit allocation fixture could not reserve its credits");
+                }
+                original = cache.live_credit_view(1);
+                blocker  = cache.live_credit_view(2);
+                std::memset(original.first, 0x5a, original.second);
+                std::memset(blocker.first, 0xa5, blocker.second);
+            }
+            const auto before                 = cache.snapshot().used_bytes;
+            credit_allocation_failed          = false;
+            credit_allocations_before_failure = stage;
+            bool escaped                      = false;
+            bool reserved                     = false;
+            try {
+                reserved = cache.reserve_live_credit(1, 512);
+            } catch (const std::bad_alloc&) { escaped = true; }
+            credit_allocations_before_failure = -1;
+            if (credit_allocation_failed) {
+                exercised_failure = true;
+                if (escaped || reserved || cache.snapshot().used_bytes != before) {
+                    failures +=
+                        fail("credit metadata pressure escaped or changed secured capacity");
+                }
+                if (relocate) {
+                    const auto current   = cache.live_credit_view(1);
+                    const auto peer      = cache.live_credit_view(2);
+                    const auto unchanged = [](const auto& view, unsigned char value) {
+                        const auto bytes =
+                            std::span(static_cast<const unsigned char*>(view.first), view.second);
+                        return std::all_of(bytes.begin(), bytes.end(),
+                                           [value](auto byte) { return byte == value; });
+                    };
+                    if (current != original || peer != blocker || !unchanged(current, 0x5a) ||
+                        !unchanged(peer, 0xa5)) {
+                        failures += fail("failed credit relocation changed existing ownership");
+                    }
+                }
+                if (!cache.reserve_live_credit(1, 512)) {
+                    failures += fail("credit funding did not recover after metadata pressure");
+                }
+            } else {
+                completed = reserved && !escaped;
+            }
+            cache.release_live_credit(1);
+            if (relocate) { cache.release_live_credit(2); }
+            // Snapshot counters cannot expose a provisional arena block leaked before credit
+            // publication. Reusing the complete arena checks the allocation ownership itself.
+            if (!cache.reserve_live_credit(3, capacity)) {
+                failures += fail("failed credit publication leaked pinned arena capacity");
+            }
+            cache.release_live_credit(3);
+        }
+        if (!completed || !exercised_failure) {
+            failures += fail("credit allocation regression did not exercise failure and success");
+        }
+    }
+    return failures;
+}
+
 int test_live_credit_invalidates_unclaimed_match(ninfer::DeviceContext& ctx,
                                                  ninfer::PagedKVPool& pool) {
     namespace q36                  = ninfer::targets::qwen3_6;
@@ -6198,6 +6279,11 @@ int main(int argc, char** argv) {
 
     int failures = 0;
     ninfer::DeviceContext ctx(0);
+    if (argc == 3 && std::strcmp(argv[1], "--case") == 0 &&
+        std::strcmp(argv[2], "credit-allocation") == 0) {
+        return test_live_credit_allocation_failure();
+    }
+
 
     auto paged_plan = plan_paged_cache(10, 10, 2,
                                        {{ninfer::DType::I8, 64, 2},
@@ -6421,6 +6507,7 @@ int main(int argc, char** argv) {
     failures += test_bounded_ram_lifecycle(ctx, paged_pool);
     failures += test_oversized_capture_preserves_fifo(ctx, paged_pool);
     failures += test_claimed_capacity_capture_preserves_fifo(ctx, paged_pool);
+    failures += test_live_credit_allocation_failure();
     failures += test_live_credit_invalidates_unclaimed_match(ctx, paged_pool);
     failures += test_ram_copy_sync_does_not_hold_io_mutex(ctx, paged_pool);
 

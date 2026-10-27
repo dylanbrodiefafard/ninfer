@@ -330,7 +330,10 @@ finite RAM can still limit concurrency. RAM off retains full-lifetime GPU reserv
 
 `--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles and secured live continuations. It is
 not a token capacity, does not enlarge the GPU pool, and defaults to `off`. `N` must be a positive
-decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated.
+decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated. The full
+configured arena is prefaulted and pinned at startup, including unused capacity. Cache payload
+usage excludes that unused reservation and the separate checkpoint slab; leave RAM for the
+process, disk-cache metadata, and the operating system.
 `--kv-disk-capacity N` is a third-tier SSD pack-file budget in MiB. It requires
 `--kv-ram-capacity > 0` and `--kv-disk-location PATH`. Location without capacity is an error.
 The bound covers allocated pack extents, reusable free slots, and writes in progress. Evicted

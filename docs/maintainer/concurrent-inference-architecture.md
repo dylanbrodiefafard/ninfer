@@ -1103,6 +1103,22 @@ preserves the source and falls back to cold prefill. Generation recovery keeps i
 while restoring or cold-prefilling the retry. It refreshes a stale host lookup once, then cold-prefills
 if that refreshed restore is also stale. Other request-local failures drain and fail only the
 request; other exceptions remain Engine-fatal.
+Allocation failure during optional retained-prefix capture, including RAM eviction-candidate
+bookkeeping, drops that capture without failing inference. Disk-assisted RAM reclaim reports
+`Failed` and counts `optional_alloc` when its metadata allocation fails; it preserves the resident
+images so a later reclaim can retry. CUDA and state-integrity errors retain their fatal semantics.
+Live suspension-credit reservation also returns unfunded on host metadata allocation failure,
+retaining existing secured credits and live images. This allows the scheduler to reduce or defer
+admission using the same resource policy as contiguous RAM exhaustion.
+Window grants reserve host page-vector metadata before committing GPU entitlements; allocation
+failure leaves the funded window unchanged. Suspension insertion and capture metadata failure
+leave the resident continuation intact. Resume metadata failure fences transfer work and clears
+only the partial destination, preserving the parked source for retry. Failed cleanup synchronization
+remains fatal. Suspended-window planning reads stored image page floors without allocating host
+image descriptors.
+
+
+
 If the held request is cancelled or fails before admit-complete, drain waits for those copies,
 harvests, releases unused RAM/disk claims, discards only sources classified invalid, and calls
 `evict_retained_lane` on every selected victim not yet evicted. A failed restore releases those
@@ -1862,6 +1878,11 @@ startup、CLI 和 caller-requested 的完整 arena diagnostics。
 GPU execution 或 state-integrity failure 属于 Engine-wide failure：停止 admission，active 和 queued
 requests 以 unavailable/failure 结束，重新创建 Engine 后才能恢复 serving。Scheduler 不猜测 failed
 shared round 中某一行可以安全继续。
+Worker failure closes admission before cache-tier cleanup begins. `Engine::available()` reads only
+the admission state, without waiting for GPU execution or disk cleanup. Serving returns HTTP 503
+with `{"status":"unavailable"}` from `/health` after worker failure or while stopping; a busy or
+full healthy executor continues to return HTTP 200 with `{"status":"ok"}`.
+
 
 ---
 

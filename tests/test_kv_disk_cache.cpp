@@ -11626,6 +11626,50 @@ int test_ram_reclaim_waits_for_inflight_spill(ninfer::DeviceContext& ctx,
     return failures;
 }
 
+int test_ram_reclaim_allocation_failure(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    TmpDir dir("ram-reclaim-allocation");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto allocation = pool.reserve(4);
+    allocation.materialize_pages(3, ctx.stream);
+    auto config = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                              64ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(config));
+    const auto entry =
+        capture_tokens(ram, pool, allocation, ctx, std::vector<ninfer::TokenId>(64, 47));
+    disk.note_ram_resident(entry, 0);
+    if (!disk.emergency_spill_ram(entry)) {
+        return fail("reclaim allocation fixture spill failed");
+    }
+    disk.wait_idle_and_fsync();
+    ram.wait_pending_copies();
+    int failures      = 0;
+    const auto before = disk.snapshot();
+    for (const bool may_block : {false, true}) {
+        // The caller's first allocation is the RAM eviction-candidate snapshot. Workers keep
+        // their allocator, so this reproduces metadata pressure without perturbing disk I/O.
+        fail_next_disk_allocation = true;
+        bool escaped              = false;
+        auto result               = q36::detail::RamReclaim::NoVictim;
+        try {
+            result = disk.reclaim_ram_entry(may_block);
+        } catch (const std::bad_alloc&) { escaped = true; }
+        const bool injected = !std::exchange(fail_next_disk_allocation, false);
+        if (!injected || escaped || result != q36::detail::RamReclaim::Failed ||
+            ram.fifo_ids() != std::vector<std::uint64_t>{entry} || disk.ram_reclaim_pending()) {
+            failures +=
+                fail("optional RAM reclaim allocation failure escaped or changed its source");
+        }
+    }
+    const auto after  = disk.snapshot();
+    const auto reason = static_cast<std::size_t>(ninfer::KvDiskDropReason::OptionalAlloc);
+    if (after.drop_reasons[reason] != before.drop_reasons[reason] + 2 ||
+        disk.reclaim_ram_entry(false) != q36::detail::RamReclaim::Evicted ||
+        !ram.fifo_ids().empty()) {
+        failures += fail("RAM reclaim did not recover after allocation pressure cleared");
+    }
+    return failures;
+}
+
 // An admission that captures several lanes rolls every capture back when it
 // defers. Its own earlier capture must not become a later capture's reclaim
 // target, or each retry recaptures it, targets it and rolls it back again.
@@ -18488,6 +18532,10 @@ int main(int argc, char** argv) {
         return test_bounded_storage(ctx, paged_pool);
     }
     if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+        std::string_view(argv[2]) == "reclaim-allocation") {
+        return test_ram_reclaim_allocation_failure(ctx, paged_pool);
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--case" &&
         std::string_view(argv[2]) == "spill-allocation") {
         return test_spill_batch_allocation_and_promotion(ctx);
     }
@@ -18668,6 +18716,7 @@ int main(int argc, char** argv) {
     failures += test_spill_pin_waits_only_its_entry(ctx, paged_pool);
     failures += test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool);
     failures += test_ram_reclaim_waits_for_inflight_spill(ctx, paged_pool);
+    failures += test_ram_reclaim_allocation_failure(ctx, paged_pool);
     failures += test_ram_reclaim_skips_attempt_captures(ctx, paged_pool);
     failures += test_restore_setup_ready_tracks_window_reads(ctx, paged_pool);
     failures += test_disk_fifo_evict_clears_ram_durable(ctx, paged_pool);

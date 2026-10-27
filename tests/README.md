@@ -63,7 +63,12 @@ preservation and guards. Its `--sanitizer` case covers B6/W12.
   is prefilled in place, the longer host checkpoint wins, a failed admission restore is
   discarded and the requeued request is computed cold, and a failed recovery restore
   cold-prefills the same lane without sticking that fallback. The live retain, copy,
-  abort, and RAM restore sequence is `targets/qwen3_6_27b/test_recovery_kv_real.cpp`;
+  abort, and RAM restore sequence is `targets/qwen3_6_27b/test_recovery_kv_real.cpp`. Its
+  `--live-allocation all` cases inject suspension, post-DMA resume, and window-growth metadata
+  failures, then check exact continuation state and next tokens/logprobs after retry. The
+  `test_engine_ram_real.cpp --case capture-allocation` route verifies real DFlash K7/NVFP4
+  request and peer survival, cached-source reuse, and later reclaim with RAM-only and disk-assisted
+  eviction allocation failures;
 - `test_typical_cycle.cpp` — suffix-square boundaries, exact repeated-passage evidence,
   non-overlapping coverage, changing/large periods, and productive-length negative controls;
 - `test_serve_metrics.cpp`, `test_request_log.cpp`, and `test_http_error_handler.cpp` — Prometheus

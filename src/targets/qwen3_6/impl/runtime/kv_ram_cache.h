@@ -220,6 +220,8 @@ public:
     [[nodiscard]] bool is_claimed(std::uint64_t entry_id) const;
 
     // Credits own real contiguous arena blocks; live images borrow them and are never indexed.
+    // Returns false when contiguous capacity or host metadata cannot be secured. Existing
+    // credits/images remain valid; unclaimed optional prefixes may be evicted while trying.
     [[nodiscard]] bool reserve_live_credit(std::uint64_t owner, std::size_t bytes);
     void release_live_credit(std::uint64_t owner);
     [[nodiscard]] std::pair<void*, std::size_t> live_credit_view(std::uint64_t owner) const;
@@ -324,6 +326,14 @@ public:
 
     void test_fail_next_capture_metadata_allocation() noexcept {
         fail_next_capture_metadata_allocation_ = true;
+    }
+
+    static void test_fail_next_eviction_snapshot_allocation() noexcept {
+        fail_next_eviction_snapshot_allocation_.store(true, std::memory_order_release);
+    }
+
+    [[nodiscard]] static bool test_eviction_snapshot_allocation_pending() noexcept {
+        return fail_next_eviction_snapshot_allocation_.load(std::memory_order_acquire);
     }
 
     static void test_fail_next_plan_metadata_allocation() noexcept {
@@ -480,6 +490,7 @@ private:
     int fail_copy_event_allocation_after_       = -1;
     inline static std::atomic<bool> fail_next_restore_metadata_allocation_{false};
     inline static std::atomic<bool> fail_next_plan_metadata_allocation_{false};
+    inline static std::atomic<bool> fail_next_eviction_snapshot_allocation_{false};
     void (*before_copy_completion_)(void*, cudaStream_t) = nullptr;
     void* before_copy_completion_state_                  = nullptr;
     int fail_copy_snapshot_allocation_stage_             = -1;

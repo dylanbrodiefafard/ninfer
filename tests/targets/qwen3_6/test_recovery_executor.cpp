@@ -27,6 +27,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -720,7 +721,7 @@ public:
         cache_idle_permission.store(idle);
     }
 
-    void shutdown_kv_tiers(const ninfer::LoadProgress& = {}) {}
+    virtual void shutdown_kv_tiers(const ninfer::LoadProgress& = {}) {}
 
     [[nodiscard]] RamSnapshot kv_ram_snapshot() const noexcept { return {}; }
 
@@ -4724,9 +4725,194 @@ int run_unused_window_reclamation(Frontend& frontend) {
     return failures;
 }
 
-int main() {
+class AvailabilityProgram final : public ProbeProgram {
+public:
+    enum class Fault {
+        PrefillAllocation,
+        DecodeAllocation,
+        StableDecodeAllocation,
+        PrefillInvariant,
+        RequestLocal
+    };
+
+    explicit AvailabilityProgram(Fault fault) : fault_(fault) {}
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
+                                                       ProbePlan plan, TransientRegion region,
+                                                       PrefillPace pace,
+                                                       const OutputSession* output) override {
+        if (!injected_) {
+            {
+                std::unique_lock lock(mutex_);
+                prefill_entered_ = true;
+                cv_.notify_all();
+                if (!cv_.wait_for(lock, std::chrono::seconds(5),
+                                  [&] { return release_prefill_; })) {
+                    throw std::runtime_error("availability prefill gate timed out");
+                }
+            }
+            injected_ = true;
+            if (fault_ == Fault::PrefillAllocation) { throw std::bad_alloc(); }
+            if (fault_ == Fault::PrefillInvariant) {
+                throw std::logic_error("availability invariant failure");
+            }
+            if (fault_ == Fault::RequestLocal) {
+                throw ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
+                                           "availability request-local failure");
+            }
+        }
+        auto step =
+            ProbeProgram::start_prefill_lane(lane, std::move(prompt), plan, region, pace, output);
+        if (fault_ == Fault::DecodeAllocation || fault_ == Fault::StableDecodeAllocation) {
+            step.round.tokens = std::span<const TokenId>(&continuation_, 1);
+        }
+        return step;
+    }
+
+    [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t>,
+                                                     std::span<const RoundBudget>) override {
+        if (fault_ == Fault::StableDecodeAllocation && ++decode_calls == 1) {
+            return {.tokens     = std::span<const TokenId>(&continuation_, 1),
+                    .row_counts = std::span<const std::int32_t>(&row_count_, 1),
+                    .row_stride = 1};
+        }
+        throw std::bad_alloc();
+    }
+
+    std::uint32_t decode_calls = 0;
+
+    void shutdown_kv_tiers(const ninfer::LoadProgress& = {}) override {
+        if (fault_ == Fault::RequestLocal) { return; }
+        std::unique_lock lock(mutex_);
+        shutdown_entered_ = true;
+        cv_.notify_all();
+        if (!cv_.wait_for(lock, std::chrono::seconds(5), [&] { return release_shutdown_; })) {
+            throw std::runtime_error("availability shutdown gate timed out");
+        }
+    }
+
+    bool wait_for_prefill() { return wait_for(prefill_entered_); }
+
+    bool wait_for_shutdown() { return wait_for(shutdown_entered_); }
+
+    void release_prefill() { release(release_prefill_); }
+
+    void release_shutdown() { release(release_shutdown_); }
+
+private:
+    bool wait_for(const bool& flag) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [&] { return flag; });
+    }
+
+    void release(bool& flag) {
+        std::lock_guard lock(mutex_);
+        flag = true;
+        cv_.notify_all();
+    }
+
+    const Fault fault_;
+    bool injected_                = false;
+    const TokenId continuation_   = 1000 + 'a';
+    const std::int32_t row_count_ = 1;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool prefill_entered_  = false;
+    bool shutdown_entered_ = false;
+    bool release_prefill_  = false;
+    bool release_shutdown_ = false;
+};
+
+int run_executor_availability(Frontend& frontend) {
+    int failures = 0;
+    using Fault  = AvailabilityProgram::Fault;
+    for (const auto fault :
+         {Fault::PrefillAllocation, Fault::DecodeAllocation, Fault::StableDecodeAllocation,
+          Fault::PrefillInvariant, Fault::RequestLocal}) {
+        AvailabilityProgram program(fault);
+        ProbeLoaded loaded{frontend};
+        RecoveryProbe instance{&program, &loaded, {}};
+        auto options                = engine_options();
+        options.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, options);
+        auto submit = [&] {
+            auto prompt        = frontend.prepare(thinking_input());
+            const auto summary = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions request;
+            request.execution.allow_prefix_reuse      = false;
+            request.execution.requested_output_tokens = kOutputBudget;
+            request.stop.token_ids                    = {kCallerStop};
+            return executor.submit(std::move(prompt), summary, 0.0, std::move(request),
+                                   ninfer::OutputDelivery::TerminalOnly);
+        };
+        failures += check(executor.available(), "idle executor was unavailable");
+        auto first = submit();
+        failures += check(program.wait_for_prefill(), "availability prefill did not start");
+        std::optional<decltype(first)> queued;
+        if (fault != Fault::StableDecodeAllocation) { queued.emplace(submit()); }
+        failures += check(executor.available(), "busy executor was unavailable");
+        program.release_prefill();
+        if (fault != Fault::RequestLocal) {
+            failures += check(program.wait_for_shutdown(), "fatal worker did not clean up tiers");
+            failures +=
+                check(!executor.available(), "fatal worker stayed available during cleanup");
+            bool rejected = false;
+            try {
+                auto unexpected = submit();
+            } catch (const ninfer::RequestError& error) {
+                rejected = error.kind() == ninfer::RequestErrorKind::Unavailable;
+            }
+            failures += check(rejected, "failed worker accepted a request during tier cleanup");
+            program.release_shutdown();
+        }
+        bool primary_preserved = false;
+        try {
+            (void)first.wait(nullptr, {});
+        } catch (const std::bad_alloc&) {
+            primary_preserved = fault == Fault::PrefillAllocation ||
+                                fault == Fault::DecodeAllocation ||
+                                fault == Fault::StableDecodeAllocation;
+        } catch (const ninfer::RequestError& error) {
+            primary_preserved = fault == Fault::RequestLocal &&
+                                error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+        } catch (const std::logic_error& error) {
+            primary_preserved = fault == Fault::PrefillInvariant &&
+                                std::string(error.what()) == "availability invariant failure";
+        }
+        failures += check(primary_preserved, "worker failure lost its original error");
+        if (queued) {
+            bool queued_completed = false;
+            try {
+                const auto result = queued->wait(nullptr, {});
+                queued_completed =
+                    fault == Fault::RequestLocal && result.finish_reason == FinishReason::StopToken;
+            } catch (const std::bad_alloc&) {
+                queued_completed =
+                    fault == Fault::PrefillAllocation || fault == Fault::DecodeAllocation;
+            } catch (const std::logic_error& error) {
+                queued_completed = fault == Fault::PrefillInvariant &&
+                                   std::string(error.what()) == "availability invariant failure";
+            }
+            failures +=
+                check(queued_completed, "queued request did not observe worker availability");
+        } else {
+            failures += check(program.decode_calls == 2,
+                              "stable decode fault did not follow a successful round");
+        }
+        failures += check(executor.available() == (fault == Fault::RequestLocal),
+                          "terminal worker availability did not match error ownership");
+    }
+    return failures;
+}
+
+int main(int argc, char** argv) {
     try {
-        Frontend frontend                = FrontendTestAccess::create_component(resources(), false);
+        Frontend frontend = FrontendTestAccess::create_component(resources(), false);
+        if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+            std::string_view(argv[2]) == "availability") {
+            return run_executor_availability(frontend);
+        }
+
         const CacheCase recovery_cases[] = {
             CacheCase::RecoveryRamRestoreFails, CacheCase::RecoveryResidentHit,
             CacheCase::RecoveryRamHit,          CacheCase::RecoveryDiskHit,
@@ -4820,6 +5006,7 @@ int main() {
         failures += run_idle_poll_does_not_block_submit(frontend);
         failures += run_admission_defers_for_reclaim(frontend);
         failures += run_cache_maintenance_idle(frontend);
+        failures += run_executor_availability(frontend);
         std::cout << "recovery executor failures=" << failures << '\n';
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

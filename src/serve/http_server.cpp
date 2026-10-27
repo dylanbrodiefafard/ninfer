@@ -23,6 +23,12 @@
 #include <utility>
 
 namespace ninfer::serve {
+void handle_health(bool available, httplib::Response& response) {
+    response.status = available ? 200 : 503;
+    response.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
+                         "application/json");
+}
+
 namespace {
 
 struct StreamingRequest {
@@ -461,8 +467,8 @@ void HttpServer::register_routes() {
             }
         });
 
-    server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+        handle_health(service_ != nullptr && service_->available(), res);
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         handle_metrics_scrape(res, false);

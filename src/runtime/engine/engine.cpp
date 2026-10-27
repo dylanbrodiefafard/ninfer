@@ -426,6 +426,20 @@ MemorySummary Engine::memory_summary() const {
         impl_->executor);
 }
 
+bool Engine::available() const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                return false;
+            } else {
+                return executor->available();
+            }
+        },
+        impl_->executor);
+}
+
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

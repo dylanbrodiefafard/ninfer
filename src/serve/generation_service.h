@@ -132,6 +132,8 @@ public:
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
+    [[nodiscard]] bool available() const { return engine_->available(); }
+
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
     [[nodiscard]] std::size_t in_flight_requests() const;

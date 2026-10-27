@@ -25,6 +25,9 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
 
+// Health reflects inference availability; a full request queue remains healthy.
+void handle_health(bool available, httplib::Response& response);
+
 class HttpServer {
 public:
     explicit HttpServer(ServeOptions options);

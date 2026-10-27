@@ -617,11 +617,14 @@ private:
     struct SuspendedRequest {
         SequenceState sequence;
         RequestControl request;
-        std::uint64_t entry_id                                  = 0;
-        std::size_t sampling_counts_offset                      = 0;
-        bool sampling_counts_present                            = false;
-        std::size_t pending_features_offset                     = 0;
-        std::size_t checkpoint_count                            = 0;
+        std::uint64_t entry_id              = 0;
+        std::size_t sampling_counts_offset  = 0;
+        bool sampling_counts_present        = false;
+        std::size_t pending_features_offset = 0;
+        std::size_t checkpoint_count        = 0;
+        // Image page floors remain available to admission without decoding host descriptors.
+        std::uint32_t text_pages                                = 0;
+        std::uint32_t backend_pages                             = 0;
         std::uint32_t lane                                      = 0;
         enum class Phase { Capturing, Parked, Restoring } phase = Phase::Capturing;
     };

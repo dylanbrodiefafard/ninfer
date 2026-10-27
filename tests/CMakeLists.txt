@@ -671,6 +671,17 @@ add_test(NAME ninfer_qwen3_8_27b_live_continuation_real_test
   COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_qwen3_6_27b_recovery_kv_real_test>
     --live-continuation)
 set_tests_properties(ninfer_qwen3_8_27b_live_continuation_real_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen3_8_27b_live_allocation_real_test
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_qwen3_6_27b_recovery_kv_real_test>
+    --live-allocation all)
+set_tests_properties(ninfer_qwen3_8_27b_live_allocation_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME ninfer_qwen3_8_27b_capture_allocation_real_test
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_qwen3_6_27b_ram_real_test>
+    --case capture-allocation)
+set_tests_properties(ninfer_qwen3_8_27b_capture_allocation_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 
 ninfer_add_test(ninfer_kv_pressure_policy_test SOURCES test_kv_pressure_policy.cpp)
 

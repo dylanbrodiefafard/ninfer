@@ -328,6 +328,11 @@ public:
         }
     }
 
+    [[nodiscard]] bool available() const {
+        std::lock_guard lock(queue_mutex_);
+        return !stopping_ && !failed_;
+    }
+
     [[nodiscard]] RuntimeStats runtime_stats() const {
         const auto disk = instance_.program->try_kv_disk_snapshot();
         RuntimeStats out;
@@ -4172,6 +4177,20 @@ private:
         }
     }
 
+    void fail_executor(const std::exception_ptr& error) noexcept {
+        {
+            std::lock_guard lock(queue_mutex_);
+            failed_ = true;
+        }
+        {
+            std::scoped_lock execution_lock(execution_mutex_);
+            drain_copy_hold_before_abort();
+            detail::run_secondary_cleanup(
+                [&] { instance_.program->shutdown_kv_tiers(load_progress_); });
+        }
+        fail_all(error);
+    }
+
     void fail_all(const std::exception_ptr& error) noexcept {
         std::scoped_lock execution_lock(execution_mutex_);
         std::vector<std::shared_ptr<Request>> pending;
@@ -4248,7 +4267,7 @@ private:
                     }
                     stable_decode_epoch = false;
                 } catch (...) {
-                    fail_all(std::current_exception());
+                    fail_executor(std::current_exception());
                     return;
                 }
             }
@@ -4448,13 +4467,7 @@ private:
                     continue;
                 }
             } catch (...) {
-                {
-                    std::scoped_lock execution_lock(execution_mutex_);
-                    drain_copy_hold_before_abort();
-                    detail::run_secondary_cleanup(
-                        [&] { instance_.program->shutdown_kv_tiers(load_progress_); });
-                }
-                fail_all(std::current_exception());
+                fail_executor(std::current_exception());
                 return;
             }
         }

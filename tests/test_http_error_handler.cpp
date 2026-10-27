@@ -22,6 +22,16 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
+    for (const bool available : {false, true}) {
+        httplib::Response response;
+        ninfer::serve::handle_health(available, response);
+        failures += check(response.status == (available ? 200 : 503) &&
+                              Json::parse(response.body) ==
+                                  Json{{"status", available ? "ok" : "unavailable"}} &&
+                              response.get_header_value("Content-Type") == "application/json",
+                          "health did not reflect inference availability");
+    }
+
     failures += check(ninfer::serve::is_unauthenticated_path("/health") &&
                           ninfer::serve::is_unauthenticated_path("/metrics") &&
                           ninfer::serve::is_unauthenticated_path("/metrics.json") &&

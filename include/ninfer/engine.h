@@ -103,6 +103,8 @@ public:
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
+    // Reports worker availability without waiting for GPU execution or cache-tier cleanup.
+    [[nodiscard]] bool available() const;
     void reset_memory_peaks() noexcept;
 
 private:

@@ -45,7 +45,7 @@ A later request cannot enable a capability omitted at startup.
 
 | Method and path | Behavior |
 |---|---|
-| `GET /health` | process health |
+| `GET /health` | inference availability: HTTP 200 when available, HTTP 503 after worker failure or during shutdown |
 | `GET /metrics` | Prometheus text exposition 0.0.4 |
 | `GET /metrics.json` | the same snapshot as JSON |
 | `GET /v1/models` | configured OpenAI model alias |

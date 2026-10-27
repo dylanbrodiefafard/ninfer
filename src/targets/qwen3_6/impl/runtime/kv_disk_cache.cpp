@@ -6921,7 +6921,7 @@ bool KVDiskCache::ram_reclaim_pending() const {
     return reclaim_waits_retired_ && config_.ram->retired_pending();
 }
 
-RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block, std::span<const std::uint64_t> keep) {
+RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block, std::span<const std::uint64_t> keep) try {
     if (config_.ram == nullptr) { return RamReclaim::NoVictim; }
     KVRamCache& ram = *config_.ram;
     // Waiting on, or dropping, an entry the caller's deferral would roll back
@@ -7072,6 +7072,11 @@ RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block, std::span<const std::u
     }
     forget_ram_resident(*victim);
     return RamReclaim::Evicted;
+} catch (const std::bad_alloc&) {
+
+    std::lock_guard lock(mutex_);
+    note_drop(KvDiskDropReason::OptionalAlloc);
+    return RamReclaim::Failed;
 }
 
 bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {

@@ -307,7 +307,7 @@ public:
     // flight, a spill still preparing, or a retired block still pinned by a spill
     // yields Pending; entries in `keep` (captures the caller would roll back on
     // Pending) are never waited on or dropped unsaved, and if only they remain the
-    // result is NoVictim.
+    // result is NoVictim. Host allocation failure returns Failed and preserves resident images.
     RamReclaim reclaim_ram_entry(bool may_block, std::span<const std::uint64_t> keep = {});
     // True while a Pending reclaim's spill has neither committed nor failed, or while the
     // retired RAM blocks it waits for are still pinned.

@@ -1601,6 +1601,89 @@ int exercise_restore_allocation_fallback(const char* artifact, bool dflash = fal
     return 0;
 }
 
+int exercise_capture_allocation_fallback(const char* artifact) {
+    using Ram = ninfer::targets::qwen3_6::detail::KVRamCache;
+    for (const bool disk : {false, true}) {
+        struct Directory {
+            std::filesystem::path path;
+
+            ~Directory() {
+                std::error_code error;
+                std::filesystem::remove_all(path, error);
+            }
+        } directory{std::filesystem::temp_directory_path() /
+                    ("ninfer-capture-allocation-" + std::to_string(::getpid()) + "-" +
+                     std::to_string(disk))};
+
+        auto options                       = ordinary_options(artifact, 2, 512, 256ULL << 20, 128);
+        options.kv_cache                   = ninfer::KvCacheStorage::Nvfp4;
+        options.speculative.backend        = ninfer::SpeculativeBackend::DFlash;
+        options.speculative.draft_tokens   = 7;
+        options.speculative.adaptive_draft = true;
+        options.speculative.proposal_head  = ninfer::ProposalHead::Optimized;
+        if (disk) {
+            options.kv_disk_capacity_bytes = 2ULL << 30;
+            options.kv_disk_location       = directory.path;
+        }
+        ninfer::Engine engine(options);
+        const auto first = engine.generate(engine.prepare_tokens(tokens_a()), greedy(4, false));
+        (void)engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
+        const auto last = engine.generate(engine.prepare_tokens(tokens_d()), greedy(4, false));
+        auto before     = engine.runtime_stats();
+        if (before.kv_ram_captures != 1 || before.kv_ram_entry_count != 1 ||
+            before.kv_ram_drops != 0 || before.kv_ram_evictions != 0) {
+            return fail("capture allocation fixture did not retain exactly one RAM source");
+        }
+        if (disk) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            while (engine.runtime_stats().kv_disk_captures == 0) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return fail("capture allocation fixture did not finish its disk spill");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        auto peer = engine.submit(
+            engine.prepare_tokens(resume_prefix(tokens_d(), last.generated_token_ids)),
+            greedy(256, true));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (engine.runtime_stats().decode_ready_requests == 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return fail("capture allocation peer did not enter decode");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        before = engine.runtime_stats();
+        Ram::test_fail_next_eviction_snapshot_allocation();
+        const auto result = engine.generate(engine.prepare_tokens(tokens_e()), greedy(8, false));
+        const auto after  = engine.runtime_stats();
+        const auto peer_result = peer.wait();
+        if (Ram::test_eviction_snapshot_allocation_pending() || !engine.available() ||
+            result.generated_token_ids.size() != 8 ||
+            peer_result.generated_token_ids.size() != 256 ||
+            after.kv_ram_drops != before.kv_ram_drops + 1 ||
+            after.kv_ram_captures != before.kv_ram_captures ||
+            after.kv_ram_evictions != before.kv_ram_evictions) {
+            return fail(
+                "capture allocation pressure failed a request, its peer, or the RAM source");
+        }
+        const auto history = resume_prefix(tokens_a(), first.generated_token_ids);
+        const auto reused  = engine.generate(engine.prepare_tokens(history), greedy(4, true));
+        if (expect_ram_hit(reused, static_cast<std::uint32_t>(history.size()),
+                           "capture allocation source") != 0) {
+            return 1;
+        }
+        const auto captures = engine.runtime_stats().kv_ram_captures;
+        (void)engine.generate(engine.prepare_tokens(tokens_b(32)), greedy(4, false));
+        (void)engine.generate(engine.prepare_tokens(tokens_d()), greedy(4, false));
+        if (!engine.available() || engine.runtime_stats().kv_ram_captures <= captures) {
+            return fail("capture/reclaim did not recover after allocation pressure cleared");
+        }
+        std::cout << "capture allocation fallback DFlash K7 NVFP4 C=2 disk=" << disk << " passed\n";
+    }
+    return 0;
+}
+
 // A preserve-off turn that stops without a tool call is stored in RAM cut at its turn
 // checkpoint (its generation opener). The next turn appends there, reusing the previous prompt
 // minus the 4-token no-thinking prologue, and decodes exactly what a resident turn-checkpoint
@@ -1761,8 +1844,15 @@ int main(int argc, char** argv) {
         argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "fallback";
     const bool planning_only =
         argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "planning";
+    const bool capture_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                              std::string(argv[2]) == "capture-allocation";
+    if (capture_only) {
+        const char* artifact = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+        if (artifact == nullptr || *artifact == '\0') { return 77; }
+        return exercise_capture_allocation_fallback(artifact);
+    }
     if (argc != 1 && !fallback_only && !planning_only) {
-        std::cerr << "usage: " << argv[0] << " [--case fallback|planning]\n";
+        std::cerr << "usage: " << argv[0] << " [--case fallback|planning|capture-allocation]\n";
         return 2;
     }
     const auto run = [fallback_only, planning_only](const char* artifact) {
@@ -1789,6 +1879,9 @@ int main(int argc, char** argv) {
     }
     if (dflash != nullptr && *dflash != '\0') {
         if (!planning_only && !fallback_only) {
+            if (const int result = exercise_capture_allocation_fallback(dflash); result != 0) {
+                return result;
+            }
             if (const int result = exercise_closed_turn_cut(dflash, true); result != 0) {
                 return result;
             }

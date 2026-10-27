@@ -16,10 +16,42 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+// Fault only the test caller's next C++ allocation; CUDA and host-copy workers keep their
+// allocators. Each fault is armed after model startup at a settled transaction boundary.
+thread_local bool fail_next_caller_allocation = false;
+thread_local bool caller_allocation_failed    = false;
+
+void* operator new(std::size_t bytes) {
+    if (std::exchange(fail_next_caller_allocation, false)) {
+        caller_allocation_failed = true;
+        throw std::bad_alloc();
+    }
+    if (void* memory = std::malloc(bytes == 0 ? 1 : bytes)) { return memory; }
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+
+// The replacement operator new uses malloc, so free is the matching release. GCC 13
+// diagnoses the inlined std::allocator path despite that pairing.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+
+void operator delete(void* memory) noexcept { std::free(memory); }
+
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+
+void operator delete[](void* memory) noexcept { std::free(memory); }
+
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+
+#pragma GCC diagnostic pop
 
 namespace {
 namespace target    = ninfer::targets::qwen3_6_27b::detail;
@@ -28,6 +60,8 @@ namespace execution = family::detail::qwen3_6_27b_runtime;
 using Package       = ninfer::targets::qwen3_6_27b::Package;
 
 constexpr std::size_t kRamBytes = 1024ULL * 1024ULL * 1024ULL;
+
+enum class AllocationFault { None, Suspend, Resume, Window, All };
 
 void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -359,7 +393,8 @@ void exercise_full_original_preservation(execution::ProgramImplCore& program,
 // Compare exact represented continuation bytes and the next target tokens/logprobs against
 // a cold run at the same execution profile. The transfer run leaves GDN history deferred until
 // start_suspend, so an omitted materialization cannot be hidden by the snapshot helper.
-void exercise_live_continuation(execution::ProgramImplCore& program, family::Frontend& frontend) {
+void exercise_live_continuation(execution::ProgramImplCore& program, family::Frontend& frontend,
+                                AllocationFault fault) {
     using ninfer::TokenId;
 
     struct Snapshot {
@@ -464,6 +499,15 @@ void exercise_live_continuation(execution::ProgramImplCore& program, family::Fro
         const std::uint64_t owner = sampled ? 2 : 1;
         require(program.reserve_suspension_credit(owner, small.suspension_bytes),
                 "live continuation could not secure RAM");
+        if (fault == AllocationFault::Suspend) {
+            const auto before           = snapshot(0);
+            caller_allocation_failed    = false;
+            fail_next_caller_allocation = true;
+            const bool started          = program.start_suspend(0, owner);
+            fail_next_caller_allocation = false;
+            require(caller_allocation_failed && !started && snapshot(0) == before,
+                    "suspension metadata allocation failure escaped or changed resident state");
+        }
         require(program.start_suspend(0, owner), "live continuation could not start capture");
         program.device.synchronize_all();
         require(program.suspension_ready(owner), "live capture did not settle");
@@ -474,7 +518,20 @@ void exercise_live_continuation(execution::ProgramImplCore& program, family::Fro
         start(1, sampled);
         (void)rounds(1, 1);
         program.abort_lane(1);
-        const auto restore = program.plan_suspended_window(owner, consumed + 1);
+        caller_allocation_failed    = false;
+        fail_next_caller_allocation = true;
+        const auto restore          = program.plan_suspended_window(owner, consumed + 1);
+        fail_next_caller_allocation = false;
+        require(!caller_allocation_failed,
+                "suspended-window planning allocated optional image descriptors");
+        if (fault == AllocationFault::Resume) {
+            using Ram = family::detail::KVRamCache;
+            Ram::test_fail_next_restore_metadata_allocation();
+            const bool started = program.start_resume(1, owner, restore);
+            require(!Ram::test_restore_metadata_failure_pending() && !started &&
+                        !program.sequences[1].kv,
+                    "resume metadata allocation failure escaped or kept a partial destination");
+        }
         require(program.start_resume(1, owner, restore),
                 "live continuation could not start restore");
         program.device.synchronize_all();
@@ -483,6 +540,18 @@ void exercise_live_continuation(execution::ProgramImplCore& program, family::Fro
         require(snapshot(1) == expected,
                 "live resume changed exact represented continuation state");
         const auto full = program.plan_window(1, original_window.output_tokens);
+        if (fault == AllocationFault::Window) {
+            const auto entitlement      = program.sequences[1].kv.value().text.page_entitlement();
+            const auto window           = program.requests[1].window_output_tokens;
+            caller_allocation_failed    = false;
+            fail_next_caller_allocation = true;
+            const bool granted          = program.grant_window(1, full);
+            fail_next_caller_allocation = false;
+            require(caller_allocation_failed && !granted && snapshot(1) == expected &&
+                        program.sequences[1].kv.value().text.page_entitlement() == entitlement &&
+                        program.requests[1].window_output_tokens == window,
+                    "window allocation failure escaped or committed a partial grant");
+        }
         require(program.grant_window(1, full), "live continuation could not regrow KV");
         require(rounds(1, 3) == next, "live resume changed next tokens or raw target logprobs");
         program.abort_lane(1);
@@ -495,7 +564,7 @@ void exercise_live_continuation(execution::ProgramImplCore& program, family::Fro
 }
 
 void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool forks_only,
-              bool live_only = false) {
+              bool live_only = false, AllocationFault fault = AllocationFault::None) {
     ninfer::DeviceContext device;
     ninfer::EngineOptions options;
     options.artifact_path         = artifact;
@@ -539,7 +608,14 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool for
     device.synchronize();
 
     if (live_only) {
-        exercise_live_continuation(program, frontend);
+        if (fault == AllocationFault::All) {
+            for (const auto selected :
+                 {AllocationFault::Suspend, AllocationFault::Resume, AllocationFault::Window}) {
+                exercise_live_continuation(program, frontend, selected);
+            }
+        } else {
+            exercise_live_continuation(program, frontend, fault);
+        }
         return;
     }
     ninfer::PromptInput input;
@@ -695,8 +771,25 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool for
 } // namespace
 
 int main(int argc, char** argv) {
-    const bool forks_only = argc == 2 && std::string(argv[1]) == "--fork-state";
-    const bool live_only  = argc == 2 && std::string(argv[1]) == "--live-continuation";
+    const bool forks_only      = argc == 2 && std::string(argv[1]) == "--fork-state";
+    const bool allocation_case = argc == 3 && std::string(argv[1]) == "--live-allocation";
+    AllocationFault fault      = AllocationFault::None;
+    if (allocation_case) {
+        const std::string selected = argv[2];
+        if (selected == "suspend") {
+            fault = AllocationFault::Suspend;
+        } else if (selected == "resume") {
+            fault = AllocationFault::Resume;
+        } else if (selected == "window") {
+            fault = AllocationFault::Window;
+        } else if (selected == "all") {
+            fault = AllocationFault::All;
+        } else {
+            return 1;
+        }
+    }
+    const bool live_only =
+        allocation_case || (argc == 2 && std::string(argv[1]) == "--live-continuation");
     if (argc != 1 && !forks_only && !live_only) { return 1; }
     const char* nvfp4                  = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const char* group                  = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
@@ -715,8 +808,8 @@ int main(int argc, char** argv) {
         return 77;
     }
     try {
-        if (live_only) { exercise(artifact, ninfer::SpeculativeBackend::None, false, true); }
-        exercise(artifact, backend, forks_only, live_only);
+        if (live_only) { exercise(artifact, ninfer::SpeculativeBackend::None, false, true, fault); }
+        exercise(artifact, backend, forks_only, live_only, fault);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
