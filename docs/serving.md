@@ -19,6 +19,8 @@ Vision is disabled by default, so its weights and buffers are not allocated. Med
 
 `--adaptive-draft` picks live k in `{3..N}` (DFlash `--draft-tokens N>=5`; MTP `{3,4,5}`) after each round by locking `argmax E[Y(k)] / T(k,C,L)` from nested hop-survival `r_i` and online least-squares round time (shared slope, per-k intercept). An unmeasured k is probed at most once and dropped when dominated; switching k costs 1 ms. The policy keeps adapting during generation; see [adaptive drafting](maintainer/qwen3.8-27b-model.md). Frozen `--draft-tokens 4` stays `{4}`. `--spec dflash` defaults to seven drafts and adaptive length; `--no-adaptive-draft` selects a fixed length. Restart the server to enable a capability omitted at startup.
 
+Server startup has a 180-second inactivity watchdog covering device initialization, model loading and warmup. Advancing load progress renews the deadline; repeated or regressing counters do not. A stalled startup exits with status 124 without HIP cleanup, allowing the process supervisor to retry instead of remaining indefinitely unhealthy after a GPU reset. The watchdog is disarmed after warmup and imposes no request, queue or idle timeout. It bounds recovery startup; it does not prevent a GPU/driver hang or guarantee that a damaged device can recover without intervention.
+
 ## Endpoints
 
 | Method and path | Behavior |

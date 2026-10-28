@@ -292,6 +292,7 @@ if(NINFER_BUILD_APPS)
     serve/response_store.cpp
     serve/translate.cpp
     serve/console_log.cpp
+    serve/startup_watchdog.cpp
     serve/generation_service.cpp
     serve/request_log.cpp
     serve/metrics.cpp

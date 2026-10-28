@@ -4,6 +4,7 @@
 #include "serve/http_server.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
+#include "serve/startup_watchdog.h"
 
 #include <atomic>
 #include <chrono>
@@ -74,7 +75,14 @@ int main(int argc, char** argv) {
         ninfer::product::LoadProgressRenderer load_progress(std::cerr,
                                                             std::move(load_progress_options));
         const auto load_start = Clock::now();
-        ninfer::serve::GenerationService service(options, load_progress.callback());
+        ninfer::serve::StartupWatchdog startup;
+        const auto rendered_progress = load_progress.callback();
+        ninfer::LoadProgress guarded_progress{
+            .callback = [&](std::string_view phase, std::uint64_t done, std::uint64_t total) {
+                startup.progress(phase, done);
+                rendered_progress.callback(phase, done, total);
+            }};
+        ninfer::serve::GenerationService service(options, std::move(guarded_progress));
         server.attach(service);
         std::ostringstream loaded;
         loaded << "model loaded in "
@@ -109,7 +117,9 @@ int main(int argc, char** argv) {
                                              (options.mixed_forward ? " (explicit)" : " (auto)"));
 
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");
+        startup.begin_warmup();
         service.warmup();
+        startup.complete();
         const ninfer::MemorySummary warmed = service.memory_summary();
         if (warmed.kv_ram_capacity_bytes != 0) {
             std::ostringstream ram;

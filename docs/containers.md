@@ -58,6 +58,8 @@ The image compiles a snapshot of **local working-tree files** using CMake and Ni
 
 Keep `COMPOSE_BAKE=false` from `.env.example` in the project's `.env`. On the maintainer host's Compose 2.37.1/Buildx 0.37.1 combination, Bake delegation built the changed image but started the existing container with its old image. Direct Compose BuildKit integration preserves the object cache and correctly recreates the container after a source change. The upstream report for this failure class is https://github.com/docker/compose/issues/12774.
 
+A GPU hang can abort the process and trigger `restart: unless-stopped`. If the restarted process instead stalls during HIP initialization, model load or warmup, the server's 180-second inactivity watchdog exits with status 124 so Compose can retry. Docker health failures alone do not restart a running container. The watchdog bypasses normal HIP teardown, which can block in a damaged driver, and is disabled once warmup completes. A persistent device/driver failure can still require host intervention; retries do not establish a fix for the original GPU hang.
+
 After changing or pulling source, run `docker compose up -d` (add `--wait` to wait for health). Compose recreates the server when the resulting image changes. Builds need no GPU lease and can overlap inference; lower `NINFER_BUILD_JOBS` if host memory or I/O is under pressure. To start an existing image without building, use `docker compose up -d --no-build --pull never server`. Tests run separately.
 
 For a dedicated Buildx builder, create it once (this does not change Docker's globally selected builder):

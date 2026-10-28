@@ -95,3 +95,5 @@ flock --exclusive "$NINFER_GPU_LOCK" \
   env NINFER_R9700_WEIGHTS=/path/to/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer \
   ctest --test-dir build-r9700 -R '^ninfer_r9700_engine_cache_write_real_test$' --output-on-failure
 ```
+
+`ninfer_startup_watchdog_test` uses subprocesses to verify exit status 124 for stalled startup and warmup, including held logging locks and a full stderr pipe. Advancing load progress can outlast the inactivity interval; repeated/regressing counters cannot. Successful warmup disarms the guard before idle serving, and ordinary startup exceptions stop its thread. No GPU hang is injected.

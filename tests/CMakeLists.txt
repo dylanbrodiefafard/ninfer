@@ -165,6 +165,9 @@ ninfer_add_r9700_test(ninfer_qwen3_score_index_test
 
 # Product CLI and external serving contracts.
 if(TARGET ninfer_serve)
+  ninfer_add_r9700_test(ninfer_startup_watchdog_test
+    SOURCES test_startup_watchdog.cpp
+    LIBRARIES ninfer_serve)
   ninfer_add_r9700_test(ninfer_schema_number_input_test
     SOURCES test_schema_number_input.cpp
     LIBRARIES ninfer_serve)
