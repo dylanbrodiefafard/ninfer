@@ -772,11 +772,10 @@ runtime::ExecutionWindow ProgramImplCore::plan_suspended_window(std::uint64_t ow
         output_tokens > parked.request.effective_output_tokens) {
         throw std::logic_error("window exceeds suspended request lifetime");
     }
-    const auto image = kv_ram_cache_.value().host_kv(parked.entry_id);
     return execution_window(parked.request.prompt_tokens, output_tokens,
                             parked.sequence.prefix_identity.packed_bytes() -
                                 13ULL * parked.sequence.prefix_identity.size(),
-                            parked.checkpoint_count, {1, image.text_pages, image.backend_pages});
+                            parked.checkpoint_count, {1, parked.text_pages, parked.backend_pages});
 }
 
 bool ProgramImplCore::grant_window(std::uint32_t lane, const runtime::ExecutionWindow& window) {
@@ -803,8 +802,13 @@ bool ProgramImplCore::grant_window(std::uint32_t lane, const runtime::ExecutionW
                                 window.admission.backend_kv_pages)) {
         return false;
     }
-    resize_sequence_kv_entitlement(sequence, window.admission.main_kv_pages,
-                                   window.admission.backend_kv_pages);
+    try {
+        resize_sequence_kv_entitlement(sequence, window.admission.main_kv_pages,
+                                       window.admission.backend_kv_pages);
+    } catch (const std::bad_alloc&) {
+        // The bundle reserves every host page vector before committing any entitlement.
+        return false;
+    }
     request.window_output_tokens = window.output_tokens;
     return true;
 }
@@ -829,7 +833,10 @@ bool ProgramImplCore::start_suspend(std::uint32_t lane, std::uint64_t owner) {
     }
     flush_deferred_gdn_fold(lane);
     device.order_copy_after_compute();
-    auto [it, inserted]         = suspended_requests_.try_emplace(owner);
+    auto it = suspended_requests_.end();
+    try {
+        it = suspended_requests_.try_emplace(owner).first;
+    } catch (const std::bad_alloc&) { return false; }
     it->second.lane             = lane;
     it->second.checkpoint_count = sequence.context_checkpoints.size();
     const bool was_retained     = sequence.retained;
@@ -837,8 +844,11 @@ bool ProgramImplCore::start_suspend(std::uint32_t lane, std::uint64_t owner) {
         sequence.retained = true;
         qwen3::detail::ResidentPrefixIdentity unused;
         auto source = ram_capture_source(sequence, unused, CacheCaptureMode::CompleteOriginal);
-        sequence.retained         = was_retained;
-        source.live_owner         = owner;
+        sequence.retained     = was_retained;
+        source.live_owner     = owner;
+        it->second.text_pages = source.text_pages.value_or(source.text->mapped_page_count());
+        it->second.backend_pages =
+            source.backend ? source.backend_pages.value_or(source.backend->mapped_page_count()) : 0;
         const auto [block, bytes] = kv_ram_cache_.value().live_credit_view(owner);
         std::size_t tail_bytes    = 0;
         if (request.sampling_host.token_counts) {
@@ -876,6 +886,11 @@ bool ProgramImplCore::start_suspend(std::uint32_t lane, std::uint64_t owner) {
         }
         it->second.entry_id = result.entry_id;
         return true;
+    } catch (const std::bad_alloc&) {
+        device.synchronize_all();
+        sequence.retained = was_retained;
+        suspended_requests_.erase(it);
+        return false;
     } catch (...) {
         (void)hipStreamSynchronize(device.copy_stream);
         sequence.retained = was_retained;
@@ -1005,6 +1020,11 @@ bool ProgramImplCore::start_resume(std::uint32_t lane, std::uint64_t owner,
         saved.lane                         = lane;
         saved.phase                        = SuspendedRequest::Phase::Restoring;
         return true;
+    } catch (const std::bad_alloc&) {
+        // Fence readers before releasing a partial destination; the source remains parked.
+        device.synchronize_all();
+        clear_lane(sequence, requests[lane]);
+        return false;
     } catch (...) {
         synchronize_all_while_unwinding(device);
         clear_lane(sequence, requests[lane]);
@@ -2584,69 +2604,71 @@ bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* r
     qwen3::detail::ResidentPrefixIdentity cut_identity;
     try {
         source = ram_capture_source(sequences[lane], cut_identity, mode);
-    } catch (const std::bad_alloc&) {
-        ram_cache.record_drop();
-        return false;
-    }
-    for (;;) {
-        const auto result = ram_cache.capture(source);
-        if (result.status == qwen3::detail::RamCaptureStatus::Captured) {
+        for (;;) {
+            const auto result = ram_cache.capture(source);
+            if (result.status == qwen3::detail::RamCaptureStatus::Captured) {
+                if (kv_disk_cache_) {
+                    qwen3::detail::KVDiskCache& disk_cache = *kv_disk_cache_;
+                    disk_cache.note_ram_resident(result.entry_id, source.disk_entry_id);
+                    // Write the new entry behind on the disk worker so that a later
+                    // RAM eviction usually finds it durable instead of spilling it
+                    // synchronously on this thread. Shutdown flushes in order instead.
+                    if (!kv_tiers_shutdown_) { disk_cache.request_idle_spill(); }
+                }
+                if (ram_entry_id != nullptr) { *ram_entry_id = result.entry_id; }
+                return true;
+            }
+            if (result.status == qwen3::detail::RamCaptureStatus::Dropped) { return false; }
             if (kv_disk_cache_) {
-                qwen3::detail::KVDiskCache& disk_cache = *kv_disk_cache_;
-                disk_cache.note_ram_resident(result.entry_id, source.disk_entry_id);
-                // Write the new entry behind on the disk worker so that a later
-                // RAM eviction usually finds it durable instead of spilling it
-                // synchronously on this thread. Shutdown flushes in order instead.
-                if (!kv_tiers_shutdown_) { disk_cache.request_idle_spill(); }
+                const auto reclaimed =
+                    kv_disk_cache_->reclaim_ram_entry(may_block, attempt_ram_ids);
+                if (reclaimed == qwen3::detail::RamReclaim::Evicted ||
+                    reclaimed == qwen3::detail::RamReclaim::Retry) {
+                    continue;
+                }
+                // Not a drop: the caller retries once the disk worker's spill lands.
+                if (reclaimed == qwen3::detail::RamReclaim::Pending) {
+                    if (deferred != nullptr) { *deferred = true; }
+                    return false;
+                }
+                ram_cache.record_drop();
+                return false;
             }
-            if (ram_entry_id != nullptr) { *ram_entry_id = result.entry_id; }
-            return true;
-        }
-        if (result.status == qwen3::detail::RamCaptureStatus::Dropped) { return false; }
-        if (kv_disk_cache_) {
-            const auto reclaimed = kv_disk_cache_->reclaim_ram_entry(may_block, attempt_ram_ids);
-            if (reclaimed == qwen3::detail::RamReclaim::Evicted ||
-                reclaimed == qwen3::detail::RamReclaim::Retry) {
-                continue;
+            // Without a disk tier the oldest unclaimed entry is dropped. Retired blocks waiting
+            // only for their copy fence free before any live entry is dropped: a non-blocking
+            // caller defers, a blocking one waits for them.
+            if (ram_cache.retired_fence_pending()) {
+                if (!may_block && deferred != nullptr) {
+                    *deferred = true;
+                    return false;
+                }
+                if (may_block && ram_cache.wait_retired_copies()) { continue; }
             }
-            // Not a drop: the caller retries once the disk worker's spill lands.
-            if (reclaimed == qwen3::detail::RamReclaim::Pending) {
+            // This admission's own earlier captures are never victims: a deferral rolls them back,
+            // so the retry would recapture and target them again.
+            std::optional<std::uint64_t> victim;
+            for (const std::uint64_t id : ram_cache.unpinned_ids()) {
+                if (std::find(attempt_ram_ids.begin(), attempt_ram_ids.end(), id) ==
+                    attempt_ram_ids.end()) {
+                    victim = id;
+                    break;
+                }
+            }
+            if (!victim) {
+                ram_cache.record_drop();
+                return false;
+            }
+            if (!may_block && !ram_cache.copies_ready(*victim)) {
                 if (deferred != nullptr) { *deferred = true; }
                 return false;
             }
-            ram_cache.record_drop();
-            return false;
+            if (may_block) { ram_cache.wait_entry_copies(*victim); }
+            (void)ram_cache.evict_one_unpinned(*victim);
         }
-        // Without a disk tier the oldest unclaimed entry is dropped. Retired blocks waiting
-        // only for their copy fence free before any live entry is dropped: a non-blocking
-        // caller defers, a blocking one waits for them.
-        if (ram_cache.retired_fence_pending()) {
-            if (!may_block && deferred != nullptr) {
-                *deferred = true;
-                return false;
-            }
-            if (may_block && ram_cache.wait_retired_copies()) { continue; }
-        }
-        // This admission's own earlier captures are never victims: a deferral rolls them back,
-        // so the retry would recapture and target them again.
-        std::optional<std::uint64_t> victim;
-        for (const std::uint64_t id : ram_cache.unpinned_ids()) {
-            if (std::find(attempt_ram_ids.begin(), attempt_ram_ids.end(), id) ==
-                attempt_ram_ids.end()) {
-                victim = id;
-                break;
-            }
-        }
-        if (!victim) {
-            ram_cache.record_drop();
-            return false;
-        }
-        if (!may_block && !ram_cache.copies_ready(*victim)) {
-            if (deferred != nullptr) { *deferred = true; }
-            return false;
-        }
-        if (may_block) { ram_cache.wait_entry_copies(*victim); }
-        (void)ram_cache.evict_one_unpinned(*victim);
+    } catch (const std::bad_alloc&) {
+        // Optional capture includes the bookkeeping required to reclaim room for it.
+        ram_cache.record_drop();
+        return false;
     }
 }
 

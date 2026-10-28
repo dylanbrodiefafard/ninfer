@@ -606,3 +606,5 @@ tool results with checkpoint boundaries. Run `ninfer_r9700_persistent_decode_qua
 changing persistent dispatch, and run both long-prompt cases in the production Compose graph
 environment.
 The cache directory contains disposable experiment data; keep the logs separately.
+
+`ninfer_r9700_live_continuation_qual ARTIFACT.ninfer none|dflash|mtp --allocation-failures` faults suspension capture, resume metadata and window growth at settled boundaries. It checks immediate KV ownership preservation and exact resumed token/logprob/publication parity with an uninterrupted control. Suspended-window planning must allocate no descriptors. The RAM qualifier also exercises credit metadata allocation/relocation faults; the disk suite preserves sources across reclaim bookkeeping failures. The recovery-KV qualifier fills RAM and faults optional capture eviction bookkeeping before its normal restore/retry checks. These commands require the shared GPU lock.

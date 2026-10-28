@@ -18,12 +18,42 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <new>
+#include <cstdlib>
+#include <utility>
+#include <span>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 #include <unistd.h>
+
+thread_local int credit_allocations_before_failure = -1;
+thread_local bool credit_allocation_failed         = false;
+
+void* operator new(std::size_t bytes) {
+    if (credit_allocations_before_failure >= 0) {
+        const bool fail_allocation = credit_allocations_before_failure == 0;
+        --credit_allocations_before_failure;
+        if (fail_allocation) {
+            credit_allocation_failed = true;
+            throw std::bad_alloc();
+        }
+    }
+    if (void* memory = std::malloc(bytes == 0 ? 1 : bytes)) { return memory; }
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+
+void operator delete(void* memory) noexcept { std::free(memory); }
+
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+
+void operator delete[](void* memory) noexcept { std::free(memory); }
+
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 
 namespace {
 
@@ -333,6 +363,78 @@ void source_preserving_reads(ninfer::DeviceContext& device, ninfer::Fp8KInt4VPag
     cache.consume(captured.entry_id);
     require(cache.snapshot().entry_count == 0 && cache.snapshot().restores == 2,
             "ordinary read did not consume after the fork");
+}
+
+void live_credit_allocation_failure() {
+    constexpr std::size_t capacity = 1ULL << 20;
+    for (const bool relocate : {false, true}) {
+        bool completed         = false;
+        bool exercised_failure = false;
+        for (int stage = 0; stage < 16 && !completed; ++stage) {
+            q3::detail::KVRamCache cache(capacity);
+            std::pair<void*, std::size_t> original;
+            std::pair<void*, std::size_t> blocker;
+            if (relocate) {
+                if (!cache.reserve_live_credit(1, 256) || !cache.reserve_live_credit(2, 256)) {
+                    throw std::runtime_error(
+                        "credit allocation fixture could not reserve its credits");
+                }
+                original = cache.live_credit_view(1);
+                blocker  = cache.live_credit_view(2);
+                std::memset(original.first, 0x5a, original.second);
+                std::memset(blocker.first, 0xa5, blocker.second);
+            }
+            const auto before                 = cache.snapshot().used_bytes;
+            credit_allocation_failed          = false;
+            credit_allocations_before_failure = stage;
+            bool escaped                      = false;
+            bool reserved                     = false;
+            try {
+                reserved = cache.reserve_live_credit(1, 512);
+            } catch (const std::bad_alloc&) { escaped = true; }
+            credit_allocations_before_failure = -1;
+            if (credit_allocation_failed) {
+                exercised_failure = true;
+                if (escaped || reserved || cache.snapshot().used_bytes != before) {
+                    throw std::runtime_error(
+                        "credit metadata pressure escaped or changed secured capacity");
+                }
+                if (relocate) {
+                    const auto current   = cache.live_credit_view(1);
+                    const auto peer      = cache.live_credit_view(2);
+                    const auto unchanged = [](const auto& view, unsigned char value) {
+                        const auto bytes =
+                            std::span(static_cast<const unsigned char*>(view.first), view.second);
+                        return std::all_of(bytes.begin(), bytes.end(),
+                                           [value](auto byte) { return byte == value; });
+                    };
+                    if (current != original || peer != blocker || !unchanged(current, 0x5a) ||
+                        !unchanged(peer, 0xa5)) {
+                        throw std::runtime_error(
+                            "failed credit relocation changed existing ownership");
+                    }
+                }
+                if (!cache.reserve_live_credit(1, 512)) {
+                    throw std::runtime_error(
+                        "credit funding did not recover after metadata pressure");
+                }
+            } else {
+                completed = reserved && !escaped;
+            }
+            cache.release_live_credit(1);
+            if (relocate) { cache.release_live_credit(2); }
+            // Snapshot counters cannot expose a provisional arena block leaked before credit
+            // publication. Reusing the complete arena checks the allocation ownership itself.
+            if (!cache.reserve_live_credit(3, capacity)) {
+                throw std::runtime_error("failed credit publication leaked pinned arena capacity");
+            }
+            cache.release_live_credit(3);
+        }
+        if (!completed || !exercised_failure) {
+            throw std::runtime_error(
+                "credit allocation regression did not exercise failure and success");
+        }
+    }
 }
 
 void live_credit_image_ownership(ninfer::DeviceContext& device,
@@ -1072,6 +1174,7 @@ int main() {
         mixed_spec.plane_layouts.value = ninfer::Fp8KInt4VPlaneLayout::FeatureFastestPageMajor;
         mixed_spec.plane_layouts.value_scale = ninfer::Fp8KInt4VPlaneLayout::TokenFastestHeadMajor;
         source_preserving_reads(device, mixed_spec);
+        live_credit_allocation_failure();
         live_credit_image_ownership(device, text_spec);
         two_pending_loads_fold_as_loads(device, text_spec);
         stream_wait_does_not_block_host(device, text_spec);

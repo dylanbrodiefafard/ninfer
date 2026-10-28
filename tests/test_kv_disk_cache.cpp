@@ -1008,6 +1008,36 @@ void ram_reclaim_never_blocks_on_disk(ninfer::DeviceContext& device) {
     require(on_disk, "reclaimed RAM entry is not on disk");
 }
 
+void ram_reclaim_allocation_failure(ninfer::DeviceContext& device) {
+    TemporaryDirectory directory;
+    Pool pool(8);
+    cache::KVRamCache ram(64ULL << 20);
+    auto allocation = pool.storage->reserve(4);
+    allocation.materialize_pages(3, device.stream);
+    cache::KVDiskCache disk(
+        config(directory.path, pool, ram, ninfer::KvDiskCompress::Off, 64ULL << 20));
+    const auto entry =
+        capture_tokens(ram, pool, allocation, device, std::vector<ninfer::TokenId>(64, 47));
+    disk.note_ram_resident(entry, 0);
+    require(disk.emergency_spill_ram(entry), "allocation fixture spill failed");
+    disk.wait_idle_and_fsync();
+    ram.wait_pending_copies();
+    const auto before = disk.snapshot();
+    for (const bool may_block : {false, true}) {
+        cache::KVRamCache::test_fail_next_eviction_snapshot_allocation();
+        require(disk.reclaim_ram_entry(may_block) == cache::RamReclaim::Failed &&
+                    !cache::KVRamCache::test_eviction_snapshot_allocation_pending() &&
+                    ram.fifo_ids() == std::vector<std::uint64_t>{entry} &&
+                    !disk.ram_reclaim_pending(),
+                "reclaim allocation failure escaped or changed its source");
+    }
+    const auto reason = static_cast<std::size_t>(ninfer::KvDiskDropReason::OptionalAlloc);
+    require(disk.snapshot().drop_reasons[reason] == before.drop_reasons[reason] + 2 &&
+                disk.reclaim_ram_entry(false) == cache::RamReclaim::Evicted &&
+                ram.fifo_ids().empty(),
+            "reclaim did not recover after allocation pressure");
+}
+
 // Under sustained load write-behind is still spilling the oldest entry when RAM fills. That entry
 // is I/O-pinned, so it is not an eviction candidate; reclaim must finish its spill and evict it
 // rather than drop a newer entry.
@@ -1835,6 +1865,7 @@ void run_stall_cases(ninfer::DeviceContext& device) {
     spill_pin_waits_only_its_entry(device);
     bounded_idle_defrag(device);
     ram_reclaim_never_blocks_on_disk(device);
+    ram_reclaim_allocation_failure(device);
     ram_reclaim_waits_for_inflight_spill(device);
     ram_reclaim_skips_attempt_captures(device);
     restore_setup_ready_tracks_window_reads(device);

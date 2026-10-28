@@ -989,6 +989,9 @@ void KVRamCache::discard(std::uint64_t entry_id) {
 
 std::vector<std::uint64_t> KVRamCache::unpinned_ids() const {
     std::lock_guard lock(io_mutex_);
+    if (fail_next_eviction_snapshot_allocation_.exchange(false, std::memory_order_acq_rel)) {
+        throw std::bad_alloc();
+    }
     std::vector<std::uint64_t> ids;
     ids.reserve(fifo_.size());
     for (std::uint64_t id : fifo_) {
@@ -1247,7 +1250,7 @@ std::size_t KVRamCache::live_image_budget(const PagedKVPool& text, const PagedKV
     return align_up(bytes, kDeviceAlign);
 }
 
-bool KVRamCache::reserve_live_credit(std::uint64_t owner, std::size_t bytes) {
+bool KVRamCache::reserve_live_credit(std::uint64_t owner, std::size_t bytes) try {
     if (owner == 0 || bytes == 0) { throw std::invalid_argument("invalid live RAM credit"); }
     std::lock_guard lock(io_mutex_);
     reap_retired_locked();
@@ -1318,7 +1321,7 @@ bool KVRamCache::reserve_live_credit(std::uint64_t owner, std::size_t bytes) {
         throw;
     }
     return true;
-}
+} catch (const std::bad_alloc&) { return false; }
 
 bool KVRamCache::live_image_ready(std::uint64_t id) const {
     std::lock_guard lock(io_mutex_);
@@ -1771,8 +1774,7 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
         record.checkpoint_path     = source.rewrite_kind == RewriteCheckpointKind::TurnClosure
                                          ? PrefixReusePath::RestoreTurnCheckpoint
                                          : PrefixReusePath::RestoreResponseCheckpoint;
-        if (fail_next_capture_metadata_allocation_) {
-            fail_next_capture_metadata_allocation_ = false;
+        if (fail_next_capture_metadata_allocation_.exchange(false, std::memory_order_acq_rel)) {
             throw std::bad_alloc();
         }
         record.ladders.reserve(source.ladder_heads.size());

@@ -4,7 +4,37 @@ Upstream is the RTX 5090/CUDA `dylanbrodiefafard/ninfer` repository’s `experim
 
 ## Baseline
 
-Reconciled through upstream `7142d4280123d9df507f863c1ae3d16f50e6476e` (2026-10-19), advanced from `edaad03a` (2026-10-17), `62687bd3` (2026-10-16), `17c504c9` (2026-10-12), `d5c38cda` (2026-10-09), `6e5b576e` (2026-10-06), `f0d3922e` (2026-10-04), `945515ea` (2026-10-04), `48eb0b01` (2026-10-03), `593c2d0c` (2026-10-03), `574a8d91` (2026-10-02), `f7f70d89` (2026-10-02), `9639c32f` (2026-09-30), `34c7119b` (2026-09-28) and `e04fad3728573a0109236929f5d473475a8657f2` (2026-09-21, AMD ports `7187d95d`, `2eab0a50`, `49c896dd`) by the dispositions below. The next sync reviews upstream changes after `7142d428` against current AMD behavior.
+Reconciled through upstream `5c2bd4b39a3cc645e400e842ca2b92968f920aec` (2026-10-27), with the 2026-10-28 AMD reconciliation below. Upstream rewrote the history that contained the former `7142d4280123d9df507f863c1ae3d16f50e6476e` baseline. This reconciliation maps the former dispositions onto the fetched history and advances the source baseline by behavior, without an ancestry merge. The next sync reviews upstream changes after `5c2bd4b3` against current AMD behavior.
+
+## Rewritten-history reconciliation and cache failure fixes (2026-10-28)
+
+The previous baseline's three source changes map to `05c7729d` (target-selected content cache identity), `2e66a610` (startup defaults and pending timeout), and `24545385` (actual disk capacity and idle defragmentation). Their existing AMD dispositions and verification remain authoritative below. Earlier rewritten counterparts include `cdb36597` (reasoning-close framing), `5798b00f` (preparation/disk telemetry), `f4878ff7` (grammar compilation), `06ee3376` (CUDA graph-update issue already removed by native immutable graph ownership), `ec2272e3` (excluded NVFP4 tail handling), `899e6b5d` (disposable cache writes), and `97147234`/`2bf403e5` (constraints and the excluded CUDA MTP fixture). This mapping preserves those decisions; it does not import NVIDIA execution or fabricate merged history.
+
+Every commit reachable after `24545385` through the fetched `5c2bd4b3` tip is dispositioned here:
+
+| Source | AMD disposition |
+|---|---|
+| `43d27d9f` | Mixed prefill/verify execution, context checkpoints, copy ownership and serving behavior already have native implementations (`68668568`, `d4886f7a` and subsequent native fixes). Exclude CUDA dependent launches, NVFP4/A4/GDN kernel tuning, CUDA private state routes, other targets and NVIDIA benchmarks. Retain the qualified gfx1201 implementations and their independent oracles. |
+| `a5bc5a14` | Exclude CUDA NVFP4 LinearAdd fixture correction; no native consumer. |
+| `b00a5c1d` | Native mixed-forward width and cadence controls are already delivered. Retain R9700's measured automatic width and startup-fixed cadence rather than importing the RTX 5090 4096-column default, CUDA tuning, alternate artifacts or NVIDIA performance claims. Its common serving/cache contracts have native equivalents. |
+| `2bdb2ce8`, `fe16bedf`, `fce1d470` | Already ported and qualified in `7bcc26a6`: tokenizer heap merges, finite LayerNorm overflow handling and exact schema numeric source values. |
+| `4af3c228` | Upstream sync documentation only; the native record remains authoritative. |
+| `8b3bea53`, `bfee77bc` | Same remaining-work scheduling change carried on merged branches. Exclude the 4K tail cutoff and short-request prefill interruption: the current AMD contract has one prefill owner with startup-fixed slices/cadence. Preserve the native bounded FIFO scheduler, mixed-round ownership, and supported MTP behavior. CUDA-specific kernels and NVIDIA measurements are excluded. |
+| `fedd87a4` | Already selectively ported (recorded below), including native raw-tool attribution. |
+| `64f8f73e` | Exclude CUDA retained GDN-history test indexing; native raw-record/deferred-Fold state has its own oracle and qualifier. |
+| `93ab32e6` | CUDA real-model Vision checkpoint fixture expectation; native checkpoints use the actual crossed chunk frontier and existing native Vision/context qualification. No production change. |
+| `dcdab4f6` | CUDA cached-prefill interruption fixture draft expectation. The associated prefill-interruption policy is excluded above. |
+| `106662c2` | Exclude CUDA W4A4 scale-plane readback correction; no native format consumer. |
+| `c3bb9dfc` | Merge of the already dispositioned source branches; no separate behavior. |
+| `cffce137` | C1..8 already delivered by native `be5848de` and subsequent width/oracle qualification. Preserve native kernels and performance evidence. |
+| `fed58c48` | Upstream port of native `44411e91` system-prefix retention; already equivalent. |
+| `c3dd2ddf` | Upstream port of native `58927804` RAM-backed windows/reasoning budgets; already equivalent, retaining the AMD cache layout and state ownership. |
+| `686e69d4` | Port RAM-index revalidation after live-credit funding, including failed funding. Reselect and fund the actual winning image at the same window before claiming it. Host regressions cover total/longest eviction, larger replacement images, failed reservation and writable/disposable reads. |
+| `5c2bd4b3` | Port optional capture/reclaim allocation containment, unfunded credit metadata failures, transactional window grants, retryable suspension/resume metadata failures, allocation-free suspended-window page floors, and fatal-worker availability published before tier cleanup. Add public Engine availability and health HTTP 200/503 behavior. Preserve HIP/GTT startup backing, AMD deferred GDN folds, checked failure fences and fixed three-plane cache semantics. |
+
+The incident was an unclaimed RAM winner evicted by live-credit funding before its claim. At 2026-10-28 07:41:57 UTC, eight requests failed with `RAM cache entry id is unknown`; the worker stopped while unconditional HTTP health kept Docker healthy. Both missing upstream fixes are included. No weight, cache representation, kernel arithmetic or scheduler policy changes are part of this reconciliation.
+
+Validation uses the R9700/gfx1201 Release build, the selected ROCm 10 toolchain and explicit production `qwen3.8-27b-r9700-lq4.ninfer` artifact. Host regressions cover stale-source reselection and failed-worker health/admission during held cleanup. GPU checks cover exact three-plane RAM ownership, metadata-fault credit allocation/relocation, source-preserving disk reclaim failures, optional capture bookkeeping failure, and cross-lane live continuation after capture/restore/window metadata faults. The live qualifier compares complete target token IDs, raw logprob bits, publication and reasoning policy against its uninterrupted control; immediate pool-count assertions protect failed state transitions. Suspension map-insertion failure is source-reviewed; its capture-metadata failure is explicitly injected without faulting HIP's internal allocator. All 64 host tests pass, including the new source-reselection and availability regressions. The RAM and disk GPU suites pass. All 18 live-allocation cases pass across ordinary, DFlash and MTP execution (three reasoning boundaries, greedy and seeded sampling); the DFlash recovery-KV qualifier also passes its optional-capture fault and committed state/retry checks. The warnings-as-errors build, formatting/lint hooks, whitespace checks and changed-line clang-tidy over 34 translation units pass with zero diagnostics. Astra reviewed the upstream dispositions, native implementation and regression coverage with no remaining findings. Evidence belongs under `profiles/server-diagnosis-20261028/`.
 
 ## Selective published-stop logprob port (2026-10-19)
 

@@ -27,6 +27,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -556,7 +557,7 @@ public:
         return plan;
     }
 
-    [[nodiscard]] ProbePlan plan_ram_reuse(const PreparedPrompt&, const ProbePlan& base) {
+    [[nodiscard]] virtual ProbePlan plan_ram_reuse(const PreparedPrompt&, const ProbePlan& base) {
         note("plan_ram");
         ProbePlan plan   = fitted_plan();
         plan.force_cold  = base.force_cold;
@@ -624,13 +625,13 @@ public:
         ++abort_count;
     }
 
-    void claim_ram_entry(std::uint64_t entry_id) {
+    virtual void claim_ram_entry(std::uint64_t entry_id) {
         note("claim_ram");
         ++claim_ram_count;
         claimed_ram_entry = entry_id;
     }
 
-    void restore_ram_entry(std::uint32_t, std::uint64_t, const ProbePlan&) {
+    virtual void restore_ram_entry(std::uint32_t, std::uint64_t, const ProbePlan&) {
         note("restore_ram");
         ++restore_ram_count;
         if (restore_ram_count <= stale_failures) {
@@ -647,7 +648,7 @@ public:
         ram_timings_pending_ = true;
     }
 
-    void release_ram_entry(std::uint64_t) { note("release_ram"); }
+    virtual void release_ram_entry(std::uint64_t) { note("release_ram"); }
 
     virtual void discard_ram_capture(std::uint64_t) {
         note("discard_ram");
@@ -728,7 +729,7 @@ public:
         cache_idle_permission.store(idle);
     }
 
-    void shutdown_kv_tiers(const ninfer::LoadProgress& = {}) {}
+    virtual void shutdown_kv_tiers(const ninfer::LoadProgress& = {}) {}
 
     [[nodiscard]] RamSnapshot kv_ram_snapshot() const noexcept { return {}; }
 
@@ -753,7 +754,7 @@ public:
     [[nodiscard]] bool kv_disk_restore_failed() const { return false; }
 
     // A request starts at index version zero. Zero here would skip the host lookup.
-    [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept { return 1; }
+    [[nodiscard]] virtual std::uint64_t kv_ram_index_version() const noexcept { return 1; }
 
     [[nodiscard]] std::uint64_t kv_disk_index_version() const noexcept { return 1; }
 
@@ -851,7 +852,7 @@ public:
         }
     }
 
-    void finish_ram_restore(std::uint64_t, ninfer::runtime::CacheReadIntent intent) {
+    virtual void finish_ram_restore(std::uint64_t, ninfer::runtime::CacheReadIntent intent) {
         if (intent == ninfer::runtime::CacheReadIntent::Fork) {
             note("release_ram_restored");
         } else {
@@ -3257,7 +3258,7 @@ int run_integrity_failure(Frontend& frontend) {
 // Each request starts with three output tokens funded, has a six-token lifetime, and requires
 // seven pages to finish. Two initial four-page reservations fit an eight-page shared pool;
 // neither can grow beside its peer. The per-lane cursor represents committed continuation.
-class ChunkedProgram final : public ProbeProgram {
+class ChunkedProgram : public ProbeProgram {
 public:
     enum class HoldPhase { None, Capture, Restore, Parked };
     HoldPhase hold_phase = HoldPhase::None;
@@ -3733,6 +3734,175 @@ struct ChunkedProbe {
     ProbeLoaded* loaded     = nullptr;
     ProbeMemory request_memory;
 };
+
+// Models the shared RAM arena's FIFO eviction during live-credit allocation. The first
+// request owns the completion cohort; its queued peer must fund credit after choosing reuse.
+class AdmissionEvictionProgram final : public ChunkedProgram {
+public:
+    enum class Eviction { All, Longest, FailedReservation };
+
+    explicit AdmissionEvictionProgram(Eviction eviction) : eviction_(eviction) {
+        wait_for_queue = true;
+    }
+
+    std::uint32_t replans          = 0;
+    std::uint32_t restores         = 0;
+    std::uint32_t funding_attempts = 0;
+    std::uint32_t admitted_window  = 0;
+    bool evicted                   = false;
+
+    [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept override { return version_; }
+
+    [[nodiscard]] ProbePlan plan_ram_reuse(const PreparedPrompt&, const ProbePlan& base) override {
+        ++replans;
+        auto plan = base;
+        if (!available_) { return plan; }
+        plan.fields.ram_entry_id           = available_;
+        plan.fields.reuse_source           = PrefixReuseSource::HostRam;
+        plan.fields.reusable_prompt_tokens = available_ == 1 ? 32 : 16;
+        // A shorter prefix can retain more checkpoint heads and require larger backing.
+        plan.fields.suspension_bytes =
+            available_ == 1 && eviction_ != Eviction::FailedReservation ? 4 : 6;
+        return plan;
+    }
+
+    [[nodiscard]] bool reserve_suspension_credit(std::uint64_t owner, std::size_t bytes) override {
+        if (owner == 2) {
+            ++funding_attempts;
+            if (!evicted) {
+                if (claimed_) { throw std::logic_error("eviction probe source is claimed"); }
+                evicted    = true;
+                available_ = eviction_ == Eviction::Longest ? 2 : 0;
+                ++version_;
+                if (eviction_ == Eviction::FailedReservation) { return false; }
+            }
+        }
+        return ChunkedProgram::reserve_suspension_credit(owner, bytes);
+    }
+
+    void claim_ram_entry(std::uint64_t id) override {
+        if (id != available_ || id == 0) {
+            throw std::logic_error("RAM cache entry id is unknown");
+        }
+        if (claimed_) { throw std::logic_error("eviction probe source is already claimed"); }
+        claimed_ = true;
+    }
+
+    void release_ram_entry(std::uint64_t id) override {
+        if (id != available_ || !claimed_) {
+            throw std::logic_error("eviction probe released an unowned source");
+        }
+        claimed_ = false;
+    }
+
+    void restore_ram_entry(std::uint32_t, std::uint64_t id, const ProbePlan&) override {
+        if (id != available_ || !claimed_) {
+            throw std::logic_error("eviction probe restored an unowned source");
+        }
+        ++restores;
+    }
+
+    void finish_ram_restore(std::uint64_t id, ninfer::runtime::CacheReadIntent intent) override {
+        release_ram_entry(id);
+        if (intent == ninfer::runtime::CacheReadIntent::Consume) {
+            available_ = 0;
+            ++version_;
+        }
+    }
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
+                                                       ProbePlan plan, TransientRegion region,
+                                                       const OutputSession* output,
+                                                       bool pace) override {
+        if (starts == 1) {
+            if (live_credits.at(2) < plan.fields.suspension_bytes) {
+                throw std::logic_error("replanned admission has insufficient RAM backing");
+            }
+            admitted_window = plan.fields.window_output_tokens;
+        }
+        return ChunkedProgram::start_prefill_lane(lane, std::move(prompt), plan, region, output,
+                                                  pace);
+    }
+
+private:
+    Eviction eviction_;
+    std::uint64_t version_   = 1;
+    std::uint64_t available_ = 1;
+    bool claimed_            = false;
+};
+
+struct AdmissionEvictionPackage : ProbePackage {
+    using Program = AdmissionEvictionProgram;
+};
+
+struct AdmissionEvictionProbe {
+    using Package                     = AdmissionEvictionPackage;
+    AdmissionEvictionProgram* program = nullptr;
+    ProbeLoaded* loaded               = nullptr;
+    ProbeMemory request_memory;
+};
+
+int run_admission_credit_eviction(Frontend& frontend) {
+    int failures = 0;
+    for (const auto eviction :
+         {AdmissionEvictionProgram::Eviction::All, AdmissionEvictionProgram::Eviction::Longest,
+          AdmissionEvictionProgram::Eviction::FailedReservation}) {
+        for (const bool cache_write : {false, true}) {
+            AdmissionEvictionProgram program(eviction);
+            ProbeLoaded loaded{frontend};
+            AdmissionEvictionProbe instance{.program = &program, .loaded = &loaded};
+            auto engine                = engine_options();
+            engine.max_concurrency     = 2;
+            engine.generation_recovery = false;
+            ninfer::runtime::ConcurrentExecutor<AdmissionEvictionProbe> executor(
+                instance, ProbeDevice{}, engine);
+            const auto submit = [&](bool reuse) {
+                auto input                    = thinking_input();
+                input.options.enable_thinking = false;
+                auto prompt                   = frontend.prepare(std::move(input));
+                const auto summary            = prompt.summary();
+                ninfer::runtime::ResolvedRequestOptions options;
+                options.execution.allow_prefix_reuse      = reuse;
+                options.execution.cache_write             = cache_write;
+                options.execution.requested_output_tokens = 6;
+                options.output.raw                        = true;
+                return executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                       ninfer::OutputDelivery::TerminalOnly);
+            };
+            auto first  = submit(false);
+            auto second = submit(true);
+            program.peer_submitted.store(true);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            ninfer::CancellationView cancel(
+                [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+            const auto a = first.wait(nullptr, cancel);
+            const auto b = second.wait(nullptr, cancel);
+            if (!program.evicted || program.replans < 2 || program.funding_attempts < 2 ||
+                program.admitted_window != 3) {
+                std::cerr << "admission eviction case=" << static_cast<int>(eviction)
+                          << " cache_write=" << cache_write << " evicted=" << program.evicted
+                          << " replans=" << program.replans
+                          << " funding=" << program.funding_attempts
+                          << " window=" << program.admitted_window
+                          << " restores=" << program.restores << '\n';
+            }
+            failures += check(a.generated_token_ids == ChunkedProgram::expected() &&
+                                  b.generated_token_ids == ChunkedProgram::expected(),
+                              "RAM credit eviction lost or replayed a continuation");
+            failures +=
+                check(program.evicted && program.replans >= 2 && program.funding_attempts >= 2 &&
+                          program.admitted_window == 3 &&
+                          program.restores ==
+                              (eviction == AdmissionEvictionProgram::Eviction::Longest ? 1U : 0U),
+                      "RAM credit eviction did not reselect and fund the surviving plan");
+            auto subsequent = submit(false);
+            failures += check(subsequent.wait(nullptr, cancel).generated_token_ids ==
+                                  ChunkedProgram::expected(),
+                              "RAM credit eviction left the Engine unavailable");
+        }
+    }
+    return failures;
+}
 
 namespace ninfer::runtime {
 
@@ -4606,9 +4776,195 @@ int run_cache_maintenance_idle(Frontend& frontend) {
     return failures;
 }
 
-int main() {
+class AvailabilityProgram final : public ProbeProgram {
+public:
+    enum class Fault {
+        PrefillAllocation,
+        DecodeAllocation,
+        StableDecodeAllocation,
+        PrefillInvariant,
+        RequestLocal
+    };
+
+    explicit AvailabilityProgram(Fault fault) : fault_(fault) {}
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
+                                                       ProbePlan plan, TransientRegion region,
+                                                       const OutputSession* output,
+                                                       bool pace) override {
+        if (!injected_) {
+            {
+                std::unique_lock lock(mutex_);
+                prefill_entered_ = true;
+                cv_.notify_all();
+                if (!cv_.wait_for(lock, std::chrono::seconds(5),
+                                  [&] { return release_prefill_; })) {
+                    throw std::runtime_error("availability prefill gate timed out");
+                }
+            }
+            injected_ = true;
+            if (fault_ == Fault::PrefillAllocation) { throw std::bad_alloc(); }
+            if (fault_ == Fault::PrefillInvariant) {
+                throw std::logic_error("availability invariant failure");
+            }
+            if (fault_ == Fault::RequestLocal) {
+                throw ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
+                                           "availability request-local failure");
+            }
+        }
+        auto step =
+            ProbeProgram::start_prefill_lane(lane, std::move(prompt), plan, region, output, pace);
+        if (fault_ == Fault::DecodeAllocation || fault_ == Fault::StableDecodeAllocation) {
+            step.round.tokens = std::span<const TokenId>(&continuation_, 1);
+        }
+        return step;
+    }
+
+    [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t>,
+                                                     std::span<const RoundBudget>) override {
+        if (fault_ == Fault::StableDecodeAllocation && ++decode_calls == 1) {
+            return {.tokens     = std::span<const TokenId>(&continuation_, 1),
+                    .row_counts = std::span<const std::int32_t>(&row_count_, 1),
+                    .row_stride = 1};
+        }
+        throw std::bad_alloc();
+    }
+
+    std::uint32_t decode_calls = 0;
+
+    void shutdown_kv_tiers(const ninfer::LoadProgress& = {}) override {
+        if (fault_ == Fault::RequestLocal) { return; }
+        std::unique_lock lock(mutex_);
+        shutdown_entered_ = true;
+        cv_.notify_all();
+        if (!cv_.wait_for(lock, std::chrono::seconds(5), [&] { return release_shutdown_; })) {
+            throw std::runtime_error("availability shutdown gate timed out");
+        }
+    }
+
+    bool wait_for_prefill() { return wait_for(prefill_entered_); }
+
+    bool wait_for_shutdown() { return wait_for(shutdown_entered_); }
+
+    void release_prefill() { release(release_prefill_); }
+
+    void release_shutdown() { release(release_shutdown_); }
+
+private:
+    bool wait_for(const bool& flag) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [&] { return flag; });
+    }
+
+    void release(bool& flag) {
+        std::lock_guard lock(mutex_);
+        flag = true;
+        cv_.notify_all();
+    }
+
+    const Fault fault_;
+    bool injected_                = false;
+    const TokenId continuation_   = 1000 + 'a';
+    const std::int32_t row_count_ = 1;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool prefill_entered_  = false;
+    bool shutdown_entered_ = false;
+    bool release_prefill_  = false;
+    bool release_shutdown_ = false;
+};
+
+int run_executor_availability(Frontend& frontend) {
+    int failures = 0;
+    using Fault  = AvailabilityProgram::Fault;
+    for (const auto fault :
+         {Fault::PrefillAllocation, Fault::DecodeAllocation, Fault::StableDecodeAllocation,
+          Fault::PrefillInvariant, Fault::RequestLocal}) {
+        AvailabilityProgram program(fault);
+        ProbeLoaded loaded{frontend};
+        RecoveryProbe instance{&program, &loaded, {}};
+        auto options                = engine_options();
+        options.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, ProbeDevice{},
+                                                                    options);
+        auto submit = [&] {
+            auto prompt        = frontend.prepare(thinking_input());
+            const auto summary = prompt.summary();
+            ninfer::runtime::ResolvedRequestOptions request;
+            request.execution.allow_prefix_reuse      = false;
+            request.execution.requested_output_tokens = kOutputBudget;
+            request.stop.token_ids                    = {kCallerStop};
+            return executor.submit(std::move(prompt), summary, 0.0, std::move(request),
+                                   ninfer::OutputDelivery::TerminalOnly);
+        };
+        failures += check(executor.available(), "idle executor was unavailable");
+        auto first = submit();
+        failures += check(program.wait_for_prefill(), "availability prefill did not start");
+        std::optional<decltype(first)> queued;
+        if (fault != Fault::StableDecodeAllocation) { queued.emplace(submit()); }
+        failures += check(executor.available(), "busy executor was unavailable");
+        program.release_prefill();
+        if (fault != Fault::RequestLocal) {
+            failures += check(program.wait_for_shutdown(), "fatal worker did not clean up tiers");
+            failures +=
+                check(!executor.available(), "fatal worker stayed available during cleanup");
+            bool rejected = false;
+            try {
+                auto unexpected = submit();
+            } catch (const ninfer::RequestError& error) {
+                rejected = error.kind() == ninfer::RequestErrorKind::Unavailable;
+            }
+            failures += check(rejected, "failed worker accepted a request during tier cleanup");
+            program.release_shutdown();
+        }
+        bool primary_preserved = false;
+        try {
+            (void)first.wait(nullptr, {});
+        } catch (const std::bad_alloc&) {
+            primary_preserved = fault == Fault::PrefillAllocation ||
+                                fault == Fault::DecodeAllocation ||
+                                fault == Fault::StableDecodeAllocation;
+        } catch (const ninfer::RequestError& error) {
+            primary_preserved = fault == Fault::RequestLocal &&
+                                error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+        } catch (const std::logic_error& error) {
+            primary_preserved = fault == Fault::PrefillInvariant &&
+                                std::string(error.what()) == "availability invariant failure";
+        }
+        failures += check(primary_preserved, "worker failure lost its original error");
+        if (queued) {
+            bool queued_completed = false;
+            try {
+                const auto result = queued->wait(nullptr, {});
+                queued_completed =
+                    fault == Fault::RequestLocal && result.finish_reason == FinishReason::StopToken;
+            } catch (const std::bad_alloc&) {
+                queued_completed =
+                    fault == Fault::PrefillAllocation || fault == Fault::DecodeAllocation;
+            } catch (const std::logic_error& error) {
+                queued_completed = fault == Fault::PrefillInvariant &&
+                                   std::string(error.what()) == "availability invariant failure";
+            }
+            failures +=
+                check(queued_completed, "queued request did not observe worker availability");
+        } else {
+            failures += check(program.decode_calls == 2,
+                              "stable decode fault did not follow a successful round");
+        }
+        failures += check(executor.available() == (fault == Fault::RequestLocal),
+                          "terminal worker availability did not match error ownership");
+    }
+    return failures;
+}
+
+int main(int argc, char** argv) {
     try {
-        Frontend frontend                = FrontendTestAccess::create_component(resources(), false);
+        Frontend frontend = FrontendTestAccess::create_component(resources(), false);
+        if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+            std::string_view(argv[2]) == "availability") {
+            return run_executor_availability(frontend);
+        }
+
         const CacheCase recovery_cases[] = {
             CacheCase::RecoveryRamRestoreFails, CacheCase::RecoveryResidentHit,
             CacheCase::RecoveryRamHit,          CacheCase::RecoveryDiskHit,
@@ -4621,6 +4977,7 @@ int main() {
             CacheCase::AdmitDiskRestoreThenCold,
         };
         int failures = run_integrity_failure(frontend);
+        failures += run_admission_credit_eviction(frontend);
         failures += run_chunked_continuation(frontend, false);
         failures += run_chunked_continuation(frontend, true);
         failures += run_chunked_continuation(frontend, true, true);
@@ -4699,6 +5056,7 @@ int main() {
         failures += run_retry_lifecycle(frontend);
         failures += run_admission_defers_for_reclaim(frontend);
         failures += run_cache_maintenance_idle(frontend);
+        failures += run_executor_availability(frontend);
         std::cout << "recovery executor failures=" << failures << '\n';
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

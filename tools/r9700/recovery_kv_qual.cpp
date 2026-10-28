@@ -11,6 +11,7 @@
 #include "targets/qwen3_8_27b/impl/load/bindings.h"
 #include "core/arena.h"
 #include "core/device.h"
+#include "targets/qwen3/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_8_27b/impl/variant.h"
 
 #include <ninfer/targets/qwen3/frontend.h>
@@ -138,7 +139,7 @@ void exercise_decoded_retries(execution::ProgramImplCore& program, family::Front
         const auto prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
         const auto insert        = recovery->recovery_insert({}, attempt);
         auto prepared_retry =
-            frontend.splice_recovery_prompt(prompt.token_ids, input, insert, recovery);
+            frontend.splice_recovery_prompt(prompt.token_ids, input, insert, recovery, true);
         require(prepared_retry.has_value(), "decoded retry splice was rejected");
         auto retry = family::PreparedPromptAccess::take(std::move(prepared_retry.value()));
 
@@ -429,7 +430,8 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
 
     const auto recovery = family::GenerationRecoveryContext::analyze(input);
     const auto insert   = recovery->recovery_insert({}, 1);
-    auto spliced_prompt = frontend.splice_recovery_prompt(prompt_ids, input, insert, recovery);
+    auto spliced_prompt =
+        frontend.splice_recovery_prompt(prompt_ids, input, insert, recovery, true);
     require(spliced_prompt.has_value(), "live thinking prompt refused the recovery splice");
     auto spliced = family::PreparedPromptAccess::take(std::move(spliced_prompt.value()));
     const std::vector<ninfer::TokenId> spliced_ids = spliced.token_ids;
@@ -469,7 +471,29 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     const std::vector<ninfer::TokenId> captured_ledger = program.sequences[0].ledger;
     const std::uint32_t captured_frontier              = program.sequences[0].execution_frontier;
     const auto captured_rewrite                        = program.sequences[0].rewrite_checkpoint;
-    std::uint64_t entry_id                             = 0;
+    // Fill the optional tier until capture must enumerate eviction candidates, then fault
+    // exactly that bookkeeping. The retained GPU continuation must remain reusable.
+    const auto initial_evictions = program.kv_ram_snapshot().evictions;
+    for (unsigned attempt = 0;
+         attempt < 64 && program.kv_ram_snapshot().evictions == initial_evictions; ++attempt) {
+        require(program.capture_retained_lane(0), "capture-allocation fixture could not fill RAM");
+        program.wait_kv_ram_copies();
+    }
+    require(program.kv_ram_snapshot().evictions > initial_evictions,
+            "capture-allocation fixture never required reclaim");
+    const auto before_allocation = program.kv_ram_snapshot();
+    family::detail::KVRamCache::test_fail_next_eviction_snapshot_allocation();
+    require(!program.capture_retained_lane(0) &&
+                !family::detail::KVRamCache::test_eviction_snapshot_allocation_pending(),
+            "optional capture bookkeeping allocation failure escaped or was not exercised");
+    const auto after_allocation = program.kv_ram_snapshot();
+    require(after_allocation.drops == before_allocation.drops + 1 &&
+                after_allocation.captures == before_allocation.captures &&
+                after_allocation.evictions == before_allocation.evictions &&
+                program.sequences[0].retained && program.sequences[0].kv.has_value() &&
+                program.sequences[0].ledger == captured_ledger,
+            "capture allocation failure changed resident continuation or retained RAM sources");
+    std::uint64_t entry_id = 0;
     require(program.capture_retained_lane(0, &entry_id) && entry_id != 0,
             "retained lane did not capture a RAM checkpoint");
     program.wait_kv_ram_copies();

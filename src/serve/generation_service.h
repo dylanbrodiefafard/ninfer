@@ -138,6 +138,8 @@ public:
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
+    [[nodiscard]] bool available() const { return engine_->available(); }
+
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
     // HTTP generation requests holding an ingress slot (preparing, pending, or running).

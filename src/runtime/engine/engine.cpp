@@ -382,6 +382,10 @@ MemorySummary Engine::memory_summary() const {
     return impl_->executor->memory_summary();
 }
 
+bool Engine::available() const {
+    return impl_ != nullptr && impl_->executor != nullptr && impl_->executor->available();
+}
+
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->executor == nullptr) {

@@ -186,6 +186,8 @@ Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions
 
 Run `./build-r9700/apps/ninfer --help` for all options and defaults.
 
+Live-image credit metadata allocation failure follows the unfunded-capacity policy: admission may reduce its output window or defer. Failed suspension, resume, or window metadata allocation preserves the existing continuation and allows retry; a failed GPU synchronization remains fatal.
+
 ## Message-input scoring
 
 `ninfer-ppl` accepts exactly one of `--ids` or `--messages`. Message input uses the same owning prompt adapter as generation; `--vision` enables image/video parts and `--thinking` controls the template. Set `--max-context` for message input. `--score-last-message` scores the final completed assistant payload, including its reasoning and turn closure, and requires preceding history. Its boundary comes from the actual rendered full-token sequence; an indivisible token crossing the header/payload boundary is scored whole. It cannot be combined with `--skip`. `--tokens` applies only to token-ID input. For example:

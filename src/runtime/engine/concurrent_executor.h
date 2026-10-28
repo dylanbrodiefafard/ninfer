@@ -352,6 +352,11 @@ public:
         return results;
     }
 
+    [[nodiscard]] bool available() const {
+        std::lock_guard lock(queue_mutex_);
+        return !stopping_ && !failed_;
+    }
+
     [[nodiscard]] RuntimeStats runtime_stats() const {
         const auto disk = instance_.program->try_kv_disk_snapshot();
         RuntimeStats out;
@@ -2391,9 +2396,18 @@ private:
                                       .value();
                         // Imported checkpoint heads can make the winning image larger than
                         // the cold base plan. Search window sizes against both GPU and RAM.
-                        funded = joins_cohort ||
-                                 instance_.program->reserve_suspension_credit(
-                                     request->id, selected_plan.summary().suspension_bytes);
+                        const auto image_bytes = selected_plan.summary().suspension_bytes;
+                        const auto ram_version = instance_.program->kv_ram_index_version();
+                        funded = joins_cohort || instance_.program->reserve_suspension_credit(
+                                                     request->id, image_bytes);
+                        // Live credit takes precedence over optional prefixes and can evict
+                        // this unclaimed winner even when allocation fails. Reselect and fund
+                        // its actual image at the same window before admitting or shrinking.
+                        if (instance_.program->kv_ram_index_version() != ram_version) {
+                            choice = find_admission_lane(request);
+                            funded = false;
+                            continue;
+                        }
                         if (funded) break;
                     }
                     const auto previous = request->base_plan->summary().window_output_tokens;
@@ -4105,6 +4119,20 @@ private:
         }
     }
 
+    void fail_executor(const std::exception_ptr& error) noexcept {
+        {
+            std::lock_guard lock(queue_mutex_);
+            failed_ = true;
+        }
+        {
+            std::scoped_lock execution_lock(execution_mutex_);
+            drain_copy_hold_before_abort();
+            detail::run_secondary_cleanup(
+                [&] { instance_.program->shutdown_kv_tiers(load_progress_); });
+        }
+        fail_all(error);
+    }
+
     void fail_all(const std::exception_ptr& error) noexcept {
         std::scoped_lock execution_lock(execution_mutex_);
         std::vector<std::shared_ptr<Request>> pending;
@@ -4190,7 +4218,7 @@ private:
                     }
                     stable_decode_epoch = false;
                 } catch (...) {
-                    fail_all(std::current_exception());
+                    fail_executor(std::current_exception());
                     return;
                 }
             }
@@ -4379,15 +4407,7 @@ private:
                     continue;
                 }
             } catch (...) {
-                {
-                    std::scoped_lock execution_lock(execution_mutex_);
-                    drain_copy_hold_before_abort();
-                    try {
-                        instance_.program->shutdown_kv_tiers(load_progress_);
-                        // NOLINTNEXTLINE(bugprone-empty-catch): shutdown fails all anyway
-                    } catch (...) {}
-                }
-                fail_all(std::current_exception());
+                fail_executor(std::current_exception());
                 return;
             }
         }

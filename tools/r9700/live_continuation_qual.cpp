@@ -8,11 +8,46 @@
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <cstdlib>
+#include <new>
+#include <utility>
+#include "targets/qwen3/impl/runtime/kv_ram_cache.h"
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+// Fault only the test caller's next C++ allocation; HIP and host-copy workers keep their
+// allocators. Each fault is armed after model startup at a settled transaction boundary.
+thread_local bool fail_next_caller_allocation = false;
+thread_local bool caller_allocation_failed    = false;
+
+void* operator new(std::size_t bytes) {
+    if (std::exchange(fail_next_caller_allocation, false)) {
+        caller_allocation_failed = true;
+        throw std::bad_alloc();
+    }
+    if (void* memory = std::malloc(bytes == 0 ? 1 : bytes)) { return memory; }
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+
+// The replacement operator new uses malloc, so free is the matching release. GCC 13
+// diagnoses the inlined std::allocator path despite that pairing.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+
+void operator delete(void* memory) noexcept { std::free(memory); }
+
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+
+void operator delete[](void* memory) noexcept { std::free(memory); }
+
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+
+#pragma GCC diagnostic pop
 
 namespace {
 using namespace ninfer;
@@ -77,7 +112,8 @@ void publish(Result& result, targets::qwen3::PublishedOutput output) {
 
 Result run(targets::Qwen3_8_27BInstance& instance, DeviceContext& device, Boundary boundary,
            bool transfer, std::uint64_t owner, bool sampled,
-           CancelTransfer cancel = CancelTransfer::None, bool shrink_before_transfer = false) {
+           CancelTransfer cancel = CancelTransfer::None, bool shrink_before_transfer = false,
+           bool allocation_faults = false) {
     auto& frontend = instance.loaded->frontend;
     auto& program  = *instance.program;
     PromptInput input;
@@ -206,6 +242,20 @@ Result run(targets::Qwen3_8_27BInstance& instance, DeviceContext& device, Bounda
                 };
                 require(program.reserve_suspension_credit(owner, window.suspension_bytes),
                         "could not fund live image credit");
+                if (allocation_faults) {
+                    using Ram             = targets::qwen3::detail::KVRamCache;
+                    const auto gpu_before = program.kv_gpu_snapshot();
+                    Ram::test_fail_next_capture_metadata_allocation();
+                    require(!program.start_suspend(lane, owner) &&
+                                !Ram::test_capture_metadata_failure_pending(),
+                            "suspend capture allocation failure escaped or was not exercised");
+                    const auto gpu_after = program.kv_gpu_snapshot();
+                    require(gpu_before.main.entitled_pages == gpu_after.main.entitled_pages &&
+                                gpu_before.spec.entitled_pages == gpu_after.spec.entitled_pages &&
+                                gpu_before.main.mapped_pages == gpu_after.main.mapped_pages &&
+                                gpu_before.spec.mapped_pages == gpu_after.spec.mapped_pages,
+                            "failed suspension changed resident KV ownership");
+                }
                 require(program.start_suspend(lane, owner), "live capture did not start");
                 if (cancel == CancelTransfer::CaptureStarted) { return cancel_transfer(true); }
                 device.synchronize_all();
@@ -213,8 +263,28 @@ Result run(targets::Qwen3_8_27BInstance& instance, DeviceContext& device, Bounda
                 const auto captured_gpu = program.kv_gpu_snapshot();
                 program.finish_suspend(lane, owner);
                 if (cancel == CancelTransfer::Parked) { return cancel_transfer(false); }
+                if (allocation_faults) {
+                    fail_next_caller_allocation = true;
+                    caller_allocation_failed    = false;
+                }
                 const auto restored_window = program.plan_suspended_window(
                     owner, shrink_before_transfer ? window.output_tokens : kOutput);
+                if (allocation_faults) {
+                    fail_next_caller_allocation = false;
+                    require(!caller_allocation_failed, "suspended window planning allocated");
+                    using Ram             = targets::qwen3::detail::KVRamCache;
+                    const auto gpu_before = program.kv_gpu_snapshot();
+                    Ram::test_fail_next_restore_metadata_allocation();
+                    require(!program.start_resume(1, owner, restored_window) &&
+                                !Ram::test_restore_metadata_failure_pending(),
+                            "resume allocation failure escaped or retained the destination");
+                    const auto gpu_after = program.kv_gpu_snapshot();
+                    require(gpu_before.main.entitled_pages == gpu_after.main.entitled_pages &&
+                                gpu_before.spec.entitled_pages == gpu_after.spec.entitled_pages &&
+                                gpu_before.main.mapped_pages == gpu_after.main.mapped_pages &&
+                                gpu_before.spec.mapped_pages == gpu_after.spec.mapped_pages,
+                            "failed resume leaked partial destination KV ownership");
+                }
                 if (shrink_before_transfer) {
                     require(restored_window.admission.main_kv_pages >=
                                     captured_gpu.main.mapped_pages &&
@@ -234,6 +304,22 @@ Result run(targets::Qwen3_8_27BInstance& instance, DeviceContext& device, Bounda
                                 restored_gpu.spec.mapped_pages == captured_gpu.spec.mapped_pages,
                             "small restore changed the captured represented page set");
                     const auto full_window = program.plan_window(1, kOutput);
+                    if (allocation_faults) {
+                        const auto gpu_before       = program.kv_gpu_snapshot();
+                        fail_next_caller_allocation = true;
+                        caller_allocation_failed    = false;
+                        const bool granted          = program.grant_window(1, full_window);
+                        fail_next_caller_allocation = false;
+                        require(caller_allocation_failed && !granted,
+                                "window allocation fault escaped or committed a partial grant");
+                        const auto gpu_after = program.kv_gpu_snapshot();
+                        require(gpu_before.main.entitled_pages == gpu_after.main.entitled_pages &&
+                                    gpu_before.spec.entitled_pages ==
+                                        gpu_after.spec.entitled_pages &&
+                                    gpu_before.main.mapped_pages == gpu_after.main.mapped_pages &&
+                                    gpu_before.spec.mapped_pages == gpu_after.spec.mapped_pages,
+                                "failed window grant changed current KV ownership");
+                    }
                     require(
                         program.grant_window(1, full_window),
                         "small restored window could not regrow to its original output allowance");
@@ -322,11 +408,14 @@ int main(int argc, char** argv) {
     try {
         require(argc == 3 || argc == 4,
                 "usage: live_continuation_qual ARTIFACT.ninfer none|dflash|mtp "
-                "[--cancel-transfers|--shrink-before-transfer]");
+                "[--cancel-transfers|--shrink-before-transfer|--allocation-failures]");
         const bool cancel_transfers =
             argc == 4 && std::string_view(argv[3]) == "--cancel-transfers";
+        const bool allocation_faults =
+            argc == 4 && std::string_view(argv[3]) == "--allocation-failures";
         const bool shrink_transfers =
-            argc == 4 && std::string_view(argv[3]) == "--shrink-before-transfer";
+            allocation_faults ||
+            (argc == 4 && std::string_view(argv[3]) == "--shrink-before-transfer");
         require(argc == 3 || cancel_transfers || shrink_transfers, "unknown qualifier mode");
         const std::string_view backend = argv[2];
         require(backend == "none" || backend == "dflash" || backend == "mtp",
@@ -377,14 +466,16 @@ int main(int argc, char** argv) {
                      {Boundary::BeforeCap, Boundary::PendingClose, Boundary::AfterClose}) {
                     const auto baseline = run(*target.active, device, boundary, false, owner++,
                                               sampled, CancelTransfer::None, false);
-                    const auto resumed  = run(*target.active, device, boundary, true, owner++,
-                                              sampled, CancelTransfer::None, shrink_transfers);
+                    const auto resumed =
+                        run(*target.active, device, boundary, true, owner++, sampled,
+                            CancelTransfer::None, shrink_transfers, allocation_faults);
                     compare(baseline, resumed);
                     std::cout << "live_continuation: PASS backend=" << backend << " sampling="
                               << (sampled ? "standard-t0.7-presence0.2-frequency0.1" : "greedy")
                               << " boundary=" << static_cast<int>(boundary)
                               << " committed=" << resumed.tokens.size() << " after_boundary="
                               << resumed.tokens.size() - resumed.boundary_output
+                              << " allocation_faults=" << allocation_faults
                               << " shrink_before_transfer=" << shrink_transfers
                               << " restore_shrunken_then_regrow=" << shrink_transfers
                               << " released_main_pages=" << resumed.released_main_pages
