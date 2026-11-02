@@ -308,7 +308,8 @@ static hipError_t launch_r9700_attention(const R9700FullAttentionArgs& a,
         tail.output += 128U * row_elements;
         return ops::r9700::kv::fp8_int4_kv_attention_wmma(tail, stream);
     }
-    if (packed_decode_route(raw, tree_or_device_count)) {
+    // Device active-row counts ride on packed decode, whose setup and merge zero inactive rows.
+    if (packed_decode_route(raw, a.ancestor_masks != nullptr)) {
         const std::size_t required =
             ops::r9700::kv::fp8_int4_kv_attention_packed_decode_workspace_bytes(
                 raw.context, static_cast<std::uint32_t>(rows));
