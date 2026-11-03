@@ -26,16 +26,16 @@ struct ResponsesRequest {
     // resolved previous_response_id context to generation.messages before
     // submitting it to GenerationService.
     std::vector<ChatTurn> input_turns;
-    std::vector<nlohmann::json> input_items;
+    std::vector<nlohmann::ordered_json> input_items;
 
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
-    nlohmann::json text_format = {{"type", "text"}};
-    nlohmann::json metadata    = nlohmann::json::object();
-    nlohmann::json tools       = nlohmann::json::array();
-    nlohmann::json tool_choice = "auto";
-    bool store                 = true;
-    bool stream                = false;
+    nlohmann::ordered_json text_format = {{"type", "text"}};
+    nlohmann::ordered_json metadata    = nlohmann::ordered_json::object();
+    nlohmann::ordered_json tools       = nlohmann::ordered_json::array();
+    nlohmann::ordered_json tool_choice = "auto";
+    bool store                         = true;
+    bool stream                        = false;
     // The request's top_logprobs value, echoed in the response object.
     int top_logprobs = 0;
 };
@@ -47,18 +47,19 @@ struct ResponsesRuntimeValues {
 };
 
 struct BuiltResponse {
-    nlohmann::json body;
-    std::vector<nlohmann::json> output_items;
+    nlohmann::ordered_json body;
+    std::vector<nlohmann::ordered_json> output_items;
     std::vector<ChatTurn> output_history;
 };
 
 // Parse POST /v1/responses. Only NInfer Responses Core capabilities are
 // accepted; recognized but unsupported OpenAI fields fail explicitly.
-ResponsesRequest parse_responses_request(const nlohmann::json& body, const RequestLimits& limits);
+ResponsesRequest parse_responses_request(const nlohmann::ordered_json& body,
+                                         const RequestLimits& limits);
 
 // Parse POST /v1/responses/input_tokens. The current OpenAI endpoint accepts
 // model + input; the result still uses GenerationRequest for shared translation.
-ResponsesRequest parse_response_input_tokens_request(const nlohmann::json& body,
+ResponsesRequest parse_response_input_tokens_request(const nlohmann::ordered_json& body,
                                                      const RequestLimits& limits);
 
 // Compose the stateless GenerationRequest submitted to Engine. Current

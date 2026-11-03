@@ -24,7 +24,7 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+using Json = nlohmann::ordered_json;
 
 // Same value as ninfer::kPagedKVPageSize. Serve does not include the core KV header.
 constexpr std::uint32_t kKvPageTokens = 64;

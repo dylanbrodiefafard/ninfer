@@ -2,6 +2,8 @@
 #include "serve/json_input.h"
 #include "serve/request.h"
 #include "serve/anthropic_schema.h"
+#include "serve/openai_schema.h"
+#include "serve/responses_schema.h"
 #include "product/prompt_input/prompt_input.h"
 
 #include <cstdint>
@@ -124,7 +126,52 @@ int main() {
             throw std::runtime_error(
                 "unsupported Anthropic output format changed error classification");
         }
+        // Response grammars emit properties in schema order, and tool schemas are rendered into
+        // the prompt as supplied. A key-sorting representation would make a JSON response begin
+        // with whichever property sorts first, for example a list before the fields it describes.
+        const std::string ordered_schema =
+            R"({"type":"object","properties":{"title":{"type":"string"},"tags":{"type":"array"},"people":{"type":"array"}},"required":["title","tags","people"]})";
+        const auto chat = ninfer::serve::parse_chat_completion_request(
+            ninfer::serve::parse_request_body(
+                R"({"model":"local","messages":[{"role":"user","content":"hello"}],"response_format":{"type":"json_schema","json_schema":{"name":"result","schema":)" +
+                    ordered_schema + "}}}",
+                Protocol::ChatCompletions),
+            {});
+        if (!chat.output_constraint || chat.output_constraint->source != ordered_schema) {
+            throw std::runtime_error("Chat response schema lost property order");
+        }
+        const auto responses = ninfer::serve::parse_responses_request(
+            ninfer::serve::parse_request_body(
+                R"({"model":"local","input":"hello","text":{"format":{"type":"json_schema","name":"result","schema":)" +
+                    ordered_schema + "}}}",
+                Protocol::Responses),
+            {});
+        if (!responses.generation.output_constraint ||
+            responses.generation.output_constraint->source != ordered_schema) {
+            throw std::runtime_error("Responses schema lost property order");
+        }
+        const auto tools = ninfer::serve::parse_chat_completion_request(
+            ninfer::serve::parse_request_body(
+                R"({"model":"local","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"f","parameters":)" +
+                    ordered_schema + "}}]}",
+                Protocol::ChatCompletions),
+            {});
+        if (tools.tools.size() != 1 || tools.tools[0].parameters_json != ordered_schema) {
+            throw std::runtime_error("Chat tool schema lost property order");
+        }
         MessagesFile messages;
+        {
+            std::ofstream stream(messages.path);
+            stream.exceptions(std::ios::failbit | std::ios::badbit);
+            stream
+                << R"({"messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"f","parameters":)"
+                << ordered_schema << "}}]}";
+        }
+        const auto file_prompt = ninfer::product::prompt_from_messages(messages.path, false, false);
+        if (file_prompt.options.tool_jsons.size() != 1 ||
+            file_prompt.options.tool_jsons[0].find(ordered_schema) == std::string::npos) {
+            throw std::runtime_error("messages-file tool schema lost property order");
+        }
         {
             std::ofstream stream(messages.path);
             stream.exceptions(std::ios::failbit | std::ios::badbit);
@@ -141,7 +188,7 @@ int main() {
         }
         if (!rejected_messages)
             throw std::runtime_error("messages file lost schema source precision");
-        std::cout << "PASS: decimal schema source values and paths\n";
+        std::cout << "PASS: decimal schema source values, paths, and property order\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

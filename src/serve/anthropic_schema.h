@@ -22,7 +22,8 @@ namespace ninfer::serve {
 // assistant tool_use blocks become tool calls. Throws ApiException on malformed /
 // unsupported requests. The `model` field is accepted verbatim (any Claude model
 // name) and echoed back, never validated against the loaded model.
-GenerationRequest parse_messages_request(const nlohmann::json& body, const RequestLimits& limits);
+GenerationRequest parse_messages_request(const nlohmann::ordered_json& body,
+                                         const RequestLimits& limits);
 
 // Map an internal finish reason (+ whether tool calls were produced) onto the
 // Anthropic stop_reason wire value.

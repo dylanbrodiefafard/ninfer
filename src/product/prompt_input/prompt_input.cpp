@@ -14,7 +14,7 @@
 namespace ninfer::product {
 namespace {
 
-using Json = nlohmann::json;
+using Json = nlohmann::ordered_json;
 
 ChatRole parse_chat_role(std::string_view role) {
     if (role == "system") { return ChatRole::System; }
@@ -256,7 +256,7 @@ PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_
             }
         }
         root = parsed.value;
-    } catch (const nlohmann::json::exception& error) {
+    } catch (const nlohmann::ordered_json::exception& error) {
         throw std::invalid_argument(std::string("failed to parse messages JSON: ") + error.what());
     }
 

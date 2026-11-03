@@ -23,8 +23,8 @@ std::size_t estimate_turn_bytes(const ChatTurn& turn) {
 
 std::size_t record_envelope_bytes(const StoredResponse& record) {
     std::size_t bytes = sizeof(StoredResponse) + record.id.size() + record.response.dump().size();
-    for (const nlohmann::json& item : record.input_items) {
-        bytes += sizeof(nlohmann::json) + item.dump().size();
+    for (const nlohmann::ordered_json& item : record.input_items) {
+        bytes += sizeof(nlohmann::ordered_json) + item.dump().size();
     }
     return bytes;
 }

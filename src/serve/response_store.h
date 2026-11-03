@@ -31,8 +31,8 @@ std::vector<ChatTurn> flatten_response_context(const ResponseContext& context);
 
 struct StoredResponse {
     std::string id;
-    nlohmann::json response;
-    std::vector<nlohmann::json> input_items;
+    nlohmann::ordered_json response;
+    std::vector<nlohmann::ordered_json> input_items;
     ResponseContext context;
     bool preserve_thinking = false;
 };

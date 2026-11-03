@@ -14,7 +14,7 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+using Json = nlohmann::ordered_json;
 
 constexpr std::size_t kMaxToolNameLength = 128;
 

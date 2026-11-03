@@ -8,7 +8,7 @@
 
 namespace ninfer::serve {
 
-nlohmann::json parse_request_body(std::string_view source, JsonRequestProtocol protocol) {
+nlohmann::ordered_json parse_request_body(std::string_view source, JsonRequestProtocol protocol) {
     const auto parsed = text::parse_json_numbers(source);
     const auto check  = [&](const std::string& path, bool tool = false,
                             const std::string& name = {}) {

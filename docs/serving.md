@@ -152,7 +152,9 @@ Regex `pattern` assertions, anchor references, assertion siblings of `$ref`/`any
 and unsupported assertions such as `uniqueItems`, `oneOf`, `allOf`, or conditionals fail
 admission with HTTP 400 `invalid_output_constraint`; they are never silently relaxed.
 JSON is generated compactly, without optional formatting whitespace, and properties follow schema order to avoid an exponential unordered-property
-state space. Additional keys alongside named properties use printable ASCII without escapes,
+state space. Request JSON keeps the client's member order, so the response's property order is the
+order of `properties` in the request; put context-establishing fields before the lists or
+details that depend on them. Additional keys alongside named properties use printable ASCII without escapes,
 quotes, or backslashes to prevent aliases overwriting named values. A positive `minProperties`
 above one with additional keys requires at least that many distinct required properties;
 otherwise admission rejects the combination because arbitrary repeated keys cannot establish a
@@ -527,7 +529,7 @@ surface, `param` identifies the source JSON Pointer, including the assertion key
 
 Qwen argument framing uses exactly one LF before and after each parameter value.
 Declared arguments may appear in any order, independently of the order of
-`properties` in the supplied schema or its HTTP JSON normalization. The grammar
+`properties` in the supplied schema. The grammar
 tracks which named keys have been emitted: it cannot close before the required
 keys are present, repeat a named key, or bypass a named value's constraints through
 `additionalProperties`. Property-count bounds still apply. Nested schema-defined

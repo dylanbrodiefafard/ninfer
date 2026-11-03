@@ -24,7 +24,7 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+using Json = nlohmann::ordered_json;
 
 class ClientDisconnected final : public std::exception {
 public:
