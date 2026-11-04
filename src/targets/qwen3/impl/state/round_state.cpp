@@ -73,7 +73,7 @@ void validate_spec(const RoundStateSpec& spec) {
         }
     }
     if (spec.batch_capacity == 0 || spec.batch_capacity > kMaximumConcurrency) {
-        throw std::invalid_argument("RoundState batch capacity must be in [1,8]");
+        throw std::invalid_argument("RoundState batch capacity must be in [1,16]");
     }
     (void)checked_i32(static_cast<std::uint64_t>(spec.draft_window) + 1ULL,
                       "RoundState draft window exceeds int32");
@@ -136,7 +136,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
                                          const OrdinaryDecodeStateLayout& layout,
                                          std::uint32_t batch_capacity) {
     if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency) {
-        throw std::invalid_argument("ordinary decode batch capacity must be in [1,8]");
+        throw std::invalid_argument("ordinary decode batch capacity must be in [1,16]");
     }
     static_assert(std::is_standard_layout_v<OrdinaryDecodeIngress>);
     static_assert(std::is_standard_layout_v<OrdinaryDecodeEgress>);
@@ -373,7 +373,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
 
 DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
                                      std::uint32_t batch_capacity, std::uint32_t draft_window) {
-    if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency || draft_window == 0 ||
+    if (batch_capacity == 0 || batch_capacity > kDFlashMaximumConcurrency || draft_window == 0 ||
         draft_window > kDFlashDecodeMaximumDrafts) {
         throw std::invalid_argument(
             "DFlash decode state dimensions are outside the supported domain");
@@ -431,10 +431,11 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         egress_tensor(offsetof(DFlashDecodeEgress, proposal_calibration), DType::FP32,
                       {ops::kPLessProposalCalibrationTemperatureCount *
                        static_cast<std::int32_t>(kDFlashDecodeMaximumDrafts) * batch});
-    logprobs = bind_round_logprobs<std::size_t{kMaximumConcurrency} * kDFlashDecodeMaximumWidth>(
-        static_cast<unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, logprob_rows),
-        static_cast<unsigned char*>(egress.data) + offsetof(DFlashDecodeEgress, logprobs), width,
-        batch);
+    logprobs =
+        bind_round_logprobs<std::size_t{kDFlashMaximumConcurrency} * kDFlashDecodeMaximumWidth>(
+            static_cast<unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, logprob_rows),
+            static_cast<unsigned char*>(egress.data) + offsetof(DFlashDecodeEgress, logprobs),
+            width, batch);
     proposal_ids               = layout.proposal_ids.bind(backing);
     proposal_positions         = layout.proposal_positions.bind(backing);
     target_rope_positions      = layout.target_rope_positions.bind(backing);

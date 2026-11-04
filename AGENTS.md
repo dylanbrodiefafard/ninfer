@@ -95,8 +95,8 @@ matrices. Vision-off binding validates those matrices without placing them on th
 Other `-eval` identities remain evaluation and conversion-base artifacts. DFlash2 keeps its model-specified BF16 selector
 codebook and private fixed BF16 state.
 
-The workload is one R9700, one resident model instance, and a startup-fixed one to eight active
-resident requests. The Engine forms one compact decode batch per round boundary with bounded FIFO
+The workload is one R9700, one resident model instance, and a startup-fixed one to sixteen active
+resident requests; DFlash2 admits one to eight. The Engine forms one compact decode batch per round boundary with bounded FIFO
 ingress. With RAM enabled, output reservations grow in windows of at most 8192 tokens and settled
 active continuations may suspend to secured RAM under KV pressure; RAM off retains full-lifetime
 GPU entitlement. A completion cohort whose target-produced lifetime envelopes jointly fit GPU capacity and dynamic

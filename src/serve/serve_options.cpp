@@ -101,7 +101,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--kv-capacity-headroom MiB] "
            "[--kv-ram-capacity off|N] [--kv-ram-system-prompts N] "
            "[--kv-disk-capacity off|N] [--kv-disk-location PATH] [--kv-disk-compress off|zstd] "
-           "[--max-concurrency 1..8] [--no-generation-recovery] "
+           "[--max-concurrency 1..16] [--no-generation-recovery] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--mixed-forward auto|N] [--mixed-forward-rounds N] "
            "[--log-stats-interval-ms N] [--device N] "
@@ -131,6 +131,7 @@ std::string serve_usage_text(const char* argv0) {
            "       Responses history is memory-only by default; --response-store-location persists "
            "it\n"
            "       Response history defaults to 1024 records / 256 MiB\n"
+           "       --max-concurrency accepts 1..16 with --spec none or mtp; DFlash: 1..8\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --kv-capacity defaults to auto: sizes KV from all free GPU memory except "
@@ -425,7 +426,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     validate_kv_disk_options(options.kv_ram_capacity_bytes, options.kv_disk_capacity_bytes,
                              options.kv_disk_location);
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("--max-concurrency must be in [1,8]");
+        throw std::invalid_argument("--max-concurrency must be in [1,16]");
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");

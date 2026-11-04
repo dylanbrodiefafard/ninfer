@@ -304,7 +304,7 @@ std::string usage_text(std::string_view program) {
         << "  --contention-context <L>    prompt tokens of each contention decode lane\n"
         << "                              (default: 512)\n"
         << "  --contention-lanes <N>      contention decode lanes, 1..C-1 (default: C-1)\n"
-        << "  --concurrency <1..8>        concurrent Engine lanes (default: 1);\n"
+        << "  --concurrency <1..16>       concurrent Engine lanes (default: 1; DFlash: 1..8);\n"
         << "                              pp+tg at C>1 reports batched decode after a sequential\n"
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
         << "                              benchmark requests use a fixed non-expiring long-run\n"
@@ -414,7 +414,7 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--concurrency") {
             options.concurrency = parse_u32(value("--concurrency"), "concurrency");
             if (options.concurrency > kMaximumConcurrency) {
-                throw std::invalid_argument("--concurrency must be in [1,8]");
+                throw std::invalid_argument("--concurrency must be in [1,16]");
             }
         } else if (arg == "--spec") {
             const std::string selected = value("--spec");

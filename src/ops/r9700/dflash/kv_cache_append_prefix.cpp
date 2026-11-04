@@ -70,7 +70,7 @@ void validate_common(const Tensor& key, const Tensor& value, const Tensor& posit
     require_vector_alignment(value, "value");
     const std::int32_t width = key.ne[2];
     const std::int32_t batch = key.ne[3];
-    if (width <= 0 || batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency) ||
+    if (width <= 0 || batch <= 0 || batch > static_cast<std::int32_t>(kDFlashMaximumConcurrency) ||
         envelope.min_count > envelope.max_count ||
         envelope.max_count > static_cast<std::uint32_t>(width)) {
         throw std::invalid_argument("kv_cache_append_prefix: invalid width, batch, or envelope");

@@ -138,6 +138,15 @@ int main() {
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
                             85819392, "48-layer T6 capacity");
+    failures += expect_size(record_bytes({.layers          = 48,
+                                          .record_capacity = 16,
+                                          .width           = 6,
+                                          .conv_channels   = 10240,
+                                          .qk_heads        = 16,
+                                          .value_heads     = 48,
+                                          .key_dim         = 128,
+                                          .value_dim       = 128}),
+                            171638784, "48-layer T6 C16 capacity");
     failures += expect_size(record_bytes({.layers          = 30,
                                           .record_capacity = 8,
                                           .width           = 6,
@@ -161,7 +170,7 @@ int main() {
         [&] {
             ninfer::LayoutBuilder invalid;
             (void)ninfer::plan_gdn_replay_records(invalid, {.layers          = 1,
-                                                            .record_capacity = 9,
+                                                            .record_capacity = 17,
                                                             .width           = 2,
                                                             .conv_channels   = 1,
                                                             .qk_heads        = 1,
@@ -169,7 +178,7 @@ int main() {
                                                             .key_dim         = 1,
                                                             .value_dim       = 1});
         },
-        "record capacity above eight");
+        "record capacity above sixteen");
 
     ninfer::LayoutBuilder state_builder;
     const auto state_layout = ninfer::plan_linear_attention_state_pool(

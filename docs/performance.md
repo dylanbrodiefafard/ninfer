@@ -13,7 +13,7 @@ NInfer distinguishes four scopes:
 3. runtime phases/rounds;
 4. complete Engine inference at fixed concurrency.
 
-A result is stated only at the scope directly measured. Kernel or Op timings do not establish tokens per second. Final production selection requires a complete model artifact, numerical quality guardrails, same-candidate graph/eager parity, resolved capacity, and end-to-end C=1..8 measurements on an otherwise idle R9700.
+A result is stated only at the scope directly measured. Kernel or Op timings do not establish tokens per second. Final production selection requires a complete model artifact, numerical quality guardrails, same-candidate graph/eager parity, resolved capacity, and end-to-end C=1..16 measurements (C=1..8 under DFlash) on an otherwise idle R9700.
 
 Benchmark schema 21 sums each request's active prepare, Vision and prefill service time across lanes. Aggregate prefill throughput divides all prompt tokens by that summed prefill service time. Batched decode retains the maximum shared lane duration; complete inference separately measures elapsed wall time. Service costs are not an additive wall-time decomposition. Schema 20 instead used the maximum lane prefill duration and overstated aggregate C>1 prefill throughput. Those concurrent prefill fields are ineligible for selection; retained C1, capacity, decode and independently measured whole-wall evidence remain valid in their respective scopes. The stopped attempt and valid raw results are retained in `profiles/bench/r9700-terminal-base-fp8-context-recovery-20260921/whole/closure.json` as historical evidence. The FP8 shared-context resource bridge and the benchmark-reporting bridge that re-admitted the hipBLASLt-era four-role hybrid evaluation artifact were retired with hipBLASLt (438f6a89): their bound runtime sources and qualifier no longer exist, and the Pareto, cutover, and DFlash-selection tools now reject any authority that binds either bridge.
 
@@ -596,6 +596,19 @@ The dominant GEMM hypotheses were also tested against the independent FP64 oracl
 
 The selected GDN route passed the required gfx1201 racecheck, memcheck and initcheck, the runtime planner qualifier, and focused clang-tidy with zero diagnostics. Evidence and exact commands are in `profiles/bench/r9700-prefill-opt-20261016/`; API attribution remains under `profiles/rocprof/r9700-prefill-20261016/`.
 
+## C9..16 main-stream residency (2026-11-04)
+
+C9..16 admit MTP or no speculation only. The main-stream bound for these concurrencies was measured on the production-recipe `blend-r9700-lq4` artifact with the Compose graph environment, max context 262144, `--kv-capacity auto` and one 8192,8 whole request per lane. Each C ran `ninfer_bench` with MTP K5 adaptive and with `--draft-tokens 0` (RAM/SSD off), and `ninfer-serve` with MTP K5 adaptive and `--spec none` (8192-MiB RAM, SSD on). Physical free is sampled from `mem_info_vram_used` every 50 ms. The residual is consumption after weights minus the logical arenas, observed graph memory, the 4-MiB allocation bound, the 2-MiB startup component and, with SSD on, its staging, descriptor and scatter reservations.
+
+| Route | C8 residual, MiB | C9..16 residual, MiB |
+|---|---:|---:|
+| MTP, cache off | 24.4 | 24.5–25.0 |
+| No speculation, cache off | 31.1 | 31.1–31.3 |
+| MTP, RAM/SSD on | 23.6 (graphs 76 MiB) | 27.3–33.3 |
+| No speculation, RAM/SSD on | 27.1 | 27.1–33.7 |
+
+The C9..16 bound is 32/32/32/34/34/34/34/34 MiB: the smallest 2-MiB step covering each concurrency's largest residual, kept non-decreasing in C. Cache-on maxima (C12 without speculation, C16 MTP) come from single runs with a step of up to 8 MiB at the first requests; the other cache-on points stay within 1 MiB of C8. The same residual exists at C8 on these routes, where its graph allowance (386–1092 MiB against 38–76 MiB observed under Compose settings) covers it; only the calibrated DFlash allowance relies on the C1..8 values. Natively (classic graph path), C16 MTP observes 786 MiB of graphs and starts with 250 MiB free at max context 71680.
+
 ## Drafter leftovers after the persistent decode kernel (2026-10-03)
 
 A whole-round C1 kernel trace (DFlash K7 `--lm-head-draft`) puts the drafter and selection at about 2.8 ms of the ~29.4 ms round, with every drafter projection at 620-640 GB/s. Two items outside the bandwidth-bound projections were examined:
@@ -752,7 +765,7 @@ Chunk size no longer moves prefill: 32K 2,949 / 2,949 tok/s and 128K 1,916 / 1,9
 
 ## C=1..8: verify-width kernels for C5..C8 (2026-10-01)
 
-`kMaximumConcurrency` is 8. DFlash verify rounds at C5..C8 run the Text and drafter projections at T = B x W = 17..64 columns (B <= 8 lanes, W = 4..8), widths the C2..C4 routes never reached. A C8 contention trace (7 decode lanes, 8K owner, production DFlash adaptive K7, `prof.sh`) attributed the regressions, and each fix was qualified against its FP64 oracle before adoption (unprofiled interleaved medians, `profiles/bench/r9700-c8-20260930/`):
+`kDFlashMaximumConcurrency` is 8. DFlash verify rounds at C5..C8 run the Text and drafter projections at T = B x W = 17..64 columns (B <= 8 lanes, W = 4..8), widths the C2..C4 routes never reached. A C8 contention trace (7 decode lanes, 8K owner, production DFlash adaptive K7, `prof.sh`) attributed the regressions, and each fix was qualified against its FP64 oracle before adoption (unprofiled interleaved medians, `profiles/bench/r9700-c8-20260930/`):
 
 | Change | Before -> after |
 |---|---|

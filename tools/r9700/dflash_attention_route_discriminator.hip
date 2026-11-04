@@ -400,8 +400,9 @@ double median(std::array<double, kTrials> values) {
 // cache planes. The pool is shared as in production: disjoint shuffled physical pages per sequence,
 // either selected through device table rows of one pool-wide table or passed as direct page tables.
 Json sequence_batch_qualification(ninfer::DeviceContext& device) {
-    constexpr std::array<std::size_t, 8> kContexts{37U,  600U,  4100U, 33000U,
-                                                   129U, 2050U, 8200U, 1000U};
+    constexpr std::array<std::size_t, 16> kContexts{37U,   600U,  4100U, 33000U, 129U, 2050U,
+                                                    8200U, 1000U, 9U,    65U,    320U, 16385U,
+                                                    257U,  3071U, 64U,   70000U};
     static_assert(kContexts.size() == kv::kPackedDecodeMaximumSequences &&
                   kContexts.size() == kv::kAppendMaximumSequences);
     constexpr std::size_t kSparePages  = 7U;
@@ -419,7 +420,7 @@ Json sequence_batch_qualification(ninfer::DeviceContext& device) {
     for (std::size_t page = 0; page < pool_pages; ++page)
         physical[page] = static_cast<std::uint32_t>(page);
     std::shuffle(physical.begin(), physical.end(), random);
-    // Pool-wide table [8][stride]; rows beyond a sequence's pages hold an out-of-pool page.
+    // Pool-wide table [16][stride]; rows beyond a sequence's pages hold an out-of-pool page.
     std::vector<std::uint32_t> tables(kContexts.size() * table_stride,
                                       static_cast<std::uint32_t>(pool_pages));
     std::size_t next_page = 0U;
@@ -477,6 +478,18 @@ Json sequence_batch_qualification(ninfer::DeviceContext& device) {
         {"b8_mixed_rows_direct_tables",
          {6U, 3U, 0U, 7U, 2U, 5U, 1U, 4U},
          {8U, 5U, 1U, 7U, 4U, 8U, 2U, 6U},
+         false},
+        {"b12_w1_table_rows",
+         {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 10U, 11U},
+         std::vector<std::uint32_t>(12U, 1U),
+         true},
+        {"b16_w6_table_rows",
+         {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 10U, 11U, 12U, 13U, 14U, 15U},
+         std::vector<std::uint32_t>(16U, 6U),
+         true},
+        {"b16_mixed_rows_direct_tables",
+         {14U, 6U, 3U, 9U, 0U, 15U, 7U, 12U, 2U, 5U, 11U, 1U, 8U, 13U, 4U, 10U},
+         {8U, 5U, 1U, 7U, 4U, 8U, 2U, 6U, 1U, 3U, 6U, 8U, 2U, 1U, 5U, 4U},
          false},
     };
     Json attention_cells = Json::array();

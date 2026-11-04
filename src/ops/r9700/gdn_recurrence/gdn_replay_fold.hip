@@ -22,7 +22,7 @@ constexpr int kValuesPerBlock = fold::kValuesPerItem;
 
 static_assert(sizeof(GdnReplayFoldKernelRow) == 80);
 static_assert(alignof(GdnReplayFoldKernelRow) == 8);
-static_assert(sizeof(GdnReplayFoldKernelRows) == 640);
+static_assert(sizeof(GdnReplayFoldKernelRows) == 80U * kMaximumConcurrency);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 
@@ -46,6 +46,8 @@ struct FoldAccess {
     std::int64_t conv_layer_stride;
     GdnReplayFoldKernelRows rows;
 };
+
+static_assert(sizeof(FoldAccess) <= 4096U, "replay fold arguments must fit the kernarg segment");
 
 // One CTA per 128-channel block. Small immutable record staging and convolution publication
 // precede projection; the large recurrent state stays untouched until the record consumer.

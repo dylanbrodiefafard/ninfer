@@ -87,7 +87,7 @@ void cyclic_oracle(std::vector<std::uint16_t>& cache_key, std::vector<std::uint1
 }
 
 void run_cyclic(ninfer::DeviceContext& device) {
-    constexpr int batch              = static_cast<int>(ninfer::kMaximumConcurrency);
+    constexpr int batch              = static_cast<int>(ninfer::kDFlashMaximumConcurrency);
     constexpr int lanes              = batch;
     const std::size_t input_elements = static_cast<std::size_t>(kD) * kHeads * kWidth * batch;
     const std::size_t cache_elements = static_cast<std::size_t>(kD) * kWindow * kHeads * lanes;

@@ -35,10 +35,10 @@ int main() {
     policy.observe(active, true);
     failures += check(!policy.pressure_needed() && !policy.draining(),
                       "single blocked lane disturbed runnable peers");
-    failures += check(policy.ranked_victims(active, KvPressureReason::Growth).count == 0,
+    failures += check(policy.ranked_victims(active, KvPressureReason::Growth).sets.empty(),
                       "single blocked lane triggered growth eviction");
     auto victims = policy.ranked_victims(active, KvPressureReason::WaitingReplacement);
-    failures += check(victims.count == 1 && victims.sets[0].mask == 1,
+    failures += check(victims.sets.size() == 1 && victims.sets[0].mask == 1,
                       "queued replacement evicted an unblocked or completion member");
     failures += check(policy.oldest_incumbent() == 1 && policy.incumbent_ids().size() == 3,
                       "pressure did not freeze original incumbent identities");
@@ -74,7 +74,7 @@ int main() {
     failures += check(pressure.draining() && pressure.pressure_needed(),
                       "second blocked request did not open evacuation drain");
     victims = pressure.ranked_victims(rows, KvPressureReason::Growth);
-    failures += check(victims.count == 7 && victims.sets[0].mask == 2 &&
+    failures += check(victims.sets.size() == 7 && victims.sets[0].mask == 2 &&
                           victims.sets[1].mask == 1 && victims.sets[2].mask == 4,
                       "victims did not prefer minimal blocked captures by transfer cost");
     // Exact geometry is deliberately external. Simulate only a two-victim post-transition
@@ -125,8 +125,22 @@ int main() {
     single[0].completion_member = true;
     alone.observe(single, false);
     failures += check(alone.draining() && !alone.allows_ingress(1, false) &&
-                          alone.ranked_victims(single, KvPressureReason::Growth).count == 0,
+                          alone.ranked_victims(single, KvPressureReason::Growth).sets.empty(),
                       "single protected member tried to spill instead of using exclusive growth");
+
+    // Every resident of a full C16 batch is addressable by a victim mask bit.
+    KvPressurePolicy full(ninfer::kMaximumConcurrency, ninfer::kMaximumConcurrency);
+    std::vector<KvPressureRequest> residents;
+    for (std::uint64_t id = 1; id <= ninfer::kMaximumConcurrency; ++id) {
+        residents.push_back(request(id, true));
+        residents.back().suspension_bytes = 1000U - id;
+    }
+    full.observe(residents, true);
+    victims = full.ranked_victims(residents, KvPressureReason::Growth);
+    failures += check(victims.sets.size() == (std::size_t{1} << ninfer::kMaximumConcurrency) - 1U &&
+                          victims.sets[0].count == 1 &&
+                          victims.sets[0].mask == 1U << (ninfer::kMaximumConcurrency - 1U),
+                      "C16 pressure ranking omitted a resident or a minimal victim");
 
     return failures == 0 ? 0 : 1;
 }

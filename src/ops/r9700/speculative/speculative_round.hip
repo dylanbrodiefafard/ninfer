@@ -329,7 +329,7 @@ std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32
         max_drafts >= kMaximumColumns || min_batch < 1 || max_batch < min_batch ||
         max_batch > kMaximumBatch) {
         throw std::invalid_argument(
-            "speculative accept workspace: require K in [1,15] and B in [1,8]");
+            "speculative accept workspace: require K in [1,15] and B in [1,16]");
     }
     return make_sampling_workspace_layout(token_domain, max_drafts + 1).bytes *
            static_cast<std::size_t>(max_batch);
@@ -344,7 +344,7 @@ std::size_t speculative_accept_tree_drafts_workspace_capacity_bytes(std::int32_t
         max_width > kMaximumColumns || min_batch < 1 || max_batch < min_batch ||
         max_batch > kMaximumBatch) {
         throw std::invalid_argument(
-            "speculative tree workspace: require W in [2,16] and B in [1,8]");
+            "speculative tree workspace: require W in [2,16] and B in [1,16]");
     }
     return make_sampling_workspace_layout(token_domain, max_width).bytes *
            static_cast<std::size_t>(max_batch);
@@ -360,7 +360,7 @@ void speculative_prepare_verify_inputs(const Tensor& anchors, const Tensor& draf
     if (drafts_per_row < 1 || drafts_per_row >= kMaximumColumns || batch < 1 ||
         batch > kMaximumBatch) {
         throw std::invalid_argument(
-            "speculative_prepare_verify_inputs: require K in [1,15] and B in [1,8]");
+            "speculative_prepare_verify_inputs: require K in [1,15] and B in [1,16]");
     }
     require_vector(anchors, DType::I32, batch, op, "anchors");
     require_matrix(drafts, DType::I32, drafts_per_row, batch, op, "drafts");
@@ -385,7 +385,7 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
     if (drafts_per_row < 1 || drafts_per_row >= kMaximumColumns || batch < 1 ||
         batch > kMaximumBatch) {
         throw std::invalid_argument(
-            "speculative_prepare_verify_ids: require K in [1,15] and B in [1,8]");
+            "speculative_prepare_verify_ids: require K in [1,15] and B in [1,16]");
     }
     require_vector(anchors, DType::I32, batch, op, "anchors");
     require_matrix(drafts, DType::I32, drafts_per_row, batch, op, "drafts");
@@ -453,7 +453,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     const int batch          = drafts.ne[1];
     if (drafts_per_row < 1 || columns > kMaximumColumns || batch < 1 || batch > kMaximumBatch) {
         throw std::invalid_argument(
-            "speculative_accept_greedy_drafts: require K in [1,15] and B in [1,8]");
+            "speculative_accept_greedy_drafts: require K in [1,15] and B in [1,16]");
     }
     require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
     require_matrix(drafts, DType::I32, drafts_per_row, batch, op, "drafts");
@@ -577,7 +577,7 @@ void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& l
     const int batch = verify_ids.ne[1];
     if (width < 2 || width > kMaximumColumns || batch < 1 || batch > kMaximumBatch) {
         throw std::invalid_argument(
-            "speculative_accept_tree_drafts: require W in [2,16] and B in [1,8]");
+            "speculative_accept_tree_drafts: require W in [2,16] and B in [1,16]");
     }
     require_matrix(target_tokens, DType::I32, width, batch, op, "target_tokens");
     require_matrix(verify_ids, DType::I32, width, batch, op, "verify_ids");

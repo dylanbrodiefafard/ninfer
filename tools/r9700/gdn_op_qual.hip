@@ -644,7 +644,6 @@ void qualify_batched_projection_conv(hipStream_t stream) {
     constexpr std::uint32_t width        = 4;
     constexpr std::uint32_t batch        = ninfer::kMaximumConcurrency;
     constexpr std::uint32_t columns      = width * batch;
-    static_assert(batch == 8U, "the fixture below lists eight rows");
     constexpr std::uint32_t state_slots = batch + batch * width;
 
     const auto query_key =
@@ -654,11 +653,24 @@ void qualify_batched_projection_conv(hipStream_t stream) {
     const auto weight = bf16_fixture(static_cast<std::size_t>(kChannels) * 4U, 107U, 1024.0F);
     const auto initial_state =
         bf16_fixture(static_cast<std::size_t>(state_slots) * 3U * kChannels, 109U, 257.0F);
-    const std::vector<std::int32_t> valid{4, 2, 3, 1, 1, 4, 2, 3};
-    const std::vector<std::int32_t> initial_slots{0, 1, 2, 3, 4, 5, 6, 7};
-    const std::vector<std::int32_t> snapshot_bases{8, 12, 16, 20, 24, 28, 32, 36};
-    const std::vector<std::int32_t> parents{-1, 0, 0, 2, -1, 0, 0, 0, -1, 0, 0, 1, -1, 0, 1, 2,
-                                            -1, 0, 1, 1, -1, 0, 1, 2, -1, 0, 0, 0, -1, 0, 0, 1};
+    // Every row's valid extent and tree shape, cycled across the whole compact batch.
+    constexpr std::array<std::int32_t, 8> kValid{4, 2, 3, 1, 1, 4, 2, 3};
+    constexpr std::array<std::array<std::int32_t, width>, 8> kParents{{{-1, 0, 0, 2},
+                                                                       {-1, 0, 0, 0},
+                                                                       {-1, 0, 0, 1},
+                                                                       {-1, 0, 1, 2},
+                                                                       {-1, 0, 1, 1},
+                                                                       {-1, 0, 1, 2},
+                                                                       {-1, 0, 0, 0},
+                                                                       {-1, 0, 0, 1}}};
+    std::vector<std::int32_t> valid, initial_slots, snapshot_bases, parents;
+    for (std::uint32_t b = 0; b < batch; ++b) {
+        valid.push_back(kValid[(b + b / 8U) % kValid.size()]);
+        initial_slots.push_back(static_cast<std::int32_t>(b));
+        snapshot_bases.push_back(static_cast<std::int32_t>(batch + b * width));
+        const auto& row_parents = kParents[(b + 3U * (b / 8U)) % kParents.size()];
+        parents.insert(parents.end(), row_parents.begin(), row_parents.end());
+    }
 
     DeviceBuffer<hip_bfloat16> d_query_key(query_key.size());
     DeviceBuffer<hip_bfloat16> d_value_z(value_z.size());

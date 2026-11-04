@@ -73,7 +73,7 @@ docker compose up -d --wait
 
 The compile-job default is 8, with no builder memory limit. The builder CPU quota allows 14 logical CPUs; it is not a Linux load-average cap. Compose's memory limit applies only to the running server. Reuse the builder for subsequent builds.
 
-`.env` can override model path, C1..8, maximum draft count and cache capacities. Defaults are C6 and DFlash adaptive K up to 7, the recommended AMD draft setting. Adaptive selection measures yield and round time; a maximum of 7 does not force every round to draft seven tokens. See `docs/performance.md` for workload-specific measurements. The runtime is bounded to 24 GiB host RAM with no container swap; this limit does not count GPU VRAM. Cache/runtime allocations must fit that bound.
+`.env` can override model path, C1..16 (C1..8 with DFlash), maximum draft count and cache capacities. Defaults are C6 and DFlash adaptive K up to 7, the recommended AMD draft setting. Adaptive selection measures yield and round time; a maximum of 7 does not force every round to draft seven tokens. See `docs/performance.md` for workload-specific measurements. The runtime is bounded to 24 GiB host RAM with no container swap; this limit does not count GPU VRAM. Cache/runtime allocations must fit that bound.
 
 Docker references: https://docs.docker.com/reference/compose-file/build/ and https://docs.docker.com/reference/cli/docker/buildx/build/. Build policy: https://docs.docker.com/reference/compose-file/services/#pull_policy; object caching: https://docs.docker.com/reference/dockerfile/#run---mounttypecache; build/restart semantics: https://docs.docker.com/reference/cli/docker/compose/up/; builder limits: https://docs.docker.com/build/builders/drivers/docker-container/.
 

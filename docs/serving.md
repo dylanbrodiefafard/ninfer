@@ -528,7 +528,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache unique-object capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
 | `--kv-disk-compress off\|zstd` | zstd-1 on new GDN/hidden/cyclic writes; KV pages stay uncompressed | `off` |
-| `--max-concurrency N` | maximum resident requests; logical lifetime count remains bounded by concurrency plus pending capacity; valid range `1..8` | `1` |
+| `--max-concurrency N` | maximum resident requests; logical lifetime count remains bounded by concurrency plus pending capacity; valid range `1..16` with `--spec none` or `mtp`, DFlash: `1..8` (startup rejects more) | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `300000` |
 | `--prefill-chunk N` | text-prefill chunk | `2048` |
@@ -680,7 +680,7 @@ The preparation line is emitted after JSON/protocol parsing and, for Responses, 
 
 ## Execution behavior
 
-The server owns one resident Engine with a startup-fixed capacity of `1..8` active generation requests. At each decode boundary, every decode-ready request is compacted into one batch and processed by one model traversal and, when graphs are enabled, one exact-batch Device Graph replay. A request joins that batch only after its single-request prefill finishes; when it completes or is cancelled, the next boundary rebuilds the batch without an empty row.
+The server owns one resident Engine with a startup-fixed capacity of `1..16` active generation requests (`1..8` with DFlash). At each decode boundary, every decode-ready request is compacted into one batch and processed by one model traversal and, when graphs are enabled, one exact-batch Device Graph replay. A request joins that batch only after its single-request prefill finishes; when it completes or is cancelled, the next boundary rebuilds the batch without an empty row.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in CPU/media preparation and completed model results whose response has not yet been released. A full capacity returns HTTP 429 with code `server_overloaded`. The absolute `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time. There is no admission ETA or unbounded overflow queue.
 

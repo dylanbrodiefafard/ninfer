@@ -9,6 +9,7 @@
 #include "core/linear_attention_state.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/types.h"
 #include "ops/r9700/gdn/gdn_ops.h"
 #include "ops/r9700/linear/fp8_activation.h"
 
@@ -94,24 +95,26 @@ float pattern(std::uint32_t seed, float scale) {
     return static_cast<float>(centered) * scale / 1000.0F;
 }
 
-std::size_t record_column(int layer, int row, int token) {
-    return (static_cast<std::size_t>(layer) * kCapacity + row) * kWidth + token;
+std::size_t record_column(int layer, int row, int token, int capacity) {
+    return (static_cast<std::size_t>(layer) * capacity + row) * kWidth + token;
 }
 
-std::size_t key_index(int layer, int row, int token, int head, int dim) {
-    return (record_column(layer, row, token) * kQkHeads + head) * kStateDim + dim;
+std::size_t key_index(int layer, int row, int token, int head, int dim, int capacity = kCapacity) {
+    return (record_column(layer, row, token, capacity) * kQkHeads + head) * kStateDim + dim;
 }
 
-std::size_t value_index(int layer, int row, int token, int head, int dim) {
-    return (record_column(layer, row, token) * kValueHeads + head) * kStateDim + dim;
+std::size_t value_index(int layer, int row, int token, int head, int dim,
+                        int capacity = kCapacity) {
+    return (record_column(layer, row, token, capacity) * kValueHeads + head) * kStateDim + dim;
 }
 
-std::size_t gate_index(int layer, int row, int token, int head, int component) {
-    return (record_column(layer, row, token) * kValueHeads + head) * 2 + component;
+std::size_t gate_index(int layer, int row, int token, int head, int component,
+                       int capacity = kCapacity) {
+    return (record_column(layer, row, token, capacity) * kValueHeads + head) * 2 + component;
 }
 
-std::size_t conv_index(int layer, int row, int token, int channel) {
-    return record_column(layer, row, token) * kConvChannels + channel;
+std::size_t conv_index(int layer, int row, int token, int channel, int capacity = kCapacity) {
+    return record_column(layer, row, token, capacity) * kConvChannels + channel;
 }
 
 std::vector<float> initial_state(int row) {
@@ -139,6 +142,7 @@ struct Fixture {
     std::vector<hip_bfloat16> key;
     std::vector<hip_bfloat16> value;
     std::vector<float> gate;
+    int capacity = kCapacity;
 };
 
 Fixture make_fixture(const ninfer::GdnReplayRecords& records) {
@@ -147,29 +151,32 @@ Fixture make_fixture(const ninfer::GdnReplayRecords& records) {
         std::vector<hip_bfloat16>(static_cast<std::size_t>(records.key.numel()), bf16(0.0F)),
         std::vector<hip_bfloat16>(static_cast<std::size_t>(records.value.numel()), bf16(0.0F)),
         std::vector<float>(static_cast<std::size_t>(records.gate.numel()), 0.0F),
+        records.spec.record_capacity,
     };
-    for (int row = 0; row < kCapacity; ++row) {
+    const int capacity = fixture.capacity;
+    for (int row = 0; row < capacity; ++row) {
         for (int token = 0; token < kWidth; ++token) {
             for (int channel = 0; channel < kConvChannels; ++channel) {
-                fixture.conv[conv_index(kOracleLayer, row, token, channel)] =
+                fixture.conv[conv_index(kOracleLayer, row, token, channel, capacity)] =
                     bf16(pattern(0x50021U + row * 181U + token * 17U + channel, 0.08F));
             }
             for (int head = 0; head < kQkHeads; ++head) {
                 for (int dim = 0; dim < kStateDim; ++dim) {
-                    fixture.key[key_index(kOracleLayer, row, token, head, dim)] =
+                    fixture.key[key_index(kOracleLayer, row, token, head, dim, capacity)] =
                         bf16(pattern(0x70001U + row * 193U + token * 19U + head * 7U + dim, 0.09F));
                 }
             }
             for (int head = 0; head < kValueHeads; ++head) {
                 for (int dim = 0; dim < kStateDim; ++dim) {
-                    fixture.value[value_index(kOracleLayer, row, token, head, dim)] = bf16(
-                        pattern(0x90031U + row * 211U + token * 23U + head * 11U + dim, 0.07F));
+                    fixture.value[value_index(kOracleLayer, row, token, head, dim, capacity)] =
+                        bf16(
+                            pattern(0x90031U + row * 211U + token * 23U + head * 11U + dim, 0.07F));
                 }
-                fixture.gate[gate_index(kOracleLayer, row, token, head, 0)] =
+                fixture.gate[gate_index(kOracleLayer, row, token, head, 0, capacity)] =
                     -0.03F -
                     static_cast<float>(mix(0xb001U + row * 31U + token * 13U + head) % 700U) /
                         1000.0F;
-                fixture.gate[gate_index(kOracleLayer, row, token, head, 1)] =
+                fixture.gate[gate_index(kOracleLayer, row, token, head, 1, capacity)] =
                     0.15F +
                     static_cast<float>(mix(0xd007U + row * 37U + token * 17U + head) % 700U) /
                         1000.0F;
@@ -192,8 +199,8 @@ std::vector<double> recurrent_oracle(const Fixture& fixture, int row,
         for (int qk_head = 0; qk_head < kQkHeads; ++qk_head) {
             double norm2 = 0.0;
             for (int dim = 0; dim < kStateDim; ++dim) {
-                const double value =
-                    fp32(fixture.key[key_index(kOracleLayer, row, token, qk_head, dim)]);
+                const double value = fp32(fixture.key[key_index(kOracleLayer, row, token, qk_head,
+                                                                dim, fixture.capacity)]);
                 normalized[static_cast<std::size_t>(qk_head) * kStateDim + dim] = value;
                 norm2 += value * value;
             }
@@ -205,9 +212,9 @@ std::vector<double> recurrent_oracle(const Fixture& fixture, int row,
                 double query_norm2 = 0.0;
                 for (int dim = 0; dim < kStateDim; ++dim) {
                     const auto index = static_cast<std::size_t>(qk_head) * kStateDim + dim;
-                    query[index] =
-                        fp32((queries != nullptr ? *queries : fixture)
-                                 .key[key_index(kOracleLayer, row, token, qk_head, dim)]);
+                    query[index]     = fp32((queries != nullptr ? *queries : fixture)
+                                                .key[key_index(kOracleLayer, row, token, qk_head, dim,
+                                                               fixture.capacity)]);
                     query_norm2 += query[index] * query[index];
                 }
                 const double query_inverse = 1.0 / std::sqrt(query_norm2 + 1.0e-6);
@@ -217,9 +224,10 @@ std::vector<double> recurrent_oracle(const Fixture& fixture, int row,
         }
         for (int value_head = 0; value_head < kValueHeads; ++value_head) {
             const int qk_head  = value_head / 3;
-            const double alpha = std::exp(static_cast<double>(
-                fixture.gate[gate_index(kOracleLayer, row, token, value_head, 0)]));
-            const double beta  = fixture.gate[gate_index(kOracleLayer, row, token, value_head, 1)];
+            const double alpha = std::exp(static_cast<double>(fixture.gate[gate_index(
+                kOracleLayer, row, token, value_head, 0, fixture.capacity)]));
+            const double beta =
+                fixture.gate[gate_index(kOracleLayer, row, token, value_head, 1, fixture.capacity)];
             for (int value_dim = 0; value_dim < kStateDim; ++value_dim) {
                 const std::size_t state_base =
                     (static_cast<std::size_t>(value_head) * kStateDim + value_dim) * kStateDim;
@@ -229,8 +237,8 @@ std::vector<double> recurrent_oracle(const Fixture& fixture, int row,
                         state[state_base + key_dim] *
                         normalized[static_cast<std::size_t>(qk_head) * kStateDim + key_dim];
                 }
-                const double represented_value = fp32(
-                    fixture.value[value_index(kOracleLayer, row, token, value_head, value_dim)]);
+                const double represented_value = fp32(fixture.value[value_index(
+                    kOracleLayer, row, token, value_head, value_dim, fixture.capacity)]);
                 const double delta = beta * (represented_value - alpha * state_key);
                 for (int key_dim = 0; key_dim < kStateDim; ++key_dim) {
                     double& element = state[state_base + key_dim];
@@ -258,7 +266,7 @@ std::vector<hip_bfloat16> conv_oracle(const Fixture& fixture, int row,
             state[channel]                 = state[kConvChannels + channel];
             state[kConvChannels + channel] = state[2 * kConvChannels + channel];
             state[2 * kConvChannels + channel] =
-                fixture.conv[conv_index(kOracleLayer, row, token, channel)];
+                fixture.conv[conv_index(kOracleLayer, row, token, channel, fixture.capacity)];
         }
     }
     return state;
@@ -330,16 +338,20 @@ std::vector<float> snapshot_state(const Fixture& fixture, int row, const std::ve
     HIP_CHECK(
         hipMemcpyAsync(state.data, initial.data(), state.bytes(), hipMemcpyHostToDevice, stream));
     for (int token : sequence) {
-        const auto* keys = fixture.key.data() + key_index(kOracleLayer, row, token, 0, 0);
+        const auto* keys =
+            fixture.key.data() + key_index(kOracleLayer, row, token, 0, 0, fixture.capacity);
         HIP_CHECK(hipMemcpyAsync(k.data, keys, k.bytes(), hipMemcpyHostToDevice, stream));
         HIP_CHECK(hipMemcpyAsync(q.data, keys, q.bytes(), hipMemcpyHostToDevice, stream));
         HIP_CHECK(hipMemcpyAsync(v.data,
-                                 fixture.value.data() + value_index(kOracleLayer, row, token, 0, 0),
+                                 fixture.value.data() +
+                                     value_index(kOracleLayer, row, token, 0, 0, fixture.capacity),
                                  v.bytes(), hipMemcpyHostToDevice, stream));
         std::array<float, kValueHeads> host_g{}, host_beta{};
         for (int head = 0; head < kValueHeads; ++head) {
-            host_g[head]    = fixture.gate[gate_index(kOracleLayer, row, token, head, 0)];
-            host_beta[head] = fixture.gate[gate_index(kOracleLayer, row, token, head, 1)];
+            host_g[head] =
+                fixture.gate[gate_index(kOracleLayer, row, token, head, 0, fixture.capacity)];
+            host_beta[head] =
+                fixture.gate[gate_index(kOracleLayer, row, token, head, 1, fixture.capacity)];
         }
         HIP_CHECK(hipMemcpyAsync(g.data, host_g.data(), g.bytes(), hipMemcpyHostToDevice, stream));
         HIP_CHECK(hipMemcpyAsync(beta.data, host_beta.data(), beta.bytes(), hipMemcpyHostToDevice,
@@ -826,6 +838,110 @@ void qualify_w8_batch(int batch, const Fixture& fixture, hipStream_t stream) {
     std::cout << "prepared fold-record B=" << batch << " W8 FP64/state/output/alias=PASS\n";
 }
 
+// A full compact batch: every kernarg row 0..C-1 folds its own distinct record row (prefix and
+// tree-path modes, varied extents) into a permuted, distinct destination slot, so a wrong row
+// index or a kernarg row table shorter than C fails the same oracle criteria as the B=2 case.
+void qualify_full_batch(hipStream_t stream) {
+    constexpr int batch = static_cast<int>(ninfer::kMaximumConcurrency);
+    ninfer::LayoutBuilder record_builder;
+    const ninfer::GdnReplayRecordLayout record_layout =
+        ninfer::plan_gdn_replay_records(record_builder, {.layers          = kLayers,
+                                                         .record_capacity = batch,
+                                                         .width           = kWidth,
+                                                         .conv_channels   = kConvChannels,
+                                                         .qk_heads        = kQkHeads,
+                                                         .value_heads     = kValueHeads,
+                                                         .key_dim         = kStateDim,
+                                                         .value_dim       = kStateDim});
+    ninfer::DeviceBuffer record_storage(record_builder.finish(256));
+    ninfer::GdnReplayRecords records({record_storage.data(), record_storage.size()}, record_layout);
+    const Fixture fixture = make_fixture(records);
+    HIP_CHECK(hipMemcpy(records.conv.data, fixture.conv.data(), records.conv.bytes(),
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(records.key.data, fixture.key.data(), records.key.bytes(),
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(records.value.data, fixture.value.data(), records.value.bytes(),
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(records.gate.data, fixture.gate.data(), records.gate.bytes(),
+                        hipMemcpyHostToDevice));
+
+    ninfer::LayoutBuilder state_builder;
+    const ninfer::LinearAttentionStatePoolLayout state_layout =
+        ninfer::plan_linear_attention_state_pool(state_builder,
+                                                 {.layers         = kLayers,
+                                                  .conv_channels  = kConvChannels,
+                                                  .conv_width     = 3,
+                                                  .value_heads    = kValueHeads,
+                                                  .value_head_dim = kStateDim,
+                                                  .key_head_dim   = kStateDim,
+                                                  .slot_count     = batch,
+                                                  .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceBuffer state_storage(state_builder.finish(256));
+    state_storage.fill(0);
+    ninfer::LinearAttentionStatePool states({state_storage.data(), state_storage.size()},
+                                            state_layout);
+
+    std::vector<ninfer::ops::GdnReplayFoldRow> rows(batch);
+    std::vector<std::vector<int>> sequences(batch);
+    std::vector<std::vector<float>> initial_recurrent(batch);
+    std::vector<std::vector<hip_bfloat16>> initial_history(batch);
+    for (int row = 0; row < batch; ++row) {
+        // 5 is coprime to every power-of-two C, so destinations form a non-identity permutation.
+        const int slot = (row * 5 + 3) % batch;
+        rows[row]      = {.linear_state_slot = slot};
+        if (row % 2 == 0) {
+            const int columns        = 1 + (row / 2) % kWidth;
+            rows[row].commit_columns = columns;
+            sequences[row].resize(columns);
+            std::iota(sequences[row].begin(), sequences[row].end(), 0);
+        } else {
+            const int length         = 2 + (row / 2) % (kWidth - 1);
+            rows[row].commit_columns = 1; // Ignored in path mode.
+            rows[row].path_length    = length;
+            sequences[row].push_back(0);
+            for (int step = 1; step < length; ++step)
+                sequences[row].push_back(1 + (row + step * 2) % (kWidth - 1));
+            std::copy(sequences[row].begin(), sequences[row].end(), rows[row].path.begin());
+        }
+        initial_recurrent[row] = initial_state(row);
+        initial_history[row]   = initial_conv(row);
+        HIP_CHECK(hipMemcpyAsync(
+            states.recurrent_slot(kOracleLayer, slot).data, initial_recurrent[row].data(),
+            initial_recurrent[row].size() * sizeof(float), hipMemcpyHostToDevice, stream));
+        HIP_CHECK(hipMemcpyAsync(
+            states.conv_slot(kOracleLayer, slot).data, initial_history[row].data(),
+            initial_history[row].size() * sizeof(hip_bfloat16), hipMemcpyHostToDevice, stream));
+    }
+    ninfer::ops::gdn_replay_fold(records, states.all_layers_view(), rows, stream);
+    HIP_CHECK(hipStreamSynchronize(stream));
+
+    for (int row = 0; row < batch; ++row) {
+        const int slot  = rows[row].linear_state_slot;
+        const auto name = "B" + std::to_string(batch) + " row " + std::to_string(row);
+        const std::vector<float> actual_state =
+            copy_tensor<float>(states.recurrent_slot(kOracleLayer, slot));
+        require_state_close(actual_state,
+                            recurrent_oracle(fixture, row, sequences[row], initial_recurrent[row]),
+                            name + " independent FP64 recurrence");
+        const auto ordinary_state =
+            snapshot_state(fixture, row, sequences[row], initial_recurrent[row], stream);
+        for (std::size_t i = 0; i < actual_state.size(); ++i)
+            if (std::bit_cast<std::uint32_t>(actual_state[i]) !=
+                std::bit_cast<std::uint32_t>(ordinary_state[i]))
+                fail(name + ": replay/ordinary state profile mismatch");
+        require_bf16_exact(copy_tensor<hip_bfloat16>(states.conv_slot(kOracleLayer, slot)),
+                           conv_oracle(fixture, row, sequences[row], initial_history[row]),
+                           name + " convolution tail");
+    }
+    const auto untouched_layer =
+        copy_tensor<float>(states.recurrent_slot(kOracleLayer + 1, batch - 1));
+    if (std::any_of(untouched_layer.begin(), untouched_layer.end(),
+                    [](float value) { return std::bit_cast<std::uint32_t>(value) != 0U; }))
+        fail("B" + std::to_string(batch) + " record outer index bled into a neighboring layer");
+    std::cout << "direct fold B=" << batch << " W=" << kWidth
+              << " prefix/path FP64/state/conv=PASS\n";
+}
+
 void qualify(hipStream_t stream) {
     ninfer::LayoutBuilder record_builder;
     const ninfer::GdnReplayRecordLayout record_layout =
@@ -958,6 +1074,7 @@ void qualify(hipStream_t stream) {
         "out-of-range path index");
 
     qualify_deferred(records, states, fixture, initial_recurrent, initial_history, stream);
+    qualify_full_batch(stream);
 
     require_bf16_exact(copy_tensor<hip_bfloat16>(records.conv), fixture.conv,
                        "read-only convolution records");
@@ -985,7 +1102,7 @@ int main() {
             throw;
         }
         std::cout << "r9700_gdn_replay_fold: PASS gfx1201 wave32 Qwen3.8 L48/Hq16/Hv48 "
-                     "B=2 W=6 prefix6/path5/no-op/read-only ordinary-state-exact "
+                     "B=2,16 W=6 prefix/path/no-op/read-only ordinary-state-exact "
                      "deferred-layer/front-fused-bitwise max_state_abs="
                   << g_max_state_abs << " max_state_rel_l2=" << g_max_state_relative_l2 << '\n';
         return 0;

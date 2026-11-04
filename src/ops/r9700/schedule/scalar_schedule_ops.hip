@@ -194,7 +194,7 @@ hipError_t prepare_masked_block_i32(const std::int32_t* anchors, const std::int3
                                     std::uint32_t batch, hipStream_t stream) noexcept {
     if (anchors == nullptr || lengths == nullptr || valid_columns == nullptr || ids == nullptr ||
         positions == nullptr || width == 0 || width > 16 || batch == 0 ||
-        batch > kMaximumConcurrency || mask_id < 0) {
+        batch > kDFlashMaximumConcurrency || mask_id < 0) {
         return hipErrorInvalidValue;
     }
     const std::uint32_t elements  = width * batch;
@@ -214,7 +214,7 @@ hipError_t prepare_ragged_prefix_bf16(const void* source, const std::int32_t* la
     if (source == nullptr || lanes == nullptr || starts == nullptr || ends == nullptr ||
         destination == nullptr || positions == nullptr || counts == nullptr ||
         vectors_per_column == 0 || width == 0 || width > 16 || batch == 0 ||
-        batch > kMaximumConcurrency || source_column_stride < vectors_per_column ||
+        batch > kDFlashMaximumConcurrency || source_column_stride < vectors_per_column ||
         source_lane_stride < static_cast<std::size_t>(width) * source_column_stride) {
         return hipErrorInvalidValue;
     }

@@ -1963,7 +1963,9 @@ void qualify_hidden_and_remap(ninfer::DeviceContext& device) {
         hidden[index].data = static_cast<std::uint16_t>((index * 7919U + 17U) & 0xffffU);
     }
     std::vector<int> selectors(batch);
-    for (int row = 0; row < batch; ++row) { selectors[static_cast<std::size_t>(row)] = row * 2; }
+    for (int row = 0; row < batch; ++row) {
+        selectors[static_cast<std::size_t>(row)] = (row * 2 + row / 8) % columns;
+    }
     std::vector<hip_bfloat16> expected(static_cast<std::size_t>(rows) * batch);
     for (int row = 0; row < batch; ++row) {
         std::copy_n(hidden.begin() +

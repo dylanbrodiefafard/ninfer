@@ -1882,8 +1882,8 @@ std::optional<std::size_t> Variant::calibrated_dflash_graph_allowance_bytes(
         prefill_chunk == 2048U || (prefill_chunk == 1024U && concurrency == 6U);
     if (!qualified_build || !is_lq4_text_profile(profile) || features.vision ||
         !features.dflash() || !features.optimized_proposal() || capacity != maximum_context ||
-        concurrency == 0U || concurrency > 8U || !qualified_chunk || draft_window != 7U ||
-        !adaptive_draft)
+        concurrency == 0U || concurrency > kDFlashMaximumConcurrency || !qualified_chunk ||
+        draft_window != 7U || !adaptive_draft)
         return std::nullopt;
 
     // Packet replay keeps immutable kernel arguments in pinned host pools when the runtime
@@ -1900,8 +1900,8 @@ std::optional<std::size_t> Variant::calibrated_dflash_graph_allowance_bytes(
         // and runtime headroom are qualified separately from chunk2048.
         // C1 remeasured after decode hosting and host-allocation changes.
         // profiles/bench/readme-refresh-20261017/
-        constexpr std::array<std::size_t, 8> host_argument_graph_mib{72, 56, 60, 60,
-                                                                     62, 62, 62, 62};
+        constexpr std::array<std::size_t, kDFlashMaximumConcurrency> host_argument_graph_mib{
+            72, 56, 60, 60, 62, 62, 62, 62};
         return host_argument_graph_mib[concurrency - 1U] << 20U;
     }
 
@@ -1910,7 +1910,8 @@ std::optional<std::size_t> Variant::calibrated_dflash_graph_allowance_bytes(
 
     // Complete immutable inventory, measured separately at every C on gfx1201.
     // profiles/bench/r9700-vram-runtime-budget-20261015/
-    constexpr std::array<std::size_t, 8> graph_mib{318, 578, 842, 1102, 1364, 1624, 1884, 2144};
+    constexpr std::array<std::size_t, kDFlashMaximumConcurrency> graph_mib{318,  578,  842,  1102,
+                                                                           1364, 1624, 1884, 2144};
     return graph_mib[concurrency - 1U] << 20U;
 }
 

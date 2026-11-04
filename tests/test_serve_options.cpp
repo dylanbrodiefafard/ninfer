@@ -38,7 +38,7 @@ int main() {
     failures += check(ServeOptions{}.pending_timeout_ms == 300000,
                       "default pending timeout must be five minutes");
 
-    static_assert(ninfer::kMaximumConcurrency == 8);
+    static_assert(ninfer::kMaximumConcurrency == 16);
 
     const auto system_cache = parse({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1024",
                                      "--kv-ram-system-prompts", "3"});
@@ -310,7 +310,7 @@ int main() {
         check(serve_usage_text("ninfer-serve").find("--context-checkpoints") != std::string::npos,
               "serve help omits --context-checkpoints");
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--max-concurrency 1..8") != std::string::npos,
+        check(serve_usage_text("ninfer-serve").find("--max-concurrency 1..16") != std::string::npos,
               "serve help omits the product concurrency range");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures +=
@@ -335,10 +335,14 @@ int main() {
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
     bool excessive_concurrency_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "9"});
+        (void)parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "17"});
     } catch (const std::invalid_argument&) { excessive_concurrency_rejected = true; }
     failures += check(excessive_concurrency_rejected,
-                      "--max-concurrency accepted more than eight active requests");
+                      "--max-concurrency accepted more than sixteen active requests");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "5",
+                             "--max-concurrency", "16"})
+                              .max_concurrency == 16,
+                      "--max-concurrency rejected sixteen active requests");
     failures += check(configured.max_context == 4096 &&
                           configured.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           configured.kv_capacity.explicit_tokens == 8192,

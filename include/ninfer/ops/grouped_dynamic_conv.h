@@ -19,7 +19,7 @@ inline constexpr std::int32_t kGroupedDynamicConvKernel    = 2;
 inline constexpr std::int32_t kGroupedDynamicConvProjRows =
     2 * kGroupedDynamicConvKernel * kGroupedDynamicConvGroups; // 1280
 inline constexpr std::int32_t kGroupedDynamicConvMaxBatch =
-    static_cast<std::int32_t>(kMaximumConcurrency);
+    static_cast<std::int32_t>(kDFlashMaximumConcurrency);
 inline constexpr std::int32_t kGroupedDynamicConvMaxWidthWhenBatched = 16;
 
 /**

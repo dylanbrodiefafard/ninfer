@@ -27,7 +27,7 @@ constexpr std::int32_t kVocabPhysical  = 248320;
 constexpr std::int32_t kVocabValid     = 248077;
 constexpr std::int32_t kDflashFeatures = 25600;
 constexpr std::int32_t kDflashWidth    = 16;
-constexpr std::int32_t kMaxBatch       = static_cast<std::int32_t>(ninfer::kMaximumConcurrency);
+constexpr std::int32_t kMaxBatch = static_cast<std::int32_t>(ninfer::kDFlashMaximumConcurrency);
 constexpr std::size_t kGuardBytes      = 256;
 constexpr std::uint8_t kGuard          = 0xA7;
 

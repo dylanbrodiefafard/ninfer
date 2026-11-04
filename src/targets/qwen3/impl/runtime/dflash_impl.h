@@ -775,7 +775,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                               std::uint32_t verify_width, DFlashEnvelopes envelopes,
                               bool exact_sequence_envelopes, DFlashMixedOwner* owner = nullptr) {
     return [&state, batch_size, k, verify_width, envelopes, exact_sequence_envelopes, owner] {
-        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kDFlashMaximumConcurrency) ||
             k == 0 || k > kDFlashDecodeMaximumDrafts || verify_width < 2) {
             throw std::logic_error("DFlash decode batch state is incomplete");
         }

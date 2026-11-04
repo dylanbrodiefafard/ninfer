@@ -219,8 +219,8 @@ target_link_libraries(ninfer_r9700_qwen3_8_27b_runtime PUBLIC
 
 # Force every runtime archive member into one physical planner executable. This prevents an
 # unresolved schedule dependency from being hidden merely because a small main does not call that
-# Program method. The observable route then constructs/finalizes every C=1..8 ordinary, Vision,
-# MTP, and DFlash planner profile on the selected gfx1201 device.
+# Program method. The observable route then constructs/finalizes every C=1..16 ordinary, Vision,
+# and MTP planner profile and every C=1..8 DFlash profile on the selected gfx1201 device.
 add_executable(ninfer_r9700_runtime_planner_qual
   ${PROJECT_SOURCE_DIR}/tools/r9700/runtime_planner_qual.cpp)
 ninfer_r9700_internal_includes(ninfer_r9700_runtime_planner_qual)
@@ -555,7 +555,7 @@ set_target_properties(ninfer_r9700_sampling_qual PROPERTIES
 target_link_libraries(ninfer_r9700_sampling_qual PRIVATE ninfer_r9700_core hip::host)
 
 # Full speculative-round transition qualification: exact preparation, chain/tree acceptance,
-# selector-q residuals, state publication, and hidden/token movement over the sole B<=8/W<=16
+# selector-q residuals, state publication, and hidden/token movement over the sole B<=16/W<=16
 # product domain.  The executable uses an independent host oracle and caller-owned workspace.
 add_executable(ninfer_r9700_speculative_round_qual
   ${PROJECT_SOURCE_DIR}/tools/r9700/speculative_round_qual.hip)
@@ -775,7 +775,7 @@ set_target_properties(ninfer_r9700_a8q4_normalized_linear_prefill_qual PROPERTIE
 target_link_libraries(ninfer_r9700_a8q4_normalized_linear_prefill_qual PRIVATE
   ninfer_r9700_core hip::host)
 
-# Exact MTP next-round state transition for the complete fixed product domain K=1..5/B=1..8.
+# Exact MTP next-round state transition for the complete fixed product domain K=1..5/B=1..16.
 # The qualifier checks every output element, pitched padding, input immutability, and public
 # shape/stride rejection against an independent host integer oracle on physical gfx1201.
 add_executable(ninfer_r9700_mtp_round_qual

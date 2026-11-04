@@ -4,6 +4,7 @@
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/types.h"
 #include "ops/r9700/gdn_recurrence/gdn_replay_fold_impl.h"
 
 #include <hip/hip_runtime_api.h>
@@ -21,7 +22,7 @@ struct alignas(8) GdnReplayFoldKernelRow {
 };
 
 struct alignas(16) GdnReplayFoldKernelRows {
-    GdnReplayFoldKernelRow row[8];
+    GdnReplayFoldKernelRow row[kMaximumConcurrency];
 };
 
 // Validated device arguments of one layer's deferred fold (gdn_replay_fold_layer), shared by the

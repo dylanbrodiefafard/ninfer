@@ -59,7 +59,7 @@ std::uint32_t validate_context(const BidirectionalGqaBF16ContextView& context) {
 void validate_profile(GqaContextExecutionEnvelope envelope, std::int32_t min_tokens,
                       std::int32_t max_tokens, std::int32_t batch_size) {
     if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 || batch_size < 1 ||
-        batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
+        batch_size > static_cast<std::int32_t>(kDFlashMaximumConcurrency) ||
         envelope.min_context > envelope.max_context ||
         envelope.max_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {

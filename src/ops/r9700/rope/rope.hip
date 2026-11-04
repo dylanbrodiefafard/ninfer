@@ -560,10 +560,11 @@ void normalized_rope_kv_append(const Tensor& fused_kv, const Tensor& key_norm,
                reinterpret_cast<std::uintptr_t>(tensor.data) % (type == DType::I32 ? 4U : 16U) ==
                    0U;
     };
-    if (width <= 0 || width > 2048 || batch < 1 || batch > static_cast<int>(kMaximumConcurrency) ||
-        cache.capacity != 2048 || cache.padded_capacity != 2048 || cache.head_dim != 128 ||
-        cache.num_kv_heads != 8 || cache.lane_capacity < batch ||
-        cache.lane_capacity > static_cast<int>(kMaximumConcurrency) ||
+    if (width <= 0 || width > 2048 || batch < 1 ||
+        batch > static_cast<int>(kDFlashMaximumConcurrency) || cache.capacity != 2048 ||
+        cache.padded_capacity != 2048 || cache.head_dim != 128 || cache.num_kv_heads != 8 ||
+        cache.lane_capacity < batch ||
+        cache.lane_capacity > static_cast<int>(kDFlashMaximumConcurrency) ||
         envelope.min_count > envelope.max_count ||
         envelope.max_count > static_cast<unsigned>(width) || !(eps > 0.0F) || !std::isfinite(eps) ||
         !valid(fused_kv, DType::BF16, 2048, width * batch, 1, 1) ||

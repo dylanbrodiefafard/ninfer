@@ -18,7 +18,7 @@ inline constexpr std::int32_t kDflash2PathSelectHidden        = 5120;
 inline constexpr std::int32_t kDflash2PathSelectCodebookRows  = 248320;
 inline constexpr std::int32_t kDflash2PathSelectShortlistRows = 131072;
 inline constexpr std::int32_t kDflash2PathSelectMaxBatch =
-    static_cast<std::int32_t>(kMaximumConcurrency);
+    static_cast<std::int32_t>(kDFlashMaximumConcurrency);
 inline constexpr std::int32_t kDflash2PathSelectMaxWidthWhenBatched = 16;
 inline constexpr int kDflash2PathSelectRngPurpose                   = 16;
 inline constexpr std::int32_t kDflash2TreeFrontier                  = 2;

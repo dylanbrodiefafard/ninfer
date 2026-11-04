@@ -181,7 +181,7 @@ int test_cli_contract() {
     failures += expect(qb::usage_text("ninfer_bench").find("artifact.ninfer") != std::string::npos,
                        "help names native artifact");
     failures +=
-        expect(qb::usage_text("ninfer_bench").find("--concurrency <1..8>") != std::string::npos,
+        expect(qb::usage_text("ninfer_bench").find("--concurrency <1..16>") != std::string::npos,
                "help names the product concurrency range");
     failures += expect(parse_for_test({"ninfer_bench", "--help"}).help_requested, "help flag");
 
@@ -211,7 +211,7 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "9"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "17"});
         },
         "unsupported concurrency");
     failures += expect_throws<std::invalid_argument>(

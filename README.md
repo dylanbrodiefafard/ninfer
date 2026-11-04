@@ -1,6 +1,6 @@
 # NInfer AMD — Radeon AI PRO R9700
 
-C++/HIP inference for **Qwen3.8-27B on one AMD Radeon AI PRO R9700**, with **1–8 concurrent requests**.
+C++/HIP inference for **Qwen3.8-27B on one AMD Radeon AI PRO R9700**, with **1–16 concurrent requests** (1–8 with DFlash2).
 
 An AMD port of [Neroued/NInfer](https://github.com/Neroued/ninfer), distributed under Apache-2.0. Model weights are separate; see `docs/acknowledgements.md` for credits.
 
@@ -16,7 +16,7 @@ An AMD port of [Neroued/NInfer](https://github.com/Neroued/ninfer), distributed 
 
 ## Built for the R9700
 
-HIP kernels and Device Graphs are tuned for `gfx1201` (wave32). The engine batches up to eight requests and can process a new prompt while other requests generate with DFlash. GPU memory is planned at startup, with workspace shared between execution phases.
+HIP kernels and Device Graphs are tuned for `gfx1201` (wave32). The engine batches up to sixteen requests with MTP or without speculation, and up to eight with DFlash, where it can process a new prompt while other requests generate. GPU memory is planned at startup, with workspace shared between execution phases.
 
 **LQ4: 4-bit codebook weights decoded to FP8 for computation.** Most Text projections and the output head use LQ4; 21 sensitive projections stay in FP8. The DFlash-enabled artifact is **16.75 GB** on disk (decimal; this is not a VRAM requirement), with identity `qwen3.8-27b/r9700-lq4`. The paged KV cache stores FP8 keys, INT4 values and FP16 scales. DFlash keeps its own BF16 state.
 
@@ -40,6 +40,8 @@ The following shared cache capacities were measured with automatic sizing, adapt
 | 6 | 608,704 |
 | 7 | 600,576 |
 | 8 | 592,512 |
+
+C9..16 runs MTP or no speculation. Shared KV tokens with MTP K5 adaptive, no RAM/SSD cache and Compose graph settings: 574,016 / 564,032 / 554,048 / 543,936 / 533,952 / 522,816 / 511,488 / 500,032 at C9..16; C16 without speculation resolves 608,704.
 
 Capacity depends on available VRAM and enabled features; automatic sizing leaves 64 MiB headroom by default. RAM/SSD caches retain prefixes, not active-context offload. Test conditions and settings: `docs/performance.md`.
 

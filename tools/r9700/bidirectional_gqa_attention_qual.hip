@@ -296,7 +296,8 @@ int main() {
     try {
         ninfer::DeviceContext device;
         if (ninfer::ops::bidirectional_gqa_attention_workspace_capacity_bytes(
-                {0, 65}, 1, 16, static_cast<std::int32_t>(ninfer::kMaximumConcurrency)) != 0) {
+                {0, 65}, 1, 16, static_cast<std::int32_t>(ninfer::kDFlashMaximumConcurrency)) !=
+            0) {
             throw std::runtime_error("direct HIP route unexpectedly requested workspace");
         }
         const Result chain = run_case(device, 5, {0, 1}, {5, 3}, {0, 1}, {0, 1});

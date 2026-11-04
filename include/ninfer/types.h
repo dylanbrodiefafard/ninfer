@@ -21,7 +21,9 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency      = 8;
+inline constexpr std::uint32_t kMaximumConcurrency       = 16;
+inline constexpr std::uint32_t kDFlashMaximumConcurrency = 8;
+static_assert(kDFlashMaximumConcurrency <= kMaximumConcurrency);
 inline constexpr std::size_t kMaxContextCheckpointMarks = 16;
 // Physical campaign commands remain explicit and do not inherit this product-wide startup default.
 // Chunks 2048 and 4096 prefill at the same rate (8K/32K/128K within 0.2%, docs/performance.md);

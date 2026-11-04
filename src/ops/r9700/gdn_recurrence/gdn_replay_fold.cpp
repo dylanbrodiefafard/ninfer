@@ -17,9 +17,7 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kStateDim    = 128;
-constexpr std::int32_t kMaximumRows = 8;
-static_assert(kMaximumRows >= static_cast<std::int32_t>(kMaximumConcurrency),
-              "every compact-batch replay record needs a kernarg row");
+constexpr auto kMaximumRows         = static_cast<std::int32_t>(kMaximumConcurrency);
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -274,7 +272,8 @@ fold::LayerArgs replay_fold_layer_args(const GdnLayerFold& layer_fold) {
     require_tensor(layer_fold.conv, DType::BF16, {spec.conv_channels, 3, slots}, 256,
                    "gdn_replay_fold_layer", "conv state");
     static_assert(sizeof(fold::DeferredRow) == sizeof(GdnDeferredFoldRow) &&
-                  sizeof(GdnDeferredFoldRows) == 8U * sizeof(fold::DeferredRow));
+                  sizeof(GdnDeferredFoldRows) ==
+                      kDFlashMaximumConcurrency * sizeof(fold::DeferredRow));
     return fold::LayerArgs{
         .planes = {static_cast<const hip_bfloat16*>(records.key.data),
                    static_cast<const hip_bfloat16*>(records.value.data),

@@ -120,39 +120,40 @@ struct MtpDecodeEgress {
 // Stable pinned/device transfer formats for one exact-B DFlash transaction. The proposal is
 // produced and verified in the same round, so no draft state crosses the round boundary.
 struct DFlashDecodeIngress {
-    std::array<TokenId, kMaximumConcurrency> anchors{};
-    std::array<std::int32_t, kMaximumConcurrency> execution_frontiers{};
-    std::array<std::int32_t, kMaximumConcurrency> context_frontiers{};
-    std::array<std::int32_t, kMaximumConcurrency> proposal_extents{};
-    std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
-    std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    std::array<TokenId, kDFlashMaximumConcurrency> anchors{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> execution_frontiers{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> context_frontiers{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> proposal_extents{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> target_valid_columns{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> text_kv_table_rows{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> dflash_kv_table_rows{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> lanes{};
     // DFlash companion positions remain absolute. The target verifier applies this per-row
     // MRoPE delta to its own position panel after proposal construction.
-    std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
-    std::array<std::int32_t, kMaximumConcurrency> logprob_rows{};
-    std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> rope_deltas{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> logprob_rows{};
+    std::array<ops::SamplingConfig, kDFlashMaximumConcurrency> sampling{};
     // The previous round's ReplaySSM fold, deferred into this round's verification forward:
     // row b folds its lane's accepted columns layer by layer ahead of that layer's GDN front.
     ops::GdnDeferredFoldRows gdn_fold{};
 };
 
 struct DFlashDecodeEgress {
-    std::array<TokenId, std::size_t{kMaximumConcurrency} * kDFlashDecodeMaximumWidth>
+    std::array<TokenId, std::size_t{kDFlashMaximumConcurrency} * kDFlashDecodeMaximumWidth>
         licensed_tokens{};
-    std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
-    std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
-    std::array<std::int32_t, kMaximumConcurrency> accepted_column{};
-    std::array<std::int32_t, std::size_t{kMaximumConcurrency} * kDFlashDecodeMaximumWidth>
+    std::array<std::int32_t, kDFlashMaximumConcurrency> licensed_counts{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> accepted_drafts{};
+    std::array<std::int32_t, kDFlashMaximumConcurrency> accepted_column{};
+    std::array<std::int32_t, std::size_t{kDFlashMaximumConcurrency} * kDFlashDecodeMaximumWidth>
         fold_path{};
     // Chain p-less proposal calibration [G,k,B] of the round
     // (ops::speculative_accept_greedy_drafts), packed at the round's k and batch.
     std::array<float, std::size_t{ops::kPLessProposalCalibrationTemperatureCount} *
-                          kDFlashDecodeMaximumDrafts * kMaximumConcurrency>
+                          kDFlashDecodeMaximumDrafts * kDFlashMaximumConcurrency>
         proposal_calibration{};
     // Slot (i,b) scores licensed_tokens[i,b] at the frame's configured width.
-    RoundLogprobRecords<std::size_t{kMaximumConcurrency} * kDFlashDecodeMaximumWidth> logprobs;
+    RoundLogprobRecords<std::size_t{kDFlashMaximumConcurrency} * kDFlashDecodeMaximumWidth>
+        logprobs;
 };
 
 struct OrdinaryDecodeStateLayout {

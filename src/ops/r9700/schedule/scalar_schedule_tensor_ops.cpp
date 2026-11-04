@@ -124,7 +124,7 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
     const std::int32_t width        = ids.ne[0];
     const std::int32_t batch        = ids.ne[1];
     if (width < 1 || width > 16 || batch < 1 ||
-        batch > static_cast<std::int32_t>(kMaximumConcurrency) || mask_id < 0) {
+        batch > static_cast<std::int32_t>(kDFlashMaximumConcurrency) || mask_id < 0) {
         throw std::invalid_argument("prepare_masked_block: requires W=1..16, B=1..8, mask_id>=0");
     }
     require_i32_vector(anchors, batch, operation, "anchors");
@@ -158,7 +158,7 @@ void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tens
     if (source.dtype != DType::BF16 || destination.dtype != DType::BF16 || source.ne[0] <= 0 ||
         (source.ne[0] % 8) != 0 || width <= 0 || width > 16 || source.ne[2] <= 0 ||
         source.ne[3] != 1 || destination.ne[0] != source.ne[0] || destination.ne[1] != width ||
-        batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency) ||
+        batch <= 0 || batch > static_cast<std::int32_t>(kDFlashMaximumConcurrency) ||
         destination.ne[3] != 1 || positions.dtype != DType::I32 || positions.ne[0] != width ||
         positions.ne[1] != batch || positions.ne[2] != 1 || positions.ne[3] != 1 ||
         !vector_shape(lanes) || !vector_shape(starts) || !vector_shape(ends) ||

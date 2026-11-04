@@ -277,7 +277,8 @@ int main() {
     try {
         ninfer::DeviceContext device;
         if (ninfer::ops::swa_workspace_capacity_bytes(
-                {0, 96}, 1, 16, static_cast<std::int32_t>(ninfer::kMaximumConcurrency)) != 0) {
+                {0, 96}, 1, 16, static_cast<std::int32_t>(ninfer::kDFlashMaximumConcurrency)) !=
+            0) {
             fail("short-envelope SWA capacity must be zero");
         }
         const std::size_t interval_capacity =

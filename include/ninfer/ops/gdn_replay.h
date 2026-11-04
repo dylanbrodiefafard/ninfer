@@ -2,6 +2,7 @@
 
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
+#include "ninfer/types.h"
 
 #include <hip/hip_runtime_api.h>
 
@@ -58,7 +59,7 @@ struct GdnDeferredFoldRow {
 };
 
 struct GdnDeferredFoldRows {
-    std::array<GdnDeferredFoldRow, 8> row{};
+    std::array<GdnDeferredFoldRow, kDFlashMaximumConcurrency> row{};
 };
 
 // One GDN layer's share of a deferred fold: rows [0, batch) of the device `rows` applied to this
