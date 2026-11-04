@@ -2044,7 +2044,7 @@ void Variant::full_attention(const Tensor& normalized_query,
     auto attention_scope                        = workspace.scope();
     const std::size_t attention_workspace_bytes = r9700_full_attention_workspace_capacity_bytes(
         static_cast<std::uint32_t>(normalized_query.ne[2]), cache_read.visible_frontier(),
-        ancestor_masks != nullptr || active_query_rows != nullptr);
+        ancestor_masks != nullptr);
     DeviceSpan attention_workspace{};
     if (attention_workspace_bytes != 0U) {
         attention_workspace = workspace.alloc_bytes(attention_workspace_bytes);

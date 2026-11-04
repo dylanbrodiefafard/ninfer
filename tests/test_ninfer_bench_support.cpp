@@ -629,7 +629,7 @@ int test_report_contract() {
                            ninfer::ops::r9700::kv::kFp8QkWmmaDecode,
                        "compiled split-512 enablement");
     failures += expect(report.at("config").at("decode_attention_profile") ==
-                               "packed-t1to6-split512-t4tree-v1" &&
+                               "packed-t1to8-device-count-split512-tree-v1" &&
                            report.at("config").at("packed_decode_min_context") == 64 &&
                            report.at("config").at("split512_min_context") == 8192,
                        "compiled decode attention classifier");

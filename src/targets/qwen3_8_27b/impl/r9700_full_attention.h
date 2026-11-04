@@ -48,10 +48,10 @@ r9700_full_attention_score_workspace_capacity_bytes(std::size_t visible_context)
 r9700_full_attention_workspace_capacity_bytes(std::uint32_t query_rows, std::size_t visible_context,
                                               bool tree_or_device_count) noexcept;
 
-// Dispatches dense prefill through staged full-score GQA6. G16 host-fixed 1..6-row decode
-// (ordinary, MTP, DFlash chain verification) uses the packed route for contexts 64..262144;
-// tree or device-selected T=4 uses split-512, and every other cell the fused leaf.
-// The default-off Text parity profile additionally overwrites only P129's tail with W1 WMMA.
+// Dispatches dense prefill through staged full-score GQA6. G16 causal 1..8-row decode
+// (ordinary, MTP, DFlash chain verification), including device-selected active prefixes, uses
+// the packed route for contexts 64..262144; tree T=4 uses split-512, and other cells the fused
+// leaf. The default-off Text parity profile additionally overwrites only P129's tail with W1 WMMA.
 [[nodiscard]] hipError_t r9700_qwen3_8_27b_full_attention(const R9700FullAttentionArgs& args,
                                                           hipStream_t stream) noexcept;
 

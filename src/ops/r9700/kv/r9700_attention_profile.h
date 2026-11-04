@@ -99,8 +99,8 @@ inline constexpr std::size_t kMidRowsChunkOverheadKeys  = 64U;
 }
 
 // Production packed decode route for 1..8 causal rows per sequence (ordinary decode, MTP and
-// DFlash chain verification): non-tree execution with host-fixed row counts and context
-// 64..262144. The caller must additionally require G16, token-fastest FP8 keys, and
+// DFlash chain verification): non-tree execution with optional device-selected active prefixes and
+// contexts 64..262144. The caller must additionally require G16, token-fastest FP8 keys, and
 // feature-fastest INT4/FP16 values and scales; other cells retain the split/fused fallback.
 [[nodiscard]] constexpr bool use_packed_decode_attention(std::uint32_t query_rows,
                                                          std::size_t visible_context,
@@ -115,8 +115,8 @@ inline constexpr std::size_t kMidRowsChunkOverheadKeys  = 64U;
     return kTextP129WmmaTailCandidate && query_rows == 129U && visible_context == 129U;
 }
 
-// Long-context T=4 schedules with tree or device-selected row metadata, which the packed decode
-// route does not serve; host-fixed rows take the packed route.
+// Long-context T=4 fallback for tree or device-selected row metadata. The target dispatches
+// non-tree device-selected prefixes to packed decode before reaching this fallback.
 [[nodiscard]] constexpr bool use_split512_attention(std::uint32_t query_rows,
                                                     std::size_t visible_context,
                                                     bool tree_or_device_count) noexcept {

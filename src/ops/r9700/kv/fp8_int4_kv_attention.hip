@@ -1800,7 +1800,7 @@ hipError_t fp8_int4_kv_attention_packed_decode(std::span<const Fp8Int4KvAttentio
             a.value_layout != Fp8Int4KvPlaneLayout::FeatureFastest ||
             a.value_scale_layout != Fp8Int4KvPlaneLayout::FeatureFastest ||
             a.ancestor_masks != nullptr || a.prefix_lengths != nullptr ||
-            a.active_query_rows != nullptr || a.prefix_length_stride > 1U ||
+            a.prefix_length_stride > 1U ||
             a.page_table_pages < (a.context + kPageSize - 1U) / kPageSize || a.value_group != 16U) {
             return hipErrorInvalidValue;
         }

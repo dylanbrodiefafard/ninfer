@@ -33,6 +33,39 @@ The latest measurements use:
 
 The GPU must otherwise be idle. Kernel and service timings use HIP events around the claimed physical work after warmup; serving throughput below uses explicitly identified wall intervals. Operators are checked against independent exact/FP64 reference calculations before their timings are used.
 
+### Device-count MTP packed attention (2026-11-04)
+
+PR #3 routes non-tree MTP attention with device-selected active row counts through the
+existing packed decode implementation. Its setup and merge already implement inactive-prefix
+semantics; tree attention retains its existing routes. Startup MTP planning already covers
+packed scratch, and each concrete call now requests that scratch consistently with dispatch.
+
+A same-host public-Engine comparison used the selected `r9700-lq4` artifact on one gfx1201
+R9700, HIP 7.15.26333 / AMD Clang 23, kernel 7.0.0-38-generic, and unchanged `auto` power mode.
+Both builds ran the bench corpus with C1, MTP K3, Device Graphs, prefill chunk 2048,
+`-pg '8192,128;64000,128' --warmup 1 -r 3 --retain-token-ids` and the fixed production cache.
+The rates below are mean decode output tokens/s over three repetitions; prefill is excluded.
+
+| Prompt tokens | Before | Packed device-count route | Speedup |
+|---:|---:|---:|---:|
+| 8192 | 87.26 | 116.57 | 1.34x |
+| 64000 | 31.56 | 108.84 | 3.45x |
+
+All generated token IDs and speculative statistics matched exactly between builds in every
+measured repetition. The target attention qualifier also checks the represented BF16-query,
+FP8-key, signed-INT4-value/FP16-scale formula against its independent FP64 oracle. Captured
+T1/T4/T8 panels at 64K pass with zero, partial, full and malformed device counts, poisoned
+inactive positions, exact positive-zero tails, recovery and guarded output/scratch; the largest
+observed full-panel absolute error was 1.47e-5. Device-count panels use the same existing
+BF16-Q/FP16-probability numerical criterion as host-fixed packed panels.
+
+The full attention qualifier passes device memcheck and initcheck. At C1/8K, eager and
+Device Graph execution produce identical token IDs and speculative statistics. A separate
+C8/8K graph run also matches the no-speculation control token-for-token across all eight lanes.
+
+These measurements establish the C1 MTP change, not a new concurrency-wide throughput matrix.
+Local commands and reports are retained under `profiles/pr3-review/`.
+
 ### README refresh and product defaults (2026-10-17)
 
 CLI and server default to DFlash with the optimized proposal head and adaptive length up to seven drafts. `--spec none` disables speculation; `--no-lm-head-draft` uses the full head. `--draft-tokens N` overrides the maximum; `--no-adaptive-draft` fixes the length. Server shared KV capacity defaults to `auto`. P-less sampling defaults to temperature 1.5 unless overridden; the standard sampler retains the registered model/mode temperature 2.0. Focused CLI/server option and sampling-resolution tests cover these defaults and overrides.

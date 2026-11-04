@@ -341,7 +341,7 @@ void qualify_long_dflash(ninfer::DeviceContext& device, std::uint32_t selected_c
                 }
         const auto cache = encode_cache(source_keys, source_values, pages, physical_pages);
         for (const std::uint32_t rows : selected_context != 0U
-                                            ? std::vector<std::uint32_t>{1U, 8U}
+                                            ? std::vector<std::uint32_t>{1U, 4U, 8U}
                                             : std::vector<std::uint32_t>{4U, 5U, 6U, 7U, 8U}) {
             // Both extents cover the five widths; together they select every compact C1..4 row.
             const std::int32_t selected_row =
@@ -480,6 +480,44 @@ void qualify_long_dflash(ninfer::DeviceContext& device, std::uint32_t selected_c
             graph.launch(device.stream);
             if (read_result() != actual)
                 fail("long DFlash poisoned graph replay differs from eager");
+            // MTP keeps fixed graph addresses while the device scalar changes the live prefix.
+            // Poison inactive positions so reading tail metadata cannot silently pass.
+            ninfer::DeviceBuffer active_count(sizeof(std::int32_t));
+            auto active_args              = args;
+            active_args.active_query_rows = static_cast<const std::int32_t*>(active_count.data());
+            ninfer::DecodeGraphDefinition active_definition;
+            active_definition.capture(device.stream, [&] {
+                HIP_CHECK(q27::r9700_qwen3_8_27b_full_attention(active_args, device.stream));
+            });
+            ninfer::DecodeGraphExecutable active_graph;
+            active_graph.instantiate(active_definition);
+            for (const std::int32_t count :
+                 {0, static_cast<std::int32_t>(rows / 2U), static_cast<std::int32_t>(rows), -1,
+                  static_cast<std::int32_t>(rows + 1U), static_cast<std::int32_t>(rows)}) {
+                const bool valid      = count >= 0 && count <= static_cast<std::int32_t>(rows);
+                auto active_positions = positions;
+                const auto live       = valid ? static_cast<std::size_t>(count) : 0U;
+                std::fill(active_positions.begin() + static_cast<std::ptrdiff_t>(live),
+                          active_positions.end(), -777);
+                pos.copy_from_host(active_positions.data(), rows * sizeof(std::int32_t));
+                active_count.copy_from_host(&count, sizeof(count));
+                poison();
+                active_graph.launch(device.stream);
+                const auto result = read_result();
+                for (std::size_t i = 0; i < result.size(); ++i) {
+                    if (!valid) {
+                        if (!std::isnan(result[i])) fail("invalid MTP count did not poison output");
+                    } else if (i >= live * kQueryHeads * kHeadDim) {
+                        if (std::bit_cast<std::uint32_t>(result[i]) != 0U)
+                            fail("inactive MTP row is not exact positive zero");
+                    } else {
+                        const double error = std::abs(result[i] - expected[i]);
+                        if (!std::isfinite(result[i]) ||
+                            (error > 2e-3 && error / std::max(std::abs(expected[i]), 1e-6) > 2e-3))
+                            fail("device-count MTP graph differs from FP64 oracle");
+                    }
+                }
+            }
             std::uint32_t resolved_status = 0, resolved_cursor = 0;
             transaction.enqueue_segmented_resolution(&resolved_status, &resolved_cursor);
             device.synchronize();
@@ -490,7 +528,7 @@ void qualify_long_dflash(ninfer::DeviceContext& device, std::uint32_t selected_c
             std::cout << "long_dflash_leaf context=" << context << " rows=" << rows
                       << " compact_table_row=" << selected_row
                       << " public_max_abs=" << maximum_error
-                      << " oracle/guards/poisoned_graph=PASS\n";
+                      << " oracle/guards/poisoned_graph/device_counts=PASS\n";
         }
     }
 }
@@ -743,10 +781,13 @@ int main(int argc, char** argv) {
             .cache_read        = committed_read,
             .row_positions     = static_cast<const std::int32_t*>(d_row_positions.data()),
             .active_query_rows = static_cast<const std::int32_t*>(d_active_query_rows.data()),
-            .output            = ninfer::Tensor(d_output.data(), ninfer::DType::FP32,
-                                                {static_cast<std::int32_t>(kHeadDim),
-                                                 static_cast<std::int32_t>(kQueryHeads),
-                                                 static_cast<std::int32_t>(kActiveCountRows)})};
+            .workspace         = d_score_workspace.data(),
+            .workspace_bytes = q27::r9700_full_attention_workspace_capacity_bytes(kActiveCountRows,
+                                                                                  kContext, false),
+            .output          = ninfer::Tensor(d_output.data(), ninfer::DType::FP32,
+                                              {static_cast<std::int32_t>(kHeadDim),
+                                               static_cast<std::int32_t>(kQueryHeads),
+                                               static_cast<std::int32_t>(kActiveCountRows)})};
         ninfer::DecodeGraphDefinition active_count_graph;
         active_count_graph.capture(device.stream, [&] {
             HIP_CHECK(q27::r9700_qwen3_8_27b_full_attention(active_count_args, device.stream));
@@ -785,11 +826,13 @@ int main(int argc, char** argv) {
             }
             const std::vector<double> expected =
                 attention_oracle(active_count_queries, live_rows, frontiers, cache);
+            // Device-selected causal panels now use the same BF16-Q/FP16-probability packed
+            // profile and its existing dense-attention criterion as host-fixed panels.
             for (std::size_t index = 0; index < live_rows * active_row_width; ++index) {
                 const double absolute =
                     std::abs(static_cast<double>(actual[index]) - expected[index]);
                 const double relative = absolute / std::max(std::abs(expected[index]), 1.0e-6);
-                if (absolute > 2.0e-4 && relative > 2.0e-4) {
+                if (!std::isfinite(actual[index]) || (absolute > 2.0e-3 && relative > 2.0e-3)) {
                     fail(std::string(label) + " active prefix differs from the FP64 oracle");
                 }
             }

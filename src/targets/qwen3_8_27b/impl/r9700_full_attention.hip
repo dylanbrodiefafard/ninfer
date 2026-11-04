@@ -219,8 +219,8 @@ static hipError_t raw_attention_args(const R9700FullAttentionArgs& a, hipStream_
     return hipSuccess;
 }
 
-// The packed decode route's cell: host-fixed causal 1..8 rows, G16, token-fastest FP8 keys and
-// feature-fastest INT4/FP16 values and scales.
+// The packed decode route's cell: causal 1..8 rows (including device-selected active prefixes),
+// G16, token-fastest FP8 keys and feature-fastest INT4/FP16 values and scales.
 [[nodiscard]] static bool packed_decode_route(const ops::r9700::kv::Fp8Int4KvAttentionArgs& raw,
                                               bool tree_or_device_count) noexcept {
     return ops::r9700::kv::use_packed_decode_attention(raw.query_rows, raw.context,
@@ -308,7 +308,8 @@ static hipError_t launch_r9700_attention(const R9700FullAttentionArgs& a,
         tail.output += 128U * row_elements;
         return ops::r9700::kv::fp8_int4_kv_attention_wmma(tail, stream);
     }
-    if (packed_decode_route(raw, tree_or_device_count)) {
+    // Device active-row counts ride on packed decode, whose setup and merge zero inactive rows.
+    if (packed_decode_route(raw, a.ancestor_masks != nullptr)) {
         const std::size_t required =
             ops::r9700::kv::fp8_int4_kv_attention_packed_decode_workspace_bytes(
                 raw.context, static_cast<std::uint32_t>(rows));
