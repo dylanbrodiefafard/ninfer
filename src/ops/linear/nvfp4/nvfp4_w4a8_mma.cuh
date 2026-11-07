@@ -402,15 +402,17 @@ void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspac
     // on MMA M (N16 tiles for T<=16, N32 above) and streams K512 of FP8 over three stages; wider
     // projections place sixteen weight rows on MMA M (SwapAB) and compile the exact eight-token
     // panel count, streaming K256 over three stages (M16) or two (M32). T=33..48 (C=5/6 verify)
-    // uses one M48 tile so every weight byte is read once; it streams K256 over the same stage
-    // counts (N<=6144 at K512 would exceed shared memory at three stages). Above 48 tokens the
-    // DFlash context projections instead take the 64-token prefill tiles their nvfp4_config.h
-    // tables select. BF16 activations halve BK to keep the same staged bytes. Every schedule keeps
-    // each output's ascending K order, so neither tile height nor panel count changes an output.
+    // uses one M48 tile and T=49..64 (C=7/8 at W7/W8) one M64 tile, so every weight byte is read
+    // once; both stream K256 over the same stage counts (N<=6144 at K512 would exceed shared memory
+    // at three stages). Wider calls repeat M64 tiles. The DFlash context projections instead take
+    // the prefill tiles their nvfp4_config.h tables select, and fall back to these tiles only for
+    // the widths those tables leave on the narrow route. BF16 activations halve BK to keep the same
+    // staged bytes. Every schedule keeps each output's ascending K order, so neither tile height
+    // nor panel count changes an output.
     const auto launch = [&]<int BM, int Panels>() {
         constexpr bool narrow = Geometry::kOutputRows <= 6144;
         constexpr int BN      = narrow ? (BM == 16 ? 16 : 32) : 64;
-        constexpr int BK      = (BM == 48 || !narrow ? 256 : 512) / kActivationBytes;
+        constexpr int BK      = (BM >= 48 || !narrow ? 256 : 512) / kActivationBytes;
         constexpr int S       = narrow || BM == 16 ? 3 : 2;
         using Schedule        = Nvfp4W4a4MmaSchedule<BM, BN, BK, 1, BN == 16 ? 2 : 4, S, 1>;
         constexpr auto kernel = nvfp4_w4a8_mma_kernel < Geometry, Schedule, Epilogue, Output,
@@ -475,11 +477,13 @@ void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspac
             launch.template operator()<16, 0>();
         } else if (tokens <= 32) {
             launch.template operator()<32, 0>();
-        } else {
+        } else if (tokens <= 48) {
             launch.template operator()<48, 0>();
+        } else {
+            launch.template operator()<64, 0>();
         }
     } else {
-        switch (std::min((tokens + 7) / 8, 6)) {
+        switch (std::min((tokens + 7) / 8, 8)) {
         case 1:
             launch.template operator()<16, 1>();
             break;
@@ -495,8 +499,14 @@ void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspac
         case 5:
             launch.template operator()<48, 5>();
             break;
-        default:
+        case 6:
             launch.template operator()<48, 6>();
+            break;
+        case 7:
+            launch.template operator()<64, 7>();
+            break;
+        default:
+            launch.template operator()<64, 8>();
             break;
         }
     }
