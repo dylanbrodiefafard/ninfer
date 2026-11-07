@@ -154,7 +154,7 @@ The RTX 5090 tree investigation is in
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or automatic sizing from remaining GPU memory | `auto` |
-| `--kv-capacity-headroom MiB` | device memory `--kv-capacity auto` leaves free; requires `auto` | `64` |
+| `--kv-capacity-headroom MiB` | device memory `--kv-capacity auto` leaves free; requires `auto` | `32` |
 | `--kv-ram-capacity off\|N` | pinned host capacity in MiB for prefixes and live suspension; enables output windows up to 8192 tokens | `off` |
 | `--kv-ram-system-prompts N` | Retain up to N rendered system prefixes inside the RAM budget; nonzero requires RAM capacity | `0` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache pack-file capacity in MiB; `off` disables the tier | `off` |
@@ -289,17 +289,17 @@ numerical comparisons and diagnostics. The prepared prompt must fit
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime
 layout. This includes the selected speculative backend, fixed sequence state, workspace, Vision
-request transient, and CUDA Graph allowance, while leaving `--kv-capacity-headroom` MiB (default 64)
+request transient, and CUDA Graph allowance, while leaving `--kv-capacity-headroom` MiB (default 32)
 unallocated. The Engine allocates all device memory at startup, so the default only covers
 driver-side growth such as lazy per-kernel local memory; raise it when a desktop or another process
-uses the same GPU. A startup failure in automatic mode names this option. It does not probe allocations or resize the pool at request time. Omitting `--kv-capacity` selects automatic sizing in both CLI and server. The 64 MiB default
+uses the same GPU. A startup failure in automatic mode names this option. It does not probe allocations or resize the pool at request time. Omitting `--kv-capacity` selects automatic sizing in both CLI and server. The 32 MiB default
 headroom is intended for a dedicated headless GPU. Desktop display and concurrent GPU loads have
 not been qualified; increase the headroom for their peak memory use.
 The startup log's `slack` includes the automatic `headroom`; they are not separate deductions.
 `graphs` reports measured GPU usage / planned allowance; the measurement is a device-wide free-memory
-delta, so other processes on the GPU can move it, and it does not fail startup. Ordinary and DFlash2 budget
-`min(12n, 24+6n)` MiB for `n` `(draft length, batch size, topology)` executables (144 MiB for
-adaptive lengths 1/2/3/4/5 and four-way concurrency). All graphs are prepared at startup; changing adaptive draft length or
+delta, so other processes on the GPU can move it, and it does not fail startup. Ordinary graphs budget
+`min(12n, 24+6n)` MiB and DFlash2 budgets `16+4.75n` MiB for `n` `(draft length, batch size, topology)`
+executables (244 MiB for adaptive drafting up to seven tokens and four-way concurrency). All graphs are prepared at startup; changing adaptive draft length or
 processing a full prefill chunk uses the already reserved runtime storage.
 Checkpoint images live in one pinned host slab that startup allocates, prefaults, and registers
 outside `--kv-ram-capacity`: each lane's turn (rewrite) checkpoint image of the GDN state

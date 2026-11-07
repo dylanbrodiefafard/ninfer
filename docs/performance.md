@@ -2402,7 +2402,7 @@ are `/build/apps/ninfer-serve-scaling-a4-projections` and
 
 ## DFlash2 automatic KV capacity
 
-### Startup concurrency (2026-10-18)
+### Startup concurrency (2026-11-07)
 
 One RTX 5090, driver 580.178.04, CUDA 13.1, Release build, `sm_120a`, and the recommended
 `qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`
@@ -2411,33 +2411,40 @@ artifact (19,589,713,920 bytes). Each server started with:
 ```bash
 build/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   --max-context 262144 --max-concurrency C \
-  --kv-capacity auto --kv-capacity-headroom 64 --prefill-chunk 4096 --kv-dtype nvfp4 \
+  --kv-capacity auto --kv-capacity-headroom 32 --prefill-chunk 4096 --kv-dtype nvfp4 \
   --spec dflash --draft-tokens 7 --adaptive-draft --lm-head-draft
 ```
 
 CUDA Graphs and prefix reuse were on; Vision and RAM/SSD caches were off. Each row records the
-resolved shared token pool after startup and warmup; all six servers became healthy. Free device
-memory after weights was 15,653,994,496 bytes at every C. These are startup capacity measurements,
-not six simultaneous full-length requests: each request is limited to 262,144 tokens, and retained
-histories share the same pool. The upper bound is C times the page-rounded per-request limit.
+resolved shared token pool after startup. Free device memory after weights was 15,653,994,496 bytes
+at every C. After startup, one request per lane decoded 64 tokens, lane 0 after an 18,400-token
+prompt; all requests completed. These are startup capacity measurements, not C simultaneous
+full-length requests: each request is limited to 262,144 tokens, and retained histories share the
+same pool. The upper bound is C times the page-rounded per-request limit.
 
-| Startup concurrency (C) | Shared KV capacity (tokens, total) |
-|---:|---:|
-| 1 | 262,144 |
-| 2 | 524,288 |
-| 3 | 732,096 |
-| 4 | 714,432 |
-| 5 | 697,408 |
-| 6 | 680,384 |
+| Startup concurrency (C) | Shared KV capacity (tokens, total) | Graph memory / allowance (MiB) |
+|---:|---:|---:|
+| 1 | 262,144 | 42 / 73 |
+| 2 | 524,288 | 100 / 130 |
+| 3 | 733,120 | 150 / 187 |
+| 4 | 715,008 | 204 / 244 |
+| 5 | 697,408 | 248 / 291.5 |
+| 6 | 679,616 | 294 / 339 |
+| 7 | 661,632 | 350 / 386.5 |
+| 8 | 643,392 | 396 / 434 |
 
-C1 and C2 reach that upper bound. C3–C6 use the available VRAM after reserving request state,
-DFlash2 state, workspace, graph allowances and 64 MiB headroom. Increasing C therefore reduces the
-shared pool after the upper bound stops being the limiting factor. The GPU lock was held across
-all six startups; 28 GPU process samples contained only the selected server or an idle GPU.
+C1 and C2 reach that upper bound. C3–C8 use the available VRAM after reserving request state,
+DFlash2 state, workspace, graph allowances and 32 MiB headroom. Increasing C therefore reduces the
+shared pool after the upper bound stops being the limiting factor. Each lane costs about 18,000
+tokens: about 250 MiB of request and DFlash2 state, 48 MiB of graph allowance and 21 MiB of
+workspace. The DFlash2 graph allowance also covers 4–20 MiB of driver memory that startup consumes
+outside the arenas, so free device memory after startup stayed 51–59 MiB, above the headroom, and
+GPU memory in use grew by at most 2 MiB through prefill and decode. The GPU lock was held for each
+startup, after five seconds without GPU processes.
 
-[Machine-readable results](../bench/results/readme-kv-capacity-20261018.json) preserve capacities
-and memory reservations. Full startup records, commands and GPU samples remain local under
-`profiles/bench/readme-capacity-20261018/`.
+[Machine-readable results](../bench/results/readme-kv-capacity-20261107.json) preserve capacities
+and memory reservations. Full startup records and commands remain local under
+`profiles/kvcap-20261107/`.
 
 ### Earlier graph-budget qualification
 

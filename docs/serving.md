@@ -1205,9 +1205,9 @@ sequence's logical ceiling; the latter sizes the shared Main Text KV pool used b
 requests and retained prefixes. Both are represented with 64-token pages internally, while a
 sequence can never cross the exact `--max-context` frontier. `--kv-capacity N` requests an explicit
 capacity; `--kv-capacity auto` chooses the largest legal capacity that fits the memory remaining
-after weights are loaded, leaving `--kv-capacity-headroom` MiB free (default 64; raise it when a
+after weights are loaded, leaving `--kv-capacity-headroom` MiB free (default 32; raise it when a
 desktop or another process shares the GPU). Automatic sizing is the default when the option is
-omitted. The 64 MiB default margin targets a dedicated headless GPU; desktop-display and
+omitted. The 32 MiB default margin targets a dedicated headless GPU; desktop-display and
 concurrent-load configurations have not been qualified. The shared pool is fixed at startup
 and is not divided evenly among request lanes.
 

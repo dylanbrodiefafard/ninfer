@@ -89,6 +89,18 @@ std::size_t graph_executables_allowance(std::size_t executables, const char* lab
     return std::min(linear, affine);
 }
 
+// Startup device memory outside the planned arenas for DFlash2 (K, B, topology) executables:
+// prepare_graphs' measured graph memory plus the driver memory that Instance construction
+// consumes outside that window (about 2 + 2.3*C MiB). Adaptive K7 serve startups at
+// 262144-token context (RTX 5090, 12 to 88 executables for C=1..8) consumed 46 to 416 MiB in
+// total, 42 to 396 MiB of it inside the graph window. 16 MiB + 4.75 MiB per executable stays
+// 17 to 27 MiB above every measured total, so Automatic capacity keeps its full headroom free;
+// n=88 is the largest reachable count (K7 adaptive, C=8).
+std::size_t dflash2_graph_executables_allowance(std::size_t executables) {
+    constexpr const char* label = "DFlash2 graph allowance";
+    return checked_add(16ULL * kMiB, checked_mul(19ULL * kMiB / 4ULL, executables, label), label);
+}
+
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
                         std::initializer_list<std::int32_t> shape, const char* label) {
     return builder.add_tensor(dtype, shape, kArenaAlign, label);
@@ -1135,8 +1147,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 // DFlash2 captures one parallel proposal/verify schedule, not the
                 // autoregressive DFlash unroll. Its definitions share one executable per
                 // (K, B, topology), just like the other graph families.
-                impl->graph_allowance_bytes = graph_executables_allowance(
-                    graph_topology_count(expanded), "DFlash exact-b graph allowance");
+                impl->graph_allowance_bytes =
+                    dflash2_graph_executables_allowance(graph_topology_count(expanded));
             } else {
                 std::vector<std::pair<std::uint32_t, std::size_t>> classes;
                 for (std::size_t i = 0; i < expanded.size(); ++i) {

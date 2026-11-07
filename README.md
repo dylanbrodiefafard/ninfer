@@ -222,7 +222,7 @@ For OpenAI-compatible clients, set the base URL to `http://127.0.0.1:8080/v1` an
 ## Context and caching
 
 `--max-context` limits prompt and answer combined, up to **262,144 tokens per request**.
-The default `--kv-capacity auto` sizes a shared token pool from free VRAM, leaving **64 MiB
+The default `--kv-capacity auto` sizes a shared token pool from free VRAM, leaving **32 MiB
 headroom**. Active and retained histories share this pool; the server reports its capacity at
 startup. Use `--kv-capacity N` for a fixed token budget.
 
@@ -233,22 +233,24 @@ still has its own `--max-context` ceiling.
 
 Measured on the RTX 5090 with the recommended DFlash2 artifact, 262,144-token context,
 4,096-token prefill chunks, adaptive drafting up to seven tokens, the optimized proposal head,
-CUDA Graphs, NVFP4 KV and 64 MiB headroom. Vision and RAM/SSD tiers were off (2026-10-18).
+CUDA Graphs, NVFP4 KV and 32 MiB headroom. Vision and RAM/SSD tiers were off (2026-11-07).
 
 | Startup concurrency (C) | Shared KV capacity (tokens, total) |
 |---:|---:|
 | 1 | 262,144 |
 | 2 | 524,288 |
-| 3 | 732,096 |
-| 4 | 714,432 |
+| 3 | 733,120 |
+| 4 | 715,008 |
 | 5 | 697,408 |
-| 6 | 680,384 |
+| 6 | 679,616 |
+| 7 | 661,632 |
+| 8 | 643,392 |
 
 These are shared totals across active and retained histories. C1 and C2 reach the concurrency cap;
-C3–C6 are limited by VRAM. Available memory and enabled features can change the result. See the
+C3–C8 are limited by VRAM. Available memory and enabled features can change the result. See the
 [capacity measurements](docs/performance.md#dflash2-automatic-kv-capacity) for commands and results.
 
-The 64 MiB margin suits a **headless, dedicated GPU**. If the GPU also drives a desktop or runs
+The 32 MiB margin suits a **headless, dedicated GPU**. If the GPU also drives a desktop or runs
 other workloads, increase `--kv-capacity-headroom MiB` to cover their peak memory use.
 Shared-display and concurrent-load configurations have not been tested.
 

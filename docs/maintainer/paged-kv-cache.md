@@ -127,7 +127,7 @@ per-allocation logical page capacity = L
 ```
 
 Explicit policy 使用 `M=ceil(K_main/P_main)`。Automatic policy 带有必须保留的 device headroom `R`，在
-权重加载并同步后查询剩余显存 `F`。CLI/server 的 `R` 固定为 1 GiB；Engine policy 可以显式指定该值。
+权重加载并同步后查询剩余显存 `F`。CLI/server 的 `R` 默认为 32 MiB，可用 `--kv-capacity-headroom` 指定；Engine policy 可以显式指定该值。
 Exact target 用同一个完整 physical candidate builder 得到：
 
 ```text
@@ -145,10 +145,12 @@ resolver 不维护模型维度或 bytes-per-token 公式，也不做 allocation 
 按 `M` 生成并核对 reservation curve。
 
 单 schedule graph families（ordinary、MTP、DFlash2）的 CUDA Graph allowance 按 `(K, B, topology)`
-executable 数 `n` 计 `min(12n, 24+6n)` MiB，包含其 reachable definitions：实测总量是固定 warm-up 部分加
-每 executable 约 4 MiB（RTX 5090 serve benches：4 个 executable 最多 46 MiB，30 个 146 MiB）。以前的 DFlash adaptive
-`K={1,2,3,4,5}`、`C=4` 的 20 个 executable 实测 144 MiB（现在 `K={3,4,5}`、`C=4` 为 12 个）。不能套用 autoregressive DFlash 的 64/96 MiB
-unroll allowance。所有 definitions 和 executables
+executable 数 `n` 计，包含其 reachable definitions。Ordinary 与 MTP 计 `min(12n, 24+6n)` MiB：实测总量是固定
+warm-up 部分加每 executable 约 4 MiB（RTX 5090 serve benches：4 个 executable 最多 46 MiB，30 个 146 MiB）。
+DFlash2 计 `16+4.75n` MiB，覆盖 graph 实测量与 Instance 构造在 arena 之外消耗的 driver 内存（约
+`2+2.3C` MiB，不在 graph 测量窗口内）：262144-token context、adaptive K7 的 C=1..8 serve startup
+（12–88 个 executable）graph 实测 42–396 MiB，arena 之外合计 46–416 MiB，allowance 比每个合计高
+17–27 MiB，所以 Automatic capacity 在 startup 后保持完整的 `R` 空闲。不能套用 autoregressive DFlash 的 64/96 MiB unroll allowance。所有 definitions 和 executables
 在 startup 建立。实测值是 preparation 前后的 device-wide free-memory 差，会计入同一 GPU 上其他进程的
 分配/释放，因此只作为 observed/allowance 报告，不作为启动失败条件；allowance 校准由 real-artifact
 capacity test 在独占 GPU 上检查。4096-token prefill 和 adaptive
@@ -157,7 +159,8 @@ K 切换使用已规划的共享 workspace，不增加 graph family 或扩展 KV
 `R` 是 capacity solver 刻意不消费的 sizing headroom。CUDA allocator、context 和 module 的物理占用不全
 等同于 arena payload；因此 Instance 与 Graph 完整建立并同步后再次查询实际 free memory，并与 policy、
 planned slack 一起报告。Engine 在 startup 之后不再分配 device memory（C=6、6 个约 158k-token 请求的
-serve 实测 per-process 占用恒定），所以默认 `R` 为 64 MiB，只覆盖 driver 侧增长（lazy per-kernel local
+serve 实测 per-process 占用恒定；C=1..8 startup 后经 18,400-token prefill 与 decode 最多增长 2 MiB，
+260000-token prefill 不增长），所以默认 `R` 为 32 MiB，只覆盖 driver 侧增长（lazy per-kernel local
 memory，最大 kernel stack 1128 B/thread）；与桌面或其他进程共享 GPU 时用 `--kv-capacity-headroom`
 增大。Automatic 模式下的 startup 失败信息会提示该选项。
 
@@ -1836,7 +1839,7 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
   `Explicit(K_main)` 或 `Automatic(R)`；令 `L=ceil(S/64)`、`M_min=max(L,max_concurrency)`、
   `M_max=max_concurrency*L`，Explicit 取 `M=ceil(K_main/64)`，Automatic 根据完整 target physical
   reservation curve 与权重加载后的空闲显存扣除 headroom `R` 后，直接求得区间内最大的 `M`；
-  CLI/server 的 `R` 为 1 GiB；Main 与 DFlash Full 的
+  CLI/server 的 `R` 默认为 32 MiB；Main 与 DFlash Full 的
   per-allocation logical capacity 均为 `L`、physical capacity 均为 `M` pages，MTP 的 logical capacity
   为 `L`、physical capacity 为 `M + max_concurrency*ceil((K_draft-1)/64)` pages，其中 `K_draft` 是
   speculative draft window；Explicit 不满足 `K_main>=S`、任一 policy 的 resolved

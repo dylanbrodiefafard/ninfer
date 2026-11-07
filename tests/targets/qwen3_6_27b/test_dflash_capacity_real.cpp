@@ -84,12 +84,12 @@ void exercise(const char* artifact) {
     require(startup.cuda_graph_observed_bytes > 0 &&
                 startup.cuda_graph_observed_bytes <= startup.cuda_graph_allowance_bytes,
             "DFlash graph allocation exceeded its allowance");
-    // Keep the prior three-width allowance-slack bound per captured shape. Short-width
-    // adaptation now captures five shapes at each batch size, rather than three.
-    require(startup.cuda_graph_allowance_bytes - startup.cuda_graph_observed_bytes <=
-                128 * kMiB * 5 / 3,
+    // The DFlash2 allowance covers graph memory plus the driver memory startup consumes outside
+    // the arenas, with 17 to 27 MiB to spare; a larger gap strands Automatic KV capacity.
+    require(startup.cuda_graph_allowance_bytes - startup.cuda_graph_observed_bytes <= 64 * kMiB,
             "automatic capacity still strands an oversized DFlash graph allowance");
-    require(startup_free >= 768 * kMiB, "startup consumed automatic headroom");
+    require(startup_free >= options.kv_capacity.automatic_headroom_bytes,
+            "startup consumed automatic headroom");
     std::cout << "startup tokens=" << resolution.resolved_tokens
               << " graphs=" << startup.cuda_graph_observed_bytes / kMiB << '/'
               << startup.cuda_graph_allowance_bytes / kMiB << " MiB free=" << startup_free / kMiB
