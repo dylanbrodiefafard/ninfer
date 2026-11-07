@@ -574,8 +574,9 @@ broad additions without a concrete regression risk do not belong in the permanen
 
 `ninfer_qwen3_8_27b_output_constraint_real_test` exercises JSON Schema and EBNF alongside an
 unconstrained request at concurrency three with NVFP4 KV, CUDA Graphs, ordinary decode, and each
-available DFlash backend. It checks parsed schema values, exact EBNF content, EOS completion,
-streaming/result agreement, and speculative verification. The plain request switches from
+available DFlash backend. It checks parsed schema values including a free-form string with a
+minimum length, exact EBNF content, EOS completion, streaming/result agreement, and speculative
+verification. The plain request switches from
 no-thinking to thinking on the second pass and checks closing-token count and streamed logprobs
 across the reasoning boundary; the second pass also exercises compiler caching.
 Set `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` to an explicit local artifact and run:

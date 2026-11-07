@@ -56,10 +56,12 @@ int exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = false;
 
-    auto schema = prompt("Return an object with answer set to approved and count set to 3.");
+    auto schema = prompt("Return an object with answer set to approved, count set to 3, and "
+                         "summary containing one sentence explaining that approval was granted "
+                         "after three checks. The summary must contain at least 20 characters.");
     schema.options.output_constraint = ninfer::OutputConstraint{
         ninfer::OutputConstraintKind::JsonSchema,
-        R"({"type":"object","properties":{"answer":{"const":"approved"},"count":{"type":"integer","minimum":3,"maximum":3}},"required":["answer","count"],"additionalProperties":false})"};
+        R"({"type":"object","properties":{"answer":{"const":"approved"},"count":{"type":"integer","minimum":3,"maximum":3},"summary":{"type":"string","minLength":20}},"required":["answer","count","summary"],"additionalProperties":false})"};
     const std::string expected =
         "approved approved approved approved approved approved approved approved";
     auto grammar                      = prompt("Reply exactly: " + expected);
@@ -93,11 +95,12 @@ int exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
         const auto ebnf  = grammar_handle.wait();
         const auto text  = ordinary_handle.wait(&ordinary_sink);
         const auto value = nlohmann::json::parse(json.content);
-        if (!value.is_object() || value.size() != 2 || value.at("answer") != "approved" ||
-            value.at("count") != 3 || sink.text != json.content ||
-            json.finish_reason != ninfer::FinishReason::StopToken || ebnf.content != expected ||
-            ebnf.finish_reason != ninfer::FinishReason::StopToken || !json.tool_calls.empty() ||
-            text.content.empty()) {
+        if (!value.is_object() || value.size() != 3 || value.at("answer") != "approved" ||
+            value.at("count") != 3 || !value.at("summary").is_string() ||
+            value.at("summary").get_ref<const std::string&>().size() < 20 ||
+            sink.text != json.content || json.finish_reason != ninfer::FinishReason::StopToken ||
+            ebnf.content != expected || ebnf.finish_reason != ninfer::FinishReason::StopToken ||
+            !json.tool_calls.empty() || text.content.empty()) {
             std::cerr << "mixed constrained output failed: JSON=" << json.content
                       << " EBNF=" << ebnf.content << '\n';
             return 1;

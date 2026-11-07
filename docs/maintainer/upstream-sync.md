@@ -15,18 +15,41 @@ so upstream work is ported by hand, not merged.
 The next review starts from `git log 27df5a34..upstream/dev`; every commit up to and including
 the watermark has been judged and needs no second pass.
 
+## AMD fork review
+
+Secondary source: `jmander11/ninfer-amd-r9700`. The October 19 review used the sibling
+`ninfer-amd-r9700` checkout through `702d2c86a`; the November 5 review used
+`ninfer-amd-r9700-2` experimental through `dffe22bd` and its uncommitted JSON grammar fix.
+These reviews do not advance the upstream `dev` watermark.
+
+Selected ports are tokenizer merges, schema-number precision, and LayerNorm overflow handling
+(detailed below), plus the response-JSON whitespace fix and matcher/speculative-mask regressions.
+JSON whitespace preserves schema assertions and property order.
+
+JSON qualification (2026-11-06): RTX 5090, `sm_120a`, CUDA 13.1/GCC 13 Release builder,
+NVFP4 KV, and the explicit `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer` DFlash2 artifact.
+The warnings-as-errors build passes. Fast-suite checks plus the focused frontend rerun pass
+(133 checks); two optional artifact checks skip. The real-artifact
+`ninfer_qwen3_8_27b_output_constraint_real_test` passes ordinary
+and DFlash mixed C3 execution, free-form JSON strings, schema values, EOS, streaming/logprobs,
+and cached compilation; both DFlash passes exercise nine speculative rounds. Changed-line
+clang-tidy reports zero diagnostics across four translation units, and pinned format/lint
+checks pass.
+
+Remaining candidates are server reasoning-effort defaults/logging (`258830b8`), a startup
+watchdog (`4d5eca67`), and secondary-cleanup handling (`2024fb8e`). The cleanup change needs
+adaptation to native request retirement and shutdown regressions. The matcher fix (`9c3beaac`)
+addresses an AMD mailbox lifecycle absent from CUDA's graph-host-node/event implementation.
+
+Unselected optional features include counted-string masks, dependency vendoring, richer schema
+composition, choices/regex, provisional tool-argument events, and message-relative media paths.
+HIP kernels, cache formats, dispatch ordering, tuning constants, and AMD measurements require
+native CUDA evaluation. AMD MTP and C12/C16 execution are outside the current product contract.
+
 ## Review of e31bc99b..27df5a34 (2026-10-19)
 
 Reviewed all 226 commits at the fetched `upstream/dev` snapshot. These are selective ports into
 the fixed RTX 5090 product, with no upstream ancestry merge.
-
-The secondary source is the sibling `ninfer-amd-r9700` checkout, repository
-`jmander11/ninfer-amd-r9700`, through `702d2c86a`. Its sync commit `7bcc26a67` reviews the first
-204 commits of this range through `05327b22`; `e4926cdac` records subsequent AMD performance
-choices. Its active `docs/maintainer/upstream-sync.md` and local commit dispositions were used
-to identify candidates, then checked against this fork's ownership and CUDA implementations.
-AMD timings, HIP kernels, graph calibration constants, LQ4 weights, FP8-K/INT4-V storage, and
-its additional artifact identities are not RTX 5090 evidence or product requirements.
 
 ### Selected ports and existing equivalents
 
@@ -55,20 +78,7 @@ Engine speed claim is made, and no upstream schedule threshold is adopted withou
 qualification. The same applies to matching BF16 Vision shapes in upstream's linear tuning;
 matching dimensions alone do not establish a faster route.
 
-AMD's counted-string masks (`0a8530d4`), dependency vendoring (`7e2973ee`), richer schema
-composition/diagnostics (`2734a56e`), choices/regex (`8ffa3131`), provisional tool-argument events
-(`bc70d7c8`), and messages-file-relative media paths (`4126ecf4`) are optional feature or
-implementation changes, not fixes required to preserve the currently documented surfaces.
-This sync retains the existing supported schema subset, whole-call tool publication, media
-resolution, and patched pinned CPU grammar library. Their absence is an explicit selection,
-not an assertion of feature parity with AMD or upstream.
-
-AMD's sampling challenger regressed its default p-less path; those measurements do not select
-a CUDA route. Carried convolution windows, vectorized Vision RoPE/scatter, pitched host KV
-transfers, direct host loading, and graph allowance reductions depend on native layout and
-measurement. This fork already has its own fused convolution, Vision, transfer, and graph
-planning implementations; none of the AMD performance constants or throughput claims are
-copied. Spark, multi-rank execution, new checkpoints, MoE offload, QSA/PLE/HC, and the upstream
+Spark, multi-rank execution, new checkpoints, MoE offload, QSA/PLE/HC, and the upstream
 preemptive scheduler are outside the product contract.
 
 ### Verification

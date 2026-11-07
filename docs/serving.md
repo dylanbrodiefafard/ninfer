@@ -151,10 +151,12 @@ Type-specific assertions require an explicit `type`; count bounds are nonnegativ
 Regex `pattern` assertions, anchor references, assertion siblings of `$ref`/`anyOf`/`enum`/`const` (except checked typed literals),
 and unsupported assertions such as `uniqueItems`, `oneOf`, `allOf`, or conditionals fail
 admission with HTTP 400 `invalid_output_constraint`; they are never silently relaxed.
-JSON is generated compactly, without optional formatting whitespace, and properties follow schema order to avoid an exponential unordered-property
-state space. Request JSON keeps the client's member order, so the response's property order is the
-order of `properties` in the request; put context-establishing fields before the lists or
-details that depend on them. Additional keys alongside named properties use printable ASCII without escapes,
+JSON permits optional spaces, tabs, carriage returns, and newlines before and after the document
+and between syntax elements, including a space before a string's opening quote. Unescaped control
+characters remain invalid inside strings. Properties follow schema order to avoid an exponential
+unordered-property state space. Request JSON keeps the client's member order, so the response's
+property order is the order of `properties` in the request; put context-establishing fields before
+the lists or details that depend on them. Additional keys alongside named properties use printable ASCII without escapes,
 quotes, or backslashes to prevent aliases overwriting named values. A positive `minProperties`
 above one with additional keys requires at least that many distinct required properties;
 otherwise admission rejects the combination because arbitrary repeated keys cannot establish a

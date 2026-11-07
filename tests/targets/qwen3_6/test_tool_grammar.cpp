@@ -347,7 +347,13 @@ int main(int argc, char** argv) {
                                           "</invoke\n\n</parameter=",
                                           "<parameter=limit>\n",
                                           "<function = null>",
-                                          "call = null>"};
+                                          "call = null>",
+                                          " \"",
+                                          "Prime",
+                                          " Minister",
+                                          "{\"summary\":",
+                                          "\"}",
+                                          "\n\n"};
     auto added = Json::array();
     for (std::size_t i = 0; i < pieces.size(); ++i) {
         added.push_back(Json{{"id", i + 1},
@@ -380,6 +386,64 @@ int main(int argc, char** argv) {
             std::cerr << label << '\n';
         }
     };
+    // Response JSON must admit the model's ordinary space-plus-quote token after a colon.
+    // Forcing compact separators can replace it with a token such as `":"`, which is
+    // schema-valid but closes a free-form string before any prose is generated.
+    const auto piece_id = [&](std::string_view bytes) {
+        return static_cast<ninfer::TokenId>(std::find(pieces.begin(), pieces.end(), bytes) -
+                                            pieces.begin() + 1);
+    };
+    for (bool reasoning : {false, true}) {
+        for (auto kind :
+             {ninfer::OutputConstraintKind::JsonSchema, ninfer::OutputConstraintKind::JsonObject}) {
+            const auto response = compiler.compile(
+                {}, reasoning,
+                ninfer::OutputConstraint{
+                    kind,
+                    kind == ninfer::OutputConstraintKind::JsonSchema
+                        ? R"({"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]})"
+                        : ""});
+            const std::string prefix = reasoning ? "Reasoning about a call.</think>" : "";
+            for (const std::string value :
+                 {R"({"summary":"Prime Minister spoke."})",
+                  "\n\n{\n\t\"summary\" : \"Prime Minister said \\\"bonjour\\\" — "
+                  "你好.\\nNext.\"\n}",
+                  R"({ "summary" : "Punctuation: } : ,", "details" : { "n" : 3 } })"}) {
+                xgrammar::GrammarMatcher matcher(response->compiled);
+                check(matcher.AcceptString(prefix + value + "\t\r\n ") && matcher.IsCompleted(),
+                      "response JSON rejected represented whitespace or free-form prose");
+            }
+            xgrammar::GrammarMatcher empty(response->compiled);
+            check(empty.AcceptString(prefix + " \n") && !empty.IsCompleted() &&
+                      !empty.AcceptToken(7),
+                  "response JSON treated boundary whitespace as a complete document");
+            xgrammar::GrammarMatcher invalid(response->compiled);
+            check(!invalid.AcceptString(prefix + "{\"summary\": \"raw\nnewline\"}"),
+                  "response JSON admitted an unescaped string newline");
+            if (kind == ninfer::OutputConstraintKind::JsonSchema) {
+                xgrammar::GrammarMatcher wrong(response->compiled);
+                check(!wrong.AcceptString(prefix + R"({"summary": {"summary":"nested"}})"),
+                      "whitespace support weakened the summary string schema");
+            }
+            fi::TokenGrammarState state(response);
+            std::vector<ninfer::TokenId> committed;
+            if (reasoning) committed = {10, 11};
+            committed.push_back(piece_id("\n\n"));
+            committed.push_back(piece_id("{\"summary\":"));
+            state.preview(committed);
+            state.commit_preview();
+            const std::array<ninfer::TokenId, 5> tree{0, piece_id(" \""), piece_id("Prime"),
+                                                      piece_id(" Minister"), piece_id("\"}")};
+            const std::array<std::int32_t, 5> parents{-1, 0, 1, 2, 3};
+            std::vector<std::uint32_t> words(tree.size() * fi::TokenGrammarState::mask_words);
+            state.fill_masks(tree, parents, words);
+            for (std::size_t node = 1; node < tree.size(); ++node) {
+                check((words[parents[node] * fi::TokenGrammarState::mask_words + tree[node] / 32] &
+                       (1u << (tree[node] % 32))) != 0,
+                      "response JSON masked a valid speculative prose continuation");
+            }
+        }
+    }
     auto schema_grammar = [&](const Json& schema) {
         return compiler.compile(
             std::vector<std::string>{Json{

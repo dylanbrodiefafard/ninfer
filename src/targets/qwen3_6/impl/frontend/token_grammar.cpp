@@ -571,11 +571,19 @@ TokenGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in
     try {
         if (constraint) {
             const auto& content = starts_in_reasoning ? format.at("elements").at(1) : format;
-            auto compiled       = constraint->kind == OutputConstraintKind::Grammar
-                                      ? compiler_->CompileGrammar(constraint->source)
-                                      : compiler_->CompileJSONSchema(
-                                            content.at("json_schema").dump(), false, std::nullopt,
-                                            std::pair<std::string, std::string>{",", ":"}, false);
+            auto compiled       = [&] {
+                if (constraint->kind == OutputConstraintKind::Grammar) {
+                    return compiler_->CompileGrammar(constraint->source);
+                }
+                // JSON whitespace is syntax, not a schema restriction. Preserve
+                // space-plus-quote tokens at free-form string boundaries instead
+                // of forcing low-probability compact spellings.
+                const auto json = xgrammar::Grammar::FromJSONSchema(
+                    content.at("json_schema").dump(), true, std::nullopt, std::nullopt, false);
+                const auto whitespace = xgrammar::Grammar::FromEBNF(R"(root ::= [ \t\r\n]*)");
+                return compiler_->CompileGrammar(
+                    xgrammar::Grammar::Concat({whitespace, json, whitespace}));
+            }();
             if (starts_in_reasoning) {
                 auto reasoning = compiler_->CompileStructuralTag(Json{
                     {"type", "structural_tag"},

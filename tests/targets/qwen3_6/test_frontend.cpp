@@ -2687,10 +2687,11 @@ int test_constrained_output() {
     failures += check(visible == answer && output.tool_calls().empty(),
                       "constrained publication changed literal framing bytes");
 
-    xgrammar::GrammarMatcher compact(grammar->compiled);
-    failures +=
-        check(compact.AcceptString(answer) && compact.IsCompleted() && !compact.AcceptString("\n"),
-              "completed compact JSON can extend with formatting whitespace");
+    xgrammar::GrammarMatcher document(grammar->compiled);
+    failures += check(document.AcceptString(answer) && document.IsCompleted() &&
+                          document.AcceptString("\n\t\r ") && document.IsCompleted() &&
+                          document.AcceptToken(6),
+                      "completed JSON rejected trailing whitespace or EOS");
 
     auto thinking_input                    = input;
     thinking_input.options.enable_thinking = true;
