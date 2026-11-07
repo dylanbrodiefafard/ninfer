@@ -311,23 +311,26 @@ Linears, SWA, and the draft head use sequential kernels. Eager propose resolves 
 direct/split route from the row frontier rather than the batch maximum; graph replay keeps
 its fixed profile envelope. Target verify stays packed `B=batch` so graphs capture one 27B
 forward; ReplaySSM records are `layer(g, 0, B)` and the feature sink covers the compact
-lanes. Packed Linear/GDN-control sites normally launch at the C=1 width via
-`linear_packed_sequences` / `packed_route_tokens` so C>1 does not select a different
-T-specialized kernel (NVFP4 SmallT warp count or A16↔W4A4). The DFlash qkv, attention-output
+lanes. Batched verification follows the batch-size consistency rule in
+[qwen3.6-27b-model.md](qwen3.6-27b-model.md) §8 item 5: precision never depends on the batch, while
+rounding may. Packed Linear/GDN-control sites normally launch at the C=1 width via
+`linear_packed_sequences` / `packed_route_tokens`, so C>1 never selects a different activation
+precision (A16↔W4A4); keeping the C=1 kernel also keeps C=1 rounding, which is not required. The DFlash qkv, attention-output
 and feature projections (BF16 activations on tensor cores) and the Q4 draft head reduce every
 column in one T-independent order, so they aggregate packed drafts of any width in one pass.
 Qualified NVFP4 and BF16-control attention-input, residual and MLP routes aggregate through
 W8. The selected default uses A8
 for both ordinary and GDN verification projections at every verification width (W2–W6), so a
-request's arithmetic depends on neither its draft width nor the batch. Prefill and ordinary
+request's precision profile depends on neither its draft width nor the batch. Prefill and ordinary
 decode retain their text policy.
 The eligible verification post-mixer fuses RMSNorm and A8 quantization before gate/up/SwiGLU,
 preserving the BF16 normalized-input rounding boundary. The down projection stays separate.
 The quality/default decision is recorded in the performance reference. A16 residual T20
 retains the T5 panel reduction profile.
 Target GQA stays `[D, heads, W, B]`. SmallT uses one batched launch with request-indexed partial
-CTAs and a batched reduction, preserving each request's arithmetic without taking the generic
-`MultiBatch=true` route; p-less temperature2 samples that reduction. These projection profiles
+CTAs and a batched reduction without taking the generic `MultiBatch=true` route. For NVFP4 KV
+windows up to 32K the split count is sized per batch to one resident wave, so attention rounding,
+not precision, varies with the batch; p-less temperature2 samples that reduction. These projection profiles
 share the existing NVFP4 attention Q codec. No DFlash arithmetic profile is required to match
 ordinary T1 decode token-for-token; same-profile isolation and state/publication correctness
 remain required.

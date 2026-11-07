@@ -443,14 +443,25 @@ One propose block:
    Qualified NVFP4 MLP, attention-input and residual projections aggregate for every chain or
    tree width while the packed extent `W*B` stays within one M48 A8 tile
    (`kVerifyAggregateMaxTokens`); larger extents run per-request panels.
+   **Batch-size consistency.** A request's precision profile must not depend on the batch size or
+   on co-scheduled requests, so batched decode is never less accurate than C=1. The profile covers
+   the weight format and the precision at which weights are decoded for the multiply (for example
+   W8 codes kept exact with the scale applied in FP32, not rounded to BF16 after scaling), the
+   activation format (A16/A8/A4), the accumulator precision, and every explicit cast, quantization
+   and state boundary.
+   Reduction order, tile shape, split count and kernel selection may vary with the batch. Such
+   rounding-level differences are accepted when every route passes its Op's mathematical oracle and
+   the change shows no quality loss on teacher-forced NLL and retrieval checks. Bit parity between
+   a packed aggregate and its per-request panels is not required.
    BF16 MMA keeps one K-ordered accumulator per output under every tile, and every BF16 verify
    width runs MMA, so BF16 attention input and residuals aggregate for every W; each request keeps
    its panel's exact output. The W8 vocabulary and Q4 draft heads share one
    weight pass of at most 48 columns with the panel reduction. GDN control uses its
    packed-sequence Op.
    SmallT
-   GQA uses one batched launch with request-indexed partial CTAs and a batched reduction, preserving
-   each request's arithmetic without taking the generic `MultiBatch=true` route. ReplaySSM records
+   GQA uses one batched launch with request-indexed partial CTAs and a batched reduction without
+   taking the generic `MultiBatch=true` route; for NVFP4 KV windows up to 32K the split count is sized
+   per batch to one resident wave, a rounding-only difference. ReplaySSM records
    are `layer(g, 0, B)`.
    Packed NVFP4 GDN conv-record under A4 (W=5..16) or A8 (W=4..16) aggregates projections while
    preserving FP32 current input to convolution and BF16 saved history. A8 uses E4M3 activations
