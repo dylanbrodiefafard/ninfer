@@ -221,38 +221,48 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     CUDA_CHECK(cudaGetLastError());
 }
 
-// T>=6 windows in (8198, 32768] use the two-stage pipelined NVFP4 kernel. Its double buffers
-// admit one CTA per SM, which wins only while the grid fits one wave, so these launches cap the
-// split count to one wave of the batch grid. Wider windows keep two single-stage CTAs per SM.
+// T>=6 windows in (8198, 32768] use the two-stage pipelined NVFP4 kernel, whose double buffers
+// admit one CTA per SM. Wider windows keep two single-stage CTAs per SM.
 constexpr std::int32_t kRtx5090SmCount = 170;
 
 bool nvfp4_pipelined_window(std::int32_t implementation_window) {
     return implementation_window > 8198 && implementation_window <= 32768;
 }
 
+// Exact-NVFP4 windows through 32768 launch at most one resident wave of the batch grid: more,
+// shorter splits only add per-CTA setup and reduce traffic. A split's page-id staging covers 64
+// pages, which bounds it below. Wider windows keep the device split policy, because their partial
+// waves imbalance worse than the extra splits cost.
 template <typename Geometry>
-std::int32_t nvfp4_pipelined_splits(std::int32_t capacity, std::int32_t implementation_window,
-                                    std::int32_t batch_size) {
+std::int32_t nvfp4_wave_splits(std::int32_t capacity, std::int32_t implementation_window,
+                               std::int32_t batch_size, std::int32_t ctas_per_sm) {
+    if (implementation_window > 32768) { return capacity; }
     const std::int32_t wave =
-        std::max<std::int32_t>(1, kRtx5090SmCount / (Geometry::KVHeads * batch_size));
-    // A split's page-id staging covers 64 pages.
+        std::max<std::int32_t>(1, kRtx5090SmCount * ctas_per_sm / (Geometry::KVHeads * batch_size));
     const std::int32_t page_floor = div_up(implementation_window, 64 * kPagedKVPageSize);
     return std::min(capacity, std::max(wave, page_floor));
 }
 
+// Launches the partial pass with at most split_capacity splits and returns the split count it
+// used; the reduce must consume the same count.
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool TreeMasked,
           typename CacheInput>
-void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
-                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
-                             std::int32_t logical_capacity, std::int32_t implementation_window,
-                             std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
-                             Tensor& partial_l, cudaStream_t stream) {
+[[nodiscard]] std::int32_t
+launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                        PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
+                        std::int32_t logical_capacity, std::int32_t implementation_window,
+                        std::int32_t split_capacity, Tensor& partial_acc, Tensor& partial_m,
+                        Tensor& partial_l, cudaStream_t stream) {
+    std::int32_t splits   = split_capacity;
     Tensor& cache_k       = cache.k_pages;
     Tensor& cache_v       = cache.v_pages;
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
     auto launch           = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool Pipelined,
                                 bool DynamicArena>() {
+        splits = nvfp4_wave_splits<Geometry>(split_capacity, implementation_window,
+                                             static_cast<std::int32_t>(invocation.batch_size),
+                                             MinBlocksPerSm);
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         constexpr std::size_t kDynamicBytes =
             DynamicArena ? static_cast<std::size_t>(
@@ -333,6 +343,7 @@ void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& po
         launch.template operator()<8, 2, 32, false, false>();
     }
     CUDA_CHECK(cudaGetLastError());
+    return splits;
 }
 
 PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
@@ -392,14 +403,10 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     }
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const std::int32_t splits_base =
+    // The exact-NVFP4 partial launch may use fewer splits than this capacity and reports the
+    // count the reduce consumes.
+    std::int32_t splits =
         gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
-    const std::int32_t splits =
-        cache.dtype == DType::U8 && !cache.sage_pv && invocation.width >= 6 &&
-                nvfp4_pipelined_window(implementation_window)
-            ? nvfp4_pipelined_splits<Geometry>(splits_base, implementation_window,
-                                               static_cast<std::int32_t>(invocation.batch_size))
-            : splits_base;
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.
@@ -418,7 +425,8 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                         keep_frac, keep.keep_tiles, keep.keep_count, keep.split_off,               \
                         keep.max_keep);                                                            \
                 } else {                                                                           \
-                    launch_tc_partial_nvfp4<Geometry, (TOKENS), MultiBatch, Masked, TreeMasked>(   \
+                    splits = launch_tc_partial_nvfp4<Geometry, (TOKENS), MultiBatch, Masked,       \
+                                                     TreeMasked>(                                  \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
                 }                                                                                  \
