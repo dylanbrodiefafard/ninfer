@@ -1375,7 +1375,7 @@ Resident Model Runtime 是 model-instance object，不是 request object。它�
 - 一份 shared execution workspace；
 - 一份最大容量为 `C` 的 `DecodeBatchFrame`；
 - speculative backend 启用时，一份容量为 `C`、宽度为 `draft_window+1` 的 all-layer ReplaySSM record arena；
-- DFlash 的 capacity-four accepted-history planes、每行 provisional innovations 和每 lane retained length；
+- DFlash 的 capacity-eight accepted-history planes、每行 provisional innovations 和每 lane retained length；
 - startup-captured graph definitions 和 topology executables。
 
 每个 request 的持久状态只存在于 slot control 和该 slot 当前拥有的 `SequenceState`。Model Runtime 不保存
@@ -1578,7 +1578,7 @@ Program-owned raw records，不推进 committed GDN state。CPU output preview �
 no-op，随后 retain 该行已 commit 的 continuation，而不是释放 bundle。Executor 只能在这个 commit tail
 成功后提交 output preview，并在 streaming 模式发布 output event。
 
-DFlash target GDN uses a Program-owned FP32 checkpoint plus capacity-four accepted history.
+DFlash target GDN uses a Program-owned FP32 checkpoint plus capacity-eight accepted history.
 The startup arena contains shared normalized keys, per-value-head innovations and decay, one
 retained length per lane across all 48 layers, and separate provisional records at the captured
 verify-width ceiling. Record reads the checkpoint and retained history, then derives innovations

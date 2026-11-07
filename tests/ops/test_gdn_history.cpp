@@ -158,7 +158,7 @@ struct AcceptedHistoryFixture {
         const auto history_layout = plan_gdn_history(history_builder, {.layers      = 48,
                                                                        .slots       = batch,
                                                                        .width       = width,
-                                                                       .capacity    = 4,
+                                                                       .capacity    = 8,
                                                                        .qk_heads    = 16,
                                                                        .value_heads = 48,
                                                                        .key_dim     = 128,

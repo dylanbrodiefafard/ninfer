@@ -14,15 +14,18 @@ struct HistoryPlanes {
     float* provisional_alpha;
     std::int32_t slots;
     std::int32_t width;
+    std::int32_t capacity;
 
     __device__ __forceinline__ std::int64_t head(int layer, int slot, int entry,
                                                  int value_head) const {
-        return ((static_cast<std::int64_t>(layer) * slots + slot) * 4 + entry) * 48 + value_head;
+        return ((static_cast<std::int64_t>(layer) * slots + slot) * capacity + entry) * 48 +
+               value_head;
     }
 
     __device__ __forceinline__ std::int64_t key_head(int layer, int slot, int entry,
                                                      int qk_head) const {
-        return ((static_cast<std::int64_t>(layer) * slots + slot) * 4 + entry) * 16 + qk_head;
+        return ((static_cast<std::int64_t>(layer) * slots + slot) * capacity + entry) * 16 +
+               qk_head;
     }
 
     __device__ __forceinline__ std::int64_t provisional_head(int layer, int row, int token,
@@ -113,7 +116,7 @@ __global__ __launch_bounds__(128, 2) void history_commit_kernel(HistoryFold fold
     const int retained = history.counts[slot];
     if (accepted == 0 && (!force_flush || retained == 0)) { return; }
     if (accepted > 0) { fold.publish_final_conv_history(coord, accepted); }
-    if (force_flush || retained + accepted >= 4) {
+    if (force_flush || retained + accepted >= history.capacity) {
         __align__(16) float state[kDvPerWarp][kQkPerLane];
         const float* checkpoint = fold.state_read_base(coord);
 #pragma unroll
@@ -182,7 +185,7 @@ __global__ void history_count_kernel(HistoryPlanes history, GdnReplayFoldKernelR
     const int accepted   = control.path_length < 0 ? control.commit_columns : control.path_length;
     const int slot       = control.linear_state_slot;
     const int total      = history.counts[slot] + accepted;
-    history.counts[slot] = force_flush || total >= 4 ? 0 : total;
+    history.counts[slot] = force_flush || total >= history.capacity ? 0 : total;
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

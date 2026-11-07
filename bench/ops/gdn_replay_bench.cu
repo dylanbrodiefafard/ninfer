@@ -595,7 +595,7 @@ void run_history_record(const Options& options, DeviceBuffer& flush) {
     const auto history_layout = plan_gdn_history(history_builder, {.layers      = kLayers,
                                                                    .slots       = 1,
                                                                    .width       = kWidth,
-                                                                   .capacity    = 4,
+                                                                   .capacity    = 8,
                                                                    .qk_heads    = 16,
                                                                    .value_heads = kHeads,
                                                                    .key_dim     = 128,

@@ -1843,8 +1843,9 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 const auto lane     = static_cast<std::uint32_t>(row.linear_state_slot);
                 const auto accepted = static_cast<std::uint32_t>(
                     row.path_length < 0 ? row.commit_columns : row.path_length);
-                const auto length         = gdn_history_lengths[lane] + accepted;
-                gdn_history_lengths[lane] = length >= 4U ? 0U : length;
+                const auto length = gdn_history_lengths[lane] + accepted;
+                gdn_history_lengths[lane] =
+                    length >= static_cast<std::uint32_t>(gdn_history->spec.capacity) ? 0U : length;
             }
         } else {
             ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),

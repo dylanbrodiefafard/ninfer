@@ -163,7 +163,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .layers      = TextConfig::gdn_layers(),
                              .slots       = static_cast<std::int32_t>(plan.max_concurrency),
                              .width       = static_cast<std::int32_t>(plan.dflash_verify_width),
-                             .capacity    = 4,
+                             .capacity    = 8,
                              .qk_heads    = TextConfig::gdn_key_heads,
                              .value_heads = TextConfig::gdn_value_heads,
                              .key_dim     = TextConfig::gdn_key_head_dim,

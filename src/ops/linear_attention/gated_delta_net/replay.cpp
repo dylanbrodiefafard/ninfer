@@ -317,10 +317,12 @@ void validate_history_layer(const GdnHistoryLayer& history, std::int32_t rows, s
     if (slots < 1 || slots > 8 || width > ceiling || ceiling > 16) {
         throw std::invalid_argument("GDN history layer extent is invalid");
     }
-    require_tensor(history.key, DType::FP32, {128, 16, 4, slots}, 16, op, "retained keys");
-    require_tensor(history.innovation, DType::FP32, {128, 48, 4, slots}, 16, op,
+    const auto capacity = history.key.ne[2];
+    if (capacity <= 0) { throw std::invalid_argument("GDN history capacity is invalid"); }
+    require_tensor(history.key, DType::FP32, {128, 16, capacity, slots}, 16, op, "retained keys");
+    require_tensor(history.innovation, DType::FP32, {128, 48, capacity, slots}, 16, op,
                    "retained innovations");
-    require_tensor(history.alpha, DType::FP32, {48, 4, slots}, 16, op, "retained decay");
+    require_tensor(history.alpha, DType::FP32, {48, capacity, slots}, 16, op, "retained decay");
     require_tensor(history.counts, DType::I32, {slots}, 4, op, "retained lengths");
     require_tensor(history.provisional_key, DType::FP32, {128, 16, ceiling, rows}, 16, op,
                    "provisional keys");
@@ -334,7 +336,7 @@ void validate_history(const GdnHistory& history, const GdnReplayRecords& records
                       LinearAttentionStateAllLayersView states) {
     constexpr const char* op = "gdn_history_commit";
     const auto& spec         = history.spec;
-    if (spec.layers != 48 || spec.slots < 1 || spec.slots > 8 || spec.capacity != 4 ||
+    if (spec.layers != 48 || spec.slots < 1 || spec.slots > 8 || spec.capacity <= 0 ||
         spec.qk_heads != 16 || spec.value_heads != 48 || spec.key_dim != 128 ||
         spec.value_dim != 128 || spec.width != records.spec.width ||
         spec.slots != records.spec.record_capacity || states.spec.layers != 48 ||
@@ -342,10 +344,12 @@ void validate_history(const GdnHistory& history, const GdnReplayRecords& records
         throw std::invalid_argument("GDN accepted-history profile is unsupported");
     }
     const int outer = 48 * spec.slots;
-    require_tensor(history.key, DType::FP32, {128, 16, 4, outer}, 256, op, "retained keys");
-    require_tensor(history.innovation, DType::FP32, {128, 48, 4, outer}, 256, op,
+    require_tensor(history.key, DType::FP32, {128, 16, spec.capacity, outer}, 256, op,
+                   "retained keys");
+    require_tensor(history.innovation, DType::FP32, {128, 48, spec.capacity, outer}, 256, op,
                    "retained innovations");
-    require_tensor(history.alpha, DType::FP32, {48, 4, outer}, 256, op, "retained decay");
+    require_tensor(history.alpha, DType::FP32, {48, spec.capacity, outer}, 256, op,
+                   "retained decay");
     require_tensor(history.counts, DType::I32, {spec.slots}, 256, op, "retained lengths");
     require_tensor(history.provisional_key, DType::FP32, {128, 16, spec.width, outer}, 256, op,
                    "provisional keys");

@@ -13,7 +13,8 @@ HistoryPlanes planes(const GdnHistoryLayer& history) {
             static_cast<float*>(history.provisional_innovation.data),
             static_cast<float*>(history.provisional_alpha.data),
             history.counts.ne[0],
-            history.provisional_key.ne[2]};
+            history.provisional_key.ne[2],
+            history.key.ne[2]};
 }
 
 HistoryPlanes planes(const GdnHistory& history) {
@@ -25,7 +26,8 @@ HistoryPlanes planes(const GdnHistory& history) {
             static_cast<float*>(history.provisional_innovation.data),
             static_cast<float*>(history.provisional_alpha.data),
             history.spec.slots,
-            history.spec.width};
+            history.spec.width,
+            history.spec.capacity};
 }
 
 template <bool Masked, bool ParentIndexed>

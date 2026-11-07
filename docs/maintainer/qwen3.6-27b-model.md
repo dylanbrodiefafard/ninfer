@@ -324,7 +324,7 @@ history commits every round. MTP keeps its native dense replay-fold state transi
 
 Dense consumers and prefix/snapshot exports materialize accepted history first. Restore and
 slot reset install dense state and clear the length. The Program startup arena owns both the
-capacity-four history and provisional derived records at the maximum verify width; neither is
+capacity-eight history and provisional derived records at the maximum verify width; neither is
 a checkpoint staging slot. All-layer commit precedes a separate ordered count publication on
 the main stream, preserving stable CUDA Graph addresses and compact-row-to-lane ownership.
 
