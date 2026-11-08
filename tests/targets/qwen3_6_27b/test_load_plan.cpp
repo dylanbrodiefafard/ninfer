@@ -12,7 +12,6 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <variant>
 
 namespace {
 
@@ -41,47 +40,6 @@ bool valid_divisors(const WeightPlan& weight) {
     const float input_divisor  = std::bit_cast<float>(weight.input_scale_divisor_bits);
     return std::isfinite(weight_divisor) && weight_divisor > 0.0F && std::isfinite(input_divisor) &&
            input_divisor > 0.0F;
-}
-
-int verify_groupwise(const std::filesystem::path& path) {
-    ninfer::artifact::Reader reader(path);
-    ninfer::artifact::Binder binder(reader);
-    if (Package::resolve_weights(reader.identity(), binder) != WeightsProfile::GroupwiseInt) {
-        std::cerr << "groupwise identity resolved to the wrong profile\n";
-        return 1;
-    }
-    const ArtifactLoadPlan plan =
-        bind_artifact(binder, WeightsProfile::GroupwiseInt, all_features());
-    if (plan.materialization.object_count != 1124 ||
-        plan.materialization.device_objects.size() != 1118 ||
-        plan.materialization.host_objects.size() != 6 ||
-        plan.materialization.device_capacity_bytes == 0) {
-        std::cerr << "groupwise materialization plan is incomplete\n";
-        return 1;
-    }
-    if (plan.bindings.token_embedding.format != NumericFormat::Q6G64_F16S ||
-        plan.bindings.output_head.format != NumericFormat::Q6G64_F16S) {
-        std::cerr << "groupwise vocabulary endpoints have the wrong storage profile\n";
-        return 1;
-    }
-    for (const TextLayerPlan& layer : plan.bindings.text_layers) {
-        if (layer.is_full_attention) {
-            if (!std::holds_alternative<SplitAttentionProjectionPlan>(layer.attention.projection)) {
-                std::cerr << "groupwise attention parent boundary changed\n";
-                return 1;
-            }
-        } else if (!std::holds_alternative<SplitGdnInputProjectionPlan>(
-                       layer.gdn.input_projection)) {
-            std::cerr << "groupwise GDN parent boundary changed\n";
-            return 1;
-        }
-        if (layer.mlp.gate_up.format != NumericFormat::Q4G64_F16S ||
-            layer.mlp.down.format != NumericFormat::Q5G64_F16S) {
-            std::cerr << "groupwise MLP storage profile changed\n";
-            return 1;
-        }
-    }
-    return 0;
 }
 
 int verify_nvfp4(const std::filesystem::path& path) {
@@ -128,21 +86,15 @@ int verify_nvfp4(const std::filesystem::path& path) {
             return 1;
         }
         if (layer.is_full_attention) {
-            const auto* fused =
-                std::get_if<FusedAttentionProjectionPlan>(&layer.attention.projection);
-            if (fused == nullptr || !count_weight(fused->query_key_gate_value) ||
-                !count_weight(layer.attention.output)) {
+            const WeightPlan& input = layer.attention.query_key_gate_value;
+            if (!count_weight(input) || !count_weight(layer.attention.output)) {
                 std::cerr << "NVFP4 attention binding is invalid\n";
                 return 1;
             }
-            bf16_attention_inputs +=
-                fused->query_key_gate_value.format == NumericFormat::BF16 ? 1 : 0;
+            bf16_attention_inputs += input.format == NumericFormat::BF16 ? 1 : 0;
             bf16_attention_outputs += layer.attention.output.format == NumericFormat::BF16 ? 1 : 0;
         } else {
-            const auto* fused =
-                std::get_if<FusedGdnInputProjectionPlan>(&layer.gdn.input_projection);
-            if (fused == nullptr || !count_weight(fused->query_key_value_z) ||
-                !count_weight(layer.gdn.output)) {
+            if (!count_weight(layer.gdn.query_key_value_z) || !count_weight(layer.gdn.output)) {
                 std::cerr << "NVFP4 GDN binding is invalid\n";
                 return 1;
             }
@@ -164,10 +116,10 @@ int verify_rejection(const std::filesystem::path& path) {
     ninfer::artifact::Reader reader(path);
     ninfer::artifact::Binder binder(reader);
     try {
-        (void)Package::resolve_weights({"qwen3.6-27b", "unknown"}, binder);
+        (void)Package::resolve_weights({"qwen3.8-27b", "unknown"}, binder);
     } catch (const std::runtime_error& error) {
         const std::string message = error.what();
-        if (message.find("qwen3.6-27b/unknown") != std::string::npos) { return 0; }
+        if (message.find("qwen3.8-27b/unknown") != std::string::npos) { return 0; }
     }
     std::cerr << "unknown weights identity was not rejected with the full identity\n";
     return 1;
@@ -181,7 +133,8 @@ int verify_profile_mismatch_rejection() {
     options.prefill_chunk  = 128;
     options.mixed_forward  = 0;
     options.use_cuda_graph = false;
-    auto planner = Package::make_sequence_planner(device, options, WeightsProfile::GroupwiseInt);
+    auto planner =
+        Package::make_sequence_planner(device, options, WeightsProfile::SelectiveFp8Nvfp4);
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
@@ -218,8 +171,7 @@ int verify_selective(const std::filesystem::path& path) {
         count(layer.mlp.gate_up);
         count(layer.mlp.down);
         if (layer.is_full_attention) {
-            const auto& input = std::get<FusedAttentionProjectionPlan>(layer.attention.projection)
-                                    .query_key_gate_value;
+            const WeightPlan& input = layer.attention.query_key_gate_value;
             count(input);
             count(layer.attention.output);
             if ((i <= 23 && input.format != NumericFormat::BF16) ||
@@ -227,8 +179,7 @@ int verify_selective(const std::filesystem::path& path) {
                 throw std::runtime_error("selective profile changed protected attention weight");
             }
         } else {
-            count(std::get<FusedGdnInputProjectionPlan>(layer.gdn.input_projection)
-                      .query_key_value_z);
+            count(layer.gdn.query_key_value_z);
             count(layer.gdn.output);
             if (i == 4 && layer.gdn.output.format != NumericFormat::BF16) {
                 throw std::runtime_error("selective profile changed protected GDN weight");
@@ -246,18 +197,14 @@ int main() {
     if (const char* selected = std::getenv("NINFER_SELECTIVE_FP8_WEIGHTS")) {
         return verify_selective(selected);
     }
-    const std::filesystem::path groupwise =
-        artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
     const std::filesystem::path nvfp4 =
-        artifact_path("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS", "qwen3_6_27b_nvfp4.ninfer");
-    if (!std::filesystem::is_regular_file(groupwise) || !std::filesystem::is_regular_file(nvfp4)) {
-        std::cerr << "skip: both real 27B artifacts are required: groupwise=" << groupwise
-                  << " nvfp4=" << nvfp4 << '\n';
+        artifact_path("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS", "qwen3_8_27b_nvfp4.ninfer");
+    if (!std::filesystem::is_regular_file(nvfp4)) {
+        std::cerr << "skip: the real 27B NVFP4 artifact is required: " << nvfp4 << '\n';
         return 77;
     }
-    if (const int result = verify_rejection(groupwise); result != 0) { return result; }
+    if (const int result = verify_rejection(nvfp4); result != 0) { return result; }
     if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
-    if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
     if (const int result = verify_nvfp4(nvfp4); result != 0) { return result; }
     return 0;
 }

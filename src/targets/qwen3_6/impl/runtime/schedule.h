@@ -5,8 +5,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
-#include "ninfer/ops/bidirectional_gqa_attention.h"
-#include "ninfer/ops/kv_cache_append_prefix.h"
+#include "ninfer/ops/normalized_rope_kv_append.h"
 #include "ninfer/ops/swa.h"
 #include "core/decode_graph.h"
 #include "runtime/contract/transient_region.h"
@@ -117,7 +116,6 @@ struct MtpGqaEnvelopes {
 
 struct DFlashEnvelopes {
     ops::SwaContextExecutionEnvelope local;
-    ops::GqaContextExecutionEnvelope full;
     ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 
@@ -273,11 +271,9 @@ void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
 void dflash_append_context(DFlashAppendContext& state, const Tensor& features,
                            const Tensor& positions, const Tensor& commit_counts,
-                           const Tensor& lanes, const Tensor& table_rows,
-                           ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+                           const Tensor& lanes, ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 void dflash_append_context(PrefillContext& state, const Tensor& features, const Tensor& positions,
                            const Tensor& commit_counts, const Tensor& lanes,
-                           const Tensor& table_rows,
                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, std::uint32_t verify_width,

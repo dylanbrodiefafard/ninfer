@@ -80,7 +80,6 @@ add_library(ninfer_ops STATIC
   ops/launcher/embed_gather.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
-  ops/launcher/bidirectional_gqa_attention.cu
   ops/launcher/swa.cu
   ops/launcher/gqa_attention_decode.cu
   ops/launcher/gqa_attention_decode_s3.cu
@@ -88,7 +87,6 @@ add_library(ninfer_ops STATIC
   ops/launcher/gqa_attention_prefill_s3.cu
   ops/launcher/gqa_attention_prefill_s3_tma.cu
   ops/launcher/gqa_attention_prefill_sparse.cu
-  ops/launcher/kv_cache_append_prefix.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
@@ -132,14 +130,6 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_quantized.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
-  ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
-  ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
-  ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp
-  ops/attn_input_proj/w8/w8_attn_input_decode.cu
-  ops/attn_input_proj/w8/w8_attn_input_gemm_mma.cu
-  ops/attn_input_proj/w8/w8_attn_input_gemm_simt.cu
-  ops/attn_input_proj/w8/w8_attn_input_gemm_splitk.cu
-  ops/attn_input_proj/w8/w8_attn_input_plan.cpp
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_quantized.cu
@@ -154,15 +144,7 @@ add_library(ninfer_ops STATIC
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_small_t.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
-  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
-  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
-  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_conv_snapshot.cu
-  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
   ops/gdn_input_proj/gdn_projected_conv.cu
-  ops/gdn_input_proj/w8/w8_gdn_input_decode.cu
-  ops/gdn_input_proj/w8/w8_gdn_input_gemm_mma.cu
-  ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu
-  ops/gdn_input_proj/w8/w8_gdn_input_plan.cpp
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
   ops/linear/bf16/bf16_gemv.cu
@@ -184,7 +166,6 @@ add_library(ninfer_ops STATIC
   ops/linear/q5/q5_dispatch.cpp
   ops/linear/q5/q5_rowsplit_gemm_mma.cu
   ops/linear/q5/q5_rowsplit_gemm_simt.cu
-  ops/linear/q5/q5_rowsplit_gemv.cu
   ops/linear_add/bf16/bf16_linear_add_decode.cu
   ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
   ops/linear_add/bf16/bf16_linear_add_plan.cpp
@@ -196,25 +177,10 @@ add_library(ninfer_ops STATIC
   ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_quantized.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
-  ops/linear_add/q5/q5_linear_add_gemm_mma.cu
-  ops/linear_add/q5/q5_linear_add_gemm_simt.cu
-  ops/linear_add/q5/q5_linear_add_gemv.cu
-  ops/linear_add/q5/q5_linear_add_plan.cpp
-  ops/linear_add/w8/w8_linear_add_gemm_mma.cu
-  ops/linear_add/w8/w8_linear_add_gemm_simt.cu
-  ops/linear_add/w8/w8_linear_add_gemm_splitk.cu
-  ops/linear_add/w8/w8_linear_add_plan.cpp
-  ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cu
-  ops/linear_swiglu/q4/q4_linear_swiglu_gemv.cu
-  ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_quantized.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
-  ops/linear_swiglu/w8/w8_linear_swiglu_decode.cu
-  ops/linear_swiglu/w8/w8_linear_swiglu_gemm_mma.cu
-  ops/linear_swiglu/w8/w8_linear_swiglu_gemm_splitk.cu
-  ops/linear_swiglu/w8/w8_linear_swiglu_plan.cpp
   ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.cpp
   ops/linear_swiglu/fp8/fp8_linear_swiglu_decode.cu
   ops/linear_swiglu/fp8/fp8_linear_swiglu_small_t.cu
@@ -224,21 +190,10 @@ add_library(ninfer_ops STATIC
   ops/linear/q6/q6_rowsplit_gemm_simt.cu
   ops/linear/w8/w8_rowsplit_gemm_mma.cu
   ops/linear/w8/w8_rowsplit_gemm_simt.cu
-  ops/linear/w8/w8_rowsplit_gemm_decode.cu
   ops/linear/w8/w8_small_t.cu
-  ops/linear/w8/w8_rowsplit_gemm_splitk.cu
   ops/linear/w8/w8_dispatch.cpp
-  ops/linear_pair/w8/w8_pair_decode.cu
-  ops/linear_pair/w8/w8_pair_gemm_concat.cu
   ops/linear_pair/w8/w8_pair_gemm_mma.cu
-  ops/linear_pair/w8/w8_pair_gemm_splitk.cu
   ops/linear_pair/w8/w8_pair_plan.cpp
-  ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
-  ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
-  ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
-  ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
-  ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
-  ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
   ops/linear/linear.cpp
   ops/linear/linear_kv_projection.cpp
   ops/linear/nvfp4/nvfp4_kv_projection.cu
@@ -260,10 +215,8 @@ add_library(ninfer_ops STATIC
   ops/wrapper/gdn_gating_proj.cpp
   ops/wrapper/gdn_input_proj.cpp
   ops/wrapper/gelu.cpp
-  ops/wrapper/bidirectional_gqa_attention.cpp
   ops/wrapper/swa.cpp
   ops/wrapper/gqa_attention.cpp
-  ops/wrapper/kv_cache_append_prefix.cpp
   ops/wrapper/normalized_rope_kv_append.cpp
   ops/launcher/normalized_rope_kv_append.cu
   ops/wrapper/attn_input_proj.cpp
@@ -290,7 +243,6 @@ add_library(ninfer_ops STATIC
   ops/wrapper/scatter.cpp
   ops/wrapper/sigmoid_mul.cpp
   ops/wrapper/silu_mul.cpp
-  ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp)
 ninfer_internal_includes(ninfer_ops)
@@ -345,7 +297,6 @@ target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
-add_subdirectory(targets/qwen3_6_35b_a3b)
 
 target_include_directories(ninfer_engine PRIVATE ${ZSTD_INCLUDE_DIRS})
 if(ZSTD_CFLAGS_OTHER)

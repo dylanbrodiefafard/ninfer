@@ -1860,19 +1860,12 @@ int main(int argc, char** argv) {
                : fallback_only ? exercise_restore_allocation_fallback(artifact)
                                : exercise_artifact(artifact);
     };
-    const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
-    const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
-    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0') &&
-        (dflash == nullptr || *dflash == '\0')) {
-        std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS, "
-                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS, or "
-                     "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS to a qwen3.6-27b or "
-                     "qwen3.8-27b .ninfer\n";
+    const char* nvfp4  = std::getenv("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
+    const char* dflash = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+    if ((nvfp4 == nullptr || *nvfp4 == '\0') && (dflash == nullptr || *dflash == '\0')) {
+        std::cout << "skip: set NINFER_QWEN3_8_27B_NVFP4_WEIGHTS or "
+                     "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS to a qwen3.8-27b .ninfer\n";
         return 77;
-    }
-    if (groupwise != nullptr && *groupwise != '\0') {
-        if (const int result = run(groupwise); result != 0) { return result; }
     }
     if (nvfp4 != nullptr && *nvfp4 != '\0') {
         if (const int result = run(nvfp4); result != 0) { return result; }

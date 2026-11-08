@@ -92,46 +92,6 @@ void require_dense_metadata(const Weight& table, const Tensor& out) {
     }
 }
 
-void require_q6_metadata(const Weight& table, const Tensor& out) {
-    if (table.layout != QuantLayout::RowSplit) {
-        throw std::invalid_argument("embedding: Q6G64_F16S table must be RowSplit");
-    }
-    require_weight_2d(table);
-    if (table.group_size != 64 || table.group != 64) {
-        throw std::invalid_argument("embedding: Q6G64_F16S table group must be 64");
-    }
-    if (table.scale_dtype != DType::FP16) {
-        throw std::invalid_argument("embedding: Q6G64_F16S table scale dtype must be FP16");
-    }
-    if (table.padded_shape[0] != table.shape[0] ||
-        table.padded_shape[1] != align_up_i32(table.shape[1], 128)) {
-        throw std::invalid_argument("embedding: Q6G64_F16S padded shape is invalid");
-    }
-    if (table.shape[1] != out.ne[0]) {
-        throw std::invalid_argument("embedding: Q6G64_F16S table d must match out.ne[0]");
-    }
-    const std::uint64_t kg = static_cast<std::uint64_t>(table.padded_shape[1] / 64);
-    const std::uint64_t nibble_plane_bytes =
-        checked_mul_u64(checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]), kg), 32);
-    const std::uint64_t high_plane_bytes =
-        checked_mul_u64(checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]), kg), 16);
-    const std::uint64_t scale_plane_bytes =
-        checked_mul_u64(checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]), kg), 2);
-    const std::uint64_t high_plane_off = ((nibble_plane_bytes + 255u) / 256u) * 256u;
-    const std::uint64_t scale_plane_off =
-        high_plane_off + ((high_plane_bytes + 255u) / 256u) * 256u;
-    const std::uint64_t expected = scale_plane_off + scale_plane_bytes;
-    if (table.payload_bytes != 0 && table.payload_bytes < expected) {
-        throw std::invalid_argument("embedding: Q6G64_F16S payload is too small");
-    }
-    if (table.qdata == nullptr || table.qhigh == nullptr || table.scales == nullptr) {
-        throw std::invalid_argument("embedding: Q6G64_F16S planes must be non-null");
-    }
-    if (table.high_plane_bytes < high_plane_bytes) {
-        throw std::invalid_argument("embedding: Q6G64_F16S high plane is too small");
-    }
-}
-
 void require_w8_metadata(const Weight& table, const Tensor& out) {
     if (table.layout != QuantLayout::RowSplit) {
         throw std::invalid_argument("embedding: W8G32_F16S table must be RowSplit");
@@ -214,12 +174,6 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         const Tensor dense = as_dense(table);
         detail::embed_gather_dense_launch(ids, dense, out, stream);
     } break;
-    case QType::Q6G64_F16S:
-        require_q6_metadata(table, out);
-        if (is_empty_T(ids, out)) { return; }
-        require_non_empty_tensors(ids, out);
-        detail::embed_gather_q6_launch(ids, table, out, stream);
-        break;
     case QType::W8G32_F16S:
         require_w8_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }

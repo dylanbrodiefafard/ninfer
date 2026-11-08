@@ -78,7 +78,7 @@ prefill estimates are different metrics.
 `ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
 committed corpus, so the corpus must be real, in-distribution text (not random tokens) and at
 least as long as the largest prefill you want to run. `make_bench_corpus.py` bakes that corpus
-offline with a local Hugging Face Qwen3.6 tokenizer.
+offline with a local Hugging Face Qwen3.8-27B tokenizer.
 
 Outputs (committed):
 
@@ -116,12 +116,12 @@ The tokenizer is loaded locally only; the tool never downloads from the network.
 ```bash
 # Regenerate the committed corpus from the built-in bank (default 65536 tokens).
 python3 tools/bench/make_bench_corpus.py \
-  --tokenizer-path /path/to/local/Qwen3.6-27B/tokenizer \
+  --tokenizer-path /path/to/local/Qwen3.8-27B/tokenizer \
   --tokens 65536
 
 # Bake from your own downloaded/assembled text instead (kept local; not committed).
 python3 tools/bench/make_bench_corpus.py \
-  --tokenizer-path /path/to/local/Qwen3.6-27B/tokenizer \
+  --tokenizer-path /path/to/local/Qwen3.8-27B/tokenizer \
   --tokens 131072 --source-text /path/to/book.txt
 
 # Check that the committed .ids and its descriptive manifest agree; no tokenizer or source needed.
@@ -137,7 +137,7 @@ optionally use `--source-text`) to benchmark longer prefills, memory permitting.
 `.ninfer` artifact and stores its local reports under `profiles/bench/`. Its defaults are:
 
 ```text
-artifact: out/qwen3_6_27b.ninfer
+artifact: models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer
 binary:   build/bench/ninfer_bench
 corpus:   bench/fixtures/bench_corpus.ids
 ```
@@ -189,11 +189,10 @@ tokens over complete-wave wall time; `prefill_active_tok_s` separately reports t
 active prefill rate. The matrix manifest is descriptive and records the commands and selected local
 inputs; it does not make repository state part of report validity.
 
-`run_serve_corpus.py` runs both registered targets and both ordinary/DFlash suites when both
-artifacts are supplied. Pass one `--artifact` to select a single target and `--mode ordinary` or
-`--mode dflash3` to run only that suite. `--mode dflash7` runs the same decode corpus with DFlash
-block=8 (`k=7`) and the optimized proposal head on 35B-A3B DFlash v1 or Qwen3.8-27B DFlash2.
-It is rejected for `qwen3_6_27b`. Add
+`run_serve_corpus.py` runs both ordinary and DFlash suites on the registered `qwen3_8_27b` target.
+Pass `--mode ordinary` or `--mode dflash3` to run only that suite. `--mode dflash7` runs the same
+decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head on Qwen3.8-27B DFlash2.
+Add
 `--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
 Its schema-v5 result and flattened summaries retain the canonical `weights_id` received from the
 schema-v9 serving startup record. The stochastic route pins its complete

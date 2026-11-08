@@ -513,8 +513,7 @@ public:
 
     [[nodiscard]] bool calibrates_p_less_drafts() const {
         return !p_less_draft_temperature.has_value() &&
-               speculative_backend == SpeculativeBackend::DFlash &&
-               DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2;
+               speculative_backend == SpeculativeBackend::DFlash;
     }
 
     // Engine-global adaptive DFlash hop hazards, learned from exploration rounds.
@@ -718,7 +717,6 @@ private:
         std::uint32_t mtp_kv_valid            = 0;
         std::uint32_t dflash_context_frontier = 0;
         bool tail_hidden_valid                = false;
-        bool backend_image_present            = false;
         std::vector<ContextCheckpointIndex> context_checkpoints;
     };
 

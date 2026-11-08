@@ -1,7 +1,5 @@
 #pragma once
 
-#include "ops/common/math.cuh"
-
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -42,26 +40,6 @@ struct Q5ScalarDecodeAtom {
             0x10;
         w0 = static_cast<float>(q0) * scale;
         w1 = static_cast<float>(q1) * scale;
-    }
-};
-
-struct Q5SimtDecodeAtom {
-    __device__ static __forceinline__ void decode_eight(std::uint32_t packed,
-                                                        std::uint8_t high_bits,
-                                                        std::uint16_t scale_bits,
-                                                        float (&weights)[8]) {
-        const std::uint32_t high = static_cast<std::uint32_t>(high_bits) ^ 0xffu;
-        const float scale        = __half2float(__ushort_as_half(scale_bits));
-        const __half2 bias       = __half2half2(__ushort_as_half(0x6410)); // 1040.0
-#pragma unroll
-        for (int pair = 0; pair < 4; ++pair) {
-            std::uint32_t bits = ((packed >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
-            bits |= (((high >> pair) & 1u) << 4) | (((high >> (pair + 4)) & 1u) << 20);
-            const __half2 decoded = __hsub2(half2_from_bits(bits), bias);
-            const float2 values   = __half22float2(decoded);
-            weights[pair]         = values.x * scale;
-            weights[pair + 4]     = values.y * scale;
-        }
     }
 };
 

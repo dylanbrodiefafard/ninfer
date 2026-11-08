@@ -73,8 +73,7 @@ __device__ __forceinline__ void speculative_chain_hop_q(const std::int32_t* sele
 
 // The selector q is the proposal law the DFlash2 path select drew each hop's draft from:
 // one-hot for greedy drafts, the shortlist softmax for sampled ones. Accept/correction use it
-// under every target sampler, p-less included (MTP and DFlash1 pass null ids, the one-hot
-// convention).
+// under every target sampler, p-less included (MTP passes null ids, the one-hot convention).
 __device__ __forceinline__ void speculative_chain_hop_q_for_target(const std::int32_t* selector_ids,
                                                                    const float* selector_q,
                                                                    int selector_k, int hop, int row,

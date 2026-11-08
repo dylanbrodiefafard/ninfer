@@ -107,11 +107,4 @@ private:
     std::vector<PrefixHash128> hashes_;
 };
 
-// D17: RAM DFlash checkpoint reuse is gated on a captured backend image, not live sequence.kv.
-[[nodiscard]] constexpr bool dflash_rewrite_checkpoint_ready(bool backend_image_present,
-                                                             std::uint32_t dflash_context_frontier,
-                                                             std::uint32_t reuse_base) noexcept {
-    return backend_image_present && dflash_context_frontier >= reuse_base;
-}
-
 } // namespace ninfer::targets::qwen3_6::detail

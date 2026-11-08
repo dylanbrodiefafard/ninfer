@@ -31,20 +31,6 @@ void require_bf16_weight(const Weight& w, std::int32_t rows, std::int32_t input_
     }
 }
 
-Weight bf16_row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
-    const std::size_t row_bytes = static_cast<std::size_t>(parent.k) * sizeof(std::uint16_t);
-    const auto* data            = static_cast<const std::uint8_t*>(parent.qdata) +
-                                  static_cast<std::size_t>(row_begin) * row_bytes;
-    Weight view                 = parent;
-    view.payload                = data;
-    view.payload_bytes          = static_cast<std::uint64_t>(rows) * row_bytes;
-    view.qdata                  = data;
-    view.shape[0]               = rows;
-    view.padded_shape[0]        = rows;
-    view.n                      = rows;
-    return view;
-}
-
 void require_vector_tensor(const Tensor& t, DType dtype, std::int32_t n0, const char* op,
                            const char* name) {
     if (t.dtype != dtype || t.ne[0] != n0 || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1 ||
@@ -93,8 +79,8 @@ std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens) {
-    return detail::bf16_gdn_norm_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
-                                                                 max_tokens);
+    return detail::bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
+                                                            max_tokens);
 }
 
 std::size_t gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
@@ -116,23 +102,6 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
     require_bf16_weight(a_weight, 48, 5120, "a_weight");
     require_bf16_weight(b_weight, 48, 5120, "b_weight");
 
-    detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
-}
-
-void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_log,
-                     const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g, Tensor& beta,
-                     cudaStream_t stream) {
-    constexpr const char* op  = "gdn_gating_proj";
-    const std::int32_t tokens = x.ne[1];
-    require_sequence_tensor(x, DType::BF16, 2048, tokens, op, "x");
-    require_vector_tensor(A_log, DType::FP32, 32, op, "A_log");
-    require_vector_tensor(dt_bias, DType::FP32, 32, op, "dt_bias");
-    require_sequence_tensor(g, DType::FP32, 32, tokens, op, "g");
-    require_sequence_tensor(beta, DType::FP32, 32, tokens, op, "beta");
-    require_bf16_weight(ab_weight, 64, 2048, "ab_weight");
-
-    const Weight a_weight = bf16_row_view(ab_weight, 0, 32);
-    const Weight b_weight = bf16_row_view(ab_weight, 32, 32);
     detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
@@ -247,30 +216,6 @@ void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_w
                                            cudaStream_t stream, std::int32_t sequence_width) {
     norm_gating_27_packed(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, ws, h,
                           &h_activation, g, beta, stream, sequence_width);
-}
-
-void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
-                          const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
-                          WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
-                          cudaStream_t stream) {
-    constexpr const char* op  = "gdn_norm_gating_proj";
-    const std::int32_t tokens = x.ne[1];
-    if (!(eps > 0.0F) || !std::isfinite(eps)) {
-        throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
-    }
-    require_sequence_tensor(x, DType::BF16, 2048, tokens, op, "x");
-    require_vector_tensor(norm_weight, DType::BF16, 2048, op, "norm_weight");
-    require_sequence_tensor(h, DType::BF16, 2048, tokens, op, "h");
-    require_vector_tensor(A_log, DType::FP32, 32, op, "A_log");
-    require_vector_tensor(dt_bias, DType::FP32, 32, op, "dt_bias");
-    require_sequence_tensor(g, DType::FP32, 32, tokens, op, "g");
-    require_sequence_tensor(beta, DType::FP32, 32, tokens, op, "beta");
-    require_bf16_weight(ab_weight, 64, 2048, "ab_weight");
-
-    const Weight a_weight = bf16_row_view(ab_weight, 0, 32);
-    const Weight b_weight = bf16_row_view(ab_weight, 32, 32);
-    detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, {}, a_weight, b_weight, A_log,
-                                          dt_bias, ws, g, beta, stream);
 }
 
 } // namespace ninfer::ops

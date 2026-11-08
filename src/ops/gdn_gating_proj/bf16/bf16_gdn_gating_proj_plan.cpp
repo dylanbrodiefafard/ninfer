@@ -39,15 +39,6 @@ constexpr std::array<RouteSpec, 5> k27Routes{{
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
-constexpr std::array<RouteSpec, 5> k35Routes{{
-    // The same progression keeps the long-range cooperative routes near 256 CTAs.
-    {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
-    {{128, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
-}};
-
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
                                  std::int32_t last) noexcept {
@@ -60,122 +51,50 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 }
 
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
-static_assert(catalog_is_closed(k35Routes, kAnyCols));
 
-bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
-    return problem.heads == 48 && problem.input_rows == 5120;
-}
-
-bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
-    return problem.heads == 32 && problem.input_rows == 2048;
-}
-
-bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-    case Bf16GdnGatingScheduleId::MmaUnsplit:
-        return true;
-    case Bf16GdnGatingScheduleId::SimtWarpRowC4:
-    case Bf16GdnGatingScheduleId::SimtWarpRowC8:
-        return false;
-    }
-    return false;
-}
-
-std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
-    return is_35(problem) ? 64 : 128;
-}
+// Every registered schedule tiles the long-context token axis in 128-column MMA tiles.
+inline constexpr std::int32_t kMmaTileCols = 128;
 
 std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
     switch (schedule) {
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
         return 40;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-        return 32;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
-        return 16;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         return 8;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         return 4;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
         return 2;
-    case Bf16GdnGatingScheduleId::SimtWarpRowC4:
-    case Bf16GdnGatingScheduleId::SimtWarpRowC8:
     case Bf16GdnGatingScheduleId::MmaUnsplit:
         return 1;
     }
     throw std::logic_error("BF16 GDN gating: unknown schedule");
 }
 
-bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols,
-                                  std::int32_t tile_cols, std::int32_t row_tiles,
-                                  std::int32_t resident_ctas) {
-    const std::int64_t column_tiles = (static_cast<std::int64_t>(cols) + tile_cols - 1) / tile_cols;
-    const std::int64_t grid_ctas =
-        column_tiles * row_tiles * static_cast<std::int64_t>(schedule_split_k(schedule));
-    return grid_ctas <= resident_ctas;
-}
-
-bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) {
+bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) {
     // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
     // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM, hence
     // 340 resident CTAs device-wide. There are three 16-row tiles per token tile.
-    return cooperative_grid_is_resident(schedule, cols, 128, 3, 340);
-}
-
-bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) {
-    // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles. With the registered CUDA
-    // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
-    // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. Across 170 SMs the
-    // device-wide limits are 340 and 680 CTAs respectively.
-    const std::int32_t resident_ctas =
-        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 340 : 680;
-    return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
+    constexpr std::int64_t kRowTiles     = 3;
+    constexpr std::int64_t kResidentCtas = 340;
+    const std::int64_t column_tiles =
+        (static_cast<std::int64_t>(cols) + kMmaTileCols - 1) / kMmaTileCols;
+    return column_tiles * kRowTiles * schedule_split_k(schedule) <= kResidentCtas;
 }
 
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingProblem& problem) {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
-    if (is_27(problem)) {
-        switch (schedule) {
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
-            // 120 CTAs, at most six warps and 20 KiB shared per CTA: one CTA/SM suffices
-            // on the 170-SM RTX 5090, independently of the token-tile specialization.
-            return problem.cols <= 48;
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-            return cooperative_27_grid_is_resident(schedule, problem.cols);
-        case Bf16GdnGatingScheduleId::MmaUnsplit:
-            return true;
-        case Bf16GdnGatingScheduleId::SimtWarpRowC4:
-        case Bf16GdnGatingScheduleId::SimtWarpRowC8:
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
-            return false;
-        }
-    }
-
     switch (schedule) {
-    case Bf16GdnGatingScheduleId::SimtWarpRowC4:
-        return problem.cols <= 4 * 65'535;
-    case Bf16GdnGatingScheduleId::SimtWarpRowC8:
-        return problem.cols <= 8 * 65'535;
-    case Bf16GdnGatingScheduleId::MmaUnsplit:
-        return true;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
+        // 120 CTAs, at most six warps and 20 KiB shared per CTA: one CTA/SM suffices
+        // on the 170-SM RTX 5090, independently of the token-tile specialization.
+        return problem.cols <= 48;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-        return cooperative_35_grid_is_resident(schedule, problem.cols);
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
-        return false;
+        return cooperative_grid_is_resident(schedule, problem.cols);
+    case Bf16GdnGatingScheduleId::MmaUnsplit:
+        return true;
     }
     return false;
 }
@@ -196,23 +115,20 @@ std::size_t checked_partial_bytes(std::int32_t heads, std::int32_t split_k, std:
 }
 
 Bf16GdnGatingPlan make_plan(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingProblem& problem) {
-    Bf16GdnGatingTokenVariant variant = Bf16GdnGatingTokenVariant::None;
-    if (schedule_uses_mma(schedule)) {
-        variant = schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit40 ||
-                          problem.cols % mma_tile_cols(problem) != 0
-                      ? Bf16GdnGatingTokenVariant::Predicated
-                      : Bf16GdnGatingTokenVariant::Full;
-    }
+    const Bf16GdnGatingTokenVariant variant =
+        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit40 ||
+                problem.cols % kMmaTileCols != 0
+            ? Bf16GdnGatingTokenVariant::Predicated
+            : Bf16GdnGatingTokenVariant::Full;
     const std::int32_t split_k = schedule_split_k(schedule);
     const std::size_t workspace =
         split_k > 1 ? checked_partial_bytes(problem.heads, split_k, problem.cols) : 0;
     return {schedule, variant, workspace};
 }
 
-void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem& problem,
-                      const Tensor& x, const Weight& a_weight, const Weight& b_weight,
-                      const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
-                      Tensor& beta, cudaStream_t stream) {
+void execute_resolved(const Bf16GdnGatingPlan& plan, const Tensor& x, const Weight& a_weight,
+                      const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias,
+                      WorkspaceArena& ws, Tensor& g, Tensor& beta, cudaStream_t stream) {
     auto scratch_scope = ws.scope();
     DeviceSpan scratch{};
     if (plan.workspace_bytes != 0) { scratch = ws.alloc_bytes(plan.workspace_bytes); }
@@ -222,70 +138,30 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
         bf16_gdn_gating_proj_mma_split40_launch(x, a_weight, b_weight, A_log, dt_bias, scratch.data,
                                                 g, beta, stream);
         return;
-    case Bf16GdnGatingScheduleId::SimtWarpRowC4:
-        bf16_gdn_gating_proj_35_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
-                                               stream);
-        return;
-    case Bf16GdnGatingScheduleId::SimtWarpRowC8:
-        bf16_gdn_gating_proj_35_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
-                                               stream);
-        return;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-        bf16_gdn_gating_proj_35_mma_split32_launch(plan.token_variant, x, a_weight, b_weight, A_log,
-                                                   dt_bias, scratch.data, g, beta, stream);
-        return;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
-        bf16_gdn_gating_proj_35_mma_split16_launch(plan.token_variant, x, a_weight, b_weight, A_log,
-                                                   dt_bias, scratch.data, g, beta, stream);
-        return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
-        if (is_35(problem)) {
-            bf16_gdn_gating_proj_35_mma_split8_launch(plan.token_variant, x, a_weight, b_weight,
-                                                      A_log, dt_bias, scratch.data, g, beta,
-                                                      stream);
-        } else {
-            bf16_gdn_gating_proj_mma_split8_launch(plan.token_variant, x, a_weight, b_weight, A_log,
-                                                   dt_bias, scratch.data, g, beta, stream);
-        }
+        bf16_gdn_gating_proj_mma_split8_launch(plan.token_variant, x, a_weight, b_weight, A_log,
+                                               dt_bias, scratch.data, g, beta, stream);
         return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
-        if (is_35(problem)) {
-            bf16_gdn_gating_proj_35_mma_split4_launch(plan.token_variant, x, a_weight, b_weight,
-                                                      A_log, dt_bias, scratch.data, g, beta,
-                                                      stream);
-        } else {
-            bf16_gdn_gating_proj_mma_split4_launch(plan.token_variant, x, a_weight, b_weight, A_log,
-                                                   dt_bias, scratch.data, g, beta, stream);
-        }
+        bf16_gdn_gating_proj_mma_split4_launch(plan.token_variant, x, a_weight, b_weight, A_log,
+                                               dt_bias, scratch.data, g, beta, stream);
         return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-        if (is_35(problem)) {
-            bf16_gdn_gating_proj_35_mma_split2_launch(plan.token_variant, x, a_weight, b_weight,
-                                                      A_log, dt_bias, scratch.data, g, beta,
-                                                      stream);
-        } else {
-            bf16_gdn_gating_proj_mma_split2_launch(plan.token_variant, x, a_weight, b_weight, A_log,
-                                                   dt_bias, scratch.data, g, beta, stream);
-        }
+        bf16_gdn_gating_proj_mma_split2_launch(plan.token_variant, x, a_weight, b_weight, A_log,
+                                               dt_bias, scratch.data, g, beta, stream);
         return;
     case Bf16GdnGatingScheduleId::MmaUnsplit:
-        if (is_35(problem)) {
-            bf16_gdn_gating_proj_35_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
-                                                       A_log, dt_bias, g, beta, stream);
-        } else {
-            bf16_gdn_gating_proj_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
-                                                    A_log, dt_bias, g, beta, stream);
-        }
+        bf16_gdn_gating_proj_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight, A_log,
+                                                dt_bias, g, beta, stream);
         return;
     }
     throw std::logic_error("BF16 GDN gating: unknown schedule");
 }
 
-template <std::size_t N>
-std::size_t route_capacity(const std::array<RouteSpec, N>& routes, const Bf16GdnGatingProblem& base,
-                           std::int32_t min_cols, std::int32_t max_cols) {
+std::size_t route_capacity(const Bf16GdnGatingProblem& base, std::int32_t min_cols,
+                           std::int32_t max_cols) {
     std::size_t maximum = 0;
-    for (const RouteSpec& route : routes) {
+    for (const RouteSpec& route : k27Routes) {
         if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
         const std::int32_t endpoint = std::min(route.cols.last, max_cols);
         maximum                     = std::max(
@@ -301,14 +177,6 @@ const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noex
     switch (schedule) {
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
         return "gdn_gating_proj.bf16.mma.cooperative_split40";
-    case Bf16GdnGatingScheduleId::SimtWarpRowC4:
-        return "gdn_gating_proj.bf16.simt.warp_row.c4";
-    case Bf16GdnGatingScheduleId::SimtWarpRowC8:
-        return "gdn_gating_proj.bf16.simt.warp_row.c8";
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-        return "gdn_gating_proj.bf16.mma.cooperative_split32";
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
-        return "gdn_gating_proj.bf16.mma.cooperative_split16";
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         return "gdn_gating_proj.bf16.mma.cooperative_split8";
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
@@ -321,19 +189,8 @@ const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noex
     return "gdn_gating_proj.bf16.unknown";
 }
 
-const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Bf16GdnNormGatingScheduleId::Composed:
-        return "gdn_norm_gating_proj.bf16.composed";
-    case Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32:
-        return "gdn_norm_gating_proj.bf16.mma.cooperative_split32";
-    }
-    return "gdn_norm_gating_proj.bf16.unknown";
-}
-
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
-    if (problem.cols < 1) { return false; }
-    return is_27(problem) || is_35(problem);
+    return problem.cols >= 1 && problem.heads == 48 && problem.input_rows == 5120;
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
@@ -345,8 +202,9 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId sche
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_packed_plan(const Bf16GdnGatingProblem& problem) {
-    if (!is_27(problem) || problem.cols < 2 || problem.cols > kBf16GdnGatingPackedMaxCols) {
-        throw std::invalid_argument("BF16 GDN gating: packed plan requires 27B T=2..48");
+    if (!bf16_gdn_gating_admits(problem) || problem.cols < 2 ||
+        problem.cols > kBf16GdnGatingPackedMaxCols) {
+        throw std::invalid_argument("BF16 GDN gating: packed plan requires T=2..48");
     }
     return make_plan(Bf16GdnGatingScheduleId::MmaCooperativeSplit40, problem);
 }
@@ -356,17 +214,9 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
-    if (is_27(problem)) {
-        for (const RouteSpec& route : k27Routes) {
-            if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
-            }
-        }
-    } else {
-        for (const RouteSpec& route : k35Routes) {
-            if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
-            }
+    for (const RouteSpec& route : k27Routes) {
+        if (route.cols.contains(problem.cols)) {
+            return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
         }
     }
     throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
@@ -380,38 +230,7 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
     const Bf16GdnGatingProblem base{heads, input_rows, 1};
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, min_cols});
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, max_cols});
-    return is_27(base) ? route_capacity(k27Routes, base, min_cols, max_cols)
-                       : route_capacity(k35Routes, base, min_cols, max_cols);
-}
-
-Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
-    Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
-    Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
-    std::int32_t norm_splits             = 0;
-    if (is_35(problem) && problem.cols <= 16) {
-        control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
-                                                     problem);
-        schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
-        norm_splits = 32;
-    }
-    const std::size_t norm_partial_bytes =
-        static_cast<std::size_t>(norm_splits) * problem.cols * sizeof(float);
-    return {schedule, control, control.workspace_bytes + norm_partial_bytes};
-}
-
-std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
-                                                          std::int32_t input_rows,
-                                                          std::int32_t min_cols,
-                                                          std::int32_t max_cols) {
-    std::size_t maximum =
-        bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
-    if (heads == 32 && input_rows == 2048 && min_cols <= 16) {
-        const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 16);
-        maximum                       = std::max(
-            maximum,
-            bf16_gdn_norm_gating_resolve_plan({heads, input_rows, fused_cols}).workspace_bytes);
-    }
-    return maximum;
+    return route_capacity(base, min_cols, max_cols);
 }
 
 std::size_t bf16_gdn_norm_gating_packed_sequences_capacity_workspace_bytes(
@@ -429,7 +248,7 @@ std::size_t bf16_gdn_norm_gating_packed_sequences_capacity_workspace_bytes(
                 maximum, bf16_gdn_gating_resolve_packed_plan({48, 5120, sequence_width * batch})
                              .workspace_bytes);
         } else {
-            maximum = std::max(maximum, bf16_gdn_norm_gating_capacity_workspace_bytes(
+            maximum = std::max(maximum, bf16_gdn_gating_capacity_workspace_bytes(
                                             48, 5120, sequence_width, sequence_width));
         }
     }
@@ -446,7 +265,7 @@ void bf16_gdn_gating_execute_plan(const Bf16GdnGatingPlan& plan, const Tensor& x
         resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("BF16 GDN gating: plan does not match the exact problem");
     }
-    execute_resolved(plan, problem, x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+    execute_resolved(plan, x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
 void bf16_gdn_gating_execute_candidate(Bf16GdnGatingScheduleId schedule, const Tensor& x,
@@ -456,7 +275,7 @@ void bf16_gdn_gating_execute_candidate(Bf16GdnGatingScheduleId schedule, const T
                                        cudaStream_t stream) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
     const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_candidate(schedule, problem);
-    execute_resolved(plan, problem, x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+    execute_resolved(plan, x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
 void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
@@ -468,8 +287,8 @@ void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Wei
 
 namespace {
 
-// The composed schedules' standalone unit-offset RMSNorm, publishing h's A8 or A4 activation as
-// well when the caller requests it.
+// The standalone unit-offset RMSNorm ahead of the control projection, publishing h's A8 or A4
+// activation as well when the caller requests it.
 void normalize(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
                Bf16GdnHiddenActivation h_activation, cudaStream_t stream) {
     if (h_activation.a8 != nullptr) {
@@ -488,25 +307,9 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                    const Weight& b_weight, const Tensor& A_log,
                                    const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
                                    Tensor& beta, cudaStream_t stream) {
-    const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
-    const Bf16GdnNormGatingPlan plan = bf16_gdn_norm_gating_resolve_plan(problem);
-    if (plan.schedule == Bf16GdnNormGatingScheduleId::Composed) {
-        normalize(x, norm_weight, eps, h, h_activation, stream);
-        execute_resolved(plan.control, problem, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta,
-                         stream);
-        return;
-    }
-
-    if (h_activation.a8 != nullptr || h_activation.a4 != nullptr) {
-        throw std::invalid_argument(
-            "gdn_norm_gating_proj: a quantized h output needs the 27B profile");
-    }
-    auto scratch_scope = ws.scope();
-    DeviceSpan scratch{};
-    if (plan.workspace_bytes != 0) { scratch = ws.alloc_bytes(plan.workspace_bytes); }
-    bf16_gdn_norm_gating_proj_35_mma_split32_launch(plan.control.token_variant, x, norm_weight, eps,
-                                                    h, a_weight, b_weight, A_log, dt_bias,
-                                                    scratch.data, g, beta, stream);
+    const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_plan({g.ne[0], x.ne[0], x.ne[1]});
+    normalize(x, norm_weight, eps, h, h_activation, stream);
+    execute_resolved(plan, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
 void bf16_gdn_norm_gating_packed_dispatch(const Tensor& x, const Tensor& norm_weight, float eps,
@@ -515,10 +318,9 @@ void bf16_gdn_norm_gating_packed_dispatch(const Tensor& x, const Tensor& norm_we
                                           const Tensor& A_log, const Tensor& dt_bias,
                                           WorkspaceArena& ws, Tensor& g, Tensor& beta,
                                           cudaStream_t stream) {
-    const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
-    const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_packed_plan(problem);
+    const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_packed_plan({g.ne[0], x.ne[0], x.ne[1]});
     normalize(x, norm_weight, eps, h, {h_activation, nullptr}, stream);
-    execute_resolved(plan, problem, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+    execute_resolved(plan, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
 } // namespace ninfer::ops::detail

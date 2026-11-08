@@ -259,7 +259,6 @@ void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const Resident
         .mtp_kv_valid            = view.mtp_kv_valid,
         .dflash_context_frontier = view.dflash_context_frontier,
         .tail_hidden_valid       = view.tail_hidden_valid,
-        .backend_image_present   = view.backend_image_present,
         .context_checkpoints     = std::move(heads),
     };
     const bool mtp_cache_present = decoder->mtp_cache() != nullptr;
@@ -267,7 +266,7 @@ void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const Resident
         state, prompt,
         base.prompt_hashes ? std::span<const qwen3_6::detail::PrefixHash128>(*base.prompt_hashes)
                            : std::span<const qwen3_6::detail::PrefixHash128>{},
-        speculative_backend, mtp_cache_present, dflash.has_value(), DFlashConfig::full_layers > 0);
+        speculative_backend, mtp_cache_present, dflash.has_value());
     plan.reuse      = selected.path;
     plan.reuse_base = selected.frontier;
 
@@ -419,7 +418,6 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         view.mtp_kv_valid            = sequence.mtp_kv_valid;
         view.dflash_context_frontier = sequence.dflash_context_frontier;
         view.tail_hidden_valid       = sequence.tail_hidden_valid;
-        view.backend_image_present   = sequence.kv && sequence.kv->backend.has_value();
         view.context_checkpoints.reserve(sequence.context_checkpoints.size());
         for (const ContextCheckpointHead& head : sequence.context_checkpoints) {
             view.context_checkpoints.push_back(ContextCheckpointIndex{
@@ -453,7 +451,7 @@ RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
     const std::optional<qwen3_6::detail::RamMatch> match = kv_ram_cache_->plan_match(
         prompt, planned_prompt_hashes(base),
         qwen3_6::detail::ReuseBackendPolicy{speculative_backend, decoder->mtp_cache() != nullptr,
-                                            dflash.has_value(), DFlashConfig::full_layers > 0});
+                                            dflash.has_value()});
     if (!match || match->reuse_base == 0) {
         finish_request_plan(*plan, nullptr, prompt, base);
         return RequestPlan(std::move(plan));
@@ -474,7 +472,6 @@ RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
     view.mtp_kv_valid            = host.mtp_kv_valid;
     view.dflash_context_frontier = host.dflash_context_frontier;
     view.tail_hidden_valid       = host.tail_hidden_valid;
-    view.backend_image_present   = host.backend_image_present;
     view.context_checkpoints.reserve(host.ladders.size());
     for (const qwen3_6::detail::RamLadderIndex& head : host.ladders) {
         view.context_checkpoints.push_back(ContextCheckpointIndex{
@@ -514,7 +511,7 @@ RequestPlan ProgramImplCore::plan_disk_reuse(const PreparedPromptData& prompt,
     const std::optional<qwen3_6::detail::DiskMatch> match = kv_disk_cache_->plan_match(
         prompt, planned_prompt_hashes(base),
         qwen3_6::detail::ReuseBackendPolicy{speculative_backend, decoder->mtp_cache() != nullptr,
-                                            dflash.has_value(), DFlashConfig::full_layers > 0});
+                                            dflash.has_value()});
     if (!match || match->reuse_base == 0) {
         finish_request_plan(*plan, nullptr, prompt, base);
         return RequestPlan(std::move(plan));
@@ -540,7 +537,6 @@ RequestPlan ProgramImplCore::plan_disk_reuse(const PreparedPromptData& prompt,
     view.mtp_kv_valid            = host.mtp_kv_valid;
     view.dflash_context_frontier = host.dflash_context_frontier;
     view.tail_hidden_valid       = host.tail_hidden_valid;
-    view.backend_image_present   = host.backend_image_present;
     view.context_checkpoints.reserve(host.ladders.size());
     for (const qwen3_6::detail::RamLadderIndex& head : host.ladders) {
         view.context_checkpoints.push_back(ContextCheckpointIndex{

@@ -50,7 +50,7 @@ Specify the weight type, `N`, `K`, and `T` explicitly to measure one production 
 ```bash
 ./build/bench/ninfer_linear_bench \
   --qtype q4 --policy a16 \
-  --n 4096 --k 5120 --t 8
+  --n 6144 --k 5120 --t 8
 ```
 
 The numbers `(N,K)` are the primary entry. The benchmark does not copy the full shape admission
@@ -113,7 +113,7 @@ Profile mode must accept exactly one exact point:
 ncu --profile-from-start off ... \
   ./build/bench/ninfer_linear_bench \
   --qtype q4 --policy a16 \
-  --n 4096 --k 5120 --t 8 --profile
+  --n 6144 --k 5120 --t 8 --profile
 ```
 
 The program completes allocation, payload initialization, warmup, and L2 flush outside the
@@ -146,9 +146,9 @@ Fix `(qtype,N,K,policy)` and scan a contiguous range of T:
 ```bash
 ./build/bench/ninfer_linear_bench \
   --qtype q4 --policy a16 \
-  --n 4096 --k 5120 \
+  --n 6144 --k 5120 \
   --sweep 1:32:1 \
-  --csv-out profiles/bench/q4_4096x5120_t1_32.csv
+  --csv-out profiles/bench/q4_6144x5120_t1_32.csv
 ```
 
 The Vision step domain can be expressed directly as:
@@ -166,12 +166,10 @@ selector, crossover, or candidate-legality tables into the benchmark.
 ### 1.4 Typical model suites
 
 To avoid hand-writing `(qtype,N,K,T)` each time, the benchmark registers a small number of
-representative 27B/35B points. One suite invocation runs all points in order:
+representative 27B points. One suite invocation runs all points in order:
 
 ```bash
 ./build/bench/ninfer_linear_bench --suite qwen3_6_27b
-./build/bench/ninfer_linear_bench --suite qwen3_6_35b_a3b
-./build/bench/ninfer_linear_bench --suite all
 ```
 
 Running with no arguments still prints usage and does not implicitly start a heavy suite. A
@@ -203,9 +201,7 @@ actually uses through pure public Linear:
 
 | Label | QType | `(N,K)` | T class | Actual role |
 |---|---|---:|---|---|
-| `27b.output_head` | Q6 | `(248320,5120)` | Continuous | full output head |
 | `27b.draft_head` | Q4 | `(131072,5120)` | Continuous | optimized proposal head |
-| `27b.gdn_output_gate` | Q5 | `(6144,5120)` | Continuous | GDN Z row view |
 | `27b.mtp_input` | W8 | `(5120,10240)` | Continuous | MTP input projection |
 | `27b.mtp_attention` | W8 | `(14336,5120)` | Continuous | packed MTP Q/K/gate/V projection |
 | `27b.mtp_gate_up` | W8 | `(34816,5120)` | Continuous | MTP gate/up |
@@ -227,43 +223,6 @@ The packed/fused parents of the base Text Attention, GDN input, and MLP are not 
 pure Linear suite merely because they exist in the artifact. They are currently owned by
 independent semantic Ops such as Attention/GDN/LinearSwiGLU/LinearAdd and should be measured in
 the corresponding Op benchmarks.
-
-### 2.3 `qwen3_6_35b_a3b`
-
-The 35B-A3B core suite registers the major head, MTP, and DFlash geometries that are currently
-really used through pure public Linear:
-
-| Label | QType | `(N,K)` | T class | Actual role |
-|---|---|---:|---|---|
-| `35b.output_head` | Q6 | `(248320,2048)` | Continuous | full output head |
-| `35b.draft_head` | Q4 | `(131072,2048)` | Continuous | optimized proposal head |
-| `35b.mtp_projection` | W8 | `(2048,4096)` | Continuous | MTP input/output projection geometry |
-| `35b.dflash_feature` | W8 | `(2048,16384)` | Continuous | DFlash conditioning projection |
-
-The 35B-A3B Vision backbone shares the first six geometries with 27B, and the merger output
-goes into the 2048 hidden size:
-
-| Label | QType | `(N,K)` | T class | Actual role |
-|---|---|---:|---|---|
-| `35b.vision_patch` | Q6 | `(1152,1536)` | VisionStep4 | patch projection |
-| `35b.vision_qkv` | Q4 | `(3456,1152)` | VisionStep4 | attention QKV |
-| `35b.vision_attn_out` | Q5 | `(1152,1152)` | VisionStep4 | attention output |
-| `35b.vision_fc1` | Q4 | `(4304,1152)` | VisionStep4 | MLP expansion |
-| `35b.vision_fc2` | Q5 | `(1152,4304)` | VisionStep4 | MLP contraction |
-| `35b.vision_merger_fc1` | W8 | `(4608,4608)` | VisionStep4 | merger expansion |
-| `35b.vision_merger_fc2` | W8 | `(2048,4608)` | VisionStep4 | merger output |
-
-The 35B routed expert `[262144,2048]` gate/up and `[524288,512]` down are not added to the pure
-Linear suite. They belong to the execution contract of `sparse_moe`, and are currently not
-geometries registered in the pure Linear selector either. The Attention/GDN/DFlash layer
-projections likewise remain the responsibility of their fused Op benchmarks.
-
-### 2.4 `all`
-
-`all` is the union of the two model suites. Points with exactly the same
-`(qtype,policy,N,K,T)` are executed only once; a shared Vision point is not timed twice just
-because both targets use it. The result may keep multiple role labels, but there is only one
-timing row.
 
 ## 3. Request pipeline
 
@@ -438,7 +397,7 @@ Adding a production Linear shape does not require modifying the benchmark:
 1. the selector and the public numerical test complete registration;
 2. it can immediately be measured with the numeric `--n/--k/--t/--qtype` options;
 3. it is added to a model suite only when it becomes a high-frequency or architecturally
-   representative geometry of 27B/35B.
+   representative geometry of 27B.
 
 A suite entry contains only:
 
@@ -491,28 +450,25 @@ AllowA4 is kept as explicit points at numeric geometries.
 The current implementation has been verified as follows:
 
 1. the `ninfer_linear_bench` Release target builds;
-2. the 49 points of the 27B suite and the 37 points of the 35B-A3B suite all execute through
-   the public Linear;
-3. `all` merges into 68 unique points, and the shared Vision exact points are executed only
-   once;
-4. the Text `T=1..3` sweep and the Vision `T=4,8` step-4 sweep both output continuous results;
-5. NCU `--profile-from-start off --launch-count 1` captures only the `q4_rowsplit_gemv_kernel`
+2. the 41 points of the 27B suite all execute through the public Linear;
+3. the Text `T=1..3` sweep and the Vision `T=4,8` step-4 sweep both output continuous results;
+4. NCU `--profile-from-start off --launch-count 1` captures only the `q4_rowsplit_gemv_kernel`
    instance produced by one public Linear call;
-6. the weight-byte result for Q4 `[4096,5120], T=1` is `11141120`, equal to
-   `4096*5120*(4/8+2/64)`; the console and the CSV use the same computation;
-7. the BF16 exact point above executes through the public Linear; the median of 500 cold-cache
+5. the weight-byte result for Q4 `[6144,5120], T=1` is `16711680`, equal to
+   `6144*5120*(4/8+2/64)`; the console and the CSV use the same computation;
+6. the BF16 exact point above executes through the public Linear; the median of 500 cold-cache
    samples across repeated runs is `95.520–97.536 us`, i.e. `1505.5–1537.3 GB/s`;
-8. relative to the `1674.5 GB/s` pure-read probe, this range is `89.91%–91.80%` of the
+7. relative to the `1674.5 GB/s` pure-read probe, this range is `89.91%–91.80%` of the
    attainable read bandwidth;
-9. the DRAM read of the final single NCU capture is `146825728` bytes, while one logical pass
+8. the DRAM read of the final single NCU capture is `146825728` bytes, while one logical pass
    over weight plus activation reads `146810880` bytes; the extra read is only `14848` bytes,
    with no weight replay;
-10. the output retains the route-neutral useful TFLOP/s and memory-floor metrics, and does not
+9. the output retains the route-neutral useful TFLOP/s and memory-floor metrics, and does not
     infer the actual activation-compute profile from AllowA4;
-11. the A4 Linear of all five NVFP4 exact problems passes the same exact-decode/naive-FP64
+10. the A4 Linear of all five NVFP4 exact problems passes the same exact-decode/naive-FP64
     oracle directly at `T=17`, the representative cp.async point, and the main `T=1024` TMA
     point;
-12. on the RTX 5090 with CUDA 13.1 and a cold cache, the complete quantization + GEMM results
+11. on the RTX 5090 with CUDA 13.1 and a cold cache, the complete quantization + GEMM results
     for the five NVFP4 A4 `T=1024` problems are:
 
     | `[N,K]` | Median | Useful throughput | Dense FP4 peak |

@@ -660,7 +660,7 @@ int main() {
         "gated_delta_net workspace accepted a non-divisible head map");
     failures += contract_rejection_cases();
 
-    // Registered 27B/35B-A3B geometries, public state forms, the recurrent route, and the chunked
+    // The registered 27B geometry, public state forms, the recurrent route, and the chunked
     // route with a full or partial last chunk are all qualified directly against the same complete
     // FP64 recurrence.
     failures += inplace_case({"27b decode fused-qk-norm", 16, 48, 1, true}, 12001u);
@@ -669,32 +669,32 @@ int main() {
     failures +=
         distinct_state_case({"27b narrowest chunked fused-qk-norm", 16, 48, 60, true}, 12060u);
     failures +=
-        distinct_state_case({"35b single partial chunk fused-qk-norm", 16, 32, 63, true}, 12063u);
+        distinct_state_case({"27b single partial chunk fused-qk-norm", 16, 48, 63, true}, 12063u);
     failures += distinct_state_case({"27b exact chunk fused-qk-norm", 16, 48, 64, true}, 12064u);
     failures += distinct_state_case({"27b exact chunk raw-qk", 16, 48, 64, false}, 12164u);
-    failures += inplace_case({"35b chunk-tail fused-qk-norm", 16, 32, 65, true}, 12065u);
+    failures += inplace_case({"27b chunk-tail fused-qk-norm", 16, 48, 65, true}, 12065u);
     failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
     failures += distinct_state_case({"27b raw-qk partial chunk", 16, 48, 100, false}, 12100u);
     failures += distinct_state_case({"27b widest tail fused-qk-norm", 16, 48, 127, true}, 12127u);
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures +=
         distinct_state_case({"27b production-tail fused-qk-norm", 16, 48, 3404, true}, 15404u);
-    failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
+    failures += inplace_case({"27b two-chunk raw-qk", 16, 48, 128, false}, 12228u);
     failures += partition_case({"27b chunk boundary", 16, 48, 128, true}, {64, 64}, 12428u);
     failures += partition_case({"27b chunk tail", 16, 48, 65, true}, {64, 1}, 12465u);
 
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the
     // selected initial state, not slot zero, seeds the complete recurrence.
     failures += snapshot_case({"27b verify fused-qk-norm", 16, 48, 4, true}, 8, 7, 1, 12104u);
-    failures += snapshot_case({"35b verify fused-qk-norm near-zero", 16, 32, 4, true, true}, 8, 6,
+    failures += snapshot_case({"27b verify fused-qk-norm near-zero", 16, 48, 4, true, true}, 8, 6,
                               1, 12204u);
     failures +=
-        batched_snapshot_case({"35b ordinary", 16, 32, 1, true}, {8, 9, 10, 11, 12, 13, 14, 15},
+        batched_snapshot_case({"27b ordinary", 16, 48, 1, true}, {8, 9, 10, 11, 12, 13, 14, 15},
                               {0, 1, 2, 3, 4, 5, 6, 7}, {}, 16, 13001u);
     failures += batched_snapshot_case({"27b MTP", 16, 48, 6, true}, {18, 19, 20}, {0, 6, 12},
                                       {6, 3, 1}, 21, 13006u);
     // Row 0's initial state is its final destination; every state tile must load it before write.
-    failures += batched_snapshot_case({"35b DFlash", 16, 32, 16, true}, {15, 33}, {0, 16}, {16, 7},
+    failures += batched_snapshot_case({"27b DFlash", 16, 48, 16, true}, {15, 33}, {0, 16}, {16, 7},
                                       34, 13016u);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";

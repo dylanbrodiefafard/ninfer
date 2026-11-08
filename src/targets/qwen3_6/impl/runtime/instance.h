@@ -44,9 +44,6 @@ inline constexpr float kGdnScale                         = Variant::gdn_scale;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = Variant::prefill_chunk_alignment;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = Variant::maximum_mtp_draft_tokens;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = Variant::maximum_dflash_draft_tokens;
-// DFlash V1's per-topology graph allowance is large; it keeps one exchanging graph.
-inline constexpr std::uint32_t kDFlashExchangeVariants =
-    DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2 ? qwen3_6::kGrammarExchangeVariants : 1U;
 
 // Packed-tree verify width of the adaptive tree arm; 0 when the target has no tree route.
 inline constexpr std::uint32_t kDFlashTreeVerifyWidth =

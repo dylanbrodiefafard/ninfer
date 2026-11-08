@@ -5,12 +5,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace ninfer::ops {
 namespace {
+
+constexpr std::int32_t kRows   = 1024;
+constexpr std::int32_t kHidden = 5120;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -24,29 +26,17 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
     }
 }
 
-std::uint64_t required_payload_bytes(std::int32_t rows, std::int32_t k) {
-    const std::uint64_t r = static_cast<std::uint64_t>(rows);
-    const std::uint64_t h = static_cast<std::uint64_t>(k);
-    if (h > std::numeric_limits<std::uint64_t>::max() / r) {
-        throw std::overflow_error("linear_pair: weight payload size overflows");
-    }
-    const std::uint64_t code_bytes = r * h;
-    const std::uint64_t groups     = h / 32;
-    if (groups > std::numeric_limits<std::uint64_t>::max() / (r * 2u)) {
-        throw std::overflow_error("linear_pair: scale payload size overflows");
-    }
-    return code_bytes + r * groups * 2u;
-}
-
-void require_weight(const Weight& weight, std::int32_t k, const char* label) {
-    const std::uint64_t payload_bytes = required_payload_bytes(1024, k);
+void require_weight(const Weight& weight, const char* label) {
+    constexpr std::uint64_t payload_bytes =
+        static_cast<std::uint64_t>(kRows) * kHidden +
+        static_cast<std::uint64_t>(kRows) * (kHidden / 32) * sizeof(std::uint16_t);
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.group_size != 32 ||
-        weight.ndim != 2 || weight.n != 1024 || weight.k != k || weight.shape[0] != 1024 ||
-        weight.shape[1] != k || weight.padded_shape[0] != 1024 || weight.padded_shape[1] != k ||
-        weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
-        weight.payload_bytes < payload_bytes || !aligned_to(weight.qdata, 16) ||
-        !aligned_to(weight.scales, 4)) {
+        weight.ndim != 2 || weight.n != kRows || weight.k != kHidden || weight.shape[0] != kRows ||
+        weight.shape[1] != kHidden || weight.padded_shape[0] != kRows ||
+        weight.padded_shape[1] != kHidden || weight.qhigh != nullptr ||
+        weight.high_plane_bytes != 0 || weight.payload_bytes < payload_bytes ||
+        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 4)) {
         throw std::invalid_argument(std::string("linear_pair: invalid ") + label);
     }
 }
@@ -91,14 +81,11 @@ void require_nonoverlap(const Tensor& x, const Weight& first_weight, const Weigh
 void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                  Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
-    if (x.ne[0] != 5120 && x.ne[0] != 2048) {
-        throw std::invalid_argument("linear_pair: x K must be 5120 or 2048");
-    }
-    require_matrix(x, x.ne[0], cols, "x");
-    require_matrix(first_out, 1024, cols, "first output");
-    require_matrix(second_out, 1024, cols, "second output");
-    require_weight(first_weight, x.ne[0], "first weight");
-    require_weight(second_weight, x.ne[0], "second weight");
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(first_out, kRows, cols, "first output");
+    require_matrix(second_out, kRows, cols, "second output");
+    require_weight(first_weight, "first weight");
+    require_weight(second_weight, "second weight");
     require_nonoverlap(x, first_weight, second_weight, first_out, second_out);
 
     detail::w8_pair_dispatch(x, first_weight, second_weight, first_out, second_out, stream);

@@ -24,8 +24,8 @@ namespace ninfer::ops {
  *
  * positions is contiguous and theta is positive and finite. Q/K tensors are BF16
  * [head_dim,heads,T] with positive head counts, contiguous head features and heads, and an optional
- * padded token stride. The registered optimized domains are D256/R64 Text Q/K head geometries
- * 24/4 and 16/2, D128/R128 1-D Text geometry 32/8, plus Vision geometry 16/16. q and k must not
+ * padded token stride. The registered optimized domains are D256/R64 Text Q/K head geometry
+ * 24/4, D128/R128 1-D Text geometry 32/8, plus Vision geometry 16/16. q and k must not
  * overlap one another or positions. The Op mutates only dimensions [0,rotary_dim) of the supplied
  * Q/K tensor storage. The oracle evaluates the rotated dimensions naively in FP64 from the
  * represented inputs. The updated BF16 values are promoted and compared directly with that result;

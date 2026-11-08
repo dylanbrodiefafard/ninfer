@@ -1,11 +1,10 @@
-// Public-Op benchmark for full and device-count-prefix KV cache append contracts.
-// Cache encoding, launch geometry, and route selection remain private to the public wrappers.
+// Public-Op benchmark for the paged gqa_kv_append contract at the Qwen3.8-27B MTP KV geometry
+// (head_dim 256, 4 KV heads). Cache encoding, launch geometry, and route selection remain private
+// to the public wrapper.
 
 #include "ninfer/ops/gqa_attention.h"
-#include "ninfer/ops/kv_cache_append_prefix.h"
 
 #include "core/device.h"
-#include "core/cyclic_kv_cache.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer_bench_common.h"
 
@@ -30,39 +29,23 @@ using namespace ninfer;
 namespace {
 
 constexpr std::int32_t kFullHeadDim     = 256;
-constexpr std::int32_t kPrefixHeadDim   = 128;
-constexpr std::int32_t kPrefixKvHeads   = 8;
+constexpr std::int32_t kKvHeads         = 4;
 constexpr std::int32_t kKvGroup         = 64;
 constexpr std::int32_t kFullScaleGroups = kFullHeadDim / kKvGroup;
-constexpr std::int32_t kRingCapacity    = 4096;
+constexpr std::int32_t kMaxTokens       = 4096;
 constexpr std::size_t kFlushBytes       = std::size_t{256} << 20;
 constexpr double kRtx5090DramGBs        = 1792.0;
 
-enum class Mode : std::uint8_t { Full, Prefix, All };
-enum class FullGeometryChoice : std::uint8_t { Kv4, Kv2, All };
 enum class KvChoice : std::uint8_t { Bf16, Int8, All };
-enum class LayoutChoice : std::uint8_t { Paged, Cyclic, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
-struct FullGeometry {
-    const char* name;
-    std::int32_t kv_heads;
-};
-
-constexpr FullGeometry kFullKv4{"d256-kv4", 4};
-constexpr FullGeometry kFullKv2{"d256-kv2", 2};
-
 struct Options {
-    Mode mode                        = Mode::All;
-    FullGeometryChoice full_geometry = FullGeometryChoice::All;
-    KvChoice kv                      = KvChoice::All;
-    LayoutChoice layout              = LayoutChoice::All;
-    Execution execution              = Execution::Graph;
-    CacheMode cache                  = CacheMode::Cold;
+    KvChoice kv         = KvChoice::All;
+    Execution execution = Execution::Graph;
+    CacheMode cache     = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 16, 1024};
-    std::vector<std::int32_t> counts{0, 1, 4, 8, 16};
     std::int32_t context = 128;
     int warmup           = 5;
     int repeat           = 50;
@@ -71,14 +54,10 @@ struct Options {
 };
 
 struct Result {
-    Mode mode;
-    const char* geometry;
     DType kv_dtype;
-    const char* layout;
     Execution execution;
     CacheState cache;
     std::int32_t tokens;
-    std::int32_t committed;
     double useful_bytes;
     bench::ColdTiming timing;
 };
@@ -86,10 +65,9 @@ struct Result {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_kv_cache_append_bench [--mode full|prefix|all] "
-                 "[--full-geometry d256-kv4|d256-kv2|all] [--kv-dtype bf16|int8|all] "
-                 "[--layout paged|cyclic|all] [--tokens T,...] [--counts C,...] "
-                 "[--context L] [--execution eager|graph|both] [--cache cold|warm|both] "
+                 "usage: ninfer_kv_cache_append_bench [--kv-dtype bf16|int8|all] "
+                 "[--tokens T,...] [--context L] [--execution eager|graph|both] "
+                 "[--cache cold|warm|both] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
     std::exit(2);
@@ -132,27 +110,7 @@ Options parse_options(int argc, char** argv) {
             if (++index == argc) { usage(flag); }
             return argv[index];
         };
-        if (argument == "--mode") {
-            const std::string_view value(next("--mode requires a value"));
-            if (value == "full")
-                options.mode = Mode::Full;
-            else if (value == "prefix")
-                options.mode = Mode::Prefix;
-            else if (value == "all")
-                options.mode = Mode::All;
-            else
-                usage("--mode expects full, prefix, or all");
-        } else if (argument == "--full-geometry") {
-            const std::string_view value(next("--full-geometry requires a value"));
-            if (value == "d256-kv4")
-                options.full_geometry = FullGeometryChoice::Kv4;
-            else if (value == "d256-kv2")
-                options.full_geometry = FullGeometryChoice::Kv2;
-            else if (value == "all")
-                options.full_geometry = FullGeometryChoice::All;
-            else
-                usage("--full-geometry expects d256-kv4, d256-kv2, or all");
-        } else if (argument == "--kv-dtype") {
+        if (argument == "--kv-dtype") {
             const std::string_view value(next("--kv-dtype requires a value"));
             if (value == "bf16")
                 options.kv = KvChoice::Bf16;
@@ -162,22 +120,9 @@ Options parse_options(int argc, char** argv) {
                 options.kv = KvChoice::All;
             else
                 usage("--kv-dtype expects bf16, int8, or all");
-        } else if (argument == "--layout") {
-            const std::string_view value(next("--layout requires a value"));
-            if (value == "paged")
-                options.layout = LayoutChoice::Paged;
-            else if (value == "cyclic")
-                options.layout = LayoutChoice::Cyclic;
-            else if (value == "all")
-                options.layout = LayoutChoice::All;
-            else
-                usage("--layout expects paged, cyclic, or all");
         } else if (argument == "--tokens") {
             options.tokens =
-                parse_list(next("--tokens requires a value"), 1, kRingCapacity, "--tokens");
-        } else if (argument == "--counts") {
-            options.counts =
-                parse_list(next("--counts requires a value"), 0, kRingCapacity, "--counts");
+                parse_list(next("--tokens requires a value"), 1, kMaxTokens, "--tokens");
         } else if (argument == "--context") {
             options.context = parse_i32(next("--context requires a value"), 0, 262144, "--context");
         } else if (argument == "--execution") {
@@ -219,17 +164,9 @@ Options parse_options(int argc, char** argv) {
         usage("context + tokens exceeds int32");
     }
     if (options.profile &&
-        (options.mode == Mode::All || options.tokens.size() != 1 ||
+        (options.tokens.size() != 1 || options.kv == KvChoice::All ||
          options.execution == Execution::Both || options.cache == CacheMode::Both)) {
-        usage("--profile requires one mode, one T, one execution, and one cache state");
-    }
-    if (options.profile && options.mode == Mode::Full &&
-        (options.full_geometry == FullGeometryChoice::All || options.kv == KvChoice::All)) {
-        usage("full --profile requires one full geometry and one KV dtype");
-    }
-    if (options.profile && options.mode == Mode::Prefix &&
-        (options.layout == LayoutChoice::All || options.counts.size() != 1)) {
-        usage("prefix --profile requires one layout and one count");
+        usage("--profile requires one T, one KV dtype, one execution, and one cache state");
     }
     return options;
 }
@@ -238,34 +175,34 @@ std::int32_t align_context(std::int32_t context) {
     return ((std::max(context, 1) + 127) / 128) * 128;
 }
 
-std::size_t full_cache_bytes(const FullGeometry& geometry, DType dtype, std::int32_t padded) {
-    return static_cast<std::size_t>(kFullHeadDim) * geometry.kv_heads * padded * dtype_size(dtype);
+std::size_t full_cache_bytes(DType dtype, std::int32_t padded) {
+    return static_cast<std::size_t>(kFullHeadDim) * kKvHeads * padded * dtype_size(dtype);
 }
 
-std::size_t full_scale_bytes(const FullGeometry& geometry, std::int32_t padded) {
-    return static_cast<std::size_t>(kFullHeadDim / kKvGroup) * geometry.kv_heads * padded *
+std::size_t full_scale_bytes(std::int32_t padded) {
+    return static_cast<std::size_t>(kFullHeadDim / kKvGroup) * kKvHeads * padded *
            dtype_size(DType::FP16);
 }
 
 PagedKVLayerView make_full_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& k_scale,
-                                DeviceBuffer& v_scale, DeviceBuffer& block_table,
-                                const FullGeometry& geometry, DType dtype, std::int32_t padded) {
+                                DeviceBuffer& v_scale, DeviceBuffer& block_table, DType dtype,
+                                std::int32_t padded) {
     const bool quantized     = dtype == DType::I8;
     const std::int32_t pages = padded / kPagedKVPageSize;
     return {
-        .k_pages = Tensor(k.p, dtype, {kFullHeadDim, kPagedKVPageSize, geometry.kv_heads, pages}),
-        .v_pages = Tensor(v.p, dtype, {kFullHeadDim, kPagedKVPageSize, geometry.kv_heads, pages}),
-        .k_scale_pages = quantized ? Tensor(k_scale.p, DType::FP16,
-                                            {kFullHeadDim / kKvGroup, kPagedKVPageSize,
-                                             geometry.kv_heads, pages})
-                                   : Tensor(),
-        .v_scale_pages = quantized ? Tensor(v_scale.p, DType::FP16,
-                                            {kFullHeadDim / kKvGroup, kPagedKVPageSize,
-                                             geometry.kv_heads, pages})
-                                   : Tensor(),
+        .k_pages       = Tensor(k.p, dtype, {kFullHeadDim, kPagedKVPageSize, kKvHeads, pages}),
+        .v_pages       = Tensor(v.p, dtype, {kFullHeadDim, kPagedKVPageSize, kKvHeads, pages}),
+        .k_scale_pages = quantized
+                             ? Tensor(k_scale.p, DType::FP16,
+                                      {kFullHeadDim / kKvGroup, kPagedKVPageSize, kKvHeads, pages})
+                             : Tensor(),
+        .v_scale_pages = quantized
+                             ? Tensor(v_scale.p, DType::FP16,
+                                      {kFullHeadDim / kKvGroup, kPagedKVPageSize, kKvHeads, pages})
+                             : Tensor(),
         .block_table   = Tensor(block_table.p, DType::I32, {pages}),
         .head_dim      = kFullHeadDim,
-        .num_kv_heads  = geometry.kv_heads,
+        .num_kv_heads  = kKvHeads,
         .dtype         = dtype,
         .quant_group   = quantized ? kKvGroup : 0,
     };
@@ -273,24 +210,24 @@ PagedKVLayerView make_full_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& 
 
 class FullCase {
 public:
-    FullCase(FullGeometry geometry, DType dtype, std::int32_t tokens, std::int32_t context)
-        : geometry_(geometry), dtype_(dtype), tokens_(tokens), capacity_(context + tokens),
+    FullCase(DType dtype, std::int32_t tokens, std::int32_t context)
+        : dtype_(dtype), tokens_(tokens), capacity_(context + tokens),
           padded_(align_context(capacity_)),
-          k_(bench::make_bf16(static_cast<std::size_t>(kFullHeadDim) * geometry.kv_heads * tokens)),
-          v_(bench::make_bf16(static_cast<std::size_t>(kFullHeadDim) * geometry.kv_heads * tokens)),
+          k_(bench::make_bf16(static_cast<std::size_t>(kFullHeadDim) * kKvHeads * tokens)),
+          v_(bench::make_bf16(static_cast<std::size_t>(kFullHeadDim) * kKvHeads * tokens)),
           positions_(static_cast<std::size_t>(tokens) * sizeof(std::int32_t)),
-          cache_k_(bench::make_zeros(full_cache_bytes(geometry, dtype, padded_))),
-          cache_v_(bench::make_zeros(full_cache_bytes(geometry, dtype, padded_))),
-          cache_k_scale_(bench::make_zeros(dtype == DType::I8 ? full_scale_bytes(geometry, padded_)
-                                                              : std::size_t{1})),
-          cache_v_scale_(bench::make_zeros(dtype == DType::I8 ? full_scale_bytes(geometry, padded_)
-                                                              : std::size_t{1})),
+          cache_k_(bench::make_zeros(full_cache_bytes(dtype, padded_))),
+          cache_v_(bench::make_zeros(full_cache_bytes(dtype, padded_))),
+          cache_k_scale_(
+              bench::make_zeros(dtype == DType::I8 ? full_scale_bytes(padded_) : std::size_t{1})),
+          cache_v_scale_(
+              bench::make_zeros(dtype == DType::I8 ? full_scale_bytes(padded_) : std::size_t{1})),
           block_table_(static_cast<std::size_t>(padded_ / kPagedKVPageSize) * sizeof(std::int32_t)),
-          k_tensor_(k_.p, DType::BF16, {kFullHeadDim, geometry.kv_heads, tokens}),
-          v_tensor_(v_.p, DType::BF16, {kFullHeadDim, geometry.kv_heads, tokens}),
+          k_tensor_(k_.p, DType::BF16, {kFullHeadDim, kKvHeads, tokens}),
+          v_tensor_(v_.p, DType::BF16, {kFullHeadDim, kKvHeads, tokens}),
           positions_tensor_(positions_.p, DType::I32, {tokens}),
           cache_view_(make_full_view(cache_k_, cache_v_, cache_k_scale_, cache_v_scale_,
-                                     block_table_, geometry, dtype, padded_)) {
+                                     block_table_, dtype, padded_)) {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
         for (std::int32_t token = 0; token < tokens; ++token) {
             host_positions[static_cast<std::size_t>(token)] = context + token;
@@ -310,7 +247,6 @@ public:
     }
 
 private:
-    FullGeometry geometry_;
     DType dtype_;
     std::int32_t tokens_;
     std::int32_t capacity_;
@@ -329,110 +265,6 @@ private:
     PagedKVLayerView cache_view_;
 };
 
-PagedKVBatchLayerView make_prefix_paged_view(DeviceBuffer& k, DeviceBuffer& v,
-                                             DeviceBuffer& block_tables) {
-    return {
-        .k_pages = Tensor(
-            k.p, DType::BF16,
-            {kPrefixHeadDim, kPagedKVPageSize, kRingCapacity / kPagedKVPageSize, kPrefixKvHeads}),
-        .v_pages = Tensor(
-            v.p, DType::BF16,
-            {kPrefixHeadDim, kPagedKVPageSize, kRingCapacity / kPagedKVPageSize, kPrefixKvHeads}),
-        .block_tables = Tensor(block_tables.p, DType::I32, {kRingCapacity / kPagedKVPageSize, 1}),
-        .head_dim     = kPrefixHeadDim,
-        .num_kv_heads = kPrefixKvHeads,
-        .dtype        = DType::BF16,
-        .quant_group  = 0,
-    };
-}
-
-CyclicKVCacheLayerView make_prefix_cyclic_view(DeviceBuffer& k, DeviceBuffer& v) {
-    return {
-        .k        = Tensor(k.p, DType::BF16, {kPrefixHeadDim, kRingCapacity, kPrefixKvHeads, 1}),
-        .v        = Tensor(v.p, DType::BF16, {kPrefixHeadDim, kRingCapacity, kPrefixKvHeads, 1}),
-        .capacity = kRingCapacity,
-        .padded_capacity = kRingCapacity,
-        .num_kv_heads    = kPrefixKvHeads,
-        .head_dim        = kPrefixHeadDim,
-        .lane_capacity   = 1,
-    };
-}
-
-class PrefixCase {
-public:
-    PrefixCase(std::int32_t tokens, std::int32_t committed, bool cyclic)
-        : tokens_(tokens), committed_(committed), cyclic_(cyclic),
-          k_(bench::make_bf16(static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * tokens)),
-          v_(bench::make_bf16(static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * tokens)),
-          positions_(static_cast<std::size_t>(tokens) * sizeof(std::int32_t)),
-          commit_count_(sizeof(std::int32_t)), selector_(sizeof(std::int32_t)),
-          cache_k_(bench::make_zeros(static_cast<std::size_t>(kPrefixHeadDim) * kRingCapacity *
-                                     kPrefixKvHeads * 2)),
-          cache_v_(bench::make_zeros(static_cast<std::size_t>(kPrefixHeadDim) * kRingCapacity *
-                                     kPrefixKvHeads * 2)),
-          block_table_(static_cast<std::size_t>(kRingCapacity / kPagedKVPageSize) *
-                       sizeof(std::int32_t)),
-          k_tensor_(k_.p, DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens, 1}),
-          v_tensor_(v_.p, DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens, 1}),
-          positions_tensor_(positions_.p, DType::I32, {tokens, 1}),
-          count_tensor_(commit_count_.p, DType::I32, {1}),
-          selector_tensor_(selector_.p, DType::I32, {1}),
-          paged_view_(make_prefix_paged_view(cache_k_, cache_v_, block_table_)),
-          cyclic_view_(make_prefix_cyclic_view(cache_k_, cache_v_)),
-          envelope_{0, static_cast<std::uint32_t>(tokens)} {
-        const std::int32_t start = cyclic ? 2 * kRingCapacity - 3 : 0;
-        std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
-        for (std::int32_t token = 0; token < tokens; ++token) {
-            host_positions[static_cast<std::size_t>(token)] = start + token;
-        }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
-                              cudaMemcpyHostToDevice));
-        std::vector<std::int32_t> host_table(kRingCapacity / kPagedKVPageSize);
-        for (std::int32_t page = 0; page < static_cast<std::int32_t>(host_table.size()); ++page) {
-            host_table[static_cast<std::size_t>(page)] = page;
-        }
-        CUDA_CHECK(cudaMemcpy(block_table_.p, host_table.data(), block_table_.bytes,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(commit_count_.p, &committed_, sizeof(committed_), cudaMemcpyHostToDevice));
-        const std::int32_t selector = 0;
-        CUDA_CHECK(cudaMemcpy(selector_.p, &selector, sizeof(selector), cudaMemcpyHostToDevice));
-    }
-
-    void launch(cudaStream_t stream) {
-        if (cyclic_) {
-            ops::kv_cache_append_prefix(k_tensor_, v_tensor_, positions_tensor_, count_tensor_,
-                                        selector_tensor_, envelope_, cyclic_view_, stream);
-        } else {
-            ops::kv_cache_append_prefix(k_tensor_, v_tensor_, positions_tensor_, count_tensor_,
-                                        selector_tensor_, envelope_, paged_view_, stream);
-        }
-    }
-
-private:
-    std::int32_t tokens_;
-    std::int32_t committed_;
-    bool cyclic_;
-    DeviceBuffer k_;
-    DeviceBuffer v_;
-    DeviceBuffer positions_;
-    DeviceBuffer commit_count_;
-    DeviceBuffer selector_;
-    DeviceBuffer cache_k_;
-    DeviceBuffer cache_v_;
-    DeviceBuffer block_table_;
-    Tensor k_tensor_;
-    Tensor v_tensor_;
-    Tensor positions_tensor_;
-    Tensor count_tensor_;
-    Tensor selector_tensor_;
-    PagedKVBatchLayerView paged_view_;
-    CyclicKVCacheLayerView cyclic_view_;
-    ops::KVCacheAppendPrefixExecutionEnvelope envelope_;
-};
-
-const char* mode_name(Mode mode) { return mode == Mode::Full ? "full" : "prefix"; }
-
 const char* dtype_name(DType dtype) { return dtype == DType::BF16 ? "bf16" : "int8"; }
 
 const char* execution_name(Execution execution) {
@@ -447,18 +279,13 @@ double full_vector_bytes(DType dtype) {
                                                       kFullScaleGroups * dtype_size(DType::FP16));
 }
 
-double full_useful_bytes(const FullGeometry& geometry, DType dtype, std::int32_t tokens) {
-    const double input  = 2.0 * kFullHeadDim * geometry.kv_heads * tokens * 2.0;
-    const double output = 2.0 * geometry.kv_heads * tokens * full_vector_bytes(dtype);
+double full_useful_bytes(DType dtype, std::int32_t tokens) {
+    const double input  = 2.0 * kFullHeadDim * kKvHeads * tokens * 2.0;
+    const double output = 2.0 * kKvHeads * tokens * full_vector_bytes(dtype);
     return input + output;
 }
 
-double prefix_useful_bytes(std::int32_t committed) {
-    return static_cast<double>(committed) * 8192.0;
-}
-
-template <class Case>
-bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
+bench::ColdTiming measure(FullCase& data, Execution execution, CacheState cache,
                           bench::TimedGraph* graph, DeviceBuffer& flush, cudaStream_t stream,
                           int warmup, int repeat) {
     if (execution == Execution::Eager) {
@@ -475,13 +302,12 @@ bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
 void report(const Result& result) {
     const double seconds = result.timing.median_us * 1.0e-6;
     const double gbps    = result.useful_bytes / seconds / 1.0e9;
-    std::printf("mode=%-6s geometry=%-9s kv=%-4s layout=%-6s execution=%-5s cache=%-4s "
-                "T=%4d C=%4d median=%8.3f us min=%8.3f us p95=%8.3f us "
-                "useful=%8.1f GB/s (%5.1f%% of %.0f)\n",
-                mode_name(result.mode), result.geometry, dtype_name(result.kv_dtype), result.layout,
-                execution_name(result.execution), cache_name(result.cache), result.tokens,
-                result.committed, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs);
+    std::printf("kv=%-4s execution=%-5s cache=%-4s T=%4d median=%8.3f us min=%8.3f us "
+                "p95=%8.3f us useful=%8.1f GB/s (%5.1f%% of %.0f)\n",
+                dtype_name(result.kv_dtype), execution_name(result.execution),
+                cache_name(result.cache), result.tokens, result.timing.median_us,
+                result.timing.min_us, result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0,
+                kRtx5090DramGBs);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -490,20 +316,16 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
-    output << "mode,geometry,kv_dtype,layout,execution,cache,T,committed,useful_bytes,"
-              "median_us,min_us,p95_us\n";
+    output << "kv_dtype,execution,cache,T,useful_bytes,median_us,min_us,p95_us\n";
     for (const Result& result : results) {
-        output << mode_name(result.mode) << ',' << result.geometry << ','
-               << dtype_name(result.kv_dtype) << ',' << result.layout << ','
-               << execution_name(result.execution) << ',' << cache_name(result.cache) << ','
-               << result.tokens << ',' << result.committed << ',' << result.useful_bytes << ','
-               << result.timing.median_us << ',' << result.timing.min_us << ','
+        output << dtype_name(result.kv_dtype) << ',' << execution_name(result.execution) << ','
+               << cache_name(result.cache) << ',' << result.tokens << ',' << result.useful_bytes
+               << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
                << result.timing.p95_us << '\n';
     }
 }
 
-template <class Case>
-void profile_case(Case& data, const char* label, const Options& options, DeviceBuffer& flush,
+void profile_case(FullCase& data, const char* label, const Options& options, DeviceBuffer& flush,
                   cudaStream_t stream) {
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
@@ -533,22 +355,15 @@ void profile_case(Case& data, const char* label, const Options& options, DeviceB
     CUDA_CHECK(cudaProfilerStop());
 }
 
-std::vector<FullGeometry> selected_geometries(FullGeometryChoice choice) {
-    if (choice == FullGeometryChoice::Kv4) return {kFullKv4};
-    if (choice == FullGeometryChoice::Kv2) return {kFullKv2};
-    return {kFullKv4, kFullKv2};
-}
-
 std::vector<DType> selected_dtypes(KvChoice choice) {
     if (choice == KvChoice::Bf16) return {DType::BF16};
     if (choice == KvChoice::Int8) return {DType::I8};
     return {DType::BF16, DType::I8};
 }
 
-template <class Case>
-void collect_case(Case& data, Mode mode, const char* geometry, DType dtype, const char* layout,
-                  std::int32_t tokens, std::int32_t committed, double bytes, const Options& options,
-                  DeviceBuffer& flush, cudaStream_t stream, std::vector<Result>& results) {
+void collect_case(FullCase& data, DType dtype, std::int32_t tokens, double bytes,
+                  const Options& options, DeviceBuffer& flush, cudaStream_t stream,
+                  std::vector<Result>& results) {
     bench::TimedGraph graph;
     if (options.execution != Execution::Eager) {
         data.launch(stream);
@@ -566,14 +381,10 @@ void collect_case(Case& data, Mode mode, const char* geometry, DType dtype, cons
                 continue;
             }
             Result result{
-                mode,
-                geometry,
                 dtype,
-                layout,
                 execution,
                 cache,
                 tokens,
-                committed,
                 bytes,
                 measure(data, execution, cache, &graph, flush, stream, options.warmup, options.repeat)};
             report(result);
@@ -595,60 +406,23 @@ int main(int argc, char** argv) {
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);
-        const std::vector<FullGeometry> geometries = selected_geometries(options.full_geometry);
-        const std::vector<DType> dtypes            = selected_dtypes(options.kv);
+        const std::vector<DType> dtypes = selected_dtypes(options.kv);
 
         if (options.profile) {
-            if (options.mode == Mode::Full) {
-                const FullGeometry geometry = geometries.front();
-                const DType dtype           = dtypes.front();
-                FullCase data(geometry, dtype, options.tokens.front(), options.context);
-                const std::string label =
-                    std::string("mode=full geometry=") + geometry.name + " kv=" + dtype_name(dtype);
-                profile_case(data, label.c_str(), options, flush, stream);
-            } else {
-                const bool cyclic = options.layout == LayoutChoice::Cyclic;
-                if (options.counts.front() > options.tokens.front()) {
-                    usage("prefix count exceeds T");
-                }
-                PrefixCase data(options.tokens.front(), options.counts.front(), cyclic);
-                const std::string label =
-                    std::string("mode=prefix layout=") + (cyclic ? "cyclic" : "paged");
-                profile_case(data, label.c_str(), options, flush, stream);
-            }
+            const DType dtype = dtypes.front();
+            FullCase data(dtype, options.tokens.front(), options.context);
+            const std::string label = std::string("kv=") + dtype_name(dtype);
+            profile_case(data, label.c_str(), options, flush, stream);
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
         }
 
         std::vector<Result> results;
-        if (options.mode != Mode::Prefix) {
-            for (const FullGeometry& geometry : geometries) {
-                for (const DType dtype : dtypes) {
-                    for (const std::int32_t tokens : options.tokens) {
-                        FullCase data(geometry, dtype, tokens, options.context);
-                        collect_case(data, Mode::Full, geometry.name, dtype, "paged", tokens,
-                                     tokens, full_useful_bytes(geometry, dtype, tokens), options,
-                                     flush, stream, results);
-                    }
-                }
-            }
-        }
-        if (options.mode != Mode::Full) {
-            for (const bool cyclic : {false, true}) {
-                if ((options.layout == LayoutChoice::Paged && cyclic) ||
-                    (options.layout == LayoutChoice::Cyclic && !cyclic)) {
-                    continue;
-                }
-                for (const std::int32_t tokens : options.tokens) {
-                    for (const std::int32_t committed : options.counts) {
-                        if (committed > tokens) { continue; }
-                        PrefixCase data(tokens, committed, cyclic);
-                        collect_case(data, Mode::Prefix, "d128-kv8", DType::BF16,
-                                     cyclic ? "cyclic" : "paged", tokens, committed,
-                                     prefix_useful_bytes(committed), options, flush, stream,
-                                     results);
-                    }
-                }
+        for (const DType dtype : dtypes) {
+            for (const std::int32_t tokens : options.tokens) {
+                FullCase data(dtype, tokens, options.context);
+                collect_case(data, dtype, tokens, full_useful_bytes(dtype, tokens), options, flush,
+                             stream, results);
             }
         }
         write_csv(options, results);

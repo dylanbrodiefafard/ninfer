@@ -55,46 +55,15 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 4096:
-        switch (n) {
-        case 2048:
-            if (t <= 48) { return launch_w8_small_t; }
-            if (t <= 56) { return launch_w8_simt_r8_c4; }
-            if (t <= 895) { return launch_w8_mma_r32_c128; }
-            return launch_w8_mma_r64_c128;
-        case 5120:
+        if (n == 5120) {
             if (t <= 4) { return launch_w8_simt_r8_c4; }
             if (t <= 16) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r64_c128;
-        default:
-            break;
-        }
-        break;
-    case 2048:
-        switch (n) {
-        case 1024:
-            if (t <= 4) { return launch_w8_simt_r8_c4; }
-            if (t <= 16) { return launch_w8_simt_r8_c8; }
-            return launch_w8_mma_r32_c128;
-        case 9216:
-            if (t <= 13) { return launch_w8_simt_r8_c4; }
-            if (t <= 128) { return launch_w8_mma_r32_c128; }
-            return launch_w8_mma_r64_c128;
-        case 12288:
-            if (t <= 16) { return launch_w8_simt_r8_c4; }
-            return launch_w8_mma_r64_c128;
-        default:
-            break;
         }
         break;
     case 4608:
         if (t > 32768) { break; }
         switch (n) {
-        case 2048:
-            if (t <= 14 || t == 16 || t == 20 || t == 24 || t == 28 || t == 32) {
-                return launch_w8_simt_r8_c4;
-            }
-            if (t <= 871) { return launch_w8_mma_r32_c128; }
-            return launch_w8_mma_r64_c128;
         case 4608:
             if (t <= 8 || t == 12) { return launch_w8_simt_r8_c4; }
             if (t <= 256) { return launch_w8_mma_r32_c128; }
@@ -107,45 +76,6 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             break;
         }
         break;
-    case 16384:
-        if (n != 2048) { break; }
-        if (t == 1) { return launch_w8_decode_r4; }
-        if (t <= 48) { return launch_w8_exact_t_splitk; }
-        if (t <= 128) { return launch_w8_dflash_medium; }
-        if (t <= 144) { return launch_w8_medium_splitk_c144; }
-        if (t <= 255) { return launch_w8_mma_r32_c128; }
-        if (t <= 384) { return launch_w8_mma_r32_c64; }
-        if (t <= 480) { return launch_w8_mma_r32_c96; }
-        if (t == 481) { return launch_w8_exact_mma_r32_c96; }
-        if (t <= 640) { return launch_w8_mma_r32_c128; }
-        if (t <= 668) { return launch_w8_exact_mma_r32_c128; }
-        if (t <= 672) { return launch_w8_mma_r48_c96; }
-        if (t == 673) { return launch_w8_exact_mma_r48_c96; }
-        if (t <= 704) { return launch_w8_mma_r48_c64; }
-        if (t <= 784) { return launch_w8_mma_r48_c112; }
-        if (t <= 896) { return launch_w8_mma_r48_c128; }
-        if (t <= 912) { return launch_w8_exact_mma_r48_c128; }
-        if (t <= 960) { return launch_w8_mma_r64_c96; }
-        if (t <= 1007) { return launch_w8_exact_mma_r64_c96; }
-        if (t == 1008) { return launch_w8_mma_r64_c112; }
-        if (t <= 1119) { return launch_w8_mma_r64_c128; }
-        if (t == 1120) { return launch_w8_mma_r64_c112; }
-        if (t <= 1280) { return launch_w8_mma_r64_c128; }
-        if (t <= 1313) { return launch_w8_exact_mma_r64_c128; }
-        if (t <= 1344) { return launch_w8_mma_r128_c64; }
-        if (t <= 1440) { return launch_w8_mma_r96_c96; }
-        if (t <= 1500) { return launch_w8_exact_mma_r96_c96; }
-        if (t <= 1680) { return launch_w8_mma_r128_c80; }
-        if (t <= 1745) { return launch_w8_exact_mma_r128_c80; }
-        if (t <= 1791) { return launch_w8_mma_r48_c128; }
-        if (t == 1792) { return launch_w8_mma_r64_c128; }
-        if (t <= 1919) { return launch_w8_mma_r48_c128; }
-        if (t == 1920) { return launch_w8_mma_r64_c128; }
-        if (t <= 1953) { return launch_w8_exact_mma_r64_c128; }
-        if (t <= 2016) { return launch_w8_mma_r64_c96; }
-        if (t <= 2048) { return launch_w8_exact_mma_r64_c96; }
-        if (t <= 2112) { return launch_w8_mma_r96_c96; }
-        return launch_w8_mma_r64_c128;
     default:
         break;
     }

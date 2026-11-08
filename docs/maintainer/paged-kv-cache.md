@@ -95,19 +95,15 @@ MTP Engine:
     Main Text KV Pool
     MTP KV Pool
 
-DFlash Engine (35B-A3B v1):
-    Main Text KV Pool
-    DFlash Full-Context KV Pool
-
 DFlash Engine (Qwen3.8-27B DFlash2):
     Main Text KV Pool
 ```
 
 Qwen3.8-27B DFlash2 sets `full_layers=0`: that Engine has only the Main Text growing pool. Its
-five SWA-2048 windows are DFlash local cyclic state, not a Full-Context pool.
+five SWA-2048 windows are DFlash local cyclic state, not a growing pool.
 
-MTP and DFlash are engine-wide mutually exclusive backends, so an Engine currently contains at
-most two growing KV pools. DFlash local cyclic KV is fixed state and is not part of this pool set.
+MTP and DFlash are engine-wide mutually exclusive backends, so an Engine contains at most two
+growing KV pools. DFlash local cyclic KV is fixed state and is not part of this pool set.
 
 These names describe how the target/runtime uses a pool. The common KV Store sees only a set of
 immutable pool layouts and opaque pool handles, and does not dispatch on feature name, attention
@@ -172,10 +168,10 @@ counts `16+4.75n` MiB, covering the measured graph amount plus the driver memory
 construction consumes outside the arena (about `2+2.3C` MiB, not inside the graph measurement
 window): at 262144-token context with adaptive K7, the C=1..8 serve startups (12-88 executables)
 measured 42-396 MiB for graphs, 46-416 MiB in total outside the arena, and the allowance is 17-27
-MiB above each total, so Automatic capacity keeps the full `R` free after startup. The 64/96 MiB
-unroll allowance of autoregressive DFlash must not be applied. All definitions and executables are
-established at startup. The measured value is the device-wide free-memory difference before and
-after preparation, which accounts for allocations/frees by other processes on the same GPU, so it
+MiB above each total, so Automatic capacity keeps the full `R` free after startup. All definitions
+and executables are established at startup. The measured value is the device-wide free-memory
+difference before and after preparation, which accounts for allocations/frees by other processes on
+the same GPU, so it
 is reported only as an observed/allowance figure and is not a startup failure condition; the
 allowance calibration is checked by the real-artifact capacity test on an exclusive GPU. The
 4096-token prefill and adaptive K switching use the already planned shared workspace, and add no
@@ -245,14 +241,13 @@ different ways:
   round the Backend mapped extent can temporarily lead Main. The target verify only needs to
   materialize Main according to its own visible domain, and must not occupy extra Main pages merely
   to maintain a false size relation between mapped frontiers;
-- DFlash Full stores only the persistent context generated from target-produced committed features,
-  the proposal query K/V is transient workspace, and the local K/V is fixed cyclic state, so it
-  usually lags behind Main.
+- DFlash2 has no backend growing pool: its proposal query K/V is transient workspace and its local
+  K/V is fixed cyclic state.
   The committed stable KV frontier still satisfies that the backend does not lead Main; the MTP lead
   exists only in the provisional range mapped within a round, and must not be interpreted as
   committed state.
 
-The Main, MTP, and DFlash Full pools of the currently registered targets all use `P=64`. Let
+The Main and MTP pools of the registered targets both use `P=64`. Let
 `C=max_concurrency`, and let the MTP draft window be `K_draft`. The startup capacity profile is
 fixed as:
 
@@ -267,13 +262,12 @@ speculative_backend = MTP:
 
 speculative_backend = DFlash:
     Main physical=M, logical-per-allocation=L
-    DFlash Full physical=M, logical-per-allocation=L
+    no backend growing pool
 ```
 
 The extra physical groups of MTP cover the `K_draft-1` provisional positions by which up to `C`
 concurrent rows each exceed their Main entitlement; this does not increase the block-table width,
 and does not allow any allocation to exceed `L` logical pages.
-DFlash Full has no such provisional lead, so it needs no extra headroom.
 
 The two pools do not share physical pages; they only plan typed payloads separately for the same
 number of logical 64-token groups. Because their materialization times differ, it is a normal state
@@ -322,9 +316,8 @@ The current pool grouping is:
 |---|---|---|
 | Main Text | K, V, and optional code/scale planes of all target full-attention layers | target materialized KV frontier |
 | MTP | K, V, and optional code/scale planes of the MTP layer | MTP KV frontier |
-| DFlash Full | K, V planes of the DFlash full-context layers | DFlash context frontier |
 
-Text, MTP, and DFlash do not form one physical page group, because they can have different
+Text and MTP do not form one physical page group, because they can have different
 valid/provisional frontiers, different retention readiness, and different consumer geometry.
 
 ### 4.2 Allocator-visible layout
@@ -348,7 +341,6 @@ fixed by the homogeneous pool, and is not chosen by the allocator or by an indiv
 ```text
 Pool            K/V or code plane       INT8-G64 scale plane
 Main Text/MTP   [D, P, Hkv, Nphysical]  [D/64, P, Hkv, Nphysical]
-DFlash Full     [D, P, Nphysical, Hkv]  not used
 ```
 
 Main Text/MTP uses contiguous page-major order. For element bytes `E` and first-dimension extent `X`
@@ -361,15 +353,6 @@ nb[2] = P * nb[1]
 nb[3] = Hkv * nb[2]
 ```
 
-DFlash Full uses contiguous head-major page-run order:
-
-```text
-nb[0] = E
-nb[1] = X * nb[0]
-nb[2] = P * nb[1]
-nb[3] = Nphysical * nb[2]
-```
-
 Slab alignment may exist between planes, but within a single plane no padding, axis permutation, or
 third target-specific physical order is allowed. For a logical position `p`:
 
@@ -380,9 +363,6 @@ g = block_table[b]
 
 Main/MTP:    K[d,h,p] = k_pages[d,o,h,g]
              V[d,h,p] = v_pages[d,o,h,g]
-
-DFlash Full: K[d,h,p] = k_pages[d,o,g,h]
-             V[d,h,p] = v_pages[d,o,g,h]
 ```
 
 INT8 code uses the same formula; scale replaces `d` with the quant group `d/64`. K, V, code, and
@@ -407,24 +387,9 @@ plane
 
 A page-group ID selects one contiguous `P*Hkv` slice in each Main/MTP plane.
 
-DFlash Full uses head-major page runs:
-
-```text
-plane
-├── head 0: physical page 0, page 1, ... page N-1
-├── head 1: physical page 0, page 1, ... page N-1
-└── ...
-```
-
-A DFlash page-group ID selects one `P`-position slice in each head slab; these head slices are not
-required to be physically adjacent to one another. This order lets a CTA that owns a single KV head
-and traverses a long context contiguously read contiguous page runs, while keeping exactly the same
-pool allocation, page ID, and block-table semantics.
-
 The allocator may return arbitrary page IDs, and consumer correctness and launch topology do not
-depend on ID contiguity. The two orders above are the complete set for the registered growing
-pools; Main/MTP Ops accept only page-major, DFlash Full Ops accept only head-major, and no
-arbitrary-stride or dual-layout execution path is provided.
+depend on ID contiguity. Page-major is the only order for the registered growing pools; Main/MTP
+Ops accept only page-major, and no arbitrary-stride or dual-layout execution path is provided.
 
 ### 4.4 Logical position domain
 
@@ -490,7 +455,6 @@ group slices in each plane, following that pool's closed physical order:
 
 ```text
 Main/MTP plane:    [page 0: all heads] [page 1: all heads] ...
-DFlash Full plane: [head 0: all pages] [head 1: all pages] ...
 
 page-group g      -> plane 0 slices selected by g
                   -> plane 1 slices selected by g
@@ -570,7 +534,7 @@ An admitted sequence holds an allocation bundle that is independent of slot iden
 ```text
 SequenceKVBundle
 ├── Main Text PoolAllocation
-└── selected Backend PoolAllocation (MTP or DFlash Full, iff enabled)
+└── MTP PoolAllocation (iff MTP is the selected backend)
 ```
 
 Each `PoolAllocation` independently contains:
@@ -658,10 +622,9 @@ Currently all registered growing pools are fixed at:
 ```text
 P_main          = 64
 P_mtp           = 64
-P_dflash_full   = 64
 ```
 
-The three pools have independent storage, page ID namespaces, and capacities, but use the same `P=64`.
+The two pools have independent storage, page ID namespaces, and capacities, but use the same `P=64`.
 `P` is not a request option and does not change dynamically during serving.
 
 ### 7.1 Design basis
@@ -695,10 +658,8 @@ prefill chunk is a multiple of 128. With `P_main=64` fixed:
 ### 7.3 Backend page sizes
 
 The context traversal of MTP full Attention uses the same `P_mtp=64` and page-major order as the
-corresponding target full Attention. A DFlash proposal block has 16 positions, so `P_dflash_full=64`
-holds exactly four proposal blocks; its Full pool uses the head-major page-run order of §4.3. The two
-keep independent pool ownership and capacity, and share only the page size, allocation, and
-block-table semantics.
+corresponding target full Attention. The MTP pool keeps independent pool ownership and capacity, and
+shares only the page size, allocation, and block-table semantics with Main Text.
 
 ### 7.4 Current pool payloads at `P=64`
 
@@ -709,20 +670,12 @@ The table below counts only KV payload, excluding static slab alignment:
 | 27B Main Text | BF16 | 65536 | 4.0000 MiB | 3.9375 MiB |
 | 27B Main Text | INT8-G64 | 33792 | 2.0625 MiB | 2.0303 MiB |
 | 27B Main Text | NVFP4-G16 | 18432 | 1.1250 MiB | 1.1074 MiB |
-| 35B-A3B Main Text | BF16 | 20480 | 1.2500 MiB | 1.2305 MiB |
-| 35B-A3B Main Text | INT8-G64 | 10560 | 0.6445 MiB | 0.6345 MiB |
-| 35B-A3B Main Text | NVFP4-G16 | 5760 | 0.3516 MiB | 0.3462 MiB |
 | 27B MTP | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
 | 27B MTP | INT8-G64 | 2112 | 0.1289 MiB | 0.1269 MiB |
 | 27B MTP | NVFP4-G16 | 1152 | 0.0703 MiB | 0.0692 MiB |
-| 35B-A3B MTP | BF16 | 2048 | 0.1250 MiB | 0.1230 MiB |
-| 35B-A3B MTP | INT8-G64 | 1056 | 0.0645 MiB | 0.0634 MiB |
-| 35B-A3B MTP | NVFP4-G16 | 576 | 0.0352 MiB | 0.0346 MiB |
-| 35B-A3B DFlash Full | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
 
 The 4 MiB page group of 27B Main Text BF16 is distributed across all full-attention planes. For a
-single K or V plane of a single layer, the aggregate bytes per page ID are 128 KiB; for 35B-A3B Main
-Text BF16 they are 64 KiB. A consumer always sees one pool-specific typed plane view, not a composite
+single K or V plane of a single layer, the aggregate bytes per page ID are 128 KiB. A consumer always sees one pool-specific typed plane view, not a composite
 payload that is a cross-model mechanism.
 
 Assuming 32-bit page IDs, a single block-table row for a 128 Ki context is 8 KiB. Even with
@@ -1065,7 +1018,7 @@ frontier GDN, tail hidden and DFlash lane, which `start_prefill_lane` overwrites
 set (the disk tier neither reads nor decodes them), and a request that drops its rewrite checkpoint
 skips the entry's rewrite set and installs no rewrite checkpoint. A RAM restore starts only once the entry's own capture copies
 are ready; while other lanes decode, the copy-hold polls that instead of blocking. KV
-`dst_extent` Main `pages_for_tokens(F)` / MTP `pages_for_tokens(F-1)` / DFlash Full `pages_for_tokens(F)`. Host RAM is not a second GPU
+`dst_extent` Main `pages_for_tokens(F)` / MTP `pages_for_tokens(F-1)`. Host RAM is not a second GPU
 working set.
 
 `--kv-ram-system-prompts N` enables retained snapshots of the exact leading system-prefix frontier
@@ -1370,7 +1323,6 @@ Not all K/V-shaped state grows with context:
 |---|---|---|
 | target full-attention KV | Main Text paged pool | grows with every target materialized token |
 | MTP persistent KV | MTP paged pool | independent MTP frontier |
-| DFlash full-context KV | DFlash Full paged pool | independent DFlash context frontier |
 | DFlash local sliding-window KV | fixed per-sequence KV state | capacity fixed at the window, does not grow with total context |
 | DFlash boundary-local snapshot | fixed per-sequence KV state | fixed checkpoint payload |
 | Vision/temporary query K/V | shared execution workspace | lives only within one operator/phase |
@@ -1513,8 +1465,7 @@ PagedKVLayerView
 `P` and `Nphysical` are given by the route's interpretation of the page tensors' shape, and the logical
 capacity is `Nlogical*P`. All currently registered growing routes accept only `P=64`; the kernel treats it
 as a compile-time fact instead of performing a runtime division in the inner loop. Main/MTP causal routes
-accept only contiguous `[D,P,Hkv,Nphysical]` and scale planes of the same order; DFlash Full append/context
-routes accept only contiguous `[D,P,Nphysical,Hkv]`. An Op does not accept a permuted, arbitrary-stride, or
+accept only contiguous `[D,P,Hkv,Nphysical]` and scale planes of the same order. An Op does not accept a permuted, arbitrary-stride, or
 other-pool-profile growing view.
 
 Each layer view of the same pool references different plane slabs but the same active slot block-table row.
@@ -1599,8 +1550,7 @@ selected allocation table row or table matrix
 PagedKVLayerView or PagedKVBatchLayerView
 ```
 
-A Main Text consumer can bind only the Main Text pool; an MTP consumer can bind only the MTP pool; a DFlash
-full-context consumer can bind only the DFlash Full pool. A common Op does not receive a pool kind and does
+A Main Text consumer can bind only the Main Text pool, and an MTP consumer can bind only the MTP pool. A common Op does not receive a pool kind and does
 not select a pool by target, layer role, or backend string.
 
 ---
@@ -1619,9 +1569,7 @@ corresponding `include/ninfer/ops/` header; this document defines only the stora
 | `gqa_attention` | writable `PagedKVBatchLayerView` + `table_rows[B]` | appends valid K/V columns for `B` independent sequences and performs one ragged causal Attention |
 | `gqa_attention_cached` | read-only `PagedKVLayerView` | reads only an already-populated paged cache |
 | `gqa_kv_append` | writable `PagedKVLayerView` | writes all supplied rows, BF16 copy or INT8-G64 encode |
-| `kv_cache_append_prefix` growing entry | writable `PagedKVBatchLayerView` + counts/table rows | writes only the exact prefix selected by each row's device count |
-| `bidirectional_gqa_attention` | read-only `PagedKVBatchLayerView` + table rows | batched read of the DFlash Full pool; the query K/V remains a transient Tensor |
-| `kv_cache_append_prefix` cyclic entry | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window, not part of a growing pool |
+| `normalized_rope_kv_append` | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window, not part of a growing pool |
 | `swa` | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window, not part of a growing pool |
 
 These entries do not form a parallel storage-overload family. The workspace capacity query is determined by
@@ -1651,11 +1599,6 @@ still `[0,p]` of that allocation; a page boundary produces no mask boundary.
 
 `gqa_attention_cached` and `gqa_kv_append` keep the single-sequence `[D,H,T]` tensor domain for the split
 prefill path and do not form a second growing-cache storage contract.
-
-The DFlash full-context entry uses a `[D,H,W,B]` query block, per-row `context_lengths[B]`,
-`valid_columns[B]`, and `table_rows[B]`. Each row reads only the context `[0,Lb)` of its own allocation,
-plus the complete transient query K/V segment of that row; the KV domains of different rows are never
-visible to each other.
 
 ### 16.3 Wrapper validation and caller promises
 
@@ -1798,17 +1741,7 @@ building a contiguous staging cache.
 - paged and cyclic append compile to different physical-address routes, with no runtime cache-kind
   branch kept on every store.
 
-### 17.6 DFlash full-context Attention
-
-The DFlash transient query K/V stay contiguous; only the persistent full context becomes paged. The
-existing 32/64-key blocks both divide `P=64`, and each context tile obtains the page ID once. The
-split partial and reduce workspace semantics are unchanged.
-
-The direct route with `context_length=0` does not access the block table. The DFlash local and
-boundary-local caches continue to use independent cyclic storage, and their modulo/window semantics
-must not change because of the full-context migration.
-
-### 17.7 CUDA Graph behavior
+### 17.6 CUDA Graph behavior
 
 The plane slab bases and each slot's block-table row pointer are stable for the lifetime of the Engine.
 What changes across replays is the device values of the table content, positions, context length, and
@@ -1835,7 +1768,7 @@ preparation, only the private pages corresponding to the current exact `B` are z
 capture and update/upload validation do not execute the consumer, so they must not scan or zero the
 entire physical pool.
 
-### 17.8 Prohibited implementations
+### 17.7 Prohibited implementations
 
 The following implementations are not accepted even if they are functionally correct:
 
@@ -1881,7 +1814,6 @@ All three must produce the same logical result and the same cache bits in the ta
 - a cached-only route does not modify any cache plane;
 - prefix append with count 0, before and after a page boundary, and the full count;
 - rejected/provisional stale bytes do not enter the valid read domain;
-- DFlash full-context length 0, at a page boundary, and at the maximum registered range;
 - cyclic DFlash local behavior keeps its fixed-window semantics;
 - updating the content of the same stable table row between graph replays, with the next replay
   reading the new mapping;
@@ -1933,13 +1865,11 @@ explained or exceeds the gate; no long-term benchmark research framework is buil
 
 The performance evidence covers actual routes, not the Cartesian product of all parameters:
 
-- BF16/INT8-G64 causal decode for the two exact targets at `B=1,2,4,8`, `T=1`, and a representative
+- BF16/INT8-G64 causal decode for the registered target at `B=1,2,4,8`, `T=1`, and a representative
   verify small-T;
 - one ordinary chunk and one long chunk of causal prefill/cached-only, including a non-aligned prefix
   base;
 - standalone append for small-T and for one prefill-sized chunk;
-- DFlash full-context at `T=1` and at the complete proposal block, covering ordinary and long
-  context;
 - the identity mapping and one fixed fragmented permutation;
 - production CUDA Graph replay, and the real-artifact request paths for ordinary, MTP, and DFlash.
 
@@ -1970,10 +1900,10 @@ or the number of valid repeats increased; it must not be treated as a pass.
 
 A storage/addressing route is admitted only if it satisfies all of the following:
 
-1. the median representative end-to-end decode throughput of the two targets regresses by no more
+1. the median representative end-to-end decode throughput of the registered target regresses by no more
    than 1% relative to the baseline of the same batch profile;
-2. the median of causal decode/cached Attention with context of at least 2K and of the DFlash
-   full-context kernel regresses by no more than 3%;
+2. the median of causal decode/cached Attention with context of at least 2K regresses by no more
+   than 3%;
 3. the median prefill Attention throughput regresses by no more than 3%;
 4. standalone append shows no repeatable bandwidth regression of more than 5%;
 5. CUDA Graph replay produces no additional host synchronization, per-page launch, or
@@ -2022,7 +1952,7 @@ The following is the architecture contract that implementations must obey:
   `M_max=max_concurrency*L`. Explicit takes `M=ceil(K_main/64)`; Automatic directly solves for the
   largest `M` in the interval from the complete target physical reservation curve and the free device
   memory after weight loading minus the headroom `R`; the CLI/server default for `R` is 32 MiB. The
-  per-allocation logical capacity of both Main and DFlash Full is `L` and the physical capacity is `M`
+  per-allocation logical capacity of Main is `L` and the physical capacity is `M`
   pages; for MTP the logical capacity is `L` and the physical capacity is
   `M + max_concurrency*ceil((K_draft-1)/64)` pages, where `K_draft` is the speculative draft window.
   Explicit is rejected if `K_main>=S` does not hold; any policy is rejected if the resolved `M` is
@@ -2031,8 +1961,7 @@ The following is the architecture contract that implementations must obey:
   mappings;
 - the page size of all registered growing pools is `P=64`;
 - the K/V and code planes of Main Text/MTP are fixed as contiguous page-major `[D,P,Hkv,Nphysical]`,
-  and the INT8-G64 scale planes are fixed as `[D/64,P,Hkv,Nphysical]`; DFlash Full K/V is fixed as a
-  contiguous head-major page-run `[D,P,Nphysical,Hkv]`;
+  and the INT8-G64 scale planes are fixed as `[D/64,P,Hkv,Nphysical]`;
 - the exact strides are uniquely determined by §4.2 for each homogeneous pool; neither the request nor
   the runtime mode selects the order;
 - K/V/code/scale and the layers of the same pool share one page-group ID and one per-sequence block

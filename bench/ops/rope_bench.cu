@@ -484,35 +484,6 @@ void run_dflash(int tokens, bool control, int candidate_block, int candidate_hea
     print_result(label.c_str(), result);
 }
 
-void run_dflash_single_k(int tokens, bool control) {
-    const std::size_t elements = static_cast<std::size_t>(kDflashHeadDim) * kDflashKHeads * tokens;
-    DeviceBuffer positions     = make_text_positions(tokens, 1);
-    DeviceBuffer x             = make_bf16(elements);
-    Tensor tpos(positions.p, DType::I32, {tokens});
-    Tensor tx(x.p, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
-    const double bytes  = 2.0 * static_cast<double>(kDflashKHeads * kDflashRotaryDim) * tokens *
-                          sizeof(__nv_bfloat16);
-    const Result result = bench_loop(
-        [&](cudaStream_t stream) {
-            if (control) {
-                rope_payload_control_kernel<ops::RopeKernelMode::DflashText1D, kDflashHeadDim,
-                                            kDflashRotaryDim, kDflashKHeads, 0>
-                    <<<tokens, kDflashKHeads * 32, 0, stream>>>(
-                        static_cast<const std::int32_t*>(tpos.data),
-                        static_cast<__nv_bfloat16*>(tx.data), nullptr, tokens,
-                        tx.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)), 0);
-                CUDA_CHECK(cudaGetLastError());
-            } else {
-                ops::rope(tpos, kDflashRotaryDim, kTextTheta, tx, stream);
-            }
-        },
-        bytes);
-    const std::string label =
-        std::string("rope ") + (control ? "control" : "text") +
-        " dflash single-k axes=1 route=fixed-b256 T=" + std::to_string(tokens);
-    print_result(label.c_str(), result);
-}
-
 void run_vision(int patches, bool control) {
     constexpr int hidden   = kVisionHeadDim * kVisionHeads;
     constexpr int qkv      = hidden * 3;
@@ -544,7 +515,6 @@ struct Options {
     bool vision         = false;
     bool control        = false;
     bool geometry27     = false;
-    bool geometry35     = false;
     bool geometryDflash = true;
     bool axes1          = true;
     bool axes3          = true;
@@ -575,10 +545,9 @@ Options parse_options(int argc, char** argv) {
         } else if (!std::strcmp(arg, "--geometry")) {
             const std::string selected(value());
             options.geometry27     = selected == "27b" || selected == "all";
-            options.geometry35     = selected == "35b" || selected == "all";
             options.geometryDflash = selected == "dflash" || selected == "all";
-            if (!options.geometry27 && !options.geometry35 && !options.geometryDflash) {
-                throw std::invalid_argument("--geometry must be dflash, 27b, 35b, or all");
+            if (!options.geometry27 && !options.geometryDflash) {
+                throw std::invalid_argument("--geometry must be dflash, 27b, or all");
             }
         } else if (!std::strcmp(arg, "--axes")) {
             const std::string selected(value());
@@ -629,14 +598,14 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--candidate-block is only valid for a Text pair form");
     }
     if (options.candidate_heads != 0 &&
-        (!options.text || !options.geometryDflash || options.geometry27 || options.geometry35 ||
-         options.control || options.single_q || options.single_k)) {
+        (!options.text || !options.geometryDflash || options.geometry27 || options.control ||
+         options.single_q || options.single_k)) {
         throw std::invalid_argument(
             "--candidate-heads is only valid for the DFlash Text pair form");
     }
-    if (options.profile && (!options.text || options.vision || !options.geometryDflash ||
-                            options.geometry27 || options.geometry35 || !options.pair ||
-                            options.single_q || options.single_k || options.tokens.size() != 1)) {
+    if (options.profile &&
+        (!options.text || options.vision || !options.geometryDflash || options.geometry27 ||
+         !options.pair || options.single_q || options.single_k || options.tokens.size() != 1)) {
         throw std::invalid_argument("--profile requires one DFlash Text pair token extent");
     }
     return options;
@@ -659,9 +628,6 @@ int main(int argc, char** argv) {
                                options.candidate_heads, options.profile);
                 }
             }
-            if (options.geometryDflash && options.axes1 && options.single_k) {
-                for (int tokens : options.tokens) { run_dflash_single_k(tokens, options.control); }
-            }
             for (int axes : {1, 3}) {
                 if ((axes == 1 && !options.axes1) || (axes == 3 && !options.axes3)) { continue; }
                 for (int tokens : options.tokens) {
@@ -675,18 +641,6 @@ int main(int argc, char** argv) {
                         }
                         if (options.single_k) {
                             run_text_single<4>(tokens, axes, options.control, "27b", "k");
-                        }
-                    }
-                    if (options.geometry35) {
-                        if (options.pair) {
-                            run_text<16, 2>(tokens, axes, options.control, options.candidate_block,
-                                            "35b");
-                        }
-                        if (options.single_q) {
-                            run_text_single<16>(tokens, axes, options.control, "35b", "q");
-                        }
-                        if (options.single_k) {
-                            run_text_single<2>(tokens, axes, options.control, "35b", "k");
                         }
                     }
                 }

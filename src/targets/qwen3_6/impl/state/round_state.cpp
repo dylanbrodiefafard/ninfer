@@ -401,8 +401,6 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, target_valid_columns), DType::I32, {batch});
     text_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
-    dflash_kv_table_rows =
-        ingress_tensor(offsetof(DFlashDecodeIngress, dflash_kv_table_rows), DType::I32, {batch});
     lanes       = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
     rope_deltas = ingress_tensor(offsetof(DFlashDecodeIngress, rope_deltas), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(

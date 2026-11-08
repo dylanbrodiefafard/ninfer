@@ -216,7 +216,6 @@ void launch_tc_partial_nvfp4s3(const Tensor& q, CacheInput input, const Tensor& 
 NINFER_S3_DECODE_INSTANTIATE(Gqa27Geometry);
 NINFER_S3_DECODE_INSTANTIATE_T(Gqa27Geometry, 7);
 NINFER_S3_DECODE_INSTANTIATE_T(Gqa27Geometry, 8);
-NINFER_S3_DECODE_INSTANTIATE(Gqa35Geometry);
 
 #undef NINFER_S3_DECODE_INSTANTIATE
 #undef NINFER_S3_DECODE_INSTANTIATE_T

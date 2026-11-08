@@ -1,9 +1,10 @@
 // Cold-cache qualification rig for the exact fused BF16 GDN-control projections.
 //
+// The geometry is the registered Qwen3.8-27B GDN control projection: 48 heads over hidden 5120.
+//
 // Examples:
-//   ./build/bench/ninfer_gdn_gating_proj_bench --35b --candidate auto
-//   ./build/bench/ninfer_gdn_gating_proj_bench --35b
-//     --candidate mma-split16 -p 128,512,1024
+//   ./build/bench/ninfer_gdn_gating_proj_bench --candidate auto
+//   ./build/bench/ninfer_gdn_gating_proj_bench --candidate mma-split40 -p 1,8,16,48
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer_bench_common.h"
@@ -27,15 +28,16 @@ using namespace ninfer::bench;
 namespace {
 
 constexpr std::size_t kDefaultFlushBytes = 256ULL << 20;
+constexpr std::int32_t kHeads            = 48;
+constexpr std::int32_t kHidden           = 5120;
 
 struct Options {
-    bool geometry35            = false;
     bool norm_control          = false;
     bool auto_route            = true;
     bool composed_norm_control = false;
     std::int32_t packed_width  = 0;
     ops::detail::Bf16GdnGatingScheduleId candidate =
-        ops::detail::Bf16GdnGatingScheduleId::SimtWarpRowC4;
+        ops::detail::Bf16GdnGatingScheduleId::MmaCooperativeSplit40;
     std::vector<std::int32_t> tokens{1, 2, 4, 6, 8, 9, 16, 32, 64, 128, 256, 512, 1024};
     int warmup              = 8;
     int repeat              = 40;
@@ -102,22 +104,10 @@ std::vector<std::int32_t> parse_tokens(const char* csv) {
 }
 
 ops::detail::Bf16GdnGatingScheduleId parse_candidate(std::string_view raw) {
-    using S = ops::detail::Bf16GdnGatingScheduleId;
-    if (raw == "simt-c4") { return S::SimtWarpRowC4; }
-    if (raw == "simt-c8") { return S::SimtWarpRowC8; }
-    if (raw == "mma-split32") { return S::MmaCooperativeSplit32; }
-    if (raw == "mma-split16") { return S::MmaCooperativeSplit16; }
-    if (raw == "mma-split8") { return S::MmaCooperativeSplit8; }
-    if (raw == "mma-split4") { return S::MmaCooperativeSplit4; }
-    if (raw == "mma-split2") { return S::MmaCooperativeSplit2; }
-    if (raw == "mma-unsplit") { return S::MmaUnsplit; }
-    if (raw == "mma-split40") { return S::MmaCooperativeSplit40; }
+    if (raw == "mma-split40") {
+        return ops::detail::Bf16GdnGatingScheduleId::MmaCooperativeSplit40;
+    }
     throw std::invalid_argument("unknown candidate: " + std::string(raw));
-}
-
-bool candidate_is_27b(const ops::detail::Bf16GdnGatingScheduleId candidate) {
-    using S = ops::detail::Bf16GdnGatingScheduleId;
-    return candidate == S::MmaCooperativeSplit40;
 }
 
 Options parse_args(int argc, char** argv) {
@@ -127,9 +117,7 @@ Options parse_args(int argc, char** argv) {
             if (i + 1 >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
             return argv[++i];
         };
-        if (!std::strcmp(argv[i], "--35b")) {
-            opt.geometry35 = true;
-        } else if (!std::strcmp(argv[i], "--norm-control")) {
+        if (!std::strcmp(argv[i], "--norm-control")) {
             opt.norm_control = true;
         } else if (!std::strcmp(argv[i], "--candidate")) {
             const std::string_view raw = next("candidate");
@@ -151,10 +139,8 @@ Options parse_args(int argc, char** argv) {
             if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
             opt.flush_bytes = static_cast<std::size_t>(mib) << 20;
         } else if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) {
-            std::printf("usage: %s [--35b] [--norm-control] "
-                        "[--candidate auto|composed|simt-c4|simt-c8|mma-split32|"
-                        "mma-split16|mma-split8|mma-split4|mma-split2|mma-unsplit|"
-                        "mma-split40] [--packed-width W] "
+            std::printf("usage: %s [--norm-control] "
+                        "[--candidate auto|composed|mma-split40] [--packed-width W] "
                         "[-p 1,2,...] [--warmup N] [--repeat N] [--flush-mib N]\n",
                         argv[0]);
             std::exit(0);
@@ -162,20 +148,11 @@ Options parse_args(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + std::string(argv[i]));
         }
     }
-    if (!opt.auto_route && !opt.composed_norm_control) {
-        if (opt.geometry35 && candidate_is_27b(opt.candidate)) {
-            throw std::invalid_argument("27B small-T candidates require the default 27B geometry");
-        }
-        if (!opt.geometry35 && !candidate_is_27b(opt.candidate)) {
-            throw std::invalid_argument("fixed candidate screening is supported only for --35b");
-        }
-    }
     if (opt.norm_control && !opt.auto_route && !opt.composed_norm_control) {
         throw std::invalid_argument("--norm-control supports only --candidate auto or composed");
     }
-    if (opt.packed_width != 0 &&
-        (!opt.norm_control || opt.geometry35 || !opt.auto_route || opt.packed_width < 1)) {
-        throw std::invalid_argument("--packed-width requires 27B --norm-control --candidate auto");
+    if (opt.packed_width != 0 && (!opt.norm_control || !opt.auto_route || opt.packed_width < 1)) {
+        throw std::invalid_argument("--packed-width requires --norm-control --candidate auto");
     }
     if (!opt.norm_control && opt.composed_norm_control) {
         throw std::invalid_argument("--candidate composed requires --norm-control");
@@ -188,9 +165,9 @@ Options parse_args(int argc, char** argv) {
 
 bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
          DeviceBuffer& flush) {
-    const std::int32_t heads  = opt.geometry35 ? 32 : 48;
-    const std::int32_t hidden = opt.geometry35 ? 2048 : 5120;
-    const std::size_t x_elems = static_cast<std::size_t>(hidden) * tokens;
+    constexpr std::int32_t heads  = kHeads;
+    constexpr std::int32_t hidden = kHidden;
+    const std::size_t x_elems     = static_cast<std::size_t>(hidden) * tokens;
     const std::size_t weight_elems =
         static_cast<std::size_t>(2 * heads) * static_cast<std::size_t>(hidden);
     const std::size_t out_elems = static_cast<std::size_t>(heads) * tokens;
@@ -233,7 +210,6 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
                    ? ops::detail::bf16_gdn_gating_resolve_plan(problem)
                    : ops::detail::bf16_gdn_gating_resolve_candidate(opt.candidate, problem);
     }();
-    const auto norm_plan              = ops::detail::bf16_gdn_norm_gating_resolve_plan(problem);
     const std::size_t workspace_bytes = std::max(interval_capacity, plan.workspace_bytes);
     WorkspaceArena ws(std::max<std::size_t>(1, workspace_bytes));
     const auto launch = [&](cudaStream_t stream) {
@@ -243,25 +219,12 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
                                                        opt.packed_width);
         } else if (opt.norm_control && opt.composed_norm_control) {
             ops::rmsnorm(tx, tnorm_weight, 1.0e-6F, true, th, stream);
-            if (opt.geometry35) {
-                ops::gdn_gating_proj(th, parent, tA_log, tdt_bias, ws, tg, tbeta, stream);
-            } else {
-                ops::gdn_gating_proj(th, wa, wb, tA_log, tdt_bias, ws, tg, tbeta, stream);
-            }
+            ops::gdn_gating_proj(th, wa, wb, tA_log, tdt_bias, ws, tg, tbeta, stream);
         } else if (opt.norm_control) {
-            if (opt.geometry35) {
-                ops::gdn_norm_gating_proj(tx, tnorm_weight, 1.0e-6F, parent, tA_log, tdt_bias, ws,
-                                          th, tg, tbeta, stream);
-            } else {
-                ops::gdn_norm_gating_proj(tx, tnorm_weight, 1.0e-6F, wa, wb, tA_log, tdt_bias, ws,
-                                          th, tg, tbeta, stream);
-            }
+            ops::gdn_norm_gating_proj(tx, tnorm_weight, 1.0e-6F, wa, wb, tA_log, tdt_bias, ws, th,
+                                      tg, tbeta, stream);
         } else if (opt.auto_route) {
-            if (opt.geometry35) {
-                ops::gdn_gating_proj(tx, parent, tA_log, tdt_bias, ws, tg, tbeta, stream);
-            } else {
-                ops::gdn_gating_proj(tx, wa, wb, tA_log, tdt_bias, ws, tg, tbeta, stream);
-            }
+            ops::gdn_gating_proj(tx, wa, wb, tA_log, tdt_bias, ws, tg, tbeta, stream);
         } else {
             ops::detail::bf16_gdn_gating_execute_candidate(opt.candidate, tx, wa, wb, tA_log,
                                                            tdt_bias, ws, tg, tbeta, stream);
@@ -272,7 +235,6 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const double sec = timing.median_us * 1e-6;
     const double useful_flops =
         2.0 * 2.0 * static_cast<double>(heads) * hidden * static_cast<double>(tokens);
-    const bool mma = plan.token_variant != ops::detail::Bf16GdnGatingTokenVariant::None;
     const bool aggregate =
         opt.packed_width != 0 &&
         ops::detail::bf16_gdn_gating_packed_aggregates(opt.packed_width, tokens / opt.packed_width);
@@ -283,12 +245,11 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
                                    : panel_cols <= 16 ? 16
                                    : panel_cols <= 32 ? 32
                                                       : 48)
-                                : (opt.geometry35 ? 64 : 128);
+                                : 128;
     // tokens is a whole number of panels; each panel executes its columns rounded up to the tile.
-    const int panels      = tokens / panel_cols;
-    const int panel_tiles = (panel_cols + mma_tile - 1) / mma_tile;
-    const double executed_cols =
-        !mma ? tokens : static_cast<double>(panels) * panel_tiles * mma_tile;
+    const int panels             = tokens / panel_cols;
+    const int panel_tiles        = (panel_cols + mma_tile - 1) / mma_tile;
+    const double executed_cols   = static_cast<double>(panels) * panel_tiles * mma_tile;
     const double executed_flops  = 2.0 * 2.0 * static_cast<double>(heads) * hidden * executed_cols;
     const double useful_tflops   = useful_flops / sec / 1e12;
     const double executed_tflops = executed_flops / sec / 1e12;
@@ -303,17 +264,13 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const char* route =
         opt.packed_width != 0 ? "gdn_norm_gating_proj.bf16.packed_sequences"
         : opt.norm_control
-            ? (opt.composed_norm_control
-                   ? "gdn_norm_gating_proj.bf16.composed_control"
-                   : ops::detail::bf16_gdn_norm_gating_schedule_name(norm_plan.schedule))
+            ? (opt.composed_norm_control ? "gdn_norm_gating_proj.bf16.composed_control"
+                                         : "gdn_norm_gating_proj.bf16.composed")
             : ops::detail::bf16_gdn_gating_schedule_name(plan.schedule);
     const std::size_t reported_workspace =
-        opt.packed_width != 0
-            ? interval_capacity
-            : (opt.norm_control && !opt.composed_norm_control ? norm_plan.workspace_bytes
-                                                              : plan.workspace_bytes);
+        opt.packed_width != 0 ? interval_capacity : plan.workspace_bytes;
 
-    std::printf("%s,%s,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%zu\n", opt.geometry35 ? "35b" : "27b",
+    std::printf("27b,%s,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%zu\n",
                 opt.norm_control ? "norm_control" : "control", tokens, route, timing.median_us,
                 timing.min_us, timing.p95_us, useful_tflops, executed_tflops, useful_gbs,
                 reported_workspace);
@@ -331,8 +288,8 @@ int main(int argc, char** argv) {
     try {
         const Options opt = parse_args(argc, argv);
         DeviceBuffer flush(opt.flush_bytes);
-        const std::int32_t heads      = opt.geometry35 ? 32 : 48;
-        const std::int32_t hidden     = opt.geometry35 ? 2048 : 5120;
+        constexpr std::int32_t heads  = kHeads;
+        constexpr std::int32_t hidden = kHidden;
         const std::int32_t min_tokens = *std::min_element(opt.tokens.begin(), opt.tokens.end());
         const std::int32_t max_tokens = *std::max_element(opt.tokens.begin(), opt.tokens.end());
         const std::size_t interval_capacity =

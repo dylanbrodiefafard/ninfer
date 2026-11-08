@@ -4,8 +4,7 @@
 //
 // Geometry, active tokens, and scheduling are independent compile-time values. K-split warps
 // cooperatively own one 16-row output tile; each warp evaluates a disjoint 64-wide K slice, then
-// the CTA reduces FP32 partials in shared memory. Output owns physical row/token addressing; an
-// optional caller epilogue may instead consume the FP32 tile.
+// the CTA reduces FP32 partials in shared memory and stores the BF16 tile.
 
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
@@ -17,21 +16,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <type_traits>
 
 namespace ninfer::ops::detail {
-
-struct W8SmallTMmaStoreEpilogue {};
-
-struct W8SmallTMmaResidualEpilogue {};
-
-struct W8SmallTMmaIdentityRows {
-    static constexpr int kOutputRowsPerCta = 16;
-
-    __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
-        return output_row0 + local_row;
-    }
-};
 
 __device__ __forceinline__ int w8_small_t_swizzle_64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
@@ -85,14 +71,11 @@ __device__ __forceinline__ W8SmallTMmaSharedStorage<Schedule>& w8_small_t_shared
     }
 }
 
-template <class Geometry, int ActiveCols, class Schedule, class Output,
-          class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
-          bool DirectPairEpilogue = false>
+template <class Geometry, int ActiveCols, class Schedule>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {},
-    RowPolicy row_policy = {}) {
+    const std::uint8_t* __restrict__ scales, W8ContiguousOutput output) {
     constexpr int kHidden     = Geometry::kInputRows;
     constexpr int kTileK      = Schedule::kTileKPerWarp;
     constexpr int kWarps      = Schedule::kKWarps;
@@ -103,7 +86,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     constexpr int kTileCols   = Schedule::kTileTokens;
     static_assert((kHidden % kGroupK) == 0);
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols);
-    static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
     constexpr int kNt        = kTileCols / 8;
     constexpr unsigned kMask = 0xffffffffu;
 
@@ -119,7 +101,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     const int lid     = lane & 3;
     const int k_split = warp;
 
-    const int cta_row0 = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
+    const int cta_row0 = static_cast<int>(blockIdx.x) * kRowsPerCta;
 
     const auto stage_x = [&](int group_k0) {
         constexpr bool kPaddedStage =
@@ -149,7 +131,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
 #pragma unroll
         for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
             const int row        = warp * Schedule::kRowsPerLoaderWarp + row_item;
-            const int weight_row = row_policy.weight_row(cta_row0, row);
+            const int weight_row = cta_row0 + row;
             for (int chunk = lane; chunk < kGroupK / 16; chunk += 32) {
                 const int swizzled_chunk = chunk ^ (row & 7);
                 cp_async<16, Schedule::kWeightCache>(
@@ -163,7 +145,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
             for (int item = tid; item < kMmaRows * kScaleChunksPerRow; item += kWarps * 32) {
                 const int row        = item / kScaleChunksPerRow;
                 const int chunk      = item - row * kScaleChunksPerRow;
-                const int weight_row = row_policy.weight_row(cta_row0, row);
+                const int weight_row = cta_row0 + row;
                 cp_async<16, Schedule::kWeightCache>(
                     &scale_shared[row][chunk * 16],
                     scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
@@ -203,7 +185,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                 lane_scale_pair =
                     *reinterpret_cast<const unsigned*>(&scale_shared[scale_row][warp_koff / 16]);
             } else {
-                const int scale_row = row_policy.weight_row(cta_row0, gid + lid * 8);
+                const int scale_row = cta_row0 + gid + lid * 8;
                 lane_scale_pair     = *reinterpret_cast<const unsigned*>(
                     scales + (static_cast<std::int64_t>(scale_row) * Geometry::kGroupsPerRow +
                               group_k0 / 32 + warp_koff / 32) *
@@ -305,7 +287,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
 
     if (k_split == 0) {
         const W8OutputTile output_tile = output.tile(cta_row0);
-        float* projected               = partial;
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {
             float4 sum = make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]);
@@ -318,48 +299,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                 sum.z += value.z;
                 sum.w += value.w;
             }
-            const int col0 = ni * 8 + 2 * lid;
-            if constexpr (std::is_same_v<Epilogue, W8SmallTMmaStoreEpilogue> ||
-                          std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue>) {
-                const auto store = [&](int row, int col, float value) {
-                    __nv_bfloat16* destination = output_tile.at(row, col);
-                    if constexpr (std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue>) {
-                        value += __bfloat162float(*destination);
-                    }
-                    *destination = __float2bfloat16_rn(value);
-                };
-                if (col0 < ActiveCols) {
-                    store(cta_row0 + gid, col0, sum.x);
-                    store(cta_row0 + gid + 8, col0, sum.z);
-                }
-                if (col0 + 1 < ActiveCols) {
-                    store(cta_row0 + gid, col0 + 1, sum.y);
-                    store(cta_row0 + gid + 8, col0 + 1, sum.w);
-                }
-            } else if constexpr (DirectPairEpilogue) {
-                epilogue.template store_pair<ActiveCols>(cta_row0 + gid, col0, sum);
-            } else {
-                if (col0 < ActiveCols) {
-                    projected[gid * kTileCols + col0]       = sum.x;
-                    projected[(gid + 8) * kTileCols + col0] = sum.z;
-                }
-                if (col0 + 1 < ActiveCols) {
-                    projected[gid * kTileCols + col0 + 1]       = sum.y;
-                    projected[(gid + 8) * kTileCols + col0 + 1] = sum.w;
-                }
+            const int col0   = ni * 8 + 2 * lid;
+            const auto store = [&](int row, int col, float value) {
+                *output_tile.at(row, col) = __float2bfloat16_rn(value);
+            };
+            if (col0 < ActiveCols) {
+                store(cta_row0 + gid, col0, sum.x);
+                store(cta_row0 + gid + 8, col0, sum.z);
             }
-        }
-        if constexpr (!std::is_same_v<Epilogue, W8SmallTMmaStoreEpilogue> &&
-                      !std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue> &&
-                      !DirectPairEpilogue) {
-            __syncwarp();
-            if (lane < kRowsPerCta) {
-                float row_values[ActiveCols];
-#pragma unroll
-                for (int token = 0; token < ActiveCols; ++token) {
-                    row_values[token] = projected[lane * kTileCols + token];
-                }
-                epilogue.store(cta_row0 + lane, row_values);
+            if (col0 + 1 < ActiveCols) {
+                store(cta_row0 + gid, col0 + 1, sum.y);
+                store(cta_row0 + gid + 8, col0 + 1, sum.w);
             }
         }
     }

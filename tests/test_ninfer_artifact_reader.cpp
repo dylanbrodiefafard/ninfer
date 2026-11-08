@@ -206,10 +206,9 @@ void test_common_validation() {
         try {
             Reader reader(fixture.path);
         } catch (const ninfer::artifact::ArtifactError& error) {
-            if (std::string_view(error.what())
-                    .find("python3 -m tools.artifact.migrate_v1_to_v2 <artifact>") ==
+            if (std::string_view(error.what()).find("NInfer artifact v1 is not supported") ==
                 std::string_view::npos) {
-                throw std::runtime_error("v1 rejection omitted the migration command");
+                throw std::runtime_error("v1 rejection has the wrong message");
             }
             return;
         }

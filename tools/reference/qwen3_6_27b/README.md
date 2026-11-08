@@ -1,45 +1,22 @@
-# Qwen3.6-27B Python reference
+# Qwen3.8-27B Python Vision reference
 
-This is the complete target-private Text, Vision, MTP, sampling, state, and weight-residency
-reference over a native `.ninfer` artifact. It uses typed artifact bindings and remains independent
-from the C++ Engine implementation.
+This is the target-private, artifact-native Vision reference over a `qwen3.8-27b/nvfp4` `.ninfer`
+artifact. It is independent of the C++ Engine implementation and has one consumer: the Vision
+intermediate validation campaign in [`tools/parity/qwen3_6_27b/`](../../parity/qwen3_6_27b/README.md).
 
-It does not need the original Hugging Face checkpoint at inference time. `Frontend` materializes the
-tokenizer, chat template, generation defaults, and image/video processor resources embedded in the
-artifact, then delegates those functions to Transformers.
+- `bindings.py`: `VisionArtifactBinding` validates the artifact identity, the six frontend
+  resources, and the complete 333-tensor Vision inventory, then exposes typed Vision blocks. Text,
+  MTP, draft-head, and DFlash2 objects are not inspected.
+- `weights.py`: `WeightStore` decodes direct Vision controls once and streams each quantized
+  matrix from the artifact mapping, dequantizing it on use.
+- `vision.py`: `VisionEncoder` runs the fixed 27-block Vision schedule and the merger, reporting
+  every Op boundary through an optional tap.
+- `config.py` and `ops.py`: the fixed Vision dimensions and the BF16-boundary `linear` and
+  `residual_add` operators. The remaining Vision operators, the frontend, and MRoPE prompt
+  metadata live in `tools/reference/qwen3_6/common/`.
 
-## Run
+The frontend does not need the original Hugging Face checkpoint: `Frontend` materializes the
+tokenizer, chat template, and image/video processor resources embedded in the artifact, then
+delegates preprocessing to Transformers.
 
-Install the target dependencies from `requirements.txt`, then run:
-
-```bash
-python3 \
-  -m tools.reference.qwen3_6_27b \
-  --weights out/qwen3_6_27b.ninfer \
-  --prompt "请简短介绍一下你自己。" --decode 512
-```
-
-The input is exactly one of `--prompt`, `--ids`, or `--messages`. Structured messages may contain
-images and videos in the normal Transformers format. Thinking is enabled by default and can be
-disabled with `--no-thinking`.
-
-MTP is disabled by default. Enable one to five draft positions with
-`--mtp-draft-tokens 1..5`; `--draft-head` selects the artifact's optimized proposal head. Target
-verification always uses the full output head. The CLI reports round counts, per-position accepted
-drafts, fallback steps, timing, memory planning, and peak CUDA allocation.
-
-Important runtime controls include:
-
-- `--gpu-memory auto|24GiB` and `--headroom 2GiB`;
-- `--kv-dtype bf16|int8`;
-- `--prefill-chunk N`;
-- `--greedy` or sampling overrides for temperature, top-p, top-k, and penalties;
-- `--vision-attention-limit N`;
-- `--activation-dump DIR --dump-level layer|op`.
-
-Quantized Text matrices retain the decoded/packed/streamed residency plan and compiled low-bit
-codec. Vision decodes large matrices one at a time and releases its weight store before Text weight
-preparation. Multimodal MTP uses the composed Vision embedding for the shifted input, including at
-prefill chunk boundaries.
-
-The target-specific source-BF16 Vision comparison lives in `tools/parity/qwen3_6_27b/`.
+Install the dependencies from `requirements.txt`; the parity README gives the campaign command.

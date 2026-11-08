@@ -363,7 +363,7 @@ void disk_forks_and_shutdown(const char* artifact) {
 
 int main() {
     const char* dflash     = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
-    const char* base       = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
+    const char* base       = std::getenv("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
     const bool have_dflash = dflash != nullptr && *dflash != '\0';
     if (!have_dflash && (base == nullptr || *base == '\0')) {
         std::cout << "skip: set a supported NVFP4 artifact environment variable\n";

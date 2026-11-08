@@ -113,10 +113,10 @@ routing map, not a mandatory reading list:
   layouts, and paged consumer contracts;
 - `docs/maintainer/artifact-container.md`, `storage-layouts.md`, and `tensor-formats.md`:
   generic `.ninfer` contracts;
-- `docs/maintainer/qwen3.6-27b-artifact.md`, `qwen3.8-27b-artifact.md`, and
-  `qwen3.6-35b-a3b-artifact.md`: target inventories, conversion, and binding;
-- `docs/maintainer/qwen3.6-27b-model.md` (also: family/Variant package structure) and
-  `qwen3.6-35b-a3b-model.md`: model mathematics, dimensions, and state semantics;
+- `docs/maintainer/qwen3.8-27b-artifact.md`: the registered target's inventory, storage profiles,
+  conversion, and binding;
+- `docs/maintainer/qwen3.6-27b-model.md` (also: family/Variant package structure): Qwen3.6-family
+  27B model mathematics, dimensions, and state semantics;
 - `docs/maintainer/op-development.md`: Op admission, contracts, ownership, qualification, and
   performance-evidence rules;
 - `docs/maintainer/kernel-iteration.md`: Layer 0-3 CUDA speed procedure (`tools.kdev`
@@ -143,7 +143,7 @@ them, updating the corresponding authorities and implementation together.
 | `src/core` | device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV-cache containers, raw transfer mechanisms | |
 | `src/artifact` | generic `.ninfer` framing, descriptors, binding primitives, materialization | checkpoint execution semantics |
 | `src/ops` | every semantically closed Op implementation, including fused, fixed-shape, and device-specialized paths; ownership follows the mathematical or state-transition contract, not the first model caller or demonstrated cross-target reuse | |
-| `src/targets/qwen3_6` | Qwen3.6-family invariants shared by 27B and 35B-A3B: tokenizer/template and output semantics, media preprocessing and MRoPE prompt construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive Vision definitions, and the fixed planning/Program/Text/Vision/speculative/state/workspace/CUDA-Graph algorithms | target identity, registry entry, artifact binder, target leaf implementation, storage for a live Program instance |
+| `src/targets/qwen3_6` | shared Qwen3.6-family architecture code used by the Qwen3.8-27B target: tokenizer/template and output semantics, media preprocessing and MRoPE prompt construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive Vision definitions, and the fixed planning/Program/Text/Vision/speculative/state/workspace/CUDA-Graph algorithms | target identity, registry entry, artifact binder, target leaf implementation, storage for a live Program instance |
 | `src/targets/<package>` | registered checkpoint identities, storage profiles, binder, `LoadedModel`, configuration, populated family model-view values and private leaf payloads, diagnostics, graph frontier values, and exactly three execution-leaf families (attention projection, GDN projection/control, post-mixer); aliases and instantiates the family runtime types | a copied Program, Text/Vision/speculative schedule, workspace composition, state transaction, or graph-capture algorithm; leaf Ops remain in `src/ops` |
 | `src/runtime` | common contracts, generated-token transaction/publication policy, public Engine PIMPL | model mathematics or target state |
 | `src/media/decode` | consuming already-owned bytes | URL/path/data acquisition, which belongs to `src/product/media_acquire`, CLI, or serving and is not linked into a target |

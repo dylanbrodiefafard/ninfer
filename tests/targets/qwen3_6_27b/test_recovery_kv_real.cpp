@@ -154,10 +154,10 @@ void exercise_exact_fork(execution::ProgramImplCore& program, family::Frontend& 
     const auto text_pages = 1U + (frontier - 1U) / 64U;
     const auto text_image =
         kv_prefix_image(program, source_kv.text, program.decoder->text_kv.pool(), text_pages);
-    auto* backend_cache =
-        program.speculative_backend == ninfer::SpeculativeBackend::Mtp
-            ? program.decoder->mtp_cache()
-            : (program.dflash && program.dflash->full ? &*program.dflash->full : nullptr);
+    // MTP owns the only backend KV cache; DFlash2 keeps its context in the cyclic local cache.
+    auto* backend_cache = program.speculative_backend == ninfer::SpeculativeBackend::Mtp
+                              ? program.decoder->mtp_cache()
+                              : nullptr;
     std::vector<std::byte> backend_image;
     const auto backend_tokens =
         program.speculative_backend == ninfer::SpeculativeBackend::Mtp ? frontier - 1 : frontier;
@@ -421,9 +421,9 @@ void exercise_live_continuation(execution::ProgramImplCore& program, family::Fro
         value.text = kv_prefix_image(program, sequence.kv->text, program.decoder->text_kv.pool(),
                                      sequence.kv->text.mapped_page_count());
         if (sequence.kv->backend) {
-            value.backend =
-                kv_prefix_image(program, *sequence.kv->backend, program.dflash->full->pool(),
-                                sequence.kv->backend->mapped_page_count());
+            value.backend = kv_prefix_image(program, *sequence.kv->backend,
+                                            program.decoder->mtp_cache()->pool(),
+                                            sequence.kv->backend->mapped_page_count());
         }
         if (program.dflash) {
             value.cyclic.resize(program.dflash->local.lane_host_bytes());
@@ -791,8 +791,7 @@ int main(int argc, char** argv) {
     const bool live_only =
         allocation_case || (argc == 2 && std::string(argv[1]) == "--live-continuation");
     if (argc != 1 && !forks_only && !live_only) { return 1; }
-    const char* nvfp4                  = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    const char* group                  = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
+    const char* nvfp4                  = std::getenv("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
     const char* dflash                 = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
     const char* artifact               = nullptr;
     ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::None;
@@ -801,8 +800,6 @@ int main(int argc, char** argv) {
         backend  = ninfer::SpeculativeBackend::DFlash;
     } else if (nvfp4 != nullptr && *nvfp4 != '\0') {
         artifact = nvfp4;
-    } else if (group != nullptr && *group != '\0') {
-        artifact = group;
     } else {
         std::cout << "skip: set a supported base or DFlash artifact environment variable\n";
         return 77;

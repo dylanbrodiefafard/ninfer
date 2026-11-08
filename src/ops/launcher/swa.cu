@@ -1,7 +1,7 @@
 #include "ops/launcher/swa.h"
 
 #include "core/device.h"
-#include "ops/kernel/bidirectional_gqa_attention.cuh"
+#include "ops/kernel/swa.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -96,12 +96,11 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
             plan.split_capacity > kSwaMaxCandidateSplit || (direct && plan.split_capacity != 1)) {
             throw std::invalid_argument("swa: inconsistent plan");
         }
-        const int window       = static_cast<int>(context.capacity);
-        constexpr int KeyBlock = 32;
-        constexpr std::size_t SmemBytes =
-            2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
+        const int window                = static_cast<int>(context.capacity);
+        constexpr int KeyBlock          = 32;
+        constexpr std::size_t SmemBytes = 2u * KeyBlock * kSwaHeadDim * sizeof(__nv_bfloat16);
         if (direct) {
-            const dim3 direct_grid(kBidirectionalGqaKVHeads, 1, q.ne[3]);
+            const dim3 direct_grid(kSwaKVHeads, 1, q.ne[3]);
             swa_split_partial_kernel<Tokens, Warps, KeyBlock, true>
                 <<<direct_grid, Warps * 32, SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
@@ -120,7 +119,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
             return;
         }
 
-        const dim3 partial_grid(kBidirectionalGqaKVHeads, plan.split_capacity, q.ne[3]);
+        const dim3 partial_grid(kSwaKVHeads, plan.split_capacity, q.ne[3]);
         swa_split_partial_kernel<Tokens, Warps, KeyBlock, false>
             <<<partial_grid, Warps * 32, SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
@@ -138,7 +137,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
         CUDA_CHECK(cudaGetLastError());
 
         constexpr int ReduceWarps = 1;
-        constexpr int ReduceRows  = kBidirectionalGqaQHeads * Tokens;
+        constexpr int ReduceRows  = kSwaQHeads * Tokens;
         const dim3 reduce_grid((ReduceRows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
         swa_reduce_kernel<Tokens, KeyBlock, ReduceWarps>
             <<<reduce_grid, ReduceWarps * 32, 0, stream>>>(

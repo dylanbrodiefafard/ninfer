@@ -1,9 +1,14 @@
 #include "ops/linear/q4/q4_launch.h"
 
 #include "core/device.h"
-#include "ops/linear/q4/q4_small_t_mma.cuh"
+#include "ops/common/memory.cuh"
+#include "ops/common/mma.cuh"
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <array>
+#include <cstdint>
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
@@ -11,20 +16,37 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kFirstSmallT    = 2;
-constexpr int kLastFullT      = 48;
-constexpr int kLastOptimizedT = 20;
-using FullGeometry            = Q4DraftHeadGeometry<5120>;
-using OptimizedGeometry       = Q4DraftHeadGeometry<2048>;
+constexpr int kFirstSmallT = 2;
+constexpr int kLastSmallT  = 48;
+
+struct Q4DraftHeadGeometry {
+    static constexpr int kOutputRows   = 131072;
+    static constexpr int kInputRows    = 5120;
+    static constexpr int kGroupsPerRow = kInputRows / 64;
+};
+
+union Q4Bf16PairBits {
+    __nv_bfloat162 pair;
+    unsigned bits;
+};
+
+// Decodes one packed byte of two signed 4-bit codes (low nibble first) into a BF16 MMA pair.
+__device__ __forceinline__ unsigned q4_bf16_pair(std::uint8_t packed) {
+    const int q0 = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
+    const int q1 = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
+    Q4Bf16PairBits result;
+    result.pair = __floats2bfloat162_rn(static_cast<float>(q0), static_cast<float>(q1));
+    return result.bits;
+}
 
 // Each warp owns sixteen weight rows over the full K, and the CTA's warps share one staged
 // activation tile, so activation traffic per weight byte stays small as T grows. Every output
 // accumulates ascending 64-wide scale groups, independent of T and of the tile schedule.
-template <class Geometry, int TileCols, int ActiveCols, int Stages, int kRows, int KC>
+template <int TileCols, int ActiveCols, int Stages, int kRows, int KC>
 __global__ __launch_bounds__(kRows * 2) void q4_draft_head_rows_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
-    constexpr int K = Geometry::kInputRows, kNt = TileCols / 8, kThreads = kRows * 2;
+    constexpr int K = Q4DraftHeadGeometry::kInputRows, kNt = TileCols / 8, kThreads = kRows * 2;
     constexpr int KT = K / KC, kCodeStride = KC / 2 + 16;
     static_assert(K % KC == 0 && KT >= Stages);
 
@@ -48,11 +70,11 @@ __global__ __launch_bounds__(kRows * 2) void q4_draft_head_rows_kernel(
                                         kt * (KC / 2) + chunk * 16);
         }
         for (int row = tid; row < kRows; row += kThreads) {
-            cp_async<(KC / 64) * 2>(
-                &st.scales[row][0],
-                scales + (static_cast<std::int64_t>(row0 + row) * Geometry::kGroupsPerRow +
-                          kt * (KC / 64)) *
-                             2);
+            cp_async<(KC / 64) * 2>(&st.scales[row][0],
+                                    scales + (static_cast<std::int64_t>(row0 + row) *
+                                                  Q4DraftHeadGeometry::kGroupsPerRow +
+                                              kt * (KC / 64)) *
+                                                 2);
         }
         for (int task = tid; task < ActiveCols * (KC / 8); task += kThreads) {
             const int col = task / (KC / 8), k8 = task % (KC / 8);
@@ -80,10 +102,10 @@ __global__ __launch_bounds__(kRows * 2) void q4_draft_head_rows_kernel(
 #pragma unroll
             for (int ks = 0; ks < 4; ++ks) {
                 const int byte    = g * 32 + ks * 8 + lid;
-                const unsigned a0 = q4_small_t_bf16_pair(st.codes[top][byte]);
-                const unsigned a1 = q4_small_t_bf16_pair(st.codes[bottom][byte]);
-                const unsigned a2 = q4_small_t_bf16_pair(st.codes[top][byte + 4]);
-                const unsigned a3 = q4_small_t_bf16_pair(st.codes[bottom][byte + 4]);
+                const unsigned a0 = q4_bf16_pair(st.codes[top][byte]);
+                const unsigned a1 = q4_bf16_pair(st.codes[bottom][byte]);
+                const unsigned a2 = q4_bf16_pair(st.codes[top][byte + 4]);
+                const unsigned a3 = q4_bf16_pair(st.codes[bottom][byte + 4]);
 #pragma unroll
                 for (int nt = 0; nt < kNt; ++nt) {
                     unsigned b0, b1;
@@ -113,20 +135,20 @@ __global__ __launch_bounds__(kRows * 2) void q4_draft_head_rows_kernel(
         for (int j = 0; j < 4; ++j) {
             const int col = nt * 8 + 2 * lid + (j & 1);
             if (col < ActiveCols) {
-                out[static_cast<std::int64_t>(col) * Geometry::kOutputRows + row0 +
+                out[static_cast<std::int64_t>(col) * Q4DraftHeadGeometry::kOutputRows + row0 +
                     (j < 2 ? top : bottom)] = __float2bfloat16_rn(acc[nt][j]);
             }
         }
     }
 }
 
-template <class Geometry, int TileTokens, int ActiveTokens>
+template <int TileTokens, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     // K256 stages stream 128 contiguous code bytes per row; above 24 tokens the activation tile
     // grows, so three K128 stages keep the same staged bytes. Both keep every output's reduction.
     constexpr int kStages = TileTokens <= 24 ? 2 : 3, kChunk = TileTokens <= 24 ? 256 : 128;
     constexpr auto kernel =
-        q4_draft_head_rows_kernel<Geometry, TileTokens, ActiveTokens, kStages, 128, kChunk>;
+        q4_draft_head_rows_kernel<TileTokens, ActiveTokens, kStages, 128, kChunk>;
     constexpr int smem =
         kStages * (128 * (kChunk / 2 + 16) + 128 * (kChunk / 64) * 2 + TileTokens * kChunk * 2);
     static const bool configured = [] {
@@ -134,44 +156,33 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
         return true;
     }();
     (void)configured;
-    kernel<<<Geometry::kOutputRows / 128, 256, smem, stream>>>(
+    kernel<<<Q4DraftHeadGeometry::kOutputRows / 128, 256, smem, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Geometry, int First, std::size_t... Offsets>
+template <std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Q4Launch, sizeof...(Offsets)>{
-        &launch_exact<Geometry, ((First + static_cast<int>(Offsets) + 7) / 8) * 8,
-                      First + static_cast<int>(Offsets)>...};
+        &launch_exact<((kFirstSmallT + static_cast<int>(Offsets) + 7) / 8) * 8,
+                      kFirstSmallT + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kFullLaunchers = make_launchers<FullGeometry, kFirstSmallT>(
-    std::make_index_sequence<kLastFullT - kFirstSmallT + 1>{});
-constexpr auto kOptimizedLaunchers = make_launchers<OptimizedGeometry, kFirstSmallT>(
-    std::make_index_sequence<kLastOptimizedT - kFirstSmallT + 1>{});
-
-template <class Geometry>
-bool matches(const Tensor& x, const Weight& weight) {
-    return weight.n == Geometry::kOutputRows && weight.k == Geometry::kInputRows &&
-           weight.padded_shape[1] == Geometry::kInputRows && x.ne[1] >= kFirstSmallT;
-}
+constexpr auto kLaunchers =
+    make_launchers(std::make_index_sequence<kLastSmallT - kFirstSmallT + 1>{});
 
 } // namespace
 
 void launch_q4_draft_head_small_t(const Tensor& x, const Weight& weight, Tensor& out,
                                   cudaStream_t stream) {
-    if (matches<FullGeometry>(x, weight) && x.ne[1] <= kLastFullT) {
-        kFullLaunchers[static_cast<std::size_t>(x.ne[1] - kFirstSmallT)](x, weight, out, stream);
-        return;
+    if (weight.n != Q4DraftHeadGeometry::kOutputRows ||
+        weight.k != Q4DraftHeadGeometry::kInputRows ||
+        weight.padded_shape[1] != Q4DraftHeadGeometry::kInputRows || x.ne[1] < kFirstSmallT ||
+        x.ne[1] > kLastSmallT) {
+        throw std::invalid_argument("Q4 Linear draft-head small-T: unsupported exact problem");
     }
-    if (matches<OptimizedGeometry>(x, weight) && x.ne[1] <= kLastOptimizedT) {
-        kOptimizedLaunchers[static_cast<std::size_t>(x.ne[1] - kFirstSmallT)](x, weight, out,
-                                                                              stream);
-        return;
-    }
-    throw std::invalid_argument("Q4 Linear draft-head small-T: unsupported exact problem");
+    kLaunchers[static_cast<std::size_t>(x.ne[1] - kFirstSmallT)](x, weight, out, stream);
 }
 
 } // namespace ninfer::ops::detail

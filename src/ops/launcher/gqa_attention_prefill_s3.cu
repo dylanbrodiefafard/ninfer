@@ -144,11 +144,8 @@ void gqa_s3_prefill_fill_launch(const Tensor& k, const Tensor& v, const Tensor& 
         const Tensor&, const Tensor&, const Tensor&, View, Meta, cudaStream_t)
 
 NINFER_S3_PREFILL_INSTANTIATE(Gqa27Geometry, PagedKVLayerView, GqaPrefillDirectMetadata);
-NINFER_S3_PREFILL_INSTANTIATE(Gqa35Geometry, PagedKVLayerView, GqaPrefillDirectMetadata);
 NINFER_S3_PREFILL_INSTANTIATE(Gqa27Geometry, PagedKVBatchLayerView, GqaPrefillBatchMetadata<false>);
 NINFER_S3_PREFILL_INSTANTIATE(Gqa27Geometry, PagedKVBatchLayerView, GqaPrefillBatchMetadata<true>);
-NINFER_S3_PREFILL_INSTANTIATE(Gqa35Geometry, PagedKVBatchLayerView, GqaPrefillBatchMetadata<false>);
-NINFER_S3_PREFILL_INSTANTIATE(Gqa35Geometry, PagedKVBatchLayerView, GqaPrefillBatchMetadata<true>);
 
 #undef NINFER_S3_PREFILL_INSTANTIATE
 

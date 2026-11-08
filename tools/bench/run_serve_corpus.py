@@ -22,8 +22,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 
 TARGET_MODEL_IDS = {
-    "qwen3_6_35b_a3b": "qwen3.6-35b-a3b",
-    "qwen3_6_27b": "qwen3.6-27b",
     "qwen3_8_27b": "qwen3.8-27b",
 }
 TARGET_ORDER = tuple(TARGET_MODEL_IDS)
@@ -433,10 +431,6 @@ def build_specs(
     for target, artifact in artifacts:
         for mode_name in mode_names:
             backend, draft_tokens, verify_width = SPECULATIVE_MODES[mode_name]
-            if backend == "dflash" and target not in {"qwen3_6_35b_a3b", "qwen3_8_27b"}:
-                raise CampaignError(
-                    "DFlash corpus measurements require the 35B-A3B or Qwen3.8-27B target"
-                )
             selected = block_fixture_names(backend)
             if fixture_filter:
                 unknown = [name for name in fixture_filter if name not in selected]

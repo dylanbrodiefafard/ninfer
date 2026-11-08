@@ -725,16 +725,15 @@ int main() {
     }
 
     int failures = 0;
-    failures += run_case(32, 2, 1, {}, 1701U);
-    failures += run_case(32, 16, 1, {7}, 1711U);
-    failures += run_case(32, 6, 4, {6, 5, 4, 3}, 1721U);
+    failures += run_case(48, 2, 1, {}, 1701U);
+    failures += run_case(48, 16, 1, {7}, 1711U);
+    failures += run_case(48, 6, 4, {6, 5, 4, 3}, 1721U);
     failures += run_case(48, 5, 3, {5, 5, 5}, 1726U);
     failures += run_case(48, 4, 1, {}, 1727U);
     failures += run_case(48, 5, 1, {}, 1728U);
     failures += run_case(48, 6, 1, {}, 1729U);
     failures += run_case(48, 2, 1, {1}, 1731U);
     failures += run_case(48, 6, 4, {6, 4, 3, 2}, 1741U);
-    failures += run_tree_case(32, 1751U);
     failures += run_tree_case(48, 1761U);
     failures += run_tree_chain_matches_sequential(48, 12, 1766U);
     failures += run_tree_chain_matches_sequential(48, 16, 1771U);
@@ -748,7 +747,7 @@ int main() {
         48, 16, {{-1, 0, 1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 0, 12, 12, 0}}, {}, 1791U);
     // Star: one branch with fifteen children; breadth-first order (parents not adjacent).
     failures += run_tree_paths_match_sequential(
-        32, 16, {{-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}, {}, 1796U);
+        48, 16, {{-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}, {}, 1796U);
     failures +=
         run_tree_paths_match_sequential(48, 12, {{-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7}}, {}, 1801U);
     // Two rows with different trees and valid extents in one launch.

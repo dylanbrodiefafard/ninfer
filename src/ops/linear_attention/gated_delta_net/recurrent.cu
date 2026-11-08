@@ -416,13 +416,6 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
         launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows, stream);
         return;
     }
-    if (records.spec.layers == FoldGeometry30x32::kLayers &&
-        records.spec.qk_heads == FoldGeometry30x32::kQkHeads &&
-        records.spec.value_heads == FoldGeometry30x32::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry30x32::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry30x32>(records, states, rows, active_rows, stream);
-        return;
-    }
     throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");
 }
 

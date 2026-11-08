@@ -38,10 +38,6 @@ cudaError_t launch_prepare_wy_wu(const prepare_wy_wu_config& cfg) {
     NINFER_GATED_DELTA_NET_PROPAGATE(v.check_grid(NT, cfg.H_v));
 
     const dim3 grid(static_cast<unsigned>(NT), static_cast<unsigned>(cfg.H_v), 1);
-    if (cfg.H_v == 32) {
-        return cfg.private_fp16 ? launch_fixed<true, 32, 16, 4>(cfg, grid, qk_map)
-                                : launch_fixed<false, 32, 16, 4>(cfg, grid, qk_map);
-    }
     return cfg.private_fp16 ? launch_fixed<true, 64, 32, 8>(cfg, grid, qk_map)
                             : launch_fixed<false, 64, 32, 8>(cfg, grid, qk_map);
 }

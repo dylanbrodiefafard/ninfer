@@ -1,10 +1,63 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
 from tools.artifact.layouts import decode_row_split_codes, dequantize_row_split
+from tools.artifact.numeric import QuantFormat, get_format
 from tools.convert.common.quantize import quantize_and_encode, quantize_matrix
+
+
+def _oracle_codes(source: torch.Tensor, format_name: str) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize logical ``[N,K]`` binary32 rows with the registered grouped formula.
+
+    Scales are ``RNE16(RNE32(max_abs / qmax))`` with a nonzero group raised to the
+    smallest binary16 subnormal. Codes are ``RNE(RNE32(x * RNE32(1 / scale)))``
+    clamped to ``[qmin, qmax]``; the K padding is zero.
+    """
+
+    format_spec = get_format(format_name)
+    assert isinstance(format_spec, QuantFormat)
+    rows, k = source.shape
+    group = format_spec.group_size
+    k_pad = -(-k // group) * group
+    values = np.zeros((rows, k_pad), dtype=np.float32)
+    values[:, :k] = source.numpy().astype(np.float32)
+    grouped = values.reshape(rows, k_pad // group, group)
+    max_abs = np.max(np.abs(grouped), axis=-1)
+    scales = (max_abs.astype(np.float64) / float(format_spec.qmax)).astype(np.float32)
+    scales = scales.astype(np.float16)
+    scales[(scales == 0) & (max_abs > 0)] = np.float16(2.0**-24)
+    reciprocal = np.zeros(scales.shape, dtype=np.float32)
+    positive = scales > 0
+    reciprocal[positive] = (1.0 / scales[positive].astype(np.float64)).astype(np.float32)
+    # Products of two binary32 values are exact in binary64, so the explicit
+    # cast supplies the specified binary32 rounding before ties-to-even.
+    normalized = (grouped.astype(np.float64) * reciprocal.astype(np.float64)[..., None]).astype(
+        np.float32
+    )
+    codes = np.clip(np.rint(normalized), format_spec.qmin, format_spec.qmax).astype(np.int8)
+    return scales, codes
+
+
+@pytest.mark.parametrize(
+    ("format_name", "k"),
+    (
+        ("Q4G64_F16S", 65),
+        ("Q5G64_F16S", 130),
+        ("Q6G64_F16S", 129),
+        ("W8G32_F16S", 33),
+    ),
+)
+def test_stored_row_split_codes_match_independent_oracle(format_name: str, k: int) -> None:
+    source = torch.linspace(-3.0, 4.0, 5 * k, dtype=torch.float32).reshape(5, k)
+    payload = quantize_and_encode(source, format_name, device="cpu")
+    stored_scales, stored_codes = decode_row_split_codes(payload, format_name, (5, k))
+    expected_scales, expected_codes = _oracle_codes(source, format_name)
+
+    assert np.array_equal(stored_scales.numpy().view(np.uint16), expected_scales.view(np.uint16))
+    assert np.array_equal(stored_codes.numpy(), expected_codes)
 
 
 def test_quantization_uses_stored_fp16_scale_and_zero_padding() -> None:

@@ -100,7 +100,7 @@ __launch_bounds__(128,
         access, coord, access.width, access.active_columns(coord));
 }
 
-using HistoryFold = FoldAccess<FoldGeometry<48, 16, 48, 10240>>;
+using HistoryFold = FoldAccess<FoldGeometry48x48>;
 
 // Grid [Hv,B,48*8], 128 threads owns disjoint layer/state/value strips. Append copies derived
 // records into the owning slot; flush applies retained and selected ancestor innovations and

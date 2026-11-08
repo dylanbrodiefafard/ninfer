@@ -57,27 +57,6 @@ struct OptimizedProposalWeights {
     Tensor token_ids;
 };
 
-struct DFlashLayerWeights {
-    Tensor input_norm;
-    Weight query_key_value;
-    Weight context_key;
-    Weight context_value;
-    Tensor query_norm;
-    Tensor key_norm;
-    Weight attention_output;
-    Tensor post_attention_norm;
-    Weight gate_up;
-    Weight down;
-};
-
-template <std::size_t Layers>
-struct DFlashWeights {
-    Weight feature_projection;
-    Tensor context_norm;
-    std::array<DFlashLayerWeights, Layers> layers;
-    Tensor final_norm;
-};
-
 struct DFlash2ConvWeights {
     Tensor base_kernel;
     Weight kernel_projection;

@@ -218,7 +218,7 @@ sampling consumes masks/configs. Uploads cover only the batch's own rows. Fixed-
 device staging uses update-safe one-dimensional row copies; pinned host transfers keep
 fixed addresses. DeviceContext's complete drain includes the callback stream, and
 Program drains before destroying borrowed sessions, including an exception after a
-fork but before its join. DFlash V1 keeps one exchanging schedule.
+fork but before its join.
 
 Runtime may withhold a completed repeated call, or pause persistent thinking after a
 committed decode round, and rebuild that request on its existing
@@ -951,7 +951,7 @@ Admission computes a target-specific entitlement for each request. The logical u
 prompt_tokens + effective_output_tokens - 1
 ```
 
-It is rounded up to the page size. The DFlash Full backend uses the same entitlement; the MTP backend also
+It is rounded up to the page size. The MTP backend also
 covers up to `K-1` provisional leading positions, and is truncated by the per-sequence `max_context`. Prefix
 reuse changes only the already-materialized portion and the prefill work; it does not lower the entitlement
 that a new request can ultimately reach.
@@ -1616,7 +1616,7 @@ current_tokens[B]
   -> sampled_tokens[B]
 ```
 
-The ordinary column layout is equivalent to `[D,1,B]`, and column-independent projection/MoE/FFN routes consume the aggregate
+The ordinary column layout is equivalent to `[D,1,B]`, and column-independent projection/FFN routes consume the aggregate
 `T=B` at once. Control code may iterate over lightweight row metadata, but must not call a layer, model
 schedule, lm_head, or sampler separately for each request.
 
@@ -1628,7 +1628,6 @@ merges the current activation columns and the weight-consuming work, and does no
 | Operator family | Batched execution requirement |
 |---|---|
 | Linear, projection, dense FFN | one operator schedule consumes the aggregate row/token extent |
-| MoE | route over the aggregate token set, then execute grouped experts over the whole set |
 | Full attention | consume per-row context length and the substrate-provided KV view as a ragged batch |
 | GDN / linear attention | execute one batched transition over independent per-row recurrent-state handles |
 | `lm_head` | produce, at once, the logits of all active rows or verification positions |
@@ -2172,5 +2171,4 @@ donors of H, and cannot restore temporal credit that has already been consumed.
 - [Paged KV context storage](paged-kv-cache.md)
 - [ReplaySSM GDN technical reference](replayssm-gdn.md)
 - [Serving behavior](../serving.md)
-- [Qwen3.6-27B model semantics](qwen3.6-27b-model.md)
-- [Qwen3.6-35B-A3B model semantics](qwen3.6-35b-a3b-model.md)
+- [Qwen3.6-family 27B model semantics](qwen3.6-27b-model.md)

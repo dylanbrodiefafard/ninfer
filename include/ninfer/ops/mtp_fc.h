@@ -18,7 +18,7 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   BF16 embedding_norm and hidden_norm [D,T], NVFP4 weight [N, 2D], BF16 out [N,T], all
- *   contiguous and 16-byte aligned. The registered domain is D=5120, N=5120 (Qwen3.6-27B MTP
+ *   contiguous and 16-byte aligned. The registered domain is D=5120, N=5120 (Qwen3.8-27B MTP
  *   `fc`). T is every positive column count.
  *
  * Numeric:

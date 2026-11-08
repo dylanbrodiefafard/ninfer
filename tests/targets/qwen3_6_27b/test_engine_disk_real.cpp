@@ -1995,9 +1995,8 @@ int main(int argc, char** argv) {
         return fail(
             "usage: disk_real [--case corrupt|metadata|event|dflash|suffix|checkpoint-heads]");
     }
-    const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
-    const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+    const char* nvfp4  = std::getenv("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
+    const char* dflash = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
     if (heads_only) {
         if (dflash == nullptr || *dflash == '\0') { return 77; }
         return exercise_disk_checkpoint_heads(dflash);
@@ -2008,23 +2007,10 @@ int main(int argc, char** argv) {
         if (result == 0) { std::cout << "ok DFlash disk restore and continuation\n"; }
         return result;
     }
-    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0') &&
-        (dflash == nullptr || *dflash == '\0')) {
-        std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS, "
-                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS, or "
+    if ((nvfp4 == nullptr || *nvfp4 == '\0') && (dflash == nullptr || *dflash == '\0')) {
+        std::cout << "skip: set NINFER_QWEN3_8_27B_NVFP4_WEIGHTS or "
                      "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
         return 77;
-    }
-    if (groupwise != nullptr && *groupwise != '\0') {
-        if (const int result = (suffix_only     ? exercise_suffix_prefill(groupwise)
-                                : event_only    ? exercise_corrupt_restore_falls_back(
-                                                      groupwise, false, RestoreFault::CopyEvent)
-                                : metadata_only ? exercise_disk_metadata_fallback(groupwise)
-                                : corrupt_only  ? exercise_corrupt_restore_falls_back(groupwise)
-                                                : exercise_artifact(groupwise));
-            result != 0) {
-            return result;
-        }
     }
     if (nvfp4 != nullptr && *nvfp4 != '\0') {
         if (const int result = (suffix_only     ? exercise_suffix_prefill(nvfp4)

@@ -1,11 +1,11 @@
 // Cold-cache benchmark for the public pure Linear contract.
 //
 // Examples:
-//   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --t 8
-//   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
+//   ./build/bench/ninfer_linear_bench --qtype q4 --n 6144 --k 5120 --t 8
+//   ./build/bench/ninfer_linear_bench --qtype q4 --n 6144 --k 5120 --sweep 1:32:1
 //   ./build/bench/ninfer_linear_bench --suite qwen3_6_27b
 //   ncu --profile-from-start off ./build/bench/ninfer_linear_bench
-//       --qtype q4 --n 4096 --k 5120 --t 8 --profile
+//       --qtype q4 --n 6144 --k 5120 --t 8 --profile
 
 #include "ninfer/ops/linear.h"
 
@@ -58,9 +58,7 @@ struct SuiteEntry {
 };
 
 constexpr SuiteEntry kQwen27bEntries[] = {
-    {"27b.output_head", QType::Q6G64_F16S, 248320, 5120, TClass::Continuous},
     {"27b.draft_head", QType::Q4G64_F16S, 131072, 5120, TClass::Continuous},
-    {"27b.gdn_output_gate", QType::Q5G64_F16S, 6144, 5120, TClass::Continuous},
     {"27b.mtp_input", QType::W8G32_F16S, 5120, 10240, TClass::Continuous},
     {"27b.mtp_attention", QType::W8G32_F16S, 14336, 5120, TClass::Continuous},
     {"27b.mtp_gate_up", QType::W8G32_F16S, 34816, 5120, TClass::Continuous},
@@ -72,20 +70,6 @@ constexpr SuiteEntry kQwen27bEntries[] = {
     {"27b.vision_fc2", QType::Q5G64_F16S, 1152, 4304, TClass::VisionStep4},
     {"27b.vision_merger_fc1", QType::W8G32_F16S, 4608, 4608, TClass::VisionStep4},
     {"27b.vision_merger_fc2", QType::W8G32_F16S, 5120, 4608, TClass::VisionStep4},
-};
-
-constexpr SuiteEntry kQwen35bEntries[] = {
-    {"35b.output_head", QType::Q6G64_F16S, 248320, 2048, TClass::Continuous},
-    {"35b.draft_head", QType::Q4G64_F16S, 131072, 2048, TClass::Continuous},
-    {"35b.mtp_projection", QType::W8G32_F16S, 2048, 4096, TClass::Continuous},
-    {"35b.dflash_feature", QType::W8G32_F16S, 2048, 16384, TClass::Continuous},
-    {"35b.vision_patch", QType::Q6G64_F16S, 1152, 1536, TClass::VisionStep4},
-    {"35b.vision_qkv", QType::Q4G64_F16S, 3456, 1152, TClass::VisionStep4},
-    {"35b.vision_attn_out", QType::Q5G64_F16S, 1152, 1152, TClass::VisionStep4},
-    {"35b.vision_fc1", QType::Q4G64_F16S, 4304, 1152, TClass::VisionStep4},
-    {"35b.vision_fc2", QType::Q5G64_F16S, 1152, 4304, TClass::VisionStep4},
-    {"35b.vision_merger_fc1", QType::W8G32_F16S, 4608, 4608, TClass::VisionStep4},
-    {"35b.vision_merger_fc2", QType::W8G32_F16S, 2048, 4608, TClass::VisionStep4},
 };
 
 struct Sweep {
@@ -319,7 +303,7 @@ void usage(const char* argv0) {
         "Usage:\n"
         "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
         "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] [options]\n"
-        "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
+        "  %s --suite qwen3_6_27b [options]\n\n"
         "Options:\n"
         "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
         "  --profile          Capture exactly one post-warmup public Linear call.\n"
@@ -385,8 +369,8 @@ Options parse_args(int argc, char** argv) {
         throw std::invalid_argument("--t and --sweep are mutually exclusive");
     }
     if (opt.have_suite) {
-        if (opt.suite != "qwen3_6_27b" && opt.suite != "qwen3_6_35b_a3b" && opt.suite != "all") {
-            throw std::invalid_argument("--suite must be qwen3_6_27b, qwen3_6_35b_a3b, or all");
+        if (opt.suite != "qwen3_6_27b") {
+            throw std::invalid_argument("--suite must be qwen3_6_27b");
         }
         if (opt.have_qtype || opt.have_n || opt.have_k || opt.have_t || opt.have_sweep) {
             throw std::invalid_argument("--suite cannot be combined with an explicit point");
@@ -448,12 +432,7 @@ void append_suite(std::vector<BenchPoint>& points, const SuiteEntry (&entries)[N
 std::vector<BenchPoint> expand_points(const Options& opt) {
     std::vector<BenchPoint> points;
     if (opt.have_suite) {
-        if (opt.suite == "qwen3_6_27b" || opt.suite == "all") {
-            append_suite(points, kQwen27bEntries);
-        }
-        if (opt.suite == "qwen3_6_35b_a3b" || opt.suite == "all") {
-            append_suite(points, kQwen35bEntries);
-        }
+        append_suite(points, kQwen27bEntries);
         return points;
     }
     if (opt.have_t) {

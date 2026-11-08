@@ -5,7 +5,7 @@
 //   prefill chunk T=1024
 //
 // Narrow one-case profiling examples:
-//   ./ninfer_rmsnorm_bench --kind dflash_hidden --tokens 1024
+//   ./ninfer_rmsnorm_bench --kind hidden27 --tokens 1024
 //   ./ninfer_rmsnorm_bench --kind dflash_q --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
 //   ncu ... ./ninfer_rmsnorm_bench --kind dflash_k --tokens 16 --profile
 #include "ninfer/ops/gated_rmsnorm.h"
@@ -47,17 +47,9 @@ enum class Route {
 };
 
 constexpr Shape kShapes[] = {
-    {"dflash_hidden", 2048, 1, false, false, true},
-    {"dflash_q", 128, 32, false, false, true},
-    {"dflash_k", 128, 8, false, false, true},
-    {"target_hidden35", 2048, 1, true, false, false},
-    {"target_q35", 256, 16, true, false, false},
-    {"target_k35", 256, 2, true, false, false},
-    {"gated35", 128, 32, false, true, false},
-    {"gated27", 128, 48, false, true, false},
-    {"hidden27", 5120, 1, true, false, false},
-    {"target_q27", 256, 24, true, false, false},
-    {"target_k27", 256, 4, true, false, false},
+    {"dflash_q", 128, 32, false, false, true},   {"dflash_k", 128, 8, false, false, true},
+    {"gated27", 128, 48, false, true, false},    {"hidden27", 5120, 1, true, false, false},
+    {"target_q27", 256, 24, true, false, false}, {"target_k27", 256, 4, true, false, false},
 };
 
 template <int Block, bool Gated>
@@ -151,7 +143,6 @@ std::vector<int> parse_t_sweep(const char* value) {
 const char* production_route(const Shape& shape, int rows) {
     (void)rows;
     if (!shape.unit_offset && !shape.gated && shape.d == 128) { return "fixed-d128-bf16x2-b128"; }
-    if (!shape.unit_offset && !shape.gated && shape.d == 2048) { return "fixed-d2048-bf16x2-b512"; }
     if (shape.d <= 256) { return "warp-bf16x2-b512"; }
     if (shape.d <= 3072) { return "cta-bf16x2-b256"; }
     return "cta-bf16x2-b512";
@@ -166,14 +157,8 @@ void launch_plain_candidate(const Shape& shape, const void* x, const void* weigh
                stream>>>(static_cast<const __nv_bfloat162*>(x),
                          static_cast<const __nv_bfloat162*>(weight), nullptr,
                          static_cast<__nv_bfloat162*>(out), shape.d, rows, 1.0e-6f);
-    } else if (shape.d == 2048) {
-        constexpr int kMaxPairsPerThread = 1024 / Block;
-        ops::rmsnorm_cta_bf16x2_kernel<ops::RmsEpilogue::Plain, Block, kMaxPairsPerThread>
-            <<<static_cast<unsigned int>(rows), Block, 0, stream>>>(
-                static_cast<const __nv_bfloat162*>(x), static_cast<const __nv_bfloat162*>(weight),
-                nullptr, static_cast<__nv_bfloat162*>(out), shape.d, rows, 1.0e-6f);
     } else {
-        throw std::invalid_argument("RMSNorm candidate requires plain D128 or D2048");
+        throw std::invalid_argument("RMSNorm candidate requires plain D128");
     }
 }
 
@@ -213,9 +198,6 @@ void run(const Shape& shape, int tokens, Route route, bool profile) {
                     rmsnorm_warp_payload_control<block, false>
                         <<<grid, block, 0, stream>>>(x2, w2, z2, out2, shape.d, rows);
                 }
-            } else if (shape.d == 2048 && !shape.unit_offset && !shape.gated) {
-                rmsnorm_cta_payload_control<512, false>
-                    <<<rows, 512, 0, stream>>>(x2, w2, z2, out2, shape.d, rows);
             } else if (shape.d <= 3072) {
                 if (shape.gated) {
                     rmsnorm_cta_payload_control<256, true>
@@ -317,8 +299,7 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr,
                          "usage: %s [--decode] [--prefill] "
-                         "[--kind dflash_hidden|dflash_q|dflash_k|target_hidden35|target_q35|"
-                         "target_k35|gated35|gated27|hidden27|target_q27|target_k27 "
+                         "[--kind dflash_q|dflash_k|gated27|hidden27|target_q27|target_k27 "
                          "(--tokens T|--t-sweep 1,2,...,1024)] "
                          "[--control|--candidate-b128|--candidate-b256|--candidate-b512|"
                          "--candidate-b1024] [--profile]\n",
@@ -335,9 +316,8 @@ int main(int argc, char** argv) {
         const Shape& shape   = find_shape(selected_kind);
         const bool candidate = route == Route::CandidateB128 || route == Route::CandidateB256 ||
                                route == Route::CandidateB512 || route == Route::CandidateB1024;
-        if (candidate &&
-            (shape.gated || shape.unit_offset || (shape.d != 128 && shape.d != 2048))) {
-            std::fprintf(stderr, "candidate routes require plain D128 or D2048\n");
+        if (candidate && (shape.gated || shape.unit_offset || shape.d != 128)) {
+            std::fprintf(stderr, "candidate routes require plain D128\n");
             return 2;
         }
         if (profile && (selected_tokens <= 0 || !selected_sweep.empty())) {

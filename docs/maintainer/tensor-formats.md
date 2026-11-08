@@ -50,7 +50,7 @@ layout, shape, checkpoint, or GPU can consume it.
 
 The design deliberately preserves the currently used group sizes. Q4, Q5, and Q6 share one G64
 group geometry, allowing their converter, codec, and kernel structures to share the same grouping
-model. W8 retains the single implemented G32 geometry. The registered Qwen3.6-27B target provides
+model. W8 retains the single implemented G32 geometry. The registered Qwen3.8-27B target provides
 the current implementation evidence for these choices. These are accepted project geometries, not
 claims that G64 or G32 is universally optimal.
 
@@ -508,7 +508,7 @@ as the exact `.ninfer` artifact size.
 
 The apparently finer W8 group is intentional. Q4, Q5, and Q6 retain one shared G64 grouping model
 across their existing converter, codec, and kernel paths, while W8G32 is the one current W8
-geometry used by the registered Qwen3.6-27B recipe. The assignment of that geometry to model roles
+geometry used by the registered Qwen3.8-27B inventory. The assignment of that geometry to model roles
 belongs to checkpoint recipes, not to the scheme definition. Its 16-bit scale contributes 0.5 bit
 per weight at G32, while the scale contributes 0.25 bit per weight to Q4 at G64; both are 6.25% of
 their code payload. This cost calculation explains why the finer W8 grouping is affordable. It is
@@ -712,12 +712,11 @@ document must separately define, for every persisted source tensor or derived te
 - the cited upstream/public evidence and engineering rationale used to select the complete lossy
   checkpoint recipe.
 
-Those facts may differ between exact checkpoints in the same family. Dense attention, MoE experts,
+Those facts may differ between exact checkpoints in the same family. Attention and MLP projections,
 MTP predictors, vision towers, embeddings, and output heads receive no automatic assignment from
-their role names. Section 4 defines how a higher-rank grouped signed-integer expert bank would be
-grouped numerically, but the current row-split storage implementation remains rank two; a future MoE
-recipe must explicitly register its physical layout or define the reshape used by its compiled
-target.
+their role names. Section 4 defines grouped signed-integer numerics for any rank, but the row-split
+storage implementation is rank two; a higher-rank recipe must explicitly register its physical
+layout or define the reshape used by its compiled target.
 
 Similarly, a format's presence in a `.ninfer` artifact does not prove runtime support. The selected
 model implementation must bind that tensor to a supported model consumer or operator path on the
@@ -850,5 +849,5 @@ questions open:
 The `.ninfer` container specification references these definitions rather than restating or
 specializing them for one model. A model-specific numeric recipe may select and combine the formats,
 but it cannot redefine them. This is the boundary that allows NInfer to add deeply optimized
-checkpoints without turning the core tensor representation into either a Qwen3.6-27B artifact or an
+checkpoints without turning the core tensor representation into either one model's artifact or an
 unbounded compatibility framework.

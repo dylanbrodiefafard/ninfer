@@ -271,22 +271,14 @@ int exercise_ram_artifact(const char* artifact) {
 } // namespace
 
 int main() {
-    const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
-    const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0')) {
-        std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
-                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS is set\n";
+    const char* nvfp4 = std::getenv("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
+    if (nvfp4 == nullptr || *nvfp4 == '\0') {
+        std::cout << "skip: NINFER_QWEN3_8_27B_NVFP4_WEIGHTS is not set\n";
         return 77;
     }
     int failures = 0;
-    if (groupwise != nullptr && *groupwise != '\0') {
-        failures += exercise_artifact(groupwise);
-        failures += exercise_ram_artifact(groupwise);
-    }
-    if (nvfp4 != nullptr && *nvfp4 != '\0') {
-        failures += exercise_artifact(nvfp4);
-        failures += exercise_ram_artifact(nvfp4);
-    }
+    failures += exercise_artifact(nvfp4);
+    failures += exercise_ram_artifact(nvfp4);
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

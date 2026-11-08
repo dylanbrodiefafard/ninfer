@@ -32,7 +32,7 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 constexpr double kRtx5090DramGBs  = 1792.0;
 
-enum class Format : std::uint8_t { Q4Q5, W8Qgkv, W8Qkv, Bf16, Nvfp4, All };
+enum class Format : std::uint8_t { Bf16, Nvfp4, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
@@ -63,7 +63,7 @@ struct Result {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_attn_input_proj_bench "
-                 "[--format q4q5|w8-qgkv|w8-qkv|bf16|nvfp4|all] "
+                 "[--format bf16|nvfp4|all] "
                  "[--nvfp4-policy a16|a4] [--tokens T,...] [--cache cold|warm|both] "
                  "[--panel-width N] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
@@ -108,20 +108,14 @@ Options parse_options(int argc, char** argv) {
         };
         if (argument == "--format") {
             const std::string_view value(next("--format requires a value"));
-            if (value == "q4q5")
-                options.format = Format::Q4Q5;
-            else if (value == "w8-qgkv")
-                options.format = Format::W8Qgkv;
-            else if (value == "w8-qkv")
-                options.format = Format::W8Qkv;
-            else if (value == "bf16")
+            if (value == "bf16")
                 options.format = Format::Bf16;
             else if (value == "nvfp4")
                 options.format = Format::Nvfp4;
             else if (value == "all")
                 options.format = Format::All;
             else
-                usage("--format expects q4q5, w8-qgkv, w8-qkv, bf16, nvfp4, or all");
+                usage("--format expects bf16, nvfp4, or all");
         } else if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
             if (value == "a16")
@@ -236,58 +230,11 @@ std::uint64_t tensor_bytes(std::int32_t rows, std::int32_t tokens) {
     return static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(tokens) * 2ULL;
 }
 
-void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
-              std::vector<Result>& results) {
-    constexpr std::int32_t hidden      = 5120;
-    constexpr std::int32_t q_rows      = 6144;
-    constexpr std::int32_t kv_rows     = 1024;
-    constexpr std::int32_t parent_rows = q_rows + kv_rows;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
-    bench::PackedQuantizedWeight qk = bench::make_row_split_weight(
-        QType::Q4G64_F16S, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
-    bench::PackedQuantizedWeight gv = bench::make_row_split_weight(
-        QType::Q5G64_F16S, parent_rows, hidden, hidden, {0x31, 0xa5, 0x3c00});
-    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);
-    DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
-    DeviceBuffer gate(static_cast<std::size_t>(q_rows) * max_tokens * 2);
-    DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
-    DeviceBuffer v(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
-    for (const std::int32_t tokens : options.tokens) {
-        Tensor x(input.p, DType::BF16, {hidden, tokens});
-        Tensor tq(q.p, DType::BF16, {q_rows, tokens});
-        Tensor tg(gate.p, DType::BF16, {q_rows, tokens});
-        Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
-        Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
-        const auto launch = [&](cudaStream_t launch_stream) {
-            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, launch_stream);
-        };
-        const CacheState profile_cache =
-            options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
-        if (options.profile) {
-            profile_public(launch, "q4q5", "a16", profile_cache, flush, stream, options.warmup);
-            continue;
-        }
-        const std::uint64_t logical = qk.model_weight_bytes() + gv.model_weight_bytes() +
-                                      tensor_bytes(hidden, tokens) +
-                                      tensor_bytes(2 * q_rows + 2 * kv_rows, tokens);
-        const double flops          = 4.0 * parent_rows * hidden * static_cast<double>(tokens);
-        for (const CacheState cache : {CacheState::Cold, CacheState::Warm}) {
-            if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
-                (options.cache == CacheMode::Warm && cache != CacheState::Warm))
-                continue;
-            append_result(
-                results, "q4q5", "a16", tokens, cache, 0, logical, flops,
-                measure_public(launch, cache, flush, stream, options.warmup, options.repeat));
-        }
-    }
-}
-
 template <class WeightFixture>
 void run_four_output(const Options& options, const char* format, QType qtype,
-                     ops::LinearPolicy policy, bool implicit_a16_entry, std::int32_t hidden,
-                     std::int32_t q_rows, std::int32_t kv_rows, std::int32_t parent_rows,
-                     WeightFixture& fixture, DeviceBuffer& flush, cudaStream_t stream,
-                     std::vector<Result>& results) {
+                     ops::LinearPolicy policy, std::int32_t hidden, std::int32_t q_rows,
+                     std::int32_t kv_rows, std::int32_t parent_rows, WeightFixture& fixture,
+                     DeviceBuffer& flush, cudaStream_t stream, std::vector<Result>& results) {
     const std::int32_t min_tokens = *std::min_element(options.tokens.begin(), options.tokens.end());
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
     const std::size_t workspace_bytes = ops::attn_input_proj_workspace_capacity_bytes(
@@ -312,22 +259,13 @@ void run_four_output(const Options& options, const char* format, QType qtype,
                     Tensor panel_g = tg.slice(1, offset, options.panel_width);
                     Tensor panel_k = tk.slice(1, offset, options.panel_width);
                     Tensor panel_v = tv.slice(1, offset, options.panel_width);
-                    if (implicit_a16_entry) {
-                        ops::attn_input_proj(panel_x, fixture.weight, panel_q, panel_g, panel_k,
-                                             panel_v, launch_stream);
-                    } else {
-                        ops::attn_input_proj(panel_x, fixture.weight, panel_q, panel_g, panel_k,
-                                             panel_v, policy, workspace, launch_stream);
-                    }
+                    ops::attn_input_proj(panel_x, fixture.weight, panel_q, panel_g, panel_k,
+                                         panel_v, policy, workspace, launch_stream);
                 }
                 return;
             }
-            if (implicit_a16_entry) {
-                ops::attn_input_proj(x, fixture.weight, tq, tg, tk, tv, launch_stream);
-            } else {
-                ops::attn_input_proj(x, fixture.weight, tq, tg, tk, tv, policy, workspace,
-                                     launch_stream);
-            }
+            ops::attn_input_proj(x, fixture.weight, tq, tg, tk, tv, policy, workspace,
+                                 launch_stream);
         };
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
@@ -349,47 +287,6 @@ void run_four_output(const Options& options, const char* format, QType qtype,
             append_result(
                 results, format, policy_name(policy), tokens, cache, workspace_bytes, logical,
                 flops,
-                measure_public(launch, cache, flush, stream, options.warmup, options.repeat));
-        }
-    }
-}
-
-void run_w8_qkv(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
-                std::vector<Result>& results) {
-    constexpr std::int32_t hidden      = 2048;
-    constexpr std::int32_t q_rows      = 4096;
-    constexpr std::int32_t kv_rows     = 1024;
-    constexpr std::int32_t parent_rows = 6144;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
-    bench::PackedQuantizedWeight weight = bench::make_row_split_weight(
-        QType::W8G32_F16S, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
-    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);
-    DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
-    DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
-    DeviceBuffer v(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
-    for (const std::int32_t tokens : options.tokens) {
-        Tensor x(input.p, DType::BF16, {hidden, tokens});
-        Tensor tq(q.p, DType::BF16, {q_rows, tokens});
-        Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
-        Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
-        const auto launch = [&](cudaStream_t launch_stream) {
-            ops::attn_input_proj(x, weight.weight, tq, tk, tv, launch_stream);
-        };
-        const CacheState profile_cache =
-            options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
-        if (options.profile) {
-            profile_public(launch, "w8-qkv", "a16", profile_cache, flush, stream, options.warmup);
-            continue;
-        }
-        const std::uint64_t logical = weight.model_weight_bytes() + tensor_bytes(hidden, tokens) +
-                                      tensor_bytes(q_rows + 2 * kv_rows, tokens);
-        const double flops          = 2.0 * parent_rows * hidden * static_cast<double>(tokens);
-        for (const CacheState cache : {CacheState::Cold, CacheState::Warm}) {
-            if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
-                (options.cache == CacheMode::Warm && cache != CacheState::Warm))
-                continue;
-            append_result(
-                results, "w8-qkv", "a16", tokens, cache, 0, logical, flops,
                 measure_public(launch, cache, flush, stream, options.warmup, options.repeat));
         }
     }
@@ -431,25 +328,15 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(kFlushBytes);
         std::vector<Result> results;
 
-        if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
-        if (selected(options.format, Format::W8Qgkv)) {
-            auto weight = bench::make_row_split_weight(QType::W8G32_F16S, 9216, 2048, 2048,
-                                                       {0x31, 0x00, 0x3c00});
-            run_four_output(options, "w8-qgkv", QType::W8G32_F16S, ops::LinearPolicy::A16Only, true,
-                            2048, 4096, 512, 9216, weight, flush, stream, results);
-        }
-        if (selected(options.format, Format::W8Qkv)) {
-            run_w8_qkv(options, flush, stream, results);
-        }
         if (selected(options.format, Format::Bf16)) {
             auto weight = bench::make_direct_bf16_weight(14336, 5120);
-            run_four_output(options, "bf16", QType::BF16_CTRL, ops::LinearPolicy::A16Only, false,
-                            5120, 6144, 1024, 14336, weight, flush, stream, results);
+            run_four_output(options, "bf16", QType::BF16_CTRL, ops::LinearPolicy::A16Only, 5120,
+                            6144, 1024, 14336, weight, flush, stream, results);
         }
         if (selected(options.format, Format::Nvfp4)) {
             auto weight = bench::make_nvfp4_weight(14336, 5120);
-            run_four_output(options, "nvfp4", QType::NVFP4, options.nvfp4_policy, false, 5120, 6144,
-                            1024, 14336, weight, flush, stream, results);
+            run_four_output(options, "nvfp4", QType::NVFP4, options.nvfp4_policy, 5120, 6144, 1024,
+                            14336, weight, flush, stream, results);
         }
         write_csv(options, results);
         CUDA_CHECK(cudaStreamDestroy(stream));

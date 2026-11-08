@@ -8,12 +8,6 @@
 
 namespace ninfer::test::linear_add {
 
-enum class WeightFormat : std::uint8_t {
-    BF16,
-    Q5G64F16S,
-    W8G32F16S,
-};
-
 struct ShapeCase {
     std::int32_t n;
     std::int32_t k;
@@ -24,6 +18,7 @@ struct ShapeCase {
 
 bool cuda_available();
 
-int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shape);
+// Checks BF16_CTRL linear_add at every route boundary of `shape` against the FP64 oracle.
+int run_shape(std::string_view label, const ShapeCase& shape);
 
 } // namespace ninfer::test::linear_add

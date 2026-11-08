@@ -125,7 +125,6 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> proposal_extents{};
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
     // DFlash companion positions remain absolute. The target verifier applies this per-row
     // MRoPE delta to its own position panel after proposal construction.
@@ -324,7 +323,6 @@ struct DFlashDecodeState {
     Tensor proposal_extents;
     Tensor target_valid_columns;
     Tensor text_kv_table_rows;
-    Tensor dflash_kv_table_rows;
     Tensor lanes;
     Tensor rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;

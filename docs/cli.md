@@ -37,8 +37,7 @@ GPU residency is frozen when the Engine starts:
 - omitting `--spec` selects adaptive DFlash2 K7 and the optimized proposal head when the
   supported Qwen3.8 NVFP4 artifact contains `dflash/`; a base artifact stays non-speculative;
 - `--spec none` omits speculative weights and state and the optimized proposal head;
-- `--spec dflash` loads the DFlash companion
-  (35B-A3B DFlash v1, or Qwen3.8-27B DFlash2 when `dflash/` is present);
+- `--spec dflash` loads the Qwen3.8-27B DFlash2 companion when `dflash/` is present;
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
@@ -46,7 +45,7 @@ GPU residency is frozen when the Engine starts:
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: an
 Engine without `--vision` rejects media and cannot enable Vision later. Qwen3.8-27B DFlash2 can be
-combined with Vision when both are selected at startup; 35B-A3B DFlash v1 remains text-only. The
+combined with Vision when both are selected at startup. The
 `--spec none` and default Vision settings produce the smallest resident profile.
 
 ## Structured messages
@@ -194,12 +193,8 @@ the loaded model and rendered prompt mode. The current presets are:
 
 | Model | Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
 |---|---|---:|---:|---:|---:|---:|
-| Qwen3.6-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
-| Qwen3.6-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 | Qwen3.8-27B | thinking | `2.0` | `0.95` | `20` | `0` | `0` |
 | Qwen3.8-27B | non-thinking | `2.0` | `0.80` | `20` | `0` | `0` |
-| Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
-| Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 
 Frequency penalty is `0` in every registered preset. Qwen's separate precise-coding recommendation
 is task-specific and is therefore an explicit override rather than an inferred Engine default.

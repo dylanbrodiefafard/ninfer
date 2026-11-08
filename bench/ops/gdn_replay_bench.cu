@@ -40,12 +40,6 @@ constexpr std::int32_t kRecordCapacity = 8;
 constexpr std::int32_t kStateSlots     = 11;
 constexpr std::size_t kDefaultFlush    = 256ULL << 20;
 
-enum class ProfileSelection : std::uint8_t {
-    Qwen27B,
-    Qwen35B,
-    All,
-};
-
 enum class CommitSelection : std::uint8_t {
     One,
     Dense,
@@ -75,7 +69,6 @@ struct Profile {
 };
 
 struct Options {
-    ProfileSelection profiles    = ProfileSelection::All;
     CommitSelection commits      = CommitSelection::All;
     ComponentSelection component = ComponentSelection::All;
     ValidSelection valid         = ValidSelection::All;
@@ -105,13 +98,6 @@ std::int32_t parse_i32(std::string_view text, const char* label, std::int32_t mi
     return static_cast<std::int32_t>(parsed);
 }
 
-ProfileSelection parse_profile(std::string_view value) {
-    if (value == "27b") return ProfileSelection::Qwen27B;
-    if (value == "35b") return ProfileSelection::Qwen35B;
-    if (value == "all") return ProfileSelection::All;
-    throw std::invalid_argument("--profile must be 27b, 35b, or all");
-}
-
 CommitSelection parse_commits(std::string_view value) {
     if (value == "one") return CommitSelection::One;
     if (value == "dense") return CommitSelection::Dense;
@@ -138,7 +124,6 @@ ValidSelection parse_valid(std::string_view value) {
 void print_help(const char* program) {
     std::printf(
         "Usage: %s [options]\n\n"
-        "  --profile 27b|35b|all       Registered all-layer geometry (default all).\n"
         "  --component fold|recurrent|history-record|all\n"
         "                              Measured component (all: fold and recurrent; default all).\n"
         "  --width T                   One physical width in [2,16].\n"
@@ -164,9 +149,7 @@ Options parse_options(int argc, char** argv) {
             if (++index >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
             return argv[index];
         };
-        if (argument == "--profile") {
-            options.profiles = parse_profile(next("profile"));
-        } else if (argument == "--component") {
+        if (argument == "--component") {
             options.component = parse_component(next("component"));
         } else if (argument == "--width") {
             options.exact_width = parse_i32(next("width"), "width", 2, 16);
@@ -195,11 +178,10 @@ Options parse_options(int argc, char** argv) {
         }
     }
     if (options.component == ComponentSelection::HistoryRecord) {
-        if (options.profiles == ProfileSelection::Qwen35B ||
-            (options.exact_width != 0 && options.exact_width != 8) ||
+        if ((options.exact_width != 0 && options.exact_width != 8) ||
             (options.exact_batch != 0 && options.exact_batch != 1) ||
             options.valid == ValidSelection::Dense || options.commits != CommitSelection::All) {
-            throw std::invalid_argument("history-record requires 27b, B1, T8 and masked inputs");
+            throw std::invalid_argument("history-record requires B1, T8 and masked inputs");
         }
         if (options.capture && options.retained_count < 0) {
             throw std::invalid_argument("--capture requires one --retained-count");
@@ -210,16 +192,8 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-std::vector<Profile> selected_profiles(ProfileSelection selection) {
-    std::vector<Profile> profiles;
-    if (selection == ProfileSelection::Qwen27B || selection == ProfileSelection::All) {
-        profiles.push_back({"27b", 48, 48, 10240, {2, 3, 4, 5, 6, 7, 8, 16}});
-    }
-    if (selection == ProfileSelection::Qwen35B || selection == ProfileSelection::All) {
-        profiles.push_back({"35b-a3b", 30, 32, 8192, {2, 6, 16}});
-    }
-    return profiles;
-}
+// The registered Qwen3.8-27B all-layer GDN geometry and its DFlash verify widths.
+Profile qwen27b_profile() { return {"27b", 48, 48, 10240, {2, 3, 4, 5, 6, 7, 8, 16}}; }
 
 std::vector<std::int32_t> selected_widths(const Profile& profile, std::int32_t exact_width) {
     if (exact_width == 0) return profile.widths;
@@ -722,30 +696,28 @@ int run(const Options& options) {
         run_history_record(options, flush);
         return 0;
     }
-    for (const Profile& profile : selected_profiles(options.profiles)) {
-        for (const std::int32_t width : selected_widths(profile, options.exact_width)) {
-            const bool run_fold      = options.component == ComponentSelection::Fold ||
-                                       options.component == ComponentSelection::All;
-            const bool run_recurrent = options.component == ComponentSelection::Recurrent ||
-                                       options.component == ComponentSelection::All;
-            if (run_fold) {
-                FoldResources resources(profile, width);
-                for (const std::int32_t batch : selected_batches(options.exact_batch)) {
-                    for (const CommitSelection commits :
-                         selected_commit_policies(options.commits)) {
-                        const std::vector<ops::GdnReplayFoldRow> rows =
-                            make_rows(batch, width, commits);
-                        const Measurement measurement =
-                            measure_fold(resources, rows, flush, options.warmup, options.repeat);
-                        print_result(profile, width, batch, commits, rows, measurement);
-                    }
+    const Profile profile = qwen27b_profile();
+    for (const std::int32_t width : selected_widths(profile, options.exact_width)) {
+        const bool run_fold      = options.component == ComponentSelection::Fold ||
+                                   options.component == ComponentSelection::All;
+        const bool run_recurrent = options.component == ComponentSelection::Recurrent ||
+                                   options.component == ComponentSelection::All;
+        if (run_fold) {
+            FoldResources resources(profile, width);
+            for (const std::int32_t batch : selected_batches(options.exact_batch)) {
+                for (const CommitSelection commits : selected_commit_policies(options.commits)) {
+                    const std::vector<ops::GdnReplayFoldRow> rows =
+                        make_rows(batch, width, commits);
+                    const Measurement measurement =
+                        measure_fold(resources, rows, flush, options.warmup, options.repeat);
+                    print_result(profile, width, batch, commits, rows, measurement);
                 }
             }
-            if (run_recurrent) {
-                for (const std::int32_t batch : selected_batches(options.exact_batch)) {
-                    for (const ValidSelection valid : selected_valid_policies(options.valid)) {
-                        run_recurrent_point(profile, width, batch, valid, flush, options);
-                    }
+        }
+        if (run_recurrent) {
+            for (const std::int32_t batch : selected_batches(options.exact_batch)) {
+                for (const ValidSelection valid : selected_valid_policies(options.valid)) {
+                    run_recurrent_point(profile, width, batch, valid, flush, options);
                 }
             }
         }

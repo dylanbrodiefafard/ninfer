@@ -41,14 +41,6 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
             reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
-    } else if (aligned2 && d == 2048 && Epilogue == RmsEpilogue::Plain) {
-        // The 512-thread CTA is faster than 128/256-thread alternatives at every measured DFlash
-        // extent and reaches the same-topology payload floor at the prefill endpoint.
-        rmsnorm_d2048_bf16x2_kernel<Epilogue><<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-            reinterpret_cast<const __nv_bfloat162*>(w_bf16),
-            reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-            reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
     } else if (aligned2 && d >= 512 && d <= 3072 && d % 512 == 0) {
         rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 6>
             <<<static_cast<unsigned int>(rows), 256, 0, stream>>>(

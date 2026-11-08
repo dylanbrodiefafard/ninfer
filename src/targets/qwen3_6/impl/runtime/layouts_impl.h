@@ -12,12 +12,9 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
-#include "ninfer/ops/linear_add.h"
-#include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/gqa_attention.h"
-#include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/swa.h"
 #include "ninfer/ops/grouped_dynamic_conv.h"
 #include "ninfer/ops/dflash2_path_select.h"
@@ -193,28 +190,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             dflash.staging_local = plan_cyclic_kv_cache(
                 builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
                 DFlashConfig::kv_heads, DFlashConfig::head_dim, 1);
-            if constexpr (DFlashConfig::full_layers > 0) {
-                PagedKVPoolSpec full_pool{
-                    .page_group_count      = physical_pages,
-                    .logical_page_capacity = page_count(plan.capacity),
-                    .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
-                    .plane_order           = PagedKVPlaneOrder::HeadMajor,
-                    .planes =
-                        {
-                            {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                            {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        },
-                };
-                dflash.full = qwen3_6::PagedKVCacheLayout{
-                    .pool        = plan_paged_kv_pool(builder, full_pool),
-                    .layers      = 1,
-                    .max_context = plan.capacity,
-                    .kv_heads    = DFlashConfig::kv_heads,
-                    .head_dim    = DFlashConfig::head_dim,
-                    .dtype       = DType::BF16,
-                    .quant_group = 0,
-                };
-            }
             dflash.prefill_features = add_tensor(
                 builder, DType::BF16, {DFlashConfig::feature_rows, effective_prefill_chunk},
                 "DFlash prefill target features");
@@ -608,20 +583,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     matrix(layout, DType::BF16, DFlashConfig::feature_rows, tokens);
                 }
                 (void)workspace_recipe::dflash_context<DFlashConfig>(layout, tokens);
-                if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
-                    scratch(layout, std::max({ops::linear_workspace_capacity_bytes(
-                                                  QType::W8G32_F16S, DFlashConfig::hidden,
-                                                  DFlashConfig::feature_rows,
-                                                  ops::LinearPolicy::A16Only, tokens, tokens),
-                                              ops::linear_workspace_capacity_bytes(
-                                                  QType::Q4G64_F16S, DFlashConfig::hidden,
-                                                  DFlashConfig::feature_rows,
-                                                  ops::LinearPolicy::A16Only, tokens, tokens),
-                                              ops::linear_workspace_capacity_bytes(
-                                                  QType::NVFP4, DFlashConfig::hidden,
-                                                  DFlashConfig::feature_rows,
-                                                  ops::LinearPolicy::AllowA4, tokens, tokens)}));
-                }
+                scratch(
+                    layout,
+                    std::max(
+                        {ops::linear_workspace_capacity_bytes(
+                             QType::W8G32_F16S, DFlashConfig::hidden, DFlashConfig::feature_rows,
+                             ops::LinearPolicy::A16Only, tokens, tokens),
+                         ops::linear_workspace_capacity_bytes(
+                             QType::Q4G64_F16S, DFlashConfig::hidden, DFlashConfig::feature_rows,
+                             ops::LinearPolicy::A16Only, tokens, tokens),
+                         ops::linear_workspace_capacity_bytes(
+                             QType::NVFP4, DFlashConfig::hidden, DFlashConfig::feature_rows,
+                             ops::LinearPolicy::AllowA4, tokens, tokens)}));
                 {
                     auto layer = layout.scope();
                     (void)workspace_recipe::dflash_context_layer<DFlashConfig>(layout, tokens);
@@ -636,21 +609,82 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 matrix(layout, DType::I32, width, batch);
                 matrix(layout, DType::I32, std::max(width - 1, 1), batch);
                 matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
-                Tensor normalized;
-                if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
-                    normalized =
-                        workspace_recipe::matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
-                    const auto linear_scratch = [&](std::int32_t n, std::int32_t k) {
-                        return std::max(
-                            {ops::linear_workspace_capacity_bytes(QType::W8G32_F16S, n, k,
-                                                                  ops::LinearPolicy::A16Only,
-                                                                  tokens, tokens),
-                             ops::linear_workspace_capacity_bytes(QType::Q4G64_F16S, n, k,
-                                                                  ops::LinearPolicy::A16Only,
-                                                                  tokens, tokens),
-                             ops::linear_workspace_capacity_bytes(
-                                 QType::NVFP4, n, k, ops::LinearPolicy::AllowA4, tokens, tokens)});
-                    };
+                Tensor normalized =
+                    workspace_recipe::matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
+                const auto linear_scratch = [&](std::int32_t n, std::int32_t k) {
+                    return std::max(
+                        {ops::linear_workspace_capacity_bytes(
+                             QType::W8G32_F16S, n, k, ops::LinearPolicy::A16Only, tokens, tokens),
+                         ops::linear_workspace_capacity_bytes(
+                             QType::Q4G64_F16S, n, k, ops::LinearPolicy::A16Only, tokens, tokens),
+                         ops::linear_workspace_capacity_bytes(
+                             QType::NVFP4, n, k, ops::LinearPolicy::AllowA4, tokens, tokens)});
+                };
+                {
+                    auto attention = layout.scope();
+                    (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens,
+                                                                           normalized);
+                    scratch(layout, ops::swa_workspace_capacity_bytes({0, plan.capacity}, width,
+                                                                      width, batch));
+                    scratch(layout,
+                            linear_scratch(DFlashConfig::query_size + 2 * DFlashConfig::kv_size,
+                                           DFlashConfig::hidden));
+                    scratch(layout,
+                            std::max({ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                          QType::W8G32_F16S, width, width, batch),
+                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                          QType::Q4G64_F16S, width, width, batch),
+                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                          QType::NVFP4, width, width, batch)}));
+                    scratch(layout, linear_scratch(DFlashConfig::hidden, DFlashConfig::query_size));
+                }
+                {
+                    auto mlp = layout.scope();
+                    (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens, normalized);
+                    scratch(layout,
+                            linear_scratch(2 * DFlashConfig::intermediate, DFlashConfig::hidden));
+                    scratch(layout,
+                            linear_scratch(DFlashConfig::hidden, DFlashConfig::intermediate));
+                    scratch(layout,
+                            std::max({ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                          QType::W8G32_F16S, width, width, batch),
+                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                          QType::Q4G64_F16S, width, width, batch),
+                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                          QType::NVFP4, width, width, batch)}));
+                }
+                matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
+                matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
+                if (plan.proposal_head == ProposalHead::Optimized) {
+                    matrix(layout, DType::BF16, Variant::draft_head_rows, drafts * batch);
+                } else {
+                    matrix(layout, DType::BF16, TextConfig::output_rows, drafts * batch);
+                }
+                const std::int32_t logit_rows = plan.proposal_head == ProposalHead::Optimized
+                                                    ? Variant::draft_head_rows
+                                                    : TextConfig::output_rows;
+                if (plan.proposal_head == ProposalHead::Optimized) {
+                    scratch(layout,
+                            ops::linear_workspace_capacity_bytes(
+                                QType::Q4G64_F16S, logit_rows, DFlashConfig::hidden,
+                                ops::LinearPolicy::A16Only, drafts * batch, drafts * batch));
+                } else {
+                    scratch(layout,
+                            ops::linear_workspace_capacity_bytes(
+                                QType::W8G32_F16S, logit_rows, DFlashConfig::hidden,
+                                ops::LinearPolicy::A16Only, drafts * batch, drafts * batch));
+                }
+                scratch(layout, std::max({ops::dflash2_path_select_workspace_capacity_bytes(
+                                              QType::W8G32_F16S, drafts, drafts, batch),
+                                          ops::dflash2_path_select_workspace_capacity_bytes(
+                                              QType::Q4G64_F16S, drafts, drafts, batch),
+                                          ops::dflash2_path_select_workspace_capacity_bytes(
+                                              QType::NVFP4, drafts, drafts, batch)}));
+                scratch(layout, static_cast<std::size_t>(ops::kDflash2PathSelectTopK) *
+                                    static_cast<std::size_t>(drafts) *
+                                    static_cast<std::size_t>(batch) *
+                                    (sizeof(std::int32_t) + sizeof(float)));
+                if constexpr (DFlashConfig::two_block_first > 0) {
                     {
                         auto attention = layout.scope();
                         (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens,
@@ -687,113 +721,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                           QType::Q4G64_F16S, width, width, batch),
                                       ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
                                           QType::NVFP4, width, width, batch)}));
-                    }
-                } else {
-                    {
-                        auto attention = layout.scope();
-                        (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
-                        scratch(layout,
-                                std::max(ops::swa_workspace_capacity_bytes({0, plan.capacity},
-                                                                           width, width, batch),
-                                         ops::bidirectional_gqa_attention_workspace_capacity_bytes(
-                                             {0, plan.capacity}, width, width, batch)));
-                        scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                            QType::W8G32_F16S, DFlashConfig::hidden,
-                                            DFlashConfig::query_size, tokens, tokens));
-                    }
-                    {
-                        auto mlp = layout.scope();
-                        (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
-                        scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                            QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
-                                            DFlashConfig::hidden, tokens, tokens));
-                        scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                            QType::W8G32_F16S, DFlashConfig::hidden,
-                                            DFlashConfig::intermediate, tokens, tokens));
-                    }
-                }
-                matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
-                matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
-                if (plan.proposal_head == ProposalHead::Optimized) {
-                    matrix(layout, DType::BF16, Variant::draft_head_rows, drafts * batch);
-                } else {
-                    matrix(layout, DType::BF16, TextConfig::output_rows, drafts * batch);
-                }
-                if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
-                    const std::int32_t logit_rows = plan.proposal_head == ProposalHead::Optimized
-                                                        ? Variant::draft_head_rows
-                                                        : TextConfig::output_rows;
-                    if (plan.proposal_head == ProposalHead::Optimized) {
-                        scratch(layout,
-                                ops::linear_workspace_capacity_bytes(
-                                    QType::Q4G64_F16S, logit_rows, DFlashConfig::hidden,
-                                    ops::LinearPolicy::A16Only, drafts * batch, drafts * batch));
-                    } else {
-                        scratch(layout,
-                                ops::linear_workspace_capacity_bytes(
-                                    QType::W8G32_F16S, logit_rows, DFlashConfig::hidden,
-                                    ops::LinearPolicy::A16Only, drafts * batch, drafts * batch));
-                    }
-                    scratch(layout, std::max({ops::dflash2_path_select_workspace_capacity_bytes(
-                                                  QType::W8G32_F16S, drafts, drafts, batch),
-                                              ops::dflash2_path_select_workspace_capacity_bytes(
-                                                  QType::Q4G64_F16S, drafts, drafts, batch),
-                                              ops::dflash2_path_select_workspace_capacity_bytes(
-                                                  QType::NVFP4, drafts, drafts, batch)}));
-                    scratch(layout, static_cast<std::size_t>(ops::kDflash2PathSelectTopK) *
-                                        static_cast<std::size_t>(drafts) *
-                                        static_cast<std::size_t>(batch) *
-                                        (sizeof(std::int32_t) + sizeof(float)));
-                    if constexpr (DFlashConfig::two_block_first > 0) {
-                        const auto linear_scratch = [&](std::int32_t n, std::int32_t k) {
-                            return std::max(
-                                {ops::linear_workspace_capacity_bytes(QType::W8G32_F16S, n, k,
-                                                                      ops::LinearPolicy::A16Only,
-                                                                      tokens, tokens),
-                                 ops::linear_workspace_capacity_bytes(QType::Q4G64_F16S, n, k,
-                                                                      ops::LinearPolicy::A16Only,
-                                                                      tokens, tokens),
-                                 ops::linear_workspace_capacity_bytes(QType::NVFP4, n, k,
-                                                                      ops::LinearPolicy::AllowA4,
-                                                                      tokens, tokens)});
-                        };
-                        {
-                            auto attention = layout.scope();
-                            (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens,
-                                                                                   normalized);
-                            scratch(layout, ops::swa_workspace_capacity_bytes({0, plan.capacity},
-                                                                              width, width, batch));
-                            scratch(layout, linear_scratch(DFlashConfig::query_size +
-                                                               2 * DFlashConfig::kv_size,
-                                                           DFlashConfig::hidden));
-                            scratch(layout,
-                                    std::max(
-                                        {ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                             QType::W8G32_F16S, width, width, batch),
-                                         ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                             QType::Q4G64_F16S, width, width, batch),
-                                         ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                             QType::NVFP4, width, width, batch)}));
-                            scratch(layout,
-                                    linear_scratch(DFlashConfig::hidden, DFlashConfig::query_size));
-                        }
-                        {
-                            auto mlp = layout.scope();
-                            (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens,
-                                                                             normalized);
-                            scratch(layout, linear_scratch(2 * DFlashConfig::intermediate,
-                                                           DFlashConfig::hidden));
-                            scratch(layout, linear_scratch(DFlashConfig::hidden,
-                                                           DFlashConfig::intermediate));
-                            scratch(layout,
-                                    std::max(
-                                        {ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                             QType::W8G32_F16S, width, width, batch),
-                                         ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                             QType::Q4G64_F16S, width, width, batch),
-                                         ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                             QType::NVFP4, width, width, batch)}));
-                        }
                     }
                 }
                 return finish(layout);
@@ -1119,7 +1046,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             const std::uint32_t k_stride =
                 qwen3_6::adaptive_k_stride(impl->max_concurrency, max_planned);
             std::vector<GraphExecutionProfile> expanded;
-            std::vector<std::uint32_t> expanded_w;
             for (std::uint32_t shape_index = 0; shape_index < impl->dflash_shapes.size();
                  ++shape_index) {
                 const DFlashRoundShape& shape = impl->dflash_shapes[shape_index];
@@ -1130,48 +1056,21 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         const std::uint32_t topology = qwen3_6::adaptive_topology_class(
                             shape_index, k_stride, planned.topology_class, impl->max_concurrency,
                             batch_size);
-                        for (std::uint32_t variant = 0; variant < kDFlashExchangeVariants;
+                        for (std::uint32_t variant = 0; variant < qwen3_6::kGrammarExchangeVariants;
                              ++variant) {
                             GraphExecutionProfile folded = planned;
                             folded.topology_class =
-                                kDFlashExchangeVariants == 1
-                                    ? topology
-                                    : qwen3_6::grammar_exchange_topology(topology, variant == 1);
+                                qwen3_6::grammar_exchange_topology(topology, variant == 1);
                             expanded.push_back(folded);
-                            expanded_w.push_back(shape.verify_width);
                         }
                     }
                 }
             }
-            if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
-                // DFlash2 captures one parallel proposal/verify schedule, not the
-                // autoregressive DFlash unroll. Its definitions share one executable per
-                // (K, B, topology), just like the other graph families.
-                impl->graph_allowance_bytes =
-                    dflash2_graph_executables_allowance(graph_topology_count(expanded));
-            } else {
-                std::vector<std::pair<std::uint32_t, std::size_t>> classes;
-                for (std::size_t i = 0; i < expanded.size(); ++i) {
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(expanded[i].max) + expanded_w[i]);
-                    const std::size_t allowance = (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
-                    const auto existing =
-                        std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
-                            return entry.first == expanded[i].topology_class;
-                        });
-                    if (existing == classes.end()) {
-                        classes.emplace_back(expanded[i].topology_class, allowance);
-                    } else {
-                        existing->second = std::max(existing->second, allowance);
-                    }
-                }
-                for (const auto& [topology_class, allowance] : classes) {
-                    (void)topology_class;
-                    impl->graph_allowance_bytes = checked_add(
-                        impl->graph_allowance_bytes, allowance, "DFlash exact-b graph allowance");
-                }
-            }
+            // Each DFlash2 graph captures one parallel proposal/verify schedule; its
+            // definitions share one executable per (K, B, topology), like the other graph
+            // families.
+            impl->graph_allowance_bytes =
+                dflash2_graph_executables_allowance(graph_topology_count(expanded));
         }
     }
 

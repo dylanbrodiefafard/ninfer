@@ -168,6 +168,6 @@ def test_reader_rejects_v1_with_the_migration_command(tmp_path):
     )
     with pytest.raises(
         ArtifactError,
-        match=r"python3 -m tools\.artifact\.migrate_v1_to_v2 <artifact>",
+        match=r"NInfer artifact v1 is not supported",
     ):
         Artifact.open(path)

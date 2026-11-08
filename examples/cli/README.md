@@ -14,7 +14,7 @@ Run from the repository root because media paths in the JSON files are repositor
 
 ```bash
 CLI=./build/apps/ninfer
-MODEL=models/qwen3_6_27b.ninfer
+MODEL=models/qwen3_8_27b_nvfp4.ninfer
 
 $CLI "$MODEL" \
   --messages examples/cli/messages/text_smoke_zh.json \
@@ -121,10 +121,10 @@ All four must output:
 ORCHID=37; COPPER=8142; HARBOR=KESTREL; COLOR=AMBER; SUM=8179
 ```
 
-The committed prompt token counts were validated against the Qwen3.6-27B and Qwen3.6-35B-A3B
-frontend profiles, which produce identical sequences for these files. Qwen3.8-27B uses the same CLI
-surface but carries its own tokenizer and chat-template resources; inspect its prepared token count
-when using these fixtures.
+The committed prompt token counts record the Qwen3.6-family frontend profile with which the
+fixtures were built (see `prompt_token_basis` in [`manifest.json`](manifest.json)). Qwen3.8-27B
+carries its own tokenizer and chat-template resources; inspect its prepared token count when using
+these fixtures.
 
 ## Fixture construction
 
@@ -136,7 +136,7 @@ long-context JSON files from the current source tree:
 
 ```bash
 python3 examples/cli/make_fixtures.py \
-  --tokenizer /path/to/Qwen3.6-27B
+  --tokenizer /path/to/Qwen3.8-27B
 ```
 
 Regeneration updates the frozen source snapshot when selected project files change, so generated

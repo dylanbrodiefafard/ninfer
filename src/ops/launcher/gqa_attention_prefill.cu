@@ -148,10 +148,9 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         Tensor& cache_k_scale    = cache.k_scale_pages;
         Tensor& cache_v_scale    = cache.v_scale_pages;
         constexpr int kFillBlock = 256;
-        // Page-tiled fill is Geometry-templated (Hkv in blockIdx.y). Enable for both
-        // Gqa35 (Hkv=2) and Gqa27/Qwen3.8 (Hkv=4); the prior Hkv==2 gate left 27B on the
-        // slower per-token warp fill for every INT8 prefill chunk.
-        if (tokens >= 128 && (Geometry::KVHeads == 2 || Geometry::KVHeads == 4)) {
+        // Long chunks use the page-tiled fill (KV head in blockIdx.y); shorter ones keep the
+        // per-token warp fill.
+        if (tokens >= 128) {
             constexpr int kPageBlock     = 256;
             constexpr int kTokensPerTile = 8;
             const int max_tiles          = div_up(tokens + kTokensPerTile - 1, kTokensPerTile);
@@ -322,13 +321,10 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            const GqaPromptSplit& split) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(
-            q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau, xattn_min_len,
-            dump, dbg_regs, dbg_q, xattn_scratch, envelope, split);
-        return;
+    if (q.ne[1] != Gqa27Geometry::QHeads) {
+        throw std::invalid_argument("gqa_attention prompt: unsupported head geometry");
     }
-    gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(
+    gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(
         q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau, xattn_min_len,
         dump, dbg_regs, dbg_q, xattn_scratch, envelope, split);
 }
@@ -337,11 +333,10 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
                           PagedKVLayerView cache, cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (k.ne[1] == Gqa27Geometry::KVHeads) {
-        gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
-        return;
+    if (k.ne[1] != Gqa27Geometry::KVHeads) {
+        throw std::invalid_argument("gqa_kv_append: unsupported KV head geometry");
     }
-    gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
+    gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
 }
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -359,18 +354,14 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
-        if (q.ne[1] == Gqa27Geometry::QHeads) {
-            gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
-            gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(
-                q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau,
-                xattn_min_len, dump, nullptr, nullptr, xattn_scratch, envelope, split);
-            return;
-        }
-        gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
-        gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(
+        gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
+        gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(
             q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau, xattn_min_len,
             dump, nullptr, nullptr, xattn_scratch, envelope, split);
     };
+    if (q.ne[1] != Gqa27Geometry::QHeads) {
+        throw std::invalid_argument("gqa_attention prompt: unsupported head geometry");
+    }
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();
     } else {
@@ -415,8 +406,6 @@ void gqa_kv_compact_path_launch(PagedKVBatchLayerView cache, const Tensor& kv_ta
     };
     if (cache.num_kv_heads == Gqa27Geometry::KVHeads) {
         launch_geometry.template operator()<Gqa27Geometry>();
-    } else if (cache.num_kv_heads == Gqa35Geometry::KVHeads) {
-        launch_geometry.template operator()<Gqa35Geometry>();
     } else {
         throw std::invalid_argument("gqa_kv_compact_path: unsupported KV head geometry");
     }

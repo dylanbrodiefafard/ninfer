@@ -300,7 +300,6 @@ struct ResidentReuseState {
     std::uint32_t mtp_kv_valid             = 0;
     std::uint32_t dflash_context_frontier  = 0;
     bool tail_hidden_valid                 = false;
-    bool backend_image_present             = false;
     std::vector<ContextCheckpointRef> context_checkpoints;
 };
 
@@ -316,7 +315,6 @@ struct ReuseBackendPolicy {
     ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::None;
     bool mtp_cache_present             = false;
     bool dflash_present                = false;
-    bool dflash_full_layers            = false;
 };
 
 // Filter every candidate before ranking, including candidates in different RAM
@@ -340,11 +338,6 @@ struct ReuseBackendPolicy {
     if (is_rewrite_checkpoint_restore(path) &&
         policy.backend == ninfer::SpeculativeBackend::DFlash) {
         if (!policy.dflash_present || state.dflash_context_frontier < frontier) { return false; }
-        if (policy.dflash_full_layers &&
-            !dflash_rewrite_checkpoint_ready(state.backend_image_present,
-                                             state.dflash_context_frontier, frontier)) {
-            return false;
-        }
     }
     return true;
 }
@@ -361,11 +354,11 @@ struct ReuseBackendPolicy {
 decide_resident_reuse(const ResidentReuseState& state, const PreparedPromptData& prompt,
                       std::span<const PrefixHash128> prompt_hashes,
                       ninfer::SpeculativeBackend backend, bool mtp_cache_present,
-                      bool dflash_present, bool dflash_full_layers) {
+                      bool dflash_present) {
     if (!state.context_checkpoints.empty() && prompt_hashes.size() != prompt.token_ids.size() + 1) {
         throw std::invalid_argument("prompt prefix hash chain does not cover the prompt");
     }
-    const ReuseBackendPolicy policy{backend, mtp_cache_present, dflash_present, dflash_full_layers};
+    const ReuseBackendPolicy policy{backend, mtp_cache_present, dflash_present};
     const auto ready = [&](ninfer::PrefixReusePath path, std::uint32_t frontier) {
         return reuse_candidate_ready(state, path, frontier, prompt.token_ids.size(), policy);
     };

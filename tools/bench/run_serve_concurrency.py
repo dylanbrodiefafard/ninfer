@@ -273,10 +273,6 @@ def build_points(artifacts: Sequence[tuple[str, Path]], args: argparse.Namespace
     for target, artifact in artifacts:
         for mode_name in mode_names:
             backend, draft_tokens, _verify_width = corpus.SPECULATIVE_MODES[mode_name]
-            if backend == "dflash" and target not in {"qwen3_6_35b_a3b", "qwen3_8_27b"}:
-                raise corpus.CampaignError(
-                    "DFlash measurements require the 35B-A3B or Qwen3.8-27B target"
-                )
             for suite in args.suite:
                 for concurrency in args.concurrency:
                     points.append(

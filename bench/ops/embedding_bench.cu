@@ -1,4 +1,4 @@
-// Public aggregate-column benchmark for the registered Qwen3.6 embedding profiles.
+// Public aggregate-column benchmark for the registered W8 [248320,5120] embedding table.
 //
 // Every measurement is exactly one ninfer::ops::embedding call. L2 eviction
 // completes before the timed interval.
@@ -26,12 +26,6 @@ constexpr std::int32_t kVocab             = 248320;
 constexpr std::size_t kL2FlushBytes       = 256ULL << 20;
 constexpr double kRtx5090SustainedReadGBs = 1674.5;
 
-enum class Profile {
-    Q6D5120,
-    W8D5120,
-    W8D2048,
-};
-
 struct ProfileSpec {
     const char* name;
     QType qtype;
@@ -40,24 +34,7 @@ struct ProfileSpec {
     std::int32_t max_proposal_k;
 };
 
-constexpr ProfileSpec profile_spec(Profile profile) {
-    switch (profile) {
-    case Profile::Q6D5120:
-        return {"q6-d5120", QType::Q6G64_F16S, 5120, 64, 5};
-    case Profile::W8D5120:
-        return {"w8-d5120", QType::W8G32_F16S, 5120, 32, 5};
-    case Profile::W8D2048:
-        return {"w8-d2048", QType::W8G32_F16S, 2048, 32, 15};
-    }
-    throw std::logic_error("unknown embedding profile");
-}
-
-Profile parse_profile(const char* raw) {
-    if (!std::strcmp(raw, "q6-d5120")) return Profile::Q6D5120;
-    if (!std::strcmp(raw, "w8-d5120")) return Profile::W8D5120;
-    if (!std::strcmp(raw, "w8-d2048")) return Profile::W8D2048;
-    throw std::invalid_argument("--profile must be q6-d5120, w8-d5120, or w8-d2048");
-}
+constexpr ProfileSpec kW8D5120{"w8-d5120", QType::W8G32_F16S, 5120, 32, 5};
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
@@ -66,8 +43,6 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
 struct PackedLayout {
     std::int32_t padded_d            = 0;
     std::uint64_t code_plane_bytes   = 0;
-    std::uint64_t high_plane_offset  = 0;
-    std::uint64_t high_plane_bytes   = 0;
     std::uint64_t scale_plane_offset = 0;
     std::uint64_t scale_plane_bytes  = 0;
     std::uint64_t payload_bytes      = 0;
@@ -77,43 +52,33 @@ PackedLayout packed_layout(const ProfileSpec& spec) {
     PackedLayout layout;
     layout.padded_d            = static_cast<std::int32_t>(align_up(spec.d, 128));
     const std::uint64_t groups = static_cast<std::uint64_t>(layout.padded_d / spec.group);
-    if (spec.qtype == QType::Q6G64_F16S) {
-        layout.code_plane_bytes  = static_cast<std::uint64_t>(kVocab) * groups * 32;
-        layout.high_plane_offset = align_up(layout.code_plane_bytes, 256);
-        layout.high_plane_bytes  = static_cast<std::uint64_t>(kVocab) * groups * 16;
-        layout.scale_plane_offset =
-            layout.high_plane_offset + align_up(layout.high_plane_bytes, 256);
-    } else {
-        layout.code_plane_bytes =
-            static_cast<std::uint64_t>(kVocab) * groups * static_cast<std::uint64_t>(spec.group);
-        layout.scale_plane_offset = align_up(layout.code_plane_bytes, 256);
-    }
-    layout.scale_plane_bytes = static_cast<std::uint64_t>(kVocab) * groups * 2;
-    layout.payload_bytes     = layout.scale_plane_offset + layout.scale_plane_bytes;
+    layout.code_plane_bytes =
+        static_cast<std::uint64_t>(kVocab) * groups * static_cast<std::uint64_t>(spec.group);
+    layout.scale_plane_offset = align_up(layout.code_plane_bytes, 256);
+    layout.scale_plane_bytes  = static_cast<std::uint64_t>(kVocab) * groups * 2;
+    layout.payload_bytes      = layout.scale_plane_offset + layout.scale_plane_bytes;
     return layout;
 }
 
 Weight make_weight(const ProfileSpec& spec, const PackedLayout& layout, void* payload) {
     auto* bytes = static_cast<std::uint8_t*>(payload);
     Weight table{};
-    table.payload          = payload;
-    table.payload_bytes    = layout.payload_bytes;
-    table.high_plane_bytes = layout.high_plane_bytes;
-    table.qtype            = spec.qtype;
-    table.layout           = QuantLayout::RowSplit;
-    table.scale_dtype      = DType::FP16;
-    table.group_size       = spec.group;
-    table.shape[0]         = kVocab;
-    table.shape[1]         = spec.d;
-    table.padded_shape[0]  = kVocab;
-    table.padded_shape[1]  = layout.padded_d;
-    table.ndim             = 2;
-    table.qdata            = payload;
-    table.qhigh  = spec.qtype == QType::Q6G64_F16S ? bytes + layout.high_plane_offset : nullptr;
-    table.scales = bytes + layout.scale_plane_offset;
-    table.n      = kVocab;
-    table.k      = spec.d;
-    table.group  = spec.group;
+    table.payload         = payload;
+    table.payload_bytes   = layout.payload_bytes;
+    table.qtype           = spec.qtype;
+    table.layout          = QuantLayout::RowSplit;
+    table.scale_dtype     = DType::FP16;
+    table.group_size      = spec.group;
+    table.shape[0]        = kVocab;
+    table.shape[1]        = spec.d;
+    table.padded_shape[0] = kVocab;
+    table.padded_shape[1] = layout.padded_d;
+    table.ndim            = 2;
+    table.qdata           = payload;
+    table.scales          = bytes + layout.scale_plane_offset;
+    table.n               = kVocab;
+    table.k               = spec.d;
+    table.group           = spec.group;
     return table;
 }
 
@@ -169,15 +134,12 @@ ColdTiming measure_point(const ProfileSpec& spec, const Weight& table, DeviceBuf
 double logical_bytes_per_column(const ProfileSpec& spec, const PackedLayout& layout) {
     const auto group_count    = layout.padded_d / spec.group; // padded_d is a multiple of group.
     const double groups       = static_cast<double>(group_count);
-    const double weight_bytes = spec.qtype == QType::Q6G64_F16S
-                                    ? groups * static_cast<double>(32 + 16 + 2)
-                                    : static_cast<double>(layout.padded_d) + groups * 2.0;
+    const double weight_bytes = static_cast<double>(layout.padded_d) + groups * 2.0;
     return weight_bytes + static_cast<double>(spec.d) * 2.0 + sizeof(std::int32_t);
 }
 
-void run_profile(Profile profile, const std::vector<std::int32_t>* requested_tokens, int warmup,
-                 int repeat, bool csv) {
-    const ProfileSpec spec = profile_spec(profile);
+void run_profile(const ProfileSpec& spec, const std::vector<std::int32_t>* requested_tokens,
+                 int warmup, int repeat, bool csv) {
     const std::vector<std::int32_t> tokens =
         requested_tokens == nullptr ? production_tokens(spec) : *requested_tokens;
     const std::int32_t max_t  = *std::max_element(tokens.begin(), tokens.end());
@@ -221,16 +183,13 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::vector<Profile> profiles;
     std::vector<std::int32_t> requested_tokens;
     bool has_requested_tokens = false;
     bool csv                  = false;
     int warmup                = 10;
     int repeat                = 61;
     for (int index = 1; index < argc; ++index) {
-        if (!std::strcmp(argv[index], "--profile") && index + 1 < argc) {
-            profiles.push_back(parse_profile(argv[++index]));
-        } else if (!std::strcmp(argv[index], "--tokens") && index + 1 < argc) {
+        if (!std::strcmp(argv[index], "--tokens") && index + 1 < argc) {
             requested_tokens     = parse_tokens(argv[++index]);
             has_requested_tokens = true;
         } else if (!std::strcmp(argv[index], "--warmup") && index + 1 < argc) {
@@ -243,17 +202,11 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("unknown or incomplete embedding benchmark argument");
         }
     }
-    if (profiles.empty()) { profiles = {Profile::Q6D5120, Profile::W8D5120, Profile::W8D2048}; }
     if (warmup < 0 || repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
-    std::sort(profiles.begin(), profiles.end());
-    profiles.erase(std::unique(profiles.begin(), profiles.end()), profiles.end());
 
     if (csv) { std::printf("profile,T,median_us,p95_us,effective_gbs,sustained_read_pct\n"); }
-    for (const Profile profile : profiles) {
-        run_profile(profile, has_requested_tokens ? &requested_tokens : nullptr, warmup, repeat,
-                    csv);
-    }
+    run_profile(kW8D5120, has_requested_tokens ? &requested_tokens : nullptr, warmup, repeat, csv);
     return 0;
 }

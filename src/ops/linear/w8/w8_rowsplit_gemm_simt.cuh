@@ -144,12 +144,12 @@ w8_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
 
 // full_slabs is computed on the host: k/1024 when k % 8 == 0 and x is 16-byte
 // aligned, else 0 (everything runs through the scalar tail).
-template <class Schedule, int ColsPerTile, int RowsPerCta, int PipelineStages, bool Full,
-          W8Epilogue Epilogue = W8Epilogue::Store, class Output = W8ContiguousOutput>
+template <class Schedule, int ColsPerTile, int RowsPerCta, int PipelineStages, bool Full>
 __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
-                                             const std::uint8_t* __restrict__ scales, Output output,
-                                             std::int32_t rows, std::int32_t k, std::int32_t cols,
+                                             const std::uint8_t* __restrict__ scales,
+                                             W8ContiguousOutput output, std::int32_t rows,
+                                             std::int32_t k, std::int32_t cols,
                                              std::int32_t padded_k, std::int32_t full_slabs) {
     using Codec                = typename Schedule::Codec;
     constexpr int kPrefetch    = PipelineStages - 1;
@@ -235,13 +235,7 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
         if (tt >= ncols) { continue; }
         float a = acc[tt];
         a       = warp_reduce_sum(a);
-        if (lane == 0) {
-            __nv_bfloat16* destination = output_tile.at(row, col0 + tt);
-            if constexpr (Epilogue == W8Epilogue::Residual) {
-                a = __bfloat162float(*destination) + a;
-            }
-            *destination = __float2bfloat16_rn(a);
-        }
+        if (lane == 0) { *output_tile.at(row, col0 + tt) = __float2bfloat16_rn(a); }
     }
 }
 

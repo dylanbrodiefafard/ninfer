@@ -1,26 +1,27 @@
-# Qwen3.6-27B Model Reference
+# Qwen3.6-Family 27B Model Reference
 
 Current product execution supports ordinary decoding and DFlash2 only. MTP execution is
 rejected at Engine admission. MTP algorithms and layouts below describe dormant private
 machinery, not an available product backend.
 
 This reference records the exact Text, MTP, Vision, multimodal-position, numeric, and persistent-state
-semantics used by the registered target. Fixed dimensions are encoded in the target's
-`impl/config.h`; artifact assignment and binding are defined in
-[`qwen3.6-27b-artifact.md`](qwen3.6-27b-artifact.md).
+semantics of the Qwen3.6-family 27B architecture used by the registered Qwen3.8-27B target. Fixed
+dimensions are encoded in the target's `impl/config.h`; artifact assignment and binding are
+defined in [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md).
 
 ## 1. Model identity
 
-The target checkpoint is called Qwen3.6-27B in this project and uses the `qwen3_5` /
-`qwen3_5_text` architecture names in Hugging Face implementations. Qwen3.8-27B shares this Text,
-MTP, and Vision shape. It is a dense multimodal model with three runtime components:
+The registered checkpoint using this architecture is Qwen3.8-27B (`qwen3.8-27b`). The
+architecture is the Qwen3.6-family 27B shape, which uses the `qwen3_5` / `qwen3_5_text`
+architecture names in Hugging Face implementations. It is a dense multimodal model with three
+runtime components:
 
 - a 64-layer hybrid Text decoder;
 - a one-layer MTP draft model;
 - a 27-layer Vision transformer and patch merger.
 
 Qwen3.8-27B NVFP4 may additionally bind an optional DFlash2 companion when `dflash/` objects are
-present. Qwen3.6-27B files do not.
+present.
 The Qwen3.8 mixed FP8/NVFP4 storage inventory and its qualified projection
 profiles are defined in `qwen3.8-27b-artifact.md`. It uses this same family
 runtime, state semantics and frontend; storage selection does not introduce a
@@ -49,7 +50,7 @@ layout, or Vision tower is a different model implementation rather than a runtim
 | MTP layers | 1 |
 
 Layer `i` is full attention exactly when `(i + 1) % 4 == 0`; all other layers are GDN. The model
-has a dense SwiGLU MLP in every layer and does not contain MoE experts.
+has a dense SwiGLU MLP in every layer.
 
 ### 2.2 Full attention
 
@@ -125,11 +126,10 @@ Vision columns are not Text token `T` and are not expanded beyond that envelope.
 
 ### 2.6 DFlash2 companion (Qwen3.8-27B)
 
-Qwen3.8-27B may carry an optional DFlash2 draft companion. Qwen3.6-27B files do not. The values
+Qwen3.8-27B may carry an optional DFlash2 draft companion. The values
 below are from Hugging Face `z-lab/Qwen3.8-27B-DFlash2` revision
 `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` and pinned `z-lab/dflash` `model.py`
-`95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c` (`DFlash2DraftModel`). This is not the 35B DFlash v1
-companion, not `z-lab/Qwen3.6-27B-DFlash`, and not a DSpark drafter.
+`95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c` (`DFlash2DraftModel`). It is not a DSpark drafter.
 
 | Field | Value |
 |---|---:|
@@ -599,7 +599,7 @@ or if budget cannot afford the locked k.
 On a long-lived serve, T is known after the first requests and `H` keeps learning across
 requests. Host tests cover hop updates, the hazard hierarchy, exploration, dominance, one
 measurement per arm, the warm-server start, and shared batch k. DFlash captures
-`{3..N}` (bounded by the target's adaptive maximum: 27B 7, 35B 5): on the A8 verify routes k=1/2
+`{3..N}` (bounded by the adaptive maximum of 7): on the A8 verify routes k=1/2
 never beat k=3 at any C=1..6 (C=1 round time
 is nearly flat in k, 14.6 ms at k=1 to 15.3–15.8 ms at k=3–5; at C≥4 a k=4 round is cheaper than a
 k=1 round), see [performance.md](../performance.md#adaptive-draft-start-and-k-set-2026-09-27).
@@ -770,7 +770,7 @@ operation order. Private accumulator precision, Tensor Core operand staging, int
 materialization, workspace dtype, and reduction association are selected by each implementation
 route and accepted against the Op's criterion for that implementation profile.
 
-GQA numerical qualification covers both registered geometries, supported prompt and small-T
+GQA numerical qualification covers the registered geometry, supported prompt and small-T
 regimes, the maintained conformance matrix, and target-representative activation ranges. Its
 BF16-cache and INT8-cache compute-profile criteria are explicitly named in the GQA conformance
 suite; they are not claimed as pointwise bounds for every arbitrary or adversarial BF16 tensor. A1
@@ -836,31 +836,29 @@ complete artifact inventory is still validated before these resident views are p
 | DFlash checkpoint/accepted-history physical planes and closed transition | `src/core/gdn_history.*`, `include/ninfer/ops/gdn_history.h`, `src/ops/linear_attention/gated_delta_net/history.*` |
 | fixed all-layer GDN state pool, ReplaySSM record arena, and Fold contract | `src/core/linear_attention_state.*`, `src/core/gdn_replay_records.*`, `include/ninfer/ops/gdn_replay.h`, `src/ops/linear_attention/gated_delta_net/replay.cpp` |
 | generated-round buffer schema, MTP alignment, and Vision control | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/`, `src/targets/qwen3_6/impl/state/round_state.cpp`, `src/targets/qwen3_6/impl/vision/control.cpp` |
-| `.ninfer` tensor assignment and binding | [`qwen3.6-27b-artifact.md`](qwen3.6-27b-artifact.md), `tools/reference/qwen3_6_27b/bindings.py` |
-| native `.ninfer` converter and verifier | `tools/convert/qwen3_6_27b` |
-| artifact-native Python Text/Vision/MTP reference | `tools/reference/qwen3_6_27b` |
+| `.ninfer` tensor assignment and binding | [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md), `src/targets/qwen3_6_27b/impl/load/` |
+| native `.ninfer` converters | `tools/convert/qwen3_8_27b` entry points over the shared family conversion helpers in `tools/convert/qwen3_6_27b` |
+| artifact-native Python Vision reference and Vision parity | `tools/reference/qwen3_6_27b`, `tools/parity/qwen3_6_27b` |
 
-The Python reference is an independent executable implementation for model/artifact inspection and
-diagnosis; it is not the per-Op mathematical oracle, does not prescribe private C++ kernel
-precision, and does not define cross-runtime generated-token equality. Each Op is checked against
-its own naive FP32/FP64 or exact oracle. The C++ target
-implements the complete Text/Vision/MTP product over `.ninfer` through the closed Engine
-architecture.
+The Python Vision reference is an independent executable implementation for Vision artifact
+inspection and parity diagnosis; it is not the per-Op mathematical oracle and does not prescribe
+private C++ kernel precision. Each Op is checked against its own naive FP32/FP64 or exact oracle.
+The C++ target implements the complete Text, Vision, and DFlash2 product over `.ninfer` through
+the closed Engine architecture.
 
 ## 16. Family runtime and Variant structure
 
-The 27B (`src/targets/qwen3_6_27b`) and 35B-A3B (`src/targets/qwen3_6_35b_a3b`) execution packages
-are peer compile-time Variants of one identity-free Qwen3.6 family runtime
+The 27B execution package (`src/targets/qwen3_6_27b`), which registers the `qwen3.8-27b/nvfp4`
+identity, is the compile-time Variant of the identity-free Qwen3.6 family runtime
 (`src/targets/qwen3_6`).
 
 The family owns the shared `SequencePlan<Variant>`, `RequestPlan<Variant>`, and `Program<Variant>`
 algorithms; frontend and output semantics; Text/Vision/speculative schedules; state transactions;
-workspace composition; and CUDA Graph capture/replay mechanics. Each package separately owns its
+workspace composition; and CUDA Graph capture/replay mechanics. The package owns its
 registered artifact identities and bindings, immutable model view, dimensions/storage facts, three
 closed execution-leaf families (attention projection, GDN projection/control, post-mixer), graph
 frontier data, and Program instance bytes.
 
-Invariants: no mutable state or device allocation is shared between Programs; neither package is
-defined as a delta from the other; and there is no runtime family selection or target-dependent
-branch inside family scheduling. All artifacts embed the same six frontend resources, and a
-prepared prompt carries no exact-target tag.
+Invariants: no mutable state or device allocation is shared between Programs, and there is no
+runtime family selection or target-dependent branch inside family scheduling. Each artifact embeds
+its own six frontend resources, and a prepared prompt carries no exact-target tag.

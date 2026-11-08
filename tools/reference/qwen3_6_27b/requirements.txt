@@ -1,8 +1,8 @@
-# Qwen3.6-27B artifact-native Python reference dependencies.
+# Qwen3.8-27B artifact-native Vision reference and parity dependencies.
 torch>=2.7
 numpy>=1.24
+safetensors
 tokenizers>=0.22
-flash-linear-attention>=0.5.1
 transformers>=5.12
 pillow>=10
 torchvision

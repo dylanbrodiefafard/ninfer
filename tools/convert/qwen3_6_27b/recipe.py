@@ -1,9 +1,16 @@
-"""Hugging Face source recipe for the complete Qwen3.6-27B inventory."""
+"""BF16 Hugging Face source recipes for the 27B Qwen3.6-family tensor roles.
+
+Each recipe maps the BF16 source checkpoint onto one named tensor role of the shared 27B geometry:
+Text, the optimized draft head, MTP, and Vision. Text input projections are recipes for their
+source row groups: ``attention/query_key`` and ``attention/gate_value`` for full attention, and
+``gdn/query_key`` and ``gdn/value_z`` for GDN. A converter that stores a fused parent such as
+``attention/query_key_gate_value`` concatenates its row groups in that order. The MTP attention
+parent is already the fused ``[query, key, output_gate, value]`` row order.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
-
+from tools.convert.qwen3_6.common.inventory import FP32
 from tools.convert.qwen3_6.common.recipe import (
     Cast,
     Concat,
@@ -12,31 +19,17 @@ from tools.convert.qwen3_6.common.recipe import (
     GatherRows,
     Reshape,
     Slice,
-    SourcePreflight,
-    SourceTensor,
     TensorRecipe,
     Transpose,
     attention_qproj_part,
     build_vision_recipes,
-    expression_sources,
     source,
 )
-from tools.convert.qwen3_6.common.recipe import (
-    preflight_sources as _preflight_recipe_sources,
-)
-from tools.convert.qwen3_6.common.recipe import (
-    source_requirements as _recipe_source_requirements,
-)
-from tools.convert.qwen3_6.common.recipe import (
-    validate_recipe_coverage as _validate_recipe_coverage,
-)
 
-from . import inventory
+from .convert import FULL_ATTENTION_LAYERS
 
 DRAFT_ROWS = 131072
 
-
-_sources = expression_sources
 _source = source
 
 
@@ -67,7 +60,7 @@ def _build_text_recipes() -> tuple[TensorRecipe, ...]:
             )
         )
 
-        if layer in inventory.FULL_ATTENTION_LAYERS:
+        if layer in FULL_ATTENTION_LAYERS:
             q_proj = source_prefix + "self_attn.q_proj.weight"
             query = _attention_qproj_part(q_proj, gate=False)
             gate = _attention_qproj_part(q_proj, gate=True)
@@ -120,11 +113,11 @@ def _build_text_recipes() -> tuple[TensorRecipe, ...]:
                 (
                     TensorRecipe(
                         object_prefix + "gdn/a_log",
-                        Cast(_source(source_prefix + "linear_attn.A_log", (48,)), inventory.FP32),
+                        Cast(_source(source_prefix + "linear_attn.A_log", (48,)), FP32),
                     ),
                     TensorRecipe(
                         object_prefix + "gdn/dt_bias",
-                        Cast(_source(source_prefix + "linear_attn.dt_bias", (48,)), inventory.FP32),
+                        Cast(_source(source_prefix + "linear_attn.dt_bias", (48,)), FP32),
                     ),
                     TensorRecipe(
                         object_prefix + "gdn/convolution",
@@ -304,18 +297,5 @@ RECIPE_SPECS = (
     + _build_vision_recipes()
 )
 RECIPES_BY_NAME = {recipe.object_name: recipe for recipe in RECIPE_SPECS}
-
-
-def validate_recipe_coverage() -> None:
-    _validate_recipe_coverage(RECIPE_SPECS, inventory.TENSOR_SPECS)
-
-
-def source_requirements() -> dict[str, SourceTensor]:
-    return _recipe_source_requirements(RECIPE_SPECS)
-
-
-def preflight_sources(model_dir: str | Path) -> SourcePreflight:
-    return _preflight_recipe_sources(model_dir, RECIPE_SPECS)
-
-
-validate_recipe_coverage()
+if len(RECIPES_BY_NAME) != len(RECIPE_SPECS):
+    raise RuntimeError("more than one 27B source recipe targets the same tensor role")

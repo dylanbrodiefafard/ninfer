@@ -7,19 +7,19 @@
 
 namespace ninfer::ops::detail {
 
-template <int TileCols>
-inline constexpr int kW8PairMmaMinBlocks = TileCols <= 64 ? 3 : 2;
+// Grid (ceil(m/32), ceil(n/kW8PairMmaTileCols)); block kW8PairMmaThreads threads.
+inline constexpr int kW8PairMmaTileCols = 128;
+inline constexpr int kW8PairMmaThreads  = (kW8PairMmaTileCols / 16) * 32;
 
-template <int TileCols, bool Full>
-__global__
-__launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_pair_gemm_mma_kernel(
+template <bool Full>
+__global__ __launch_bounds__(kW8PairMmaThreads, 2) void w8_pair_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ k_codes,
     const std::uint8_t* __restrict__ k_scales, const std::uint8_t* __restrict__ v_codes,
     const std::uint8_t* __restrict__ v_scales, __nv_bfloat16* __restrict__ k_out,
     __nv_bfloat16* __restrict__ v_out, std::int32_t m, std::int32_t k, std::int32_t n,
     std::int32_t padded_k) {
     constexpr int BM                = 32;
-    constexpr int BN                = TileCols;
+    constexpr int BN                = kW8PairMmaTileCols;
     constexpr int BK                = 64;
     constexpr int WN                = 16;
     constexpr int MT                = 2;
@@ -29,8 +29,7 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
     constexpr int WARPS             = WARPS_N;
     constexpr int THREADS           = WARPS * 32;
     constexpr int SCALE_CACHE_BYTES = 16;
-    static_assert(TileCols == 64 || TileCols == 80 || TileCols == 96 || TileCols == 112 ||
-                  TileCols == 128);
+    static_assert(THREADS == kW8PairMmaThreads);
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[2][BN * BK];

@@ -39,10 +39,8 @@ FAST=0
 CTEST_ARGS=()
 
 WEIGHT_VARS=(
-  NINFER_QWEN3_6_27B_NVFP4_WEIGHTS
-  NINFER_QWEN3_6_27B_WEIGHTS
+  NINFER_QWEN3_8_27B_NVFP4_WEIGHTS
   NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS
-  NINFER_QWEN3_6_35B_A3B_WEIGHTS
 )
 
 while [[ $# -gt 0 ]]; do
@@ -94,36 +92,24 @@ container_for_pid() {
 
 weight_filenames() {
   case "$1" in
-    NINFER_QWEN3_6_27B_NVFP4_WEIGHTS)
-      printf '%s\n' qwen3_8_27b_nvfp4.ninfer qwen3_6_27b_nvfp4.ninfer
-      ;;
-    NINFER_QWEN3_6_27B_WEIGHTS)
-      printf '%s\n' qwen3_8_27b.ninfer qwen3_6_27b.ninfer
+    NINFER_QWEN3_8_27B_NVFP4_WEIGHTS)
+      printf '%s\n' qwen3_8_27b_nvfp4.ninfer
       ;;
     NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS)
       printf '%s\n' qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
         qwen3_8_27b_nvfp4_dflash_w8.ninfer \
         qwen3_8_27b_nvfp4_dflash_nvfp4_codebook.ninfer
       ;;
-    NINFER_QWEN3_6_35B_A3B_WEIGHTS)
-      printf '%s\n' qwen3_6_35b_a3b.ninfer
-      ;;
   esac
 }
 
 weight_tests() {
   case "$1" in
-    NINFER_QWEN3_6_27B_NVFP4_WEIGHTS)
-      echo "prefix, ram, recovery-kv, checkpoint, serve-prepend"
-      ;;
-    NINFER_QWEN3_6_27B_WEIGHTS)
+    NINFER_QWEN3_8_27B_NVFP4_WEIGHTS)
       echo "prefix, ram, recovery-kv, checkpoint, serve-prepend, load-plan"
       ;;
     NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS)
       echo "ninfer_qwen3_8_27b_dflash_real_test, logprobs, recovery-kv"
-      ;;
-    NINFER_QWEN3_6_35B_A3B_WEIGHTS)
-      echo "35B real, ram, dflash, load-plan"
       ;;
   esac
 }
@@ -368,14 +354,13 @@ print_weights_report() {
 }
 
 require_real_weights() {
-  if [[ -n "${NINFER_QWEN3_6_27B_NVFP4_WEIGHTS:-}" \
-     || -n "${NINFER_QWEN3_6_27B_WEIGHTS:-}" \
+  if [[ -n "${NINFER_QWEN3_8_27B_NVFP4_WEIGHTS:-}" \
      || -n "${NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS:-}" ]]; then
     return 0
   fi
   echo "Cannot run --real: no 27B .ninfer is visible." >&2
   echo "Place qwen3_8_27b_nvfp4.ninfer in models/ (or the builder /models mount)," >&2
-  echo "or set NINFER_QWEN3_6_27B_NVFP4_WEIGHTS in models/weights.env." >&2
+  echo "or set NINFER_QWEN3_8_27B_NVFP4_WEIGHTS in models/weights.env." >&2
   exit 1
 }
 
@@ -471,7 +456,6 @@ run_python_suite() {
   (cd "$ROOT" && "$py" -m pytest \
     tests/artifact \
     tests/targets/qwen3_6_27b \
-    tests/targets/qwen3_6_35b_a3b \
     tests/test_bench_matrix.py \
     tests/test_serve_corpus.py)
 }

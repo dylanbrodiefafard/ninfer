@@ -17,7 +17,6 @@ enum class Category : std::uint32_t {
     Attention,
     Gdn,
     PostMixer,
-    Moe,
     Control,
 };
 
@@ -46,9 +45,6 @@ enum class Name : std::size_t {
     PrefillGdn,
     VerifyGdn,
     PrefillChunk,
-    SparseMoePrefill,
-    SparseMoeSmallT,
-    SparseMoeDecode,
     TokenGrammarMasks,
     Count,
 };
@@ -71,8 +67,6 @@ enum class Name : std::size_t {
         return 0xffe15759u;
     case Category::PostMixer:
         return 0xffedc948u;
-    case Category::Moe:
-        return 0xffb07aa1u;
     case Category::Control:
         return 0xff9c9c9cu;
     }
@@ -90,7 +84,6 @@ enum class Name : std::size_t {
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Attention), "attention");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Gdn), "gdn");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::PostMixer), "post-mixer");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Moe), "moe");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Control), "control");
         return out;
     }();
@@ -123,9 +116,6 @@ enum class Name : std::size_t {
         "prefill.gdn",
         "verify.gdn",
         "prefill.chunk",
-        "sparse_moe.prefill",
-        "sparse_moe.small_t",
-        "sparse_moe.decode",
         "token_grammar.masks",
     };
     static const auto handles = [] {

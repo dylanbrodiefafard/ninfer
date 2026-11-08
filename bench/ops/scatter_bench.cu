@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::int32_t d    = 2048;
+    std::int32_t d    = 5120;
     bool control      = false;
     bool profile_once = false;
     std::vector<std::int32_t> vision_tokens;

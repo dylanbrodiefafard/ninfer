@@ -2149,7 +2149,7 @@ int test_unready_ram_image_does_not_shadow_usable_image(ninfer::DeviceContext& c
     const auto chain  = q36::detail::prefix_hash_chain(prompt);
     for (auto backend : {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp,
                          ninfer::SpeculativeBackend::DFlash}) {
-        const q36::detail::ReuseBackendPolicy policy{backend, true, true, false};
+        const q36::detail::ReuseBackendPolicy policy{backend, true, true};
         for (bool shorter : {false, true}) {
             q36::detail::KVRamCache cache(8ULL << 20);
             if (capture_text_entry(cache, pool, source, prompt, ctx.copy_stream, 0, false, 128)) {
@@ -2186,7 +2186,7 @@ int test_unready_ram_image_does_not_shadow_usable_image(ninfer::DeviceContext& c
         }
         const auto match = cache.plan_match(
             prompt, chain,
-            q36::detail::ReuseBackendPolicy{ninfer::SpeculativeBackend::Mtp, true, false, false});
+            q36::detail::ReuseBackendPolicy{ninfer::SpeculativeBackend::Mtp, true, false});
         if (!match || match->entry_id != checkpoint_id || match->reuse_base != 64 ||
             match->reuse != ninfer::PrefixReusePath::RestoreTurnCheckpoint) {
             return fail("RAM invalid append lost its valid checkpoint fallback");

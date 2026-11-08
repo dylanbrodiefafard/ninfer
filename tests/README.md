@@ -35,12 +35,9 @@ preservation and guards. Its `--sanitizer` case covers B6/W12.
 - `targets/qwen3_6/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
   stop/output decoding, hybrid topology, decoder/GDN and round-state layouts/views, shifted-MTP
   alignment, Vision control, and family runtime mechanisms;
-- `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
-  bindings, reference diagnostics, family Program/multimodal/MTP behavior, and the opt-in real-Engine
-  prefix and RAM-tier tests;
-- `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
-  reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
-  and the opt-in real public-Engine route;
+- `targets/qwen3_6_27b/` — the registered Qwen3.8-27B inventory, shared family conversion recipe
+  and verifier, Vision reference diagnostics, family Program/multimodal/MTP behavior, and the
+  opt-in real-Engine tests;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
 - `test_cache_tensor_identity.cpp` — retained-state fingerprint mutations across NVFP4, W8, and
@@ -211,20 +208,14 @@ Run the native Python suites with the project Python environment:
 
 ```bash
 python3 -m pytest \
-  tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
+  tests/artifact tests/targets/qwen3_6_27b \
   tests/test_bench_matrix.py tests/test_serve_corpus.py
 ```
-
-The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for
-`out/qwen3_6_27b.ninfer`. They report a pytest skip when neither path provides the real
-artifact. The 35B-A3B reference binding test follows the same rule with
-`NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.ninfer`. The remaining Python
-target tests still run without either artifact.
 
 The C++ prefix, RAM-tier, and three-tier disk integration tests load a full artifact and run
 the real Engine. Use `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` for the DFlash prefix,
 context-checkpoint, and speculative cache cases. Ordinary cases also accept
-`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS`. MTP execution is disabled; the CPU cache-tensor-identity
+`NINFER_QWEN3_8_27B_NVFP4_WEIGHTS` (the path to `qwen3_8_27b_nvfp4.ninfer`). MTP execution is disabled; the CPU cache-tensor-identity
 test checks that Engine admission rejects it before artifact or device initialization.
 `ninfer_qwen3_8_27b_logprobs_real_test` (`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`) qualifies
 token logprobs through the public Engine on the ordinary, DFlash chain, packed-tree, adaptive,
@@ -245,7 +236,7 @@ and the C=3 shared-pool analog (three 3-page chats, two 4-page continuations plu
 `ninfer_qwen3_6_27b_cache_admission_real_test` checks that a 1 MiB RAM budget cannot block
 admission at C=1–4. It forces selected-lane and shared-pool victim capture drops, then verifies
 overlapping dirty-lane replacements complete at C>1. It uses NVFP4 KV and
-`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS`.
+`NINFER_QWEN3_8_27B_NVFP4_WEIGHTS`.
 The disk Engine suite also checks tiny-RAM capture drops during `HostDisk` admission at
 C=1–4, retained sibling continuations, greedy replay parity, and request-local copy timing.
 
@@ -260,7 +251,7 @@ explorations execute the real cache implementations:
 | `ninfer_qwen3_6_27b_cache_interleavings_real_test` | Every cancellation subset at C=1–4, RAM-only and RAM+disk, for ordinary and DFlash execution (60 subsets per backend); ordinary cancellation after the first publication, speculative cancellation after the second with a per-request backend-round witness | Actual RAM reuse, concurrent decode, canceled/completed terminal states, next-token continuation against fresh computation of the same represented history |
 
 The Engine matrix uses NVFP4 KV and `--backend ordinary|dflash`. Ordinary uses
-`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS`; DFlash uses
+`NINFER_QWEN3_8_27B_NVFP4_WEIGHTS`; DFlash uses
 `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`. Speculative cases require actual backend execution.
 The opt-in real CTests register ordinary and DFlash backends.
 Its cancellation
@@ -410,9 +401,9 @@ that copy/compute overlap proof:
 ```bash
 NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=/path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
-NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
+NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_ram_real_test --output-on-failure
-NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
+NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_disk_real_test --output-on-failure
 NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=/path/to/qwen3_8_27b_nvfp4_dflash.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_disk_real_test --output-on-failure
@@ -422,8 +413,6 @@ NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_dflash_w8.nin
   ctest --test-dir build -R ninfer_qwen3_6_27b_context_checkpoint_real_test --output-on-failure
 NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \
   ctest --test-dir build -R ninfer_qwen3_8_27b_dflash_real_test --output-on-failure
-NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_ram_real_test --output-on-failure
 ```
 
 The prefix real test accepts `--case vision` to run image continuation, DFlash visual bridge,
@@ -432,7 +421,7 @@ and many-turn image prefill admission checks without the text-only cache scenari
 `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` set to the DFlash artifact.
 
 `ninfer_qwen3_6_27b_recovery_kv_real_test` loads the DFlash artifact when set, otherwise
-an ordinary NVFP4 or groupwise artifact and drives the production Program. It prefills a
+an ordinary NVFP4 artifact and drives the production Program. It prefills a
 thinking prompt, retains the lane, copies the prompt without its sampled token, and prefills
 only the recovery suffix from that resident checkpoint. It then captures the stacked prompt,
 aborts the lane three times, restores the RAM image onto the empty lane, and prefills again
@@ -444,7 +433,7 @@ same prefill decomposition. Greedy speculative continuation must match as well. 
 the ordinary and DFlash weight variables separately to check both restoration profiles.
 
 ```bash
-NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
+NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ./scripts/run-unit-tests.sh --real -R '^ninfer_qwen3_6_27b_recovery_kv_real_test$'
 ```
 
@@ -509,7 +498,7 @@ tokens stay in the reusable prefix. `ninfer_serve_system_prepend_real_test` chec
 turn 2 and a host-RAM restore after an unrelated chat spills the first turn:
 
 ```bash
-NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
+NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_serve_system_prepend_real_test --output-on-failure
 ```
 
@@ -526,13 +515,13 @@ PYTHONPATH=eval eval/.venv/bin/python -m unittest discover \
 Run the serving contract manually after starting a resident server in another terminal:
 
 ```bash
-./build/apps/ninfer-serve out/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 --port 18080
 ```
 
 ```bash
 python3 -m tools.smoke.serve_contract \
-  --base-url http://127.0.0.1:18080 --model qwen3.6-27b
+  --base-url http://127.0.0.1:18080 --model qwen3.8-27b
 ```
 
 This smoke check is intentionally not a CTest: it needs the real artifact, a supported GPU, and a
@@ -547,9 +536,6 @@ inheritance:
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \
   --artifact models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer --backend dflash
-
-python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact out/qwen3_6_35b_a3b.ninfer --backend dflash
 ```
 
 The shared messages are in

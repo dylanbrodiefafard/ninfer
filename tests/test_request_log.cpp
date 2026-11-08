@@ -74,7 +74,7 @@ int main() {
                       "request log accepted the model artifact as its output path");
 
     ServeOptions options;
-    options.artifact_path                  = "/models/qwen3_6_27b.ninfer";
+    options.artifact_path                  = "/models/qwen3_8_27b_nvfp4.ninfer";
     options.host                           = "127.0.0.1";
     options.port                           = 8123;
     options.api_key                        = "must-not-appear";
@@ -101,9 +101,9 @@ int main() {
     };
 
     ninfer::LoadSummary load;
-    load.target               = "qwen3_6_27b";
-    load.model_id             = "qwen3.6-27b";
-    load.weights_id           = "groupwise-int";
+    load.target               = "qwen3_8_27b";
+    load.model_id             = "qwen3.8-27b";
+    load.weights_id           = "nvfp4";
     load.load_seconds         = 1.234567890123;
     load.upload_seconds       = 0.345678901234;
     load.artifact_bytes_read  = 1000;
@@ -155,9 +155,9 @@ int main() {
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
-    failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
-    failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
-                      "server weights id missing");
+    failures += check(server.at("artifact").at("target") == "qwen3_8_27b", "server target missing");
+    failures +=
+        check(server.at("artifact").at("weights_id") == "nvfp4", "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
@@ -229,7 +229,7 @@ int main() {
                       "server argv did not retain the redaction marker");
 
     GenerationRequest request;
-    request.model          = "qwen3.6-27b";
+    request.model          = "qwen3.8-27b";
     request.stream         = false;
     request.max_tokens     = 4096;
     request.max_tokens_set = true;

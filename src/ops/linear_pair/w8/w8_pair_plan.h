@@ -4,7 +4,6 @@
 
 #include <cuda_runtime.h>
 
-#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -12,53 +11,7 @@ namespace ninfer::ops::detail {
 enum class W8PairScheduleId {
     TwoSimtR8C4,
     TwoSimtR8C8,
-    DualDecodeR4,
-    DualDecodeR8,
-    DualDecodeR16,
-    DualSplitKMmaExactT,
-    DualSplitKMediumC48,
-    DualSplitKMediumC64,
-    DualSplitKMediumC80,
-    DualSplitKMediumC88,
-    DualSplitKMediumC96,
-    DualSplitKMediumC104,
-    DualSplitKMediumC112,
-    DualSplitKMediumC128,
-    DualSplitKMediumC160,
-    DualSplitKMediumC192,
-    DualSplitKMediumC224,
-    DualSplitKMediumC256,
-    DualMmaR32C64,
-    DualMmaR32C80,
-    DualMmaR32C96,
-    DualMmaR32C112,
     DualMmaR32C128,
-    ConcatMmaR32C64,
-    ConcatMmaR32C80,
-    ConcatMmaR32C96,
-    ConcatMmaR32C112,
-    ConcatMmaR32C128,
-    ConcatMmaR48C64,
-    ConcatMmaR48C96,
-    ConcatMmaR48C112,
-    ConcatMmaR48C128,
-    ConcatMmaR64C64,
-    ConcatMmaR64C80,
-    ConcatMmaR64C96,
-    ConcatMmaR64C128,
-    ConcatMmaR96C64,
-    ConcatMmaR96C80,
-    ConcatMmaR96C96,
-    ConcatMmaR96C112,
-    ConcatMmaR128C64,
-    ConcatMmaR128C80,
-    ExactConcatMmaR32C96,
-    ExactConcatMmaR32C128,
-    ExactConcatMmaR64C96,
-    ExactConcatMmaR64C128,
-    ExactConcatMmaR96C96,
-    ExactConcatMmaR128C64,
-    ExactConcatMmaR128C80,
 };
 
 struct W8PairProblem {

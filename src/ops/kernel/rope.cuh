@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/ninfer/ops/rope.h
-// Fixed matches: BF16 Qwen3.6 Text 24Q/4K and 16Q/2K at D/R=256/64, DFlash 32Q/8K at
+// Fixed matches: BF16 Qwen3.6 Text 24Q/4K at D/R=256/64, DFlash 32Q/8K at
 // D/R=128/128, plus packed Vision 16Q/16K at D/R=72/72. One CTA owns one token and shares its
 // rotary coefficients across heads.
 

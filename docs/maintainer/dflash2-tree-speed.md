@@ -421,8 +421,8 @@ the compact decode batch, not a quality loss.
 For W=5, the compact verify tensor is consumed at T=5*C by the A16 LinearAdd residual projections,
 NVFP4 LinearSwiGLU, and fused NVFP4/BF16-control attention-input projections. The latter two use
 explicit T=10/15/20 schedules qualified against both their independent mathematical oracles and
-five-token panel execution. Q4/Q5 attention input and other verify widths retain their prior panel
-execution until separately qualified.
+five-token panel execution. Other verify widths retain their prior panel execution until separately
+qualified.
 
 Matched greedy W=5 serving, 2,048 output tokens per request, NVFP4 KV:
 

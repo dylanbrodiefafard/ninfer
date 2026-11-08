@@ -13,9 +13,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include <utility>
-#include <variant>
 
 namespace ninfer {
 namespace {
@@ -144,10 +142,7 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
-    using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
-    using Executor =
-        std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
+    using Executor = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)), device(options.device) {
@@ -155,23 +150,13 @@ public:
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
-        executor          = std::visit(
-            [&](auto& target_ptr) -> Executor {
-                using Instance =
-                    typename std::remove_reference_t<decltype(target_ptr)>::element_type;
-                if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                    return std::make_unique<Executor27>(*target_ptr, options);
-                } else {
-                    return std::make_unique<Executor35>(*target_ptr, options);
-                }
-            },
-            active);
+        executor          = std::make_unique<Executor>(*active, options);
     }
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
         // Destroying the executor joins its worker, so no CUDA work is issued after this point.
-        visit_loaded_executor([](auto& loaded) noexcept { loaded.reset(); });
+        executor.reset();
         // The final drain only orders teardown of device resources owned by later members; a
         // destructor has no caller to report a sticky device error to, and every allocation is
         // released by its own RAII owner regardless.
@@ -181,15 +166,16 @@ public:
         } catch (const std::exception&) {}
     }
 
-    // Calls visitor with the active executor's owning pointer; does nothing before an executor
-    // is constructed. std::get_if keeps this path free of std::bad_variant_access.
-    template <class Visitor>
-    void visit_loaded_executor(Visitor&& visitor) noexcept {
-        if (auto* loaded27 = std::get_if<std::unique_ptr<Executor27>>(&executor)) {
-            std::forward<Visitor>(visitor)(*loaded27);
-        } else if (auto* loaded35 = std::get_if<std::unique_ptr<Executor35>>(&executor)) {
-            std::forward<Visitor>(visitor)(*loaded35);
+    [[nodiscard]] const targets::Qwen3_6_27BInstance& target() const {
+        if (active == nullptr) { throw std::logic_error("Engine target is not active"); }
+        return *active;
+    }
+
+    [[nodiscard]] Executor& loaded_executor() const {
+        if (executor == nullptr) {
+            throw std::logic_error("concurrent Engine executor is unavailable");
         }
+        return *executor;
     }
 
     EngineOptions options;
@@ -197,7 +183,7 @@ public:
     targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
-    Executor executor;
+    std::unique_ptr<Executor> executor;
     mutable targets::qwen3_6::frontend_internal::EncodedHistoryCache host_encode_cache;
 };
 
@@ -214,75 +200,53 @@ PreparedPrompt Engine::prepare(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     const SamplingMode sampling_mode =
         input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    return std::visit(
-        [&](const auto& target_ptr) -> PreparedPrompt {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            auto prepared = targets::qwen3_6::EncodedHistoryPrepare::prepare(
-                target_ptr->loaded->frontend, std::move(input), impl_->host_encode_cache,
-                impl_->options.kv_ram_system_prompts != 0);
-            PromptSummary info = prepared.summary();
-            if (info.prompt_tokens > target_ptr->capacity) {
-                throw RequestError(
-                    RequestErrorKind::ContextLengthExceeded,
-                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
-            }
-            const double seconds = prepared.prepare_seconds();
-            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, seconds, sampling_mode, std::move(prepared)));
-        },
-        impl_->active);
+    const auto& target = impl_->target();
+    auto prepared      = targets::qwen3_6::EncodedHistoryPrepare::prepare(
+        target.loaded->frontend, std::move(input), impl_->host_encode_cache,
+        impl_->options.kv_ram_system_prompts != 0);
+    PromptSummary info = prepared.summary();
+    if (info.prompt_tokens > target.capacity) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           context_capacity_error(info.prompt_tokens, target.capacity));
+    }
+    const double seconds = prepared.prepare_seconds();
+    return PreparedPrompt(
+        std::make_unique<PreparedPrompt::Impl>(info, seconds, sampling_mode, std::move(prepared)));
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                       bool allow_prefix_identity) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& target_ptr) -> PreparedPrompt {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            auto prepared      = target_ptr->loaded->frontend.prepare_tokens(std::move(token_ids),
-                                                                             allow_prefix_identity);
-            PromptSummary info = prepared.summary();
-            if (info.prompt_tokens > target_ptr->capacity) {
-                throw RequestError(
-                    RequestErrorKind::ContextLengthExceeded,
-                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
-            }
-            const double seconds = prepared.prepare_seconds();
-            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, seconds, SamplingMode::Thinking, std::move(prepared)));
-        },
-        impl_->active);
+    const auto& target = impl_->target();
+    auto prepared =
+        target.loaded->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
+    PromptSummary info = prepared.summary();
+    if (info.prompt_tokens > target.capacity) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           context_capacity_error(info.prompt_tokens, target.capacity));
+    }
+    const double seconds = prepared.prepare_seconds();
+    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+        info, seconds, SamplingMode::Thinking, std::move(prepared)));
 }
 
 std::uint32_t Engine::count_tokens(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return targets::qwen3_6::EncodedHistoryPrepare::count_tokens(
-                target_ptr->loaded->frontend, std::move(input), impl_->host_encode_cache);
-        },
-        impl_->active);
+    const auto& target = impl_->target();
+    return targets::qwen3_6::EncodedHistoryPrepare::count_tokens(
+        target.loaded->frontend, std::move(input), impl_->host_encode_cache);
 }
 
 PromptCapabilities Engine::prompt_capabilities() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.prompt_capabilities();
-        },
-        impl_->active);
+    const auto& target = impl_->target();
+    return target.loaded->frontend.prompt_capabilities();
 }
 
 std::string Engine::token_bytes(TokenId token) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [token](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return std::string(target_ptr->loaded->frontend.token_bytes(token));
-        },
-        impl_->active);
+    const auto& target = impl_->target();
+    return std::string(target.loaded->frontend.token_bytes(token));
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -352,20 +316,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             impl_, std::move(immediate), resolved_sampling));
     }
 
-    return std::visit(
-        [&](auto& executor) -> GenerationHandle {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (std::is_same_v<Executor, std::monostate>) {
-                throw std::logic_error("concurrent Engine executor is unavailable");
-            } else {
-                auto submission = executor->submit(
-                    std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
-                    std::move(resolved_options), delivery, pending_deadline, std::move(host_input));
-                return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-                    impl_, std::move(submission), resolved_sampling));
-            }
-        },
-        impl_->executor);
+    auto& executor  = impl_->loaded_executor();
+    auto submission = executor.submit(std::move(prompt.impl_->value), prompt_summary,
+                                      prepare_seconds, std::move(resolved_options), delivery,
+                                      pending_deadline, std::move(host_input));
+    return GenerationHandle(
+        std::make_unique<GenerationHandle::Impl>(impl_, std::move(submission), resolved_sampling));
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
@@ -390,16 +346,8 @@ ScoreResult Engine::score(PreparedPrompt prompt, ScoreOptions options) {
     if (options.schedule == ScoreSchedule::Decode && prompt_summary.prompt_tokens < 3) {
         throw std::invalid_argument("decode score requires at least three prompt tokens");
     }
-    return std::visit(
-        [&](auto& executor) -> ScoreResult {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (std::is_same_v<Executor, std::monostate>) {
-                throw std::logic_error("concurrent Engine executor is unavailable");
-            } else {
-                return executor->score(std::move(prompt.impl_->value), options);
-            }
-        },
-        impl_->executor);
+    auto& executor = impl_->loaded_executor();
+    return executor.score(std::move(prompt.impl_->value), options);
 }
 
 const EngineOptions& Engine::options() const {
@@ -414,49 +362,23 @@ LoadSummary Engine::load_summary() const {
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& executor) -> MemorySummary {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (std::is_same_v<Executor, std::monostate>) {
-                throw std::logic_error("concurrent Engine executor is unavailable");
-            } else {
-                return executor->memory_summary();
-            }
-        },
-        impl_->executor);
+    auto& executor = impl_->loaded_executor();
+    return executor.memory_summary();
 }
 
 bool Engine::available() const {
-    if (impl_ == nullptr) { return false; }
-    return std::visit(
-        [](const auto& executor) {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (std::is_same_v<Executor, std::monostate>) {
-                return false;
-            } else {
-                return executor->available();
-            }
-        },
-        impl_->executor);
+    return impl_ != nullptr && impl_->executor != nullptr && impl_->executor->available();
 }
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& executor) -> RuntimeStats {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (std::is_same_v<Executor, std::monostate>) {
-                throw std::logic_error("concurrent Engine executor is unavailable");
-            } else {
-                return executor->runtime_stats();
-            }
-        },
-        impl_->executor);
+    auto& executor = impl_->loaded_executor();
+    return executor.runtime_stats();
 }
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
-    impl_->visit_loaded_executor([](auto& executor) noexcept { executor->reset_memory_peaks(); });
+    if (impl_->executor != nullptr) { impl_->executor->reset_memory_peaks(); }
 }
 
 } // namespace ninfer

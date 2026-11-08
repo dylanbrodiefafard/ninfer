@@ -12,35 +12,6 @@
 
 namespace ninfer::ops {
 
-// The single-parent target domain also admits FP8_E4M3FN_ROW_BF16S RowScale
-// [14336,5120], ordered [Q(6144),K(1024),gate(6144),V(1024)]. A16Only and AllowA8
-// admit every positive T. The mathematical oracle is the complete projection
-// from signed E4M3FN codes times exact BF16 row multipliers, without private
-// activation quantization in the oracle. A8 workspace is caller-owned.
-
-/**
- * Computes four independent linear projections for each token:
- *
- *   q[:,t]    = linear(x[:,t], query_key_weight[0:6144,:])
- *   k[:,t]    = linear(x[:,t], query_key_weight[6144:7168,:])
- *   gate[:,t] = linear(x[:,t], gate_value_weight[0:6144,:])
- *   v[:,t]    = linear(x[:,t], gate_value_weight[6144:7168,:]).
- *
- * All tensors are contiguous BF16. Shapes are x [5120,T], q/gate [6144,T], and k/v [1024,T].
- * T may be any positive value.
- * The two parent weights are RowSplit [7168,5120] with FP16 scales and group size 64:
- * query_key is Q4G64_F16S and gate_value is Q5G64_F16S. The oracle exact-decodes each row and
- * evaluates every projection naively in FP64 from the represented inputs. The BF16 outputs are
- * promoted and compared directly with those ideal values; final output storage rounding belongs
- * to AttnInputProj's named A16 criterion, not the oracle. Production routes choose their private
- * accumulator and staging precision. Inputs and the four outputs must be mutually non-overlapping.
- * Current registered routes require no transient allocation. The Op has no persistent state side
- * effect.
- */
-void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
-                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     cudaStream_t stream);
-
 /**
  * Computes the single-parent Q/K/output-gate/V projection.
  *
@@ -51,18 +22,20 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *
  * Registered parent forms are:
  *
- * - W8G32_F16S RowSplit `[9216,2048]`, with row counts `[4096,512,4096,512]`. `x` is
- *   BF16 `[2048,T]`, q/gate are BF16 `[4096,T]`, and k/v are BF16 `[512,T]`.
  * - BF16_CTRL Contiguous `[14336,5120]`, with row counts `[6144,1024,6144,1024]`. `x` is
  *   BF16 `[5120,T]`, q/gate are BF16 `[6144,T]`, and k/v are BF16 `[1024,T]`.
  * - NVFP4 BlockScaleK16M128x4 `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16_CTRL.
+ * - FP8_E4M3FN_ROW_BF16S RowScale `[14336,5120]`, with the same logical row and tensor shapes as
+ *   BF16_CTRL. Its represented weight is each signed E4M3FN code times the exact BF16 row
+ *   multiplier.
  *
- * `T` is the positive token extent of the Op contract. BF16_CTRL and W8G32_F16S admit only
+ * `T` is the positive token extent of the Op contract. BF16_CTRL admits only
  * LinearPolicy::A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8; AllowA4 permits the private
  * resolver to select either a qualified A16 route or activation quantization to NVFP4 at every
  * positive T. NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=4, otherwise A16. Its
- * per16-scale partial accumulation preserves the original represented NVFP4 weights.
+ * per16-scale partial accumulation preserves the original represented NVFP4 weights. FP8 admits
+ * A16Only and AllowA8 at every positive T.
  *
  * The oracle evaluates every projection independently with naive FP64 accumulation from the
  * logical values represented by the persistent weight and BF16 activation. The final four BF16
@@ -108,16 +81,5 @@ void attn_input_proj(const A8Activation& x, const Weight& query_key_gate_value_w
  */
 void attn_input_proj(const A4Activation& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
-
-/**
- * Qwen3.6 companion W8 specialization. The W8G32_F16S RowSplit parent has shape [6144,2048]
- * and stored row order [query 4096, key 1024, value 1024]. `x` is contiguous BF16 [2048,T],
- * q is contiguous BF16 [4096,T], and k/v are contiguous BF16 [1024,T]. Every route writes
- * the three independent final allocations directly; no parent output or transient workspace
- * is materialized. T may be any positive value. Q and K remain raw projection outputs: this
- * Op does not normalize or rotate either tensor.
- */
-void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
-                     Tensor& v, cudaStream_t stream);
 
 } // namespace ninfer::ops

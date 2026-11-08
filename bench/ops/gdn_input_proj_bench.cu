@@ -1,4 +1,4 @@
-// Public-Op benchmark for every registered GDN input-projection contract.
+// Public-Op benchmark for the NVFP4 GDN input-projection contract.
 // Production dispatch is owned exclusively by gdn_input_proj().
 
 #include "ninfer/ops/gdn_input_proj.h"
@@ -31,12 +31,10 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 constexpr double kRtx5090DramGBs  = 1792.0;
 
-enum class Format : std::uint8_t { Q4Q5, W8, Nvfp4, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
 struct Options {
-    Format format                  = Format::All;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
@@ -61,7 +59,7 @@ struct Result {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_gdn_input_proj_bench "
-                 "[--format q4q5|w8|nvfp4|all] [--nvfp4-policy a16|a4] "
+                 "[--nvfp4-policy a16|a4] "
                  "[--tokens T,...] [--cache cold|warm|both] [--warmup N] [--repeat N] "
                  "[--profile] [--csv-out PATH]\n",
                  message);
@@ -104,19 +102,7 @@ Options parse_options(int argc, char** argv) {
             if (++index == argc) { usage(flag); }
             return argv[index];
         };
-        if (argument == "--format") {
-            const std::string_view value(next("--format requires a value"));
-            if (value == "q4q5")
-                options.format = Format::Q4Q5;
-            else if (value == "w8")
-                options.format = Format::W8;
-            else if (value == "nvfp4")
-                options.format = Format::Nvfp4;
-            else if (value == "all")
-                options.format = Format::All;
-            else
-                usage("--format expects q4q5, w8, nvfp4, or all");
-        } else if (argument == "--nvfp4-policy") {
+        if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
             if (value == "a16")
                 options.nvfp4_policy = ops::LinearPolicy::A16Only;
@@ -150,9 +136,8 @@ Options parse_options(int argc, char** argv) {
             usage("unknown argument");
         }
     }
-    if (options.profile && (options.format == Format::All || options.tokens.size() != 1 ||
-                            options.cache == CacheMode::Both)) {
-        usage("--profile requires one format, one T, and one cache state");
+    if (options.profile && (options.tokens.size() != 1 || options.cache == CacheMode::Both)) {
+        usage("--profile requires one T and one cache state");
     }
     return options;
 }
@@ -245,63 +230,6 @@ void measure_points(const Options& options, const char* format, const char* poli
     }
 }
 
-void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
-              std::vector<Result>& results) {
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kQkRows     = 4096;
-    constexpr std::int32_t kValueRows  = 6144;
-    constexpr std::int32_t kZRows      = 6144;
-    constexpr std::int32_t kOutputRows = kQkRows + kValueRows + kZRows;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
-    bench::PackedQuantizedWeight qk = bench::make_row_split_weight(
-        QType::Q4G64_F16S, kQkRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
-    bench::PackedQuantizedWeight value_z = bench::make_row_split_weight(
-        QType::Q5G64_F16S, kValueRows + kZRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
-    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens);
-    DeviceBuffer qkv(static_cast<std::size_t>(kQkRows + kValueRows) * max_tokens * 2);
-    DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
-    const auto make_launch = [&](std::int32_t tokens) {
-        return [&, tokens](cudaStream_t launch_stream) {
-            Tensor x(input.p, DType::BF16, {kHidden, tokens});
-            Tensor tqkv(qkv.p, DType::BF16, {kQkRows + kValueRows, tokens});
-            Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, launch_stream);
-        };
-    };
-    measure_points(
-        options, "q4q5", "a16", kHidden, kOutputRows,
-        qk.model_weight_bytes() + value_z.model_weight_bytes(),
-        [](std::int32_t) { return std::size_t{0}; }, make_launch, flush, stream, results);
-}
-
-void run_w8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
-            std::vector<Result>& results) {
-    constexpr std::int32_t kHidden     = 2048;
-    constexpr std::int32_t kQkvRows    = 8192;
-    constexpr std::int32_t kZRows      = 4096;
-    constexpr std::int32_t kOutputRows = kQkvRows + kZRows;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
-    bench::PackedQuantizedWeight parent = bench::make_row_split_weight(
-        QType::W8G32_F16S, kOutputRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
-    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens);
-    DeviceBuffer qkv(static_cast<std::size_t>(kQkvRows) * max_tokens * 2);
-    DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
-    const auto make_launch = [&](std::int32_t tokens) {
-        return [&, tokens](cudaStream_t launch_stream) {
-            Tensor x(input.p, DType::BF16, {kHidden, tokens});
-            Tensor tqkv(qkv.p, DType::BF16, {kQkvRows, tokens});
-            Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, parent.weight, tqkv, tz, launch_stream);
-        };
-    };
-    const auto workspace_capacity = [](std::int32_t tokens) {
-        return ops::gdn_input_proj_workspace_capacity_bytes(
-            QType::W8G32_F16S, kOutputRows, kHidden, ops::LinearPolicy::A16Only, tokens, tokens);
-    };
-    measure_points(options, "w8", "a16", kHidden, kOutputRows, parent.model_weight_bytes(),
-                   workspace_capacity, make_launch, flush, stream, results);
-}
-
 void run_nvfp4(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
                std::vector<Result>& results) {
     constexpr std::int32_t kHidden     = 5120;
@@ -351,10 +279,6 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     }
 }
 
-bool selected(Format configured, Format candidate) {
-    return configured == Format::All || configured == candidate;
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
@@ -370,9 +294,7 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(kFlushBytes);
         std::vector<Result> results;
 
-        if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
-        if (selected(options.format, Format::W8)) { run_w8(options, flush, stream, results); }
-        if (selected(options.format, Format::Nvfp4)) { run_nvfp4(options, flush, stream, results); }
+        run_nvfp4(options, flush, stream, results);
 
         write_csv(options, results);
         CUDA_CHECK(cudaStreamDestroy(stream));

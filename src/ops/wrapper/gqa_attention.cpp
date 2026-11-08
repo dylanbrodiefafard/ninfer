@@ -16,25 +16,25 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeadDim                      = 256;
-constexpr std::int32_t kQuantGroup                   = 64;
-constexpr std::int32_t kNvfp4Group                   = 16;
-constexpr std::int32_t kNvfp4CodeWidth               = 128;
-constexpr float kExpectedScale                       = 0.0625f;
-constexpr std::int32_t kMaximumVerifyTokens          = 16;
-constexpr std::int32_t kMaximumBatchSize             = 8;
-constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
-constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
-constexpr std::int32_t kMaximumChunkedPromptWidth    = 60;
+constexpr std::int32_t kHeadDim                   = 256;
+constexpr std::int32_t kQuantGroup                = 64;
+constexpr std::int32_t kNvfp4Group                = 16;
+constexpr std::int32_t kNvfp4CodeWidth            = 128;
+constexpr float kExpectedScale                    = 0.0625f;
+constexpr std::int32_t kMaximumVerifyTokens       = 16;
+constexpr std::int32_t kMaximumBatchSize          = 8;
+constexpr std::int32_t kMaximumChunkedPromptWidth = 60;
+
+constexpr std::int32_t kQHeads  = 24;
+constexpr std::int32_t kKVHeads = 4;
 
 std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
-    if (q_heads == 24) { return 4; }
-    if (q_heads == 16) { return 2; }
+    if (q_heads == kQHeads) { return kKVHeads; }
     throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry");
 }
 
 void require_kv_heads(std::int32_t kv_heads, const char* op) {
-    if (kv_heads != 4 && kv_heads != 2) {
+    if (kv_heads != kKVHeads) {
         throw std::invalid_argument(std::string(op) + ": unsupported KV head geometry");
     }
 }
@@ -399,11 +399,11 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
         });
 }
 
-// 27B NVFP4 crossover (RTX 5090, public-Op timing): the context-split Prompt tile costs about
+// NVFP4 crossover (RTX 5090, public-Op timing): the context-split Prompt tile costs about
 // seven six-row decode passes at 16K visible keys and eleven at 262K; below 512 keys the single
 // Prompt tile wins. Non-decreasing in the visible length, so a width's route changes at most
 // once across an execution envelope.
-std::int32_t chunked_prompt_max_width_27b(std::uint32_t visible_keys) {
+std::int32_t chunked_prompt_max_width(std::uint32_t visible_keys) {
     if (visible_keys <= 256) { return 0; }
     if (visible_keys <= 4096) { return 12; }
     if (visible_keys <= 8192) { return 18; }
@@ -428,15 +428,7 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
     }
     if (width >= 1 && width <= chunk_tokens) { return GqaAttentionRoute::SmallT; }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
-    if (q_heads == 24 && dense_nvfp4) {
-        return width <= chunked_prompt_max_width_27b(envelope.max_visible_keys)
-                   ? GqaAttentionRoute::ChunkedSmallT
-                   : GqaAttentionRoute::Prompt;
-    }
-    const std::uint32_t prompt_visible_keys =
-        width <= 2 * chunk_tokens ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
-    if (q_heads == 16 && width <= kMaximumVerifyTokens &&
-        envelope.max_visible_keys > prompt_visible_keys) {
+    if (dense_nvfp4 && width <= chunked_prompt_max_width(envelope.max_visible_keys)) {
         return GqaAttentionRoute::ChunkedSmallT;
     }
     return GqaAttentionRoute::Prompt;

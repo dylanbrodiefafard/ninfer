@@ -97,8 +97,8 @@ so JSON does not repeat a schema or version number.
 
 ```json
 {
-  "model_id": "qwen3.6-27b",
-  "weights_id": "groupwise-int"
+  "model_id": "qwen3.8-27b",
+  "weights_id": "nvfp4"
 }
 ```
 
@@ -121,13 +121,13 @@ A tensor object has all and only these seven members:
 
 ```json
 {
-  "name": "text/layers/3/attention/query_key",
+  "name": "vision/layers/0/attention/qkv",
   "kind": "tensor",
-  "shape": [7168, 5120],
+  "shape": [3456, 1152],
   "format": "Q4G64_F16S",
   "layout": "row-split-k128-v1",
   "offset": 12582912,
-  "bytes": 19496960
+  "bytes": 2115072
 }
 ```
 
@@ -198,8 +198,8 @@ The version-2 registry contains:
 | Namespace | Registered identities | Authority |
 |---|---|---|
 | tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `FP8_E4M3FN_ROW_BF16S` | [`tensor-formats.md`](tensor-formats.md) |
-| `model_id` | `qwen3.6-27b`, `qwen3.6-35b-a3b`, `qwen3.8-27b` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
-| `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int`, `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
+| `model_id` | `qwen3.8-27b` | [Qwen3.8-27B artifact reference](qwen3.8-27b-artifact.md) |
+| `(model_id, weights_id)` | `qwen3.8-27b/nvfp4` | [Qwen3.8-27B artifact reference](qwen3.8-27b-artifact.md) |
 | tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `row-scale-v1` | [`storage-layouts.md`](storage-layouts.md) |
 | resource encoding | `raw-bytes-v1` | [`storage-layouts.md`](storage-layouts.md) |
 
@@ -218,10 +218,9 @@ quantization run, physical object order, or artifact instance.
 `weights_id` identifies one complete target-owned weight-storage contract under that model:
 inventory, names, fusion, format assignment, layout assignment, and associated persistent scalar
 objects. It is not a dominant tensor format, an average BPW, a converter recipe, an execution
-policy, or an artifact-instance digest. `groupwise-int` therefore covers the existing mixed
-groupwise-integer contracts of both registered models without naming either artifact after one
-internal format; `nvfp4` identifies the 27B NVFP4 contract including its fixed BF16 and non-Text
-exceptions.
+policy, or an artifact-instance digest. `nvfp4` therefore identifies the 27B NVFP4 contract
+including its fixed BF16 and non-Text exceptions, and the Qwen3.8-27B package resolves the
+selective and mixed FP8/NVFP4 inventories under the same identity to their own weights profiles.
 
 ## 5. Payload geometry
 
@@ -421,7 +420,7 @@ correctly without carrying it.
 ## 11. Required implementation evidence
 
 The native implementation in `tools/artifact/`, `tools/convert/qwen3_6_27b/`,
-`tools/convert/qwen3_8_27b/`, `tools/reference/qwen3_6_27b/`, and `src/artifact/` satisfies this
+`tools/convert/qwen3_8_27b/`, `tools/reference/qwen3_6_27b/` (Vision), and `src/artifact/` satisfies this
 layer. The compact evidence retained for later changes is:
 
 - Python version-2 round trips for all eight numeric formats and a raw resource;
@@ -430,10 +429,10 @@ layer. The compact evidence retained for later changes is:
   trips;
 - an independently constructed C++ version-2 fixture covering hierarchical identity, payload spans,
   encoded sizes, and alignment;
-- the complete registered target inventories, including the 1124-object 27B groupwise contracts
-  and the 1307-object 27B NVFP4 contract with 247 validation-only input divisors;
-- inspection, representative source probes, Python reference inference, and public Engine loading
-  of both real converter-generated Qwen3.6-27B artifacts and the real 35B-A3B artifact.
+- the complete registered target inventories, including the 1307-object 27B NVFP4 contract with
+  247 validation-only input divisors;
+- inspection, Python Vision reference parity, and public Engine loading of a real
+  `qwen3.8-27b/nvfp4` artifact.
 
 This contract does not require canonical-JSON spelling tests, arbitrary malformed-input matrices,
 fuzz/resource-exhaustion campaigns, failure injection, interrupted-publication tests, full-file

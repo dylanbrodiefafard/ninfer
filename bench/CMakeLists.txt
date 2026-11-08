@@ -28,7 +28,6 @@ ninfer_add_op_bench(ninfer_gdn_gating_bench SOURCES ops/gdn_gating_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_gating_proj_bench SOURCES ops/gdn_gating_proj_bench.cu)
 ninfer_add_op_bench(ninfer_gated_delta_net_bench SOURCES ops/gated_delta_net_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_replay_bench SOURCES ops/gdn_replay_bench.cu)
-ninfer_add_op_bench(ninfer_gdn_layer_bench SOURCES ops/gdn_layer_bench.cu)
 ninfer_add_op_bench(ninfer_rope_bench SOURCES ops/rope_bench.cu)
 ninfer_add_op_bench(ninfer_add_bias_bench SOURCES ops/add_bias_bench.cu)
 ninfer_add_op_bench(ninfer_gelu_bench SOURCES ops/gelu_bench.cu)
@@ -44,12 +43,10 @@ ninfer_add_op_bench(ninfer_argmax_bench SOURCES ops/argmax_bench.cu)
 ninfer_add_op_bench(ninfer_token_logprobs_bench SOURCES ops/token_logprobs_bench.cu)
 ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES ops/causal_conv1d_silu_bench.cu)
 ninfer_add_op_bench(ninfer_linear_bench SOURCES ops/linear_bench.cu)
-ninfer_add_op_bench(ninfer_output_stage_bench SOURCES ops/output_stage_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_input_proj_bench SOURCES ops/gdn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
   SOURCES ops/gdn_input_proj_conv_snapshot_bench.cu)
 ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES ops/attn_input_proj_bench.cu)
-ninfer_add_op_bench(ninfer_w8_linear_swiglu_bench SOURCES ops/w8_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES ops/nvfp4_linear_swiglu_bench.cu)
 # Curated NVFP4 decode T=4 harnesses (ninfer/bench/PERF_LANDS.md). Superseded
 # sweeps live in ops/_archive/ and are not built.
@@ -63,15 +60,10 @@ ninfer_add_op_bench(ninfer_nvfp4_mlp_pair_ncu_v5
   SOURCES ops/nvfp4_mlp_pair_ncu_v5.cu)
 ninfer_add_op_bench(ninfer_nvfp4_swiglu_w4a4_tile_v5
   SOURCES ops/nvfp4_swiglu_w4a4_tile_v5.cu)
-ninfer_add_op_bench(ninfer_q4_linear_swiglu_bench SOURCES ops/q4_linear_swiglu_bench.cu)
-ninfer_add_op_bench(ninfer_w8_linear_add_bench SOURCES ops/w8_linear_add_bench.cu)
-ninfer_add_op_bench(ninfer_q5_linear_add_bench SOURCES ops/q5_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_bf16_linear_add_bench SOURCES ops/bf16_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_add_bench SOURCES ops/nvfp4_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_causal_softmax_attention_bench
   SOURCES ops/causal_softmax_attention_bench.cu)
-ninfer_add_op_bench(ninfer_context_softmax_attention_bench
-  SOURCES ops/context_softmax_attention_bench.cu)
 ninfer_add_op_bench(ninfer_gqa_attention_nvfp4s3_bench
   SOURCES ops/gqa_attention_nvfp4s3_bench.cu)
 ninfer_add_op_bench(ninfer_gqa_attention_nvfp4_sparse_bench
@@ -88,7 +80,6 @@ ninfer_add_op_bench(ninfer_kv_cache_append_bench SOURCES ops/kv_cache_append_ben
 ninfer_add_op_bench(ninfer_prepare_masked_block_bench
   SOURCES ops/prepare_masked_block_bench.cu)
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES ops/sampling_select_bench.cu)
-ninfer_add_op_bench(ninfer_sparse_moe_bench SOURCES ops/sparse_moe_bench.cu)
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES ops/linear_pair_bench.cu)
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES ops/mtp_pack_bench.cu)
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES ops/proposal_remap_bench.cu)
@@ -109,16 +100,3 @@ target_include_directories(ninfer_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party)
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
-
-# Complete production DFlash steady round: confirmed-context append, next proposal, target
-# verification/acceptance, and host publication over a real 35B artifact.
-add_executable(ninfer_qwen3_6_35b_a3b_dflash_round_bench
-  targets/qwen3_6_35b_a3b/dflash_round_bench.cpp)
-target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
-  ${PROJECT_SOURCE_DIR}/include
-  ${PROJECT_SOURCE_DIR}/src
-  ${PROJECT_SOURCE_DIR}/third_party
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
-  ninfer_engine ninfer_core)

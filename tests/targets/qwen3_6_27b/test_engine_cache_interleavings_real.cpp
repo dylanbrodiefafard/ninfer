@@ -270,11 +270,11 @@ int main(int argc, char** argv) {
                                               : ninfer::SpeculativeBackend::None;
     const char* artifact =
         std::getenv(selected == "dflash" ? "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS"
-                                         : "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
+                                         : "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: set "
                   << (selected == "dflash" ? "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS"
-                                           : "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS")
+                                           : "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS")
                   << " to the Qwen3.8 NVFP4 artifact with the selected backend\n";
         return 77;
     }

@@ -220,31 +220,4 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k) {
     return result;
 }
 
-inline Weight row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
-    if (parent.layout != QuantLayout::RowSplit || row_begin < 0 || rows <= 0 ||
-        row_begin > parent.n - rows) {
-        throw std::invalid_argument("benchmark RowSplit row view is out of range");
-    }
-    const detail::QuantizedGeometry geometry = detail::quantized_geometry(parent.qtype);
-    const std::uint64_t groups_per_row =
-        static_cast<std::uint64_t>(parent.padded_shape[1] / geometry.group_size);
-    const std::uint64_t low_row_bytes = groups_per_row * 32;
-    const std::uint64_t high_row_bytes =
-        groups_per_row * static_cast<std::uint64_t>(geometry.high_bytes_per_group);
-    const std::uint64_t scale_row_bytes = groups_per_row * 2;
-
-    Weight view = parent;
-    view.qdata  = static_cast<const std::uint8_t*>(parent.qdata) +
-                  static_cast<std::uint64_t>(row_begin) * low_row_bytes;
-    view.qhigh  = high_row_bytes == 0 ? nullptr
-                                      : static_cast<const std::uint8_t*>(parent.qhigh) +
-                                            static_cast<std::uint64_t>(row_begin) * high_row_bytes;
-    view.scales = static_cast<const std::uint8_t*>(parent.scales) +
-                  static_cast<std::uint64_t>(row_begin) * scale_row_bytes;
-    view.n      = rows;
-    view.shape[0]        = rows;
-    view.padded_shape[0] = rows;
-    return view;
-}
-
 } // namespace ninfer::bench

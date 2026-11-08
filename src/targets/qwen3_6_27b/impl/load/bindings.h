@@ -16,7 +16,6 @@
 #include <optional>
 #include <utility>
 #include <vector>
-#include <variant>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 
@@ -37,29 +36,11 @@ struct MlpPlan {
     WeightPlan down;
 };
 
-struct SplitAttentionProjectionPlan {
-    WeightPlan query_key;
-    WeightPlan gate_value;
-};
-
-struct FusedAttentionProjectionPlan {
-    WeightPlan query_key_gate_value;
-};
-
 struct FullAttentionPlan {
-    std::variant<SplitAttentionProjectionPlan, FusedAttentionProjectionPlan> projection;
+    WeightPlan query_key_gate_value;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
     WeightPlan output;
-};
-
-struct SplitGdnInputProjectionPlan {
-    WeightPlan query_key;
-    WeightPlan value_z;
-};
-
-struct FusedGdnInputProjectionPlan {
-    WeightPlan query_key_value_z;
 };
 
 struct GdnPlan {
@@ -69,7 +50,7 @@ struct GdnPlan {
     artifact::ObjectHandle a_projection;
     artifact::ObjectHandle b_projection;
     std::optional<artifact::ObjectHandle> a_b_projection;
-    std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan> input_projection;
+    WeightPlan query_key_value_z;
     artifact::ObjectHandle norm;
     WeightPlan output;
 };
@@ -165,36 +146,16 @@ struct DensePostMixerPayload {
     Weight down;
 };
 
-struct SplitAttentionProjectionPayload {
-    Weight query_key;
-    Weight gate_value;
-};
-
-struct FusedAttentionProjectionPayload {
+struct FullAttentionProjectionPayload {
     Weight query_key_gate_value;
 };
-
-using FullAttentionProjectionPayload =
-    std::variant<SplitAttentionProjectionPayload, FusedAttentionProjectionPayload>;
-
-struct SplitGdnInputProjectionPayload {
-    Weight query_key;
-    Weight value_z;
-};
-
-struct FusedGdnInputProjectionPayload {
-    Weight query_key_value_z;
-};
-
-using GdnInputProjectionPayload =
-    std::variant<SplitGdnInputProjectionPayload, FusedGdnInputProjectionPayload>;
 
 struct GdnProjectionPayload {
     Tensor a_log;
     Tensor dt_bias;
     Weight a_projection;
     Weight b_projection;
-    GdnInputProjectionPayload input_projection;
+    Weight query_key_value_z;
 };
 
 struct MtpAttentionPayload {

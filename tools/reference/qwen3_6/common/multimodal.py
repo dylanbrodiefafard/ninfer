@@ -1,4 +1,4 @@
-"""Qwen3.6 multimodal prompt metadata and visual-embedding alignment."""
+"""Qwen3.6 multimodal prompt metadata."""
 
 from __future__ import annotations
 
@@ -25,71 +25,6 @@ class MultimodalBatch:
     image_grid_thw: torch.Tensor | None
     pixel_values_videos: torch.Tensor | None
     video_grid_thw: torch.Tensor | None
-
-    @property
-    def prompt_length(self) -> int:
-        return int(self.input_ids.numel())
-
-    @property
-    def image_tokens(self) -> int:
-        return int((self.mm_token_type_ids == 1).sum().item())
-
-    @property
-    def video_tokens(self) -> int:
-        return int((self.mm_token_type_ids == 2).sum().item())
-
-    @property
-    def has_vision(self) -> bool:
-        return bool(self.image_tokens or self.video_tokens)
-
-    def scatter_visual_embeddings_(
-        self,
-        token_embeddings: torch.Tensor,
-        image_embeddings: torch.Tensor | None,
-        video_embeddings: torch.Tensor | None,
-        *,
-        offset: int = 0,
-    ) -> torch.Tensor:
-        """Replace media-placeholder rows in one prompt slice, preserving item order.
-
-        ``offset`` addresses the slice in the complete processed prompt.  That makes
-        the same operation usable for chunked prefill and one-token MTP lookahead.
-        The supplied tensor is updated in place and returned.
-        """
-
-        if token_embeddings.ndim != 2:
-            raise ValueError("token embeddings must have shape [tokens, hidden]")
-        rows = token_embeddings.shape[0]
-        if offset < 0 or offset + rows > self.prompt_length:
-            raise ValueError("embedding slice is outside the processed prompt")
-
-        image_rows = 0 if image_embeddings is None else image_embeddings.shape[0]
-        video_rows = 0 if video_embeddings is None else video_embeddings.shape[0]
-        if image_rows != self.image_tokens:
-            raise ValueError("image placeholder/embedding count mismatch")
-        if video_rows != self.video_tokens:
-            raise ValueError("video placeholder/embedding count mismatch")
-
-        all_types = self.mm_token_type_ids.flatten()
-        slice_types = all_types[offset : offset + rows]
-        prefix_types = all_types[:offset]
-        image_begin = int((prefix_types == 1).sum().item())
-        video_begin = int((prefix_types == 2).sum().item())
-        image_count = int((slice_types == 1).sum().item())
-        video_count = int((slice_types == 2).sum().item())
-        device_types = slice_types.to(device=token_embeddings.device)
-
-        if image_count:
-            assert image_embeddings is not None
-            token_embeddings[device_types == 1] = image_embeddings[
-                image_begin : image_begin + image_count
-            ].to(device=token_embeddings.device, dtype=token_embeddings.dtype)
-        if video_count:
-            assert video_embeddings is not None
-            token_embeddings[device_types == 2] = video_embeddings[
-                video_begin : video_begin + video_count
-            ].to(device=token_embeddings.device, dtype=token_embeddings.dtype)
-        return token_embeddings
 
 
 def load_messages(path: str | Path) -> list[dict[str, Any]]:

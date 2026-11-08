@@ -2,17 +2,14 @@
 
 #include <ninfer/engine.h>
 #include <ninfer/targets/qwen3_6_27b/package.h>
-#include <ninfer/targets/qwen3_6_35b_a3b/package.h>
 
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 
 namespace {
 
 using Package27 = ninfer::targets::qwen3_6_27b::Package;
-using Package35 = ninfer::targets::qwen3_6_35b_a3b::Package;
 
 ninfer::EngineOptions dflash_vision_options(std::string model_id, std::string weights_id) {
     ninfer::EngineOptions options;
@@ -30,19 +27,6 @@ ninfer::EngineOptions dflash_vision_options(std::string model_id, std::string we
     return options;
 }
 
-template <class MakePlanner>
-int expect_rejection(std::string_view label, MakePlanner&& make_planner) {
-    try {
-        (void)make_planner();
-    } catch (const std::invalid_argument& error) {
-        if (std::string(error.what()).find("DFlash and Vision") != std::string::npos) { return 0; }
-        std::cerr << label << " rejected for the wrong reason: " << error.what() << '\n';
-        return 1;
-    }
-    std::cerr << label << " unexpectedly accepted DFlash with Vision\n";
-    return 1;
-}
-
 } // namespace
 
 int main() {
@@ -54,21 +38,5 @@ int main() {
         std::cerr << "qwen3.8-27b/nvfp4 rejected DFlash with Vision: " << error.what() << '\n';
         return 1;
     }
-
-    int failures = 0;
-    failures += expect_rejection("qwen3.6-27b/nvfp4", [&] {
-        auto options = dflash_vision_options("qwen3.6-27b", "nvfp4");
-        return Package27::make_sequence_planner(device, options, Package27::WeightsProfile::Nvfp4);
-    });
-    failures += expect_rejection("qwen3.8-27b/groupwise-int", [&] {
-        auto options = dflash_vision_options("qwen3.8-27b", "groupwise-int");
-        return Package27::make_sequence_planner(device, options,
-                                                Package27::WeightsProfile::GroupwiseIntW8Endpoints);
-    });
-    failures += expect_rejection("qwen3.6-35b-a3b/groupwise-int", [&] {
-        auto options = dflash_vision_options("qwen3.6-35b-a3b", "groupwise-int");
-        return Package35::make_sequence_planner(device, options,
-                                                Package35::WeightsProfile::GroupwiseInt);
-    });
-    return failures == 0 ? 0 : 1;
+    return 0;
 }

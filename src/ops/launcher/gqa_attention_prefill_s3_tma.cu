@@ -220,11 +220,8 @@ bool gqa_s3_prefill_tma_try_launch(const Tensor& q, const Tensor& positions, flo
         GqaS3PrefillDump*, std::uint32_t*, std::uint8_t*)
 
 NINFER_S3_TMA_INSTANTIATE(Gqa27Geometry, PagedKVLayerView, GqaPrefillDirectMetadata);
-NINFER_S3_TMA_INSTANTIATE(Gqa35Geometry, PagedKVLayerView, GqaPrefillDirectMetadata);
 NINFER_S3_TMA_INSTANTIATE(Gqa27Geometry, PagedKVBatchLayerView, GqaPrefillBatchMetadata<false>);
 NINFER_S3_TMA_INSTANTIATE(Gqa27Geometry, PagedKVBatchLayerView, GqaPrefillBatchMetadata<true>);
-NINFER_S3_TMA_INSTANTIATE(Gqa35Geometry, PagedKVBatchLayerView, GqaPrefillBatchMetadata<false>);
-NINFER_S3_TMA_INSTANTIATE(Gqa35Geometry, PagedKVBatchLayerView, GqaPrefillBatchMetadata<true>);
 
 #undef NINFER_S3_TMA_INSTANTIATE
 

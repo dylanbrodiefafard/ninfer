@@ -168,10 +168,10 @@ void exercise_eight_windows(const char* artifact) {
 int main(int argc, char** argv) {
     const bool eight_windows = argc == 2 && std::string_view(argv[1]) == "--eight-windows";
     if (argc != 1 && !eight_windows) { return 1; }
-    const char* artifact = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
+    const char* artifact = std::getenv("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
     if (eight_windows) { artifact = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS"); }
     if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: set NINFER_QWEN3_6_27B_NVFP4_WEIGHTS to the Qwen3.8 NVFP4 artifact\n";
+        std::cout << "skip: set NINFER_QWEN3_8_27B_NVFP4_WEIGHTS to the Qwen3.8 NVFP4 artifact\n";
         return 77;
     }
     if (eight_windows) {

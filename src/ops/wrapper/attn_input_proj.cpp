@@ -7,8 +7,6 @@
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
-#include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
-#include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
@@ -28,33 +26,6 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
     if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != cols ||
         tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         !aligned_to(tensor.data, 16)) {
-        throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
-    }
-}
-
-void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
-    const bool q4_planes =
-        qtype != QType::Q4G64_F16S || (weight.qhigh == nullptr && weight.high_plane_bytes == 0);
-    const bool q5_planes =
-        qtype != QType::Q5G64_F16S || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
-    if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
-        weight.scale_dtype != DType::FP16 || weight.group_size != 64 || weight.group != 64 ||
-        weight.ndim != 2 || weight.n != rows || weight.k != 5120 || weight.shape[0] != rows ||
-        weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != 5120 || !q4_planes || !q5_planes ||
-        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 4) ||
-        (qtype == QType::Q5G64_F16S && !aligned_to(weight.qhigh, 16))) {
-        throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
-    }
-}
-
-void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* label) {
-    if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
-        weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
-        weight.ndim != 2 || weight.n != rows || weight.k != 2048 || weight.shape[0] != rows ||
-        weight.shape[1] != 2048 || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != 2048 || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
-        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
     }
 }
@@ -153,22 +124,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
-    constexpr std::int32_t kHidden = 2048;
-    constexpr std::int32_t kQRows  = 4096;
-    constexpr std::int32_t kKvRows = 512;
-    constexpr std::int32_t kRows   = 9216;
-    const std::int32_t cols        = x.ne[1];
-    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-    if (policy != LinearPolicy::A16Only) {
-        throw std::invalid_argument("W8 attn_input_proj admits only A16");
-    }
-    require_matrix(x, kHidden, cols, "x");
-    require_matrix(q, kQRows, cols, "q");
-    require_matrix(gate, kQRows, cols, "gate");
-    require_matrix(k, kKvRows, cols, "k");
-    require_matrix(v, kKvRows, cols, "v");
-    require_w8_rowsplit(weight, kRows, "query/key/gate/value weight");
-    detail::w8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
+    throw std::invalid_argument("attn_input_proj: unsupported parent qtype");
 }
 
 } // namespace
@@ -203,14 +159,6 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::W8G32_F16S:
-        if (parent_rows != 9216 || input_rows != 2048 || policy != LinearPolicy::A16Only) {
-            throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
-        }
-        (void)detail::w8_attn_input_resolve_plan(
-            {input_rows, 4096, 512, parent_rows, input_rows, min_tokens});
-        (void)detail::w8_attn_input_resolve_plan(
-            {input_rows, 4096, 512, parent_rows, input_rows, max_tokens});
-        return 0;
     case QType::Q4G64_F16S:
     case QType::Q5G64_F16S:
     case QType::Q6G64_F16S:
@@ -219,25 +167,6 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         break;
     }
     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
-}
-
-void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
-                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     cudaStream_t stream) {
-    constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
-    const std::int32_t cols        = x.ne[1];
-    require_matrix(x, kHidden, cols, "x");
-    require_matrix(q, kQRows, cols, "q");
-    require_matrix(gate, kQRows, cols, "gate");
-    require_matrix(k, kKvRows, cols, "k");
-    require_matrix(v, kKvRows, cols, "v");
-    require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, "query/key weight");
-    require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, "gate/value weight");
-
-    detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                      stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
@@ -312,23 +241,6 @@ void attn_input_proj(const A4Activation& x, const Weight& query_key_gate_value_w
         weight, cols,
         {static_cast<std::uint8_t*>(x.codes.data), static_cast<std::uint8_t*>(x.scales.data)}, q,
         gate, k, v, stream);
-}
-
-void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
-                     Tensor& v, cudaStream_t stream) {
-    constexpr std::int32_t kHidden = 2048;
-    constexpr std::int32_t kQRows  = 4096;
-    constexpr std::int32_t kKvRows = 1024;
-    constexpr std::int32_t kRows   = 6144;
-    const std::int32_t cols        = x.ne[1];
-    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-    require_matrix(x, kHidden, cols, "x");
-    require_matrix(q, kQRows, cols, "q");
-    require_matrix(k, kKvRows, cols, "k");
-    require_matrix(v, kKvRows, cols, "v");
-    require_w8_rowsplit(query_key_value_weight, kRows, "query/key/value weight");
-
-    detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
 }
 
 } // namespace ninfer::ops

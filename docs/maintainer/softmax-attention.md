@@ -4,7 +4,7 @@ This document defines the target semantics, public contracts, source organizatio
 of existing implementations for NInfer Softmax Attention. It refines
 [`op-development.md`](op-development.md) for the Attention domain. It describes the only target
 state after the migration is complete; until the migration is complete, the `gqa_attention`,
-`vision_attention`, `bidirectional_gqa_attention`, and `swa` symbols still visible in the source
+`vision_attention`, and `swa` symbols still visible in the source
 are the current state to be replaced, not a second interface that must be kept compatible.
 
 ## 1. Design Conclusions
@@ -30,9 +30,9 @@ The current migration follows these conclusions:
 
 1. MHA, MQA, and GQA are not three Ops and not three source directories. They are values of the
    Head geometry of a unified Q/K/V Attention.
-2. Text causal cache Attention, packed Vision Attention, and DFlash context Attention all belong
-   to the `dense` family, but their visible domains, physical inputs, and state effects differ, so
-   each keeps an independent entry with a clear effect.
+2. Text causal cache Attention and packed Vision Attention both belong to the `dense` family, but
+   their visible domains, physical inputs, and state effects differ, so each keeps an independent
+   entry with a clear effect.
 3. `vision` is a caller identity, not Attention semantics. Public symbols, file names, tests, and
    benchmarks no longer use `vision_attention`.
 4. `gqa` describes only the mapping from Query Head to KV Head. Public symbols, file names, tests,
@@ -55,7 +55,7 @@ names from different axes must not be listed side by side as directories:
 |---|---|---|---|
 | Mathematical family | What are the output formula, visible domain, and state transition | dense, sliding window | Determines the family under `softmax_attention/` |
 | Head geometry | Which KV Head each Query Head uses | MHA, MQA, GQA | Ordinary values and validation rules; no family is created |
-| Input/state representation | Whether K/V are ordinary Tensors, packed segments, a linear cache, a cyclic cache, or a latent cache | packed, causal cache, context+query, future MLA | Forms an entry with a clear effect, or a new family, within a family |
+| Input/state representation | Whether K/V are ordinary Tensors, packed segments, a linear cache, a cyclic cache, or a latent cache | packed, causal cache, future MLA | Forms an entry with a clear effect, or a new family, within a family |
 | Implementation strategy | How to tile, move, reduce, and address | flash, split-KV, paged, small-T | Exists only in private launchers, plans, and kernels |
 
 The following classifications are mandatory:
@@ -150,11 +150,9 @@ the finite domain that the current production path already supports:
 
 | Use site | geometry | cache/layout | Entry after migration |
 |---|---:|---|---|
-| Qwen3.6-27B Text/MTP | `D256/Hq24/Hkv4` | BF16 or INT8-G64 linear cache | `causal_softmax_attention` |
-| Qwen3.6-35B-A3B Text/MTP | `D256/Hq16/Hkv2` | BF16 or INT8-G64 linear cache | `causal_softmax_attention` |
+| Qwen3.8-27B Text/MTP | `D256/Hq24/Hkv4` | BF16 or INT8-G64 linear cache | `causal_softmax_attention` |
 | Qwen3.6 Vision | `D72/Hq16/Hkv16` | packed BF16 Q/K/V | `packed_softmax_attention` |
-| Qwen3.6-35B-A3B DFlash full | `D128/Hq32/Hkv8` | read-only BF16 context + query K/V | `context_softmax_attention` |
-| Qwen3.6-35B-A3B DFlash local | `D128/Hq32/Hkv8` | read-only BF16 cyclic context + query K/V | `sliding_window_attention` |
+| Qwen3.8-27B DFlash2 local | `D128/Hq32/Hkv8` | read-only BF16 cyclic context + query K/V | `sliding_window_attention` |
 
 ## 4. Public Contracts
 
@@ -261,34 +259,7 @@ causal_softmax_attention_workspace_capacity_bytes(
 `positions` determines the exact causal visible domain; the execution envelope only guarantees
 graph-safe launch capacity and is not a mask parameter.
 
-### 4.4 Context + query dense Attention
-
-The true semantics of the current `bidirectional_gqa_attention` is: the Query sees both the
-read-only persistent context and the complete query K/V segment. It migrates to:
-
-```cpp
-struct ContextAttentionExecutionEnvelope {
-    std::uint32_t min_context;
-    std::uint32_t max_context;
-};
-
-void context_softmax_attention(
-    const Tensor& q, const Tensor& query_k, const Tensor& query_v,
-    const Tensor& context_length, AttentionHeadGeometry geometry, float scale,
-    const KVCacheLayerView& context, ContextAttentionExecutionEnvelope envelope,
-    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
-```
-
-All Query rows see `[0, context_length)` and the complete query segment; there is no causal
-triangle. `context` and the query K/V remain two physical segments, with no requirement to
-concatenate or copy them. The capacity query is
-`context_softmax_attention_workspace_capacity_bytes(...)`.
-
-`bidirectional` no longer appears in the name, because it describes only the visible domain of the
-current entry; `GQA` no longer appears in the name, because `D128/Hq32/Hkv8` is already expressed by
-the geometry.
-
-### 4.5 Sliding-window Attention
+### 4.4 Sliding-window Attention
 
 SWA migrates to an independent header and family:
 
@@ -307,7 +278,7 @@ void sliding_window_attention(
     WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 ```
 
-The only currently registered `window` is 4096. The explicit parameter makes
+Qwen3.8-27B DFlash2 uses `window = 2048`. The explicit parameter makes
 `abs(key_position-query_position) < window` part of the complete Op semantics; the wrapper still
 accepts only values that have been implemented and qualified. The cyclic physical slot
 `absolute_position % window` is the state layout contract of this entry.
@@ -316,7 +287,7 @@ The public symbol spells out `sliding_window_attention` in full. `SWA` may be us
 terminology, local variables, or profiler notes, but is no longer the primary name of a contract,
 file, test target, or benchmark target.
 
-### 4.6 KV cache append moves out of Attention
+### 4.5 KV cache append moves out of Attention
 
 The current `gqa_kv_append` only writes the cache and optionally encodes INT8-G64; it does not
 compute Attention. It is not a dense Attention entry, and migrates to `kv_cache_append`:
@@ -327,8 +298,7 @@ void kv_cache_append(const Tensor& k, const Tensor& v,
                      cudaStream_t stream);
 ```
 
-Together with the existing `kv_cache_append_prefix`, it forms one cache state-transition overload
-group, and both migrate together to:
+It migrates to:
 
 ```text
 include/ninfer/ops/kv_cache_append.h
@@ -336,15 +306,16 @@ src/ops/kv_cache/append/
 ```
 
 `kv_cache_append` covers all input rows and performs a BF16 exact copy or INT8-G64 encode according
-to the target cache dtype; `kv_cache_append_prefix` continues to accept a device `commit_count` and
-writes only the admitted prefix. Neither belongs under `softmax_attention/` merely because
-Attention calls it.
+to the target cache dtype. The DFlash local-window cache write is the separate fused
+`normalized_rope_kv_append`, which normalizes and rotates K and then appends a device-selected
+prefix to the BF16 cyclic cache. Neither belongs under `softmax_attention/` merely because
+Attention reads the cache it writes.
 
 The fused append-and-attend entry of `causal_softmax_attention` must refer to the same cache codec
 semantics and produce the same code/scale bits; it may own a fused implementation for performance
 and need not go through the public `kv_cache_append`, which would add an extra launch.
 
-### 4.7 Unified interfaces explicitly not introduced
+### 4.6 Unified interfaces explicitly not introduced
 
 The following designs are not introduced:
 
@@ -367,8 +338,7 @@ private implementation route, not the calling model:
 src/ops/
 ├── softmax_attention/
 │   ├── common/
-│   │   ├── head_mapping.cuh
-│   │   └── context_query.cuh
+│   │   └── head_mapping.cuh
 │   ├── dense/
 │   │   ├── causal_cache/
 │   │   │   ├── causal_softmax_attention.cpp
@@ -381,13 +351,8 @@ src/ops/
 │   │   │   ├── prompt_common.cuh
 │   │   │   ├── prompt_bf16.cuh
 │   │   │   └── prompt_i8.cuh
-│   │   ├── packed/
-│   │   │   ├── packed_softmax_attention.cpp
-│   │   │   ├── launch.h
-│   │   │   ├── launch.cu
-│   │   │   └── kernel.cuh
-│   │   └── context/
-│   │       ├── context_softmax_attention.cpp
+│   │   └── packed/
+│   │       ├── packed_softmax_attention.cpp
 │   │       ├── launch.h
 │   │       ├── launch.cu
 │   │       └── kernel.cuh
@@ -414,11 +379,9 @@ make the tree line up:
 - `softmax_attention/common/` accepts only narrow device primitives that at least two families
   actually share already.
 
-Currently `bidirectional_gqa_attention.cuh` hosts the device body shared by linear-context and
-cyclic-SWA. During migration this part should become `common/context_query.cuh`, which carries no
-GQA/SWA identity and is called by the entry kernels of `dense/context` and `sliding_window`. The
-`sliding_window/` code must not include the private kernel of `dense/context`, and a generic
-Attention backend framework must not be created.
+The context-plus-query device body of the sliding-window entry is entry-local to `sliding_window/`;
+it does not move to `common/` until a second family shares it, and a generic Attention backend
+framework must not be created.
 
 `head_mapping.cuh` implements only the zero-cost indexing derived from the facts validated in
 `AttentionHeadGeometry`; it does no runtime registry or target selection.
@@ -445,15 +408,10 @@ Attention files.
 | `vision_attention_workspace_capacity_bytes` | `packed_softmax_attention_workspace_capacity_bytes` | Axis names become the generic tokens/segments |
 | `vision_attention(..., cu_seqlens, ...)` | `packed_softmax_attention(..., cu_seqlens, ...)` | Add the geometry and an explicit scale |
 | `vision_attention(..., segment_length, ...)` | `packed_softmax_attention(..., segment_length, ...)` | Keep the equal-length segment overload |
-| `include/ninfer/ops/bidirectional_gqa_attention.h` | `include/ninfer/ops/softmax_attention.h` | Delete the old header |
-| `GqaContextExecutionEnvelope` | `ContextAttentionExecutionEnvelope` | Remove the GQA identity |
-| `bidirectional_gqa_attention` | `context_softmax_attention` | The name expresses the context+query physical semantics |
-| `bidirectional_gqa_attention_workspace_capacity_bytes` | `context_softmax_attention_workspace_capacity_bytes` | Same name as the entry |
 | `include/ninfer/ops/swa.h` | `include/ninfer/ops/sliding_window_attention.h` | Delete the abbreviated header |
 | `SwaContextExecutionEnvelope` | `SlidingWindowAttentionExecutionEnvelope` | Name with the full semantics |
 | `swa` | `sliding_window_attention` | Keep the current window formula |
 | `swa_workspace_capacity_bytes` | `sliding_window_attention_workspace_capacity_bytes` | Same name as the entry |
-| `include/ninfer/ops/kv_cache_append_prefix.h` | `include/ninfer/ops/kv_cache_append.h` | Forms an overload group with the full append |
 
 Project-owned interfaces do not preserve compatibility. In the end there must be no old function
 aliases, old type aliases, forwarding headers, doubly registered CMake sources, or simultaneously
@@ -469,12 +427,9 @@ maintained old and new tests.
 | `src/ops/wrapper/vision_attention.cpp` | `softmax_attention/dense/packed/packed_softmax_attention.cpp` |
 | `src/ops/launcher/vision_attention.*` | `softmax_attention/dense/packed/launch.*` |
 | `src/ops/kernel/vision_attention.cuh` | `softmax_attention/dense/packed/kernel.cuh` |
-| `src/ops/wrapper/bidirectional_gqa_attention.cpp` | `softmax_attention/dense/context/context_softmax_attention.cpp` |
-| `src/ops/launcher/bidirectional_gqa_attention.*` | `softmax_attention/dense/context/launch.*` |
 | `src/ops/wrapper/swa.cpp` | `softmax_attention/sliding_window/sliding_window_attention.cpp` |
 | `src/ops/launcher/swa.*` | `softmax_attention/sliding_window/launch.*` |
-| `src/ops/kernel/bidirectional_gqa_attention.cuh` | Split into `softmax_attention/common/context_query.cuh` and the context/sliding-window entry-local kernels |
-| `src/ops/wrapper/kv_cache_append_prefix.cpp` and the corresponding launcher/kernel | `kv_cache/append/`, which also receives the standalone append separated from the causal cache |
+| `src/ops/kernel/swa.cuh` | `softmax_attention/sliding_window/kernel.cuh` |
 
 Private C++/CUDA types migrate in step, according to their actual responsibilities:
 
@@ -482,11 +437,10 @@ Private C++/CUDA types migrate in step, according to their actual responsibiliti
 |---|---|
 | `GqaAttentionRoute` | `CausalAttentionRoute` |
 | `GqaAppendInput` / `GqaCachedInput` | `CausalAppendInput` / `CausalCachedInput` |
-| `Gqa27Geometry` / `Gqa35Geometry` | `CausalD256H24Kv4` / `CausalD256H16Kv2`, named by their numeric facts |
-| `BidirectionalGqaPlan` / `BidirectionalGqaRoute` | `ContextAttentionPlan` / `ContextAttentionRoute` |
+| `Gqa27Geometry` | `CausalD256H24Kv4`, named by its numeric facts |
 | `SwaPlan` / `SwaRoute` | `SlidingWindowAttentionPlan` / `SlidingWindowAttentionRoute` |
 | `VisionAttentionTile` | `PackedAttentionTile` |
-| `kGqa*` / `kBidirectionalGqa*` / `kVisionAttention*` | Preferably derived from the validated geometry; where they must be fixed at compile time, named by entry, format, or tile facts |
+| `kGqa*` / `kSwa*` / `kVisionAttention*` | Preferably derived from the validated geometry; where they must be fixed at compile time, named by entry, format, or tile facts |
 
 The numeric-geometry-specific types are private compile-time dispatch material, not a new public Head
 classification, and they do not enter target includes. Public calls always pass `AttentionHeadGeometry`.
@@ -503,10 +457,10 @@ fixing the Program phase into the implementation identity.
 | `src/targets/qwen3_6/impl/runtime/text_context_impl.h` | Include `softmax_attention.h`; Text/MTP call `causal_softmax_attention` or `_cached`; standalone cache writes call `kv_cache_append` |
 | `src/targets/qwen3_6/impl/runtime/layouts_impl.h` | Capacity queries use the geometry and the new entry names |
 | `src/targets/qwen3_6/impl/runtime/vision_context_impl.h` | Include `softmax_attention.h`; call `packed_softmax_attention` without passing a Vision identity to the Op |
-| `src/targets/qwen3_6/impl/runtime/dflash_impl.h` | The full route calls `context_softmax_attention`; the local route calls `sliding_window_attention` |
+| `src/targets/qwen3_6/impl/runtime/dflash_impl.h` | The local route calls `sliding_window_attention` |
 | `src/targets/qwen3_6/impl/runtime/workspace_recipe.h` | Target-local region names may keep their model meaning; Op capacity and shape use the unified geometry |
 
-The family schedule still decides when to call the full, local, Vision, or MTP path; the Op wrapper
+The family schedule still decides when to call the Text, DFlash local, Vision, or MTP path; the Op wrapper
 does not read the layer role or the target Variant.
 
 ### 6.4 Build ownership
@@ -534,8 +488,7 @@ tests/ops/softmax_attention/
 ├── oracle.h
 ├── main.cpp
 ├── causal_cache.cpp
-├── plain_and_packed.cpp
-└── context.cpp
+└── plain_and_packed.cpp
 
 tests/ops/test_sliding_window_attention.cpp
 tests/ops/test_kv_cache_append.cpp
@@ -555,18 +508,15 @@ Existing tests migrate as follows:
 |---|---|
 | `test_gqa_attention.cpp` | `softmax_attention/causal_cache.cpp`; the codec-only part moves to `test_kv_cache_append.cpp` |
 | `test_vision_attention.cpp` | `softmax_attention/plain_and_packed.cpp` |
-| `test_bidirectional_gqa_attention.cpp` | `softmax_attention/context.cpp` |
 | `test_swa.cpp` | `test_sliding_window_attention.cpp` |
-| `test_kv_cache_append_prefix.cpp` | Merged into the prefix cases of `test_kv_cache_append.cpp` |
 
 The oracle must compute the Head mapping from the geometry and the entry's visible set, and must not
 copy the group constants of the production kernels. It must cover:
 
-- the four currently registered geometries;
+- the three currently registered geometries;
 - the BF16 and INT8-G64 causal cache profiles;
 - append-and-attend, cached-only, and standalone append;
 - the plain single-segment entry, and packed unequal-length and equal-length segments;
-- the context+query visible domain with zero and nonzero context;
 - the window boundary, where `distance=window-1` is included and `distance=window` is excluded;
 - valid replay of the CUDA Graph execution envelope;
 - cache code/scale bits, read-only inputs, and all declared state writes.
@@ -582,9 +532,8 @@ The long-lived benchmarks are divided by public semantics:
 |---|---|
 | `ninfer_causal_softmax_attention_bench` | append-and-attend or cached-only |
 | `ninfer_packed_softmax_attention_bench` | uniform plain segment or packed segments |
-| `ninfer_context_softmax_attention_bench` | context-plus-query |
 | `ninfer_sliding_window_attention_bench` | symmetric sliding window |
-| `ninfer_kv_cache_append_bench` | full append or device-count prefix append |
+| `ninfer_kv_cache_append_bench` | full append |
 
 Fixture construction, the public capacity query, cache conditioning, CUDA Graph capture/instantiate,
 and synchronization are all outside the timed interval. The eager timed body calls the public Op
@@ -606,13 +555,11 @@ require keeping releasable intermediate compatibility states:
 
 1. In `attention_geometry.h` and `softmax_attention.h`, write the unified geometry, the public
    formulas, the dense entries, the envelopes, and the capacity contract.
-2. Converge the standalone `gqa_kv_append` and the existing prefix append into `kv_cache_append.h` and
-   `src/ops/kv_cache/append/`, and fix a single cache codec semantics.
-3. Move the causal cache, packed, and context implementations into `softmax_attention/dense/`, first
-   keeping numerics and route selection unchanged, then eliminating the GQA/Vision/bidirectional
-   naming.
-4. Extract the shared context+query device body into a neutral common primitive, move SWA into
-   `sliding_window/`, and rename it completely.
+2. Move the standalone `gqa_kv_append` into `kv_cache_append.h` and `src/ops/kv_cache/append/`, and
+   fix a single cache codec semantics.
+3. Move the causal cache and packed implementations into `softmax_attention/dense/`, first keeping
+   numerics and route selection unchanged, then eliminating the GQA/Vision naming.
+4. Move SWA into `sliding_window/` and rename it completely.
 5. Update the target callers, workspace capacity, explicit CMake sources, tests, and benchmarks.
 6. Update the affected model references, the benchmark README, and the test commands.
 7. Delete all old headers, sources, symbols, targets, and forwarding paths.
@@ -679,7 +626,7 @@ The migration is complete only when all of the following conditions hold:
 - Old headers, old sources, old symbols, old test targets, old benchmark targets, and compatibility
   aliases are deleted;
 - The independent qualification of dense, sliding-window, and KV append passes;
-- The Text, Vision, MTP, DFlash, prefix reuse, and CUDA Graph paths of the two registered targets
+- The Text, Vision, DFlash2, prefix reuse, and CUDA Graph paths of the registered 27B targets
   remain supported;
 - Affected documents and commands use the new names, and no stale references remain apart from the
   migration mapping in this document;

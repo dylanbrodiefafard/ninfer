@@ -1,4 +1,4 @@
-// Performance bench for the warp-row L2Norm domain. The registered 35B geometry is
+// Performance bench for the warp-row L2Norm domain. The registered Qwen3.8-27B GDN geometry is
 // [D,heads,T]=[128,16,T], with T=1..6 for decode/verification and T=1024 for prefill.
 //
 // Narrow one-case profiling example:

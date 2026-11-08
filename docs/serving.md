@@ -1003,11 +1003,10 @@ For the measured three-decode-lane setup:
 
 With p-less disabled, Engine selects sampling defaults from the loaded model and the request's
 resolved thinking mode.
-Qwen3.6-27B uses `1.0/0.95/20/0/0` for temperature/top-p/top-k/min-p/presence penalty in thinking
-mode and `0.7/0.80/20/0/1.5` in non-thinking mode. Qwen3.8-27B uses temperature `2.0` and presence
-penalty `0` in both modes (`2.0/0.95/20/0/0` thinking, `2.0/0.80/20/0/0` non-thinking).
-Qwen3.6-35B-A3B uses `1.0/0.95/20/0/1.5` in thinking mode and `0.7/0.80/20/0/1.5` in
-non-thinking mode. Frequency penalty is `0` for all registered presets. Process flags override
+Qwen3.8-27B uses temperature `2.0` and presence penalty `0` in both modes
+(`2.0/0.95/20/0/0` for temperature/top-p/top-k/min-p/presence penalty in thinking mode,
+`2.0/0.80/20/0/0` in non-thinking mode).
+Frequency penalty is `0` for all registered presets. Process flags override
 registered values, request fields override process flags, and `--greedy` finally forces
 temperature `0`. P-less is enabled by default with temperature `1.5` unless explicitly overridden;
 it keeps temperature and seed and ignores top-p,

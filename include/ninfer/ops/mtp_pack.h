@@ -14,8 +14,8 @@ namespace ninfer::ops {
  *   out[D:2D, t] = hidden_norm[:, t]
  *
  * Logical shapes:
- *   BF16 embedding_norm and hidden_norm [D,T], out [2D,T], contiguous. The registered domains are
- *   D=5120 for Qwen3.6-27B and D=2048 for Qwen3.6-35B-A3B.
+ *   BF16 embedding_norm and hidden_norm [D,T], out [2D,T], contiguous. The registered domain is
+ *   D=5120.
  *
  * Numeric:
  *   Exact BF16 element copies; no arithmetic or conversion.

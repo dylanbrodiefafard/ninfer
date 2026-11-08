@@ -37,8 +37,7 @@ Qwen3.6 uses \(K=V=128\). The state of one value head contains 16,384 FP32 eleme
 
 | Model | GDN layers | value heads | One recurrent state |
 |---|---:|---:|---:|
-| Qwen3.6-27B | 48 | 48 | 144 MiB |
-| Qwen3.6-35B-A3B | 30 | 32 | 60 MiB |
+| Qwen3.8-27B | 48 | 48 | 144 MiB |
 
 ### 1.2 Snapshot baseline
 
@@ -593,29 +592,24 @@ T(P_{gdn}+P_{conv}).
 | Model | \(L_g\) | \(H_q\) | \(H_v\) | \(K/V\) | \(C_p\) | \(W\) |
 |---|---:|---:|---:|---:|---:|---:|
 | 27B | 48 | 16 | 48 | 128/128 | 10,240 | 4 |
-| 35B-A3B | 30 | 16 | 32 | 128/128 | 8,192 | 4 |
 
 The corresponding per-token state/record sizes are:
 
 | Model | recurrent image | conv history | raw GDN record | conv record | record total |
 |---|---:|---:|---:|---:|---:|
 | 27B | 144.000 MiB | 2.8125 MiB | 0.767578 MiB | 0.9375 MiB | 1.705078 MiB |
-| 35B-A3B | 60.000 MiB | 1.40625 MiB | 0.358887 MiB | 0.46875 MiB | 0.827637 MiB |
 
 The ratio of one raw record to one recurrent+conv snapshot is:
 
 | Model | snapshot/position | raw record/position | Size ratio |
 |---|---:|---:|---:|
 | 27B | 146.8125 MiB | 1.705078 MiB | about 86.1x |
-| 35B-A3B | 61.40625 MiB | 0.827637 MiB | about 74.2x |
 
 The record capacity for typical verify windows is:
 
 | Model and window | raw GDN records | conv records | Total |
 |---|---:|---:|---:|
 | 27B, \(T=6\) | 4.605469 MiB | 5.625000 MiB | 10.230469 MiB |
-| 35B-A3B, \(T=6\) | 2.153320 MiB | 2.812500 MiB | 4.965820 MiB |
-| 35B-A3B, \(T=16\) | 5.742188 MiB | 7.500000 MiB | 13.242188 MiB |
 
 ### 6.3 Compute shape
 

@@ -1,4 +1,4 @@
-"""Fixed Qwen3.6-27B vision-tower schedule over a native NInfer artifact."""
+"""Fixed Qwen3.8-27B Vision-tower schedule over a native NInfer artifact."""
 
 from __future__ import annotations
 
@@ -19,10 +19,14 @@ from tools.reference.qwen3_6.common.vision_ops import (
     vision_position_ids,
 )
 
-from .bindings import ArtifactBinding, PhysicalBlock
+from .bindings import PhysicalBlock, VisionArtifactBinding
 from .config import VISION_CFG
 from .ops import linear, residual_add
 from .weights import WeightStore
+
+# Device memory left free for the CUDA context, allocator fragmentation, and
+# concurrent library workspaces when admitting one encode.
+_HEADROOM_BYTES = 2 << 30
 
 
 @dataclass(frozen=True)
@@ -35,15 +39,6 @@ class VisionStats:
     estimated_peak_bytes: int
     peak_allocated_bytes: int
     encode_seconds: float
-
-    def summary(self) -> str:
-        return (
-            f"images={self.images} videos={self.videos} raw_patches={self.raw_patches} "
-            f"llm_tokens={self.llm_tokens} attention_pairs={self.attention_pairs} "
-            f"estimate={self.estimated_peak_bytes / (1 << 30):.2f}GiB "
-            f"peak={self.peak_allocated_bytes / (1 << 30):.2f}GiB "
-            f"seconds={self.encode_seconds:.3f}"
-        )
 
 
 @dataclass
@@ -58,29 +53,14 @@ class VisionEncoder:
 
     def __init__(
         self,
-        binding: ArtifactBinding,
+        binding: VisionArtifactBinding,
         device: torch.device | str,
         *,
         compile_codec: bool,
-        memory_bytes: int | None = None,
-        headroom_bytes: int = 2 << 30,
-        attention_limit: int | None = None,
     ):
         self.binding = binding
         self.device = torch.device(device)
-        self.memory_bytes = memory_bytes
-        self.headroom_bytes = headroom_bytes
-        self.attention_limit = attention_limit
-        self.weights = WeightStore(
-            binding,
-            self.device,
-            capacity=1,
-            text=False,
-            vision=True,
-            compile_codec=compile_codec,
-            memory_bytes=memory_bytes,
-            headroom_bytes=headroom_bytes,
-        )
+        self.weights = WeightStore(binding, self.device, compile_codec=compile_codec)
 
     def _weight(self, block: PhysicalBlock) -> torch.Tensor:
         return self.weights.tensor(block)
@@ -103,19 +83,13 @@ class VisionEncoder:
         )
         return activation_elems * 2 + (768 << 20)
 
-    def _validate_budget(self, patches: int, attention_pairs: int) -> int:
+    def _validate_budget(self, patches: int) -> int:
         estimate = self._estimate_peak(patches)
-        if self.attention_limit is not None and attention_pairs > self.attention_limit:
-            raise ValueError(
-                f"vision attention work {attention_pairs} exceeds configured limit "
-                f"{self.attention_limit}"
-            )
         if self.device.type != "cuda":
             return estimate
         with torch.cuda.device(self.device):
             free, _ = torch.cuda.mem_get_info()
-        available = min(free, self.memory_bytes) if self.memory_bytes is not None else free
-        usable = max(0, available - self.headroom_bytes)
+        usable = max(0, free - _HEADROOM_BYTES)
         if estimate > usable:
             raise MemoryError(
                 f"estimated vision peak {estimate / (1 << 30):.2f}GiB exceeds usable "
@@ -154,7 +128,7 @@ class VisionEncoder:
         raw_patches = image_patches + video_patches
         llm_tokens = image_tokens + video_tokens
         attention_pairs = image_pairs + video_pairs
-        estimate = self._validate_budget(raw_patches, attention_pairs)
+        estimate = self._validate_budget(raw_patches)
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 

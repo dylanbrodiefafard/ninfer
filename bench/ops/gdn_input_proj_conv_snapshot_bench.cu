@@ -36,8 +36,6 @@ constexpr std::int32_t kQueryRows          = 2048;
 constexpr std::int32_t kKeyRows            = 2048;
 constexpr std::int32_t kValueRows          = 6144;
 constexpr std::int32_t kZRows              = 6144;
-constexpr std::int32_t kQkRows             = kQueryRows + kKeyRows;
-constexpr std::int32_t kValueZRows         = kValueRows + kZRows;
 constexpr std::int32_t kChannels           = kQueryRows + kKeyRows + kValueRows;
 constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
 
@@ -56,13 +54,6 @@ enum class CacheMode : std::uint8_t {
 enum class CacheState : std::uint8_t {
     Cold,
     Warm,
-};
-
-enum class Format : std::uint8_t {
-    Q4Q5,
-    Nvfp4,
-    W8,
-    All,
 };
 
 enum class Form : std::uint8_t {
@@ -89,7 +80,6 @@ struct TokenSweep {
 
 struct Options {
     TokenSweep tokens;
-    Format format                  = Format::Q4Q5;
     Form form                      = Form::Snapshot;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     Execution execution            = Execution::Graph;
@@ -186,14 +176,6 @@ CacheMode parse_cache(std::string_view value) {
     throw std::invalid_argument("--cache must be cold, warm, or both");
 }
 
-Format parse_format(std::string_view value) {
-    if (value == "q4q5") return Format::Q4Q5;
-    if (value == "nvfp4") return Format::Nvfp4;
-    if (value == "w8") return Format::W8;
-    if (value == "all") return Format::All;
-    throw std::invalid_argument("--format must be q4q5, nvfp4, w8, or all");
-}
-
 Form parse_form(std::string_view value) {
     if (value == "snapshot") return Form::Snapshot;
     if (value == "record") return Form::Record;
@@ -223,7 +205,6 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
-                 "  --format q4q5|nvfp4|w8|all   Default q4q5.\n"
                  "  --form snapshot|record|both  Default snapshot.\n"
                  "  --nvfp4-policy a16|a4|a8     Default a4; A8 is record-only.\n"
                  "  --tokens T                    Exact token extent.\n"
@@ -251,9 +232,7 @@ Options parse_options(int argc, char** argv) {
             if (++index >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
             return argv[index];
         };
-        if (argument == "--format") {
-            options.format = parse_format(next("format"));
-        } else if (argument == "--form") {
+        if (argument == "--form") {
             options.form = parse_form(next("form"));
         } else if (argument == "--nvfp4-policy") {
             options.nvfp4_policy = parse_nvfp4_policy(next("NVFP4 policy"));
@@ -373,66 +352,6 @@ const char* policy_name(ops::LinearPolicy policy) {
                : (policy == ops::LinearPolicy::AllowA4 ? "a4" : "a16");
 }
 
-class Q4Q5Fixture {
-public:
-    explicit Q4Q5Fixture(std::size_t flush_bytes)
-        : qk_(bench::make_row_split_weight(QType::Q4G64_F16S, kQkRows, kHidden, kHidden,
-                                           {0x53, 0x00, 0x3400})),
-          value_z_(bench::make_row_split_weight(QType::Q5G64_F16S, kValueZRows, kHidden, kHidden,
-                                                {0x53, 0x55, 0x3400})),
-          conv_weight_(bench::make_bf16(static_cast<std::size_t>(kChannels) * 4)),
-          flush_(flush_bytes) {
-        CUDA_CHECK(cudaMemset(flush_.p, 0xa5, flush_.bytes));
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-
-    [[nodiscard]] Tensor conv_weight() const {
-        return Tensor(conv_weight_.p, DType::BF16, {kChannels, 4});
-    }
-
-    [[nodiscard]] const char* profile() const noexcept { return "q4-q5"; }
-
-    [[nodiscard]] GdnGeometry geometry() const noexcept {
-        return {kHidden, kQueryRows, kKeyRows, kValueRows, kZRows};
-    }
-
-    [[nodiscard]] std::size_t workspace_capacity(Form form, std::int32_t batch,
-                                                 std::int32_t tokens) const {
-        if (form == Form::Record) {
-            return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                kQueryRows, kKeyRows, kValueRows, batch, tokens, tokens);
-        }
-        return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            kQueryRows, kKeyRows, kValueRows, batch, tokens, tokens);
-    }
-
-    void launch(Form form, const Tensor& x, Tensor& conv_states, const Tensor& initial,
-                const Tensor& snapshot_base, const Tensor& valid_columns, Tensor& conv_record,
-                Tensor& query, Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
-                cudaStream_t stream) {
-        Tensor convolution_weight = conv_weight();
-        if (form == Form::Record) {
-            ops::gdn_input_proj_conv_record(x, qk_.weight, value_z_.weight, convolution_weight,
-                                            conv_states, valid_columns, initial, conv_record, query,
-                                            key, value, z, workspace, stream);
-        } else {
-            ops::gdn_input_proj_conv_snapshot(x, qk_.weight, value_z_.weight, convolution_weight,
-                                              conv_states, valid_columns, initial, snapshot_base,
-                                              query, key, value, z, workspace, stream);
-        }
-    }
-
-    void flush(cudaStream_t stream) {
-        CUDA_CHECK(cudaMemsetAsync(flush_.p, 0xa5, flush_.bytes, stream));
-    }
-
-private:
-    bench::PackedQuantizedWeight qk_;
-    bench::PackedQuantizedWeight value_z_;
-    DeviceBuffer conv_weight_;
-    DeviceBuffer flush_;
-};
-
 class Nvfp4Fixture {
 public:
     Nvfp4Fixture(std::size_t flush_bytes, ops::LinearPolicy policy)
@@ -492,60 +411,6 @@ private:
     DeviceBuffer conv_weight_;
     DeviceBuffer flush_;
     ops::LinearPolicy policy_;
-};
-
-class W8Fixture {
-public:
-    explicit W8Fixture(std::size_t flush_bytes)
-        : parent_(bench::make_row_split_weight(QType::W8G32_F16S, 12288, 2048, 2048,
-                                               {0x03, 0x00, 0x3c00})),
-          conv_weight_(bench::make_bf16(static_cast<std::size_t>(8192) * 4)), flush_(flush_bytes) {
-        CUDA_CHECK(cudaMemset(flush_.p, 0xa5, flush_.bytes));
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-
-    [[nodiscard]] Tensor conv_weight() const {
-        return Tensor(conv_weight_.p, DType::BF16, {8192, 4});
-    }
-
-    [[nodiscard]] const char* profile() const noexcept { return "w8"; }
-
-    [[nodiscard]] GdnGeometry geometry() const noexcept { return {2048, 2048, 2048, 4096, 4096}; }
-
-    [[nodiscard]] std::size_t workspace_capacity(Form form, std::int32_t batch,
-                                                 std::int32_t tokens) const {
-        if (form == Form::Record) {
-            return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 4096, batch,
-                                                                            tokens, tokens);
-        }
-        return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, batch,
-                                                                          tokens, tokens);
-    }
-
-    void launch(Form form, const Tensor& x, Tensor& conv_states, const Tensor& initial,
-                const Tensor& snapshot_base, const Tensor& valid_columns, Tensor& conv_record,
-                Tensor& query, Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
-                cudaStream_t stream) {
-        Tensor convolution_weight = conv_weight();
-        if (form == Form::Record) {
-            ops::gdn_input_proj_conv_record(x, parent_.weight, convolution_weight, conv_states,
-                                            valid_columns, initial, conv_record, query, key, value,
-                                            z, workspace, stream);
-        } else {
-            ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
-                                              valid_columns, initial, snapshot_base, query, key,
-                                              value, z, workspace, stream);
-        }
-    }
-
-    void flush(cudaStream_t stream) {
-        CUDA_CHECK(cudaMemsetAsync(flush_.p, 0xa5, flush_.bytes, stream));
-    }
-
-private:
-    bench::PackedQuantizedWeight parent_;
-    DeviceBuffer conv_weight_;
-    DeviceBuffer flush_;
 };
 
 template <class Fixture>
@@ -839,33 +704,18 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         DeviceContext context;
-        const char* configured_format = options.format == Format::Q4Q5    ? "q4q5"
-                                        : options.format == Format::Nvfp4 ? "nvfp4"
-                                        : options.format == Format::W8    ? "w8"
-                                                                          : "all";
         std::printf(
-            "# op=gdn_input_proj_conv form=%s format=%s nvfp4_policy=%s gpu=%s sm=%d "
+            "# op=gdn_input_proj_conv form=%s format=nvfp4 nvfp4_policy=%s gpu=%s sm=%d "
             "batch=%d execution=%s "
             "timed_scope=full_public_op_device_body cold_flush_mib=%llu\n",
-            options.form == Form::Both ? "both" : form_name(options.form), configured_format,
+            options.form == Form::Both ? "both" : form_name(options.form),
             policy_name(options.nvfp4_policy), context.props.name, context.sm(), options.batch,
             options.execution == Execution::Both ? "both" : execution_name(options.execution),
             static_cast<unsigned long long>(options.flush_bytes >> 20));
 
         std::vector<Result> results;
-        if (options.format == Format::Q4Q5 || options.format == Format::All) {
-            Q4Q5Fixture fixture(static_cast<std::size_t>(options.flush_bytes));
-            run_fixture(fixture, options, context.stream, results);
-        }
-        if (options.format == Format::Nvfp4 || options.format == Format::All) {
-            Nvfp4Fixture fixture(static_cast<std::size_t>(options.flush_bytes),
-                                 options.nvfp4_policy);
-            run_fixture(fixture, options, context.stream, results);
-        }
-        if (options.format == Format::W8 || options.format == Format::All) {
-            W8Fixture fixture(static_cast<std::size_t>(options.flush_bytes));
-            run_fixture(fixture, options, context.stream, results);
-        }
+        Nvfp4Fixture fixture(static_cast<std::size_t>(options.flush_bytes), options.nvfp4_policy);
+        run_fixture(fixture, options, context.stream, results);
         write_csv(options.csv_out, results, options, context);
         return 0;
     } catch (const std::exception& error) {

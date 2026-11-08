@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Iterable
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -38,11 +37,11 @@ def _fetch_videos_opencv(_processor, video_or_videos, sample_indices_fn=None):
 
 
 class Frontend:
-    """Processor, tokenizer, template, and generation defaults for one artifact."""
+    """Processor, tokenizer, and chat template for one artifact."""
 
     def __init__(self, binding: Any):
         try:
-            from transformers import AutoProcessor, GenerationConfig
+            from transformers import AutoProcessor
             from transformers.utils import is_torchcodec_available
         except ImportError as exc:
             raise RuntimeError(
@@ -66,9 +65,6 @@ class Frontend:
             for filename, resource in files:
                 (directory / filename).write_bytes(binding.resource_bytes(resource))
             self.processor = AutoProcessor.from_pretrained(directory, local_files_only=True)
-            self.generation_config = GenerationConfig.from_pretrained(
-                directory, local_files_only=True
-            )
 
         self.tokenizer = self.processor.tokenizer
         if not is_torchcodec_available():
@@ -101,15 +97,6 @@ class Frontend:
                     f"artifact tokenizer maps {token} to {actual}; expected {expected}"
                 )
 
-    @property
-    def default_stop_token_ids(self) -> set[int]:
-        values = self.generation_config.eos_token_id
-        if values is None:
-            return set()
-        if isinstance(values, int):
-            return {values}
-        return {int(value) for value in values}
-
     def process(self, messages: list[dict[str, Any]], *, thinking: bool) -> MultimodalBatch:
         output = self.processor.apply_chat_template(
             messages,
@@ -120,17 +107,6 @@ class Frontend:
             enable_thinking=thinking,
         )
         return batch_from_processor_output(output)
-
-    def process_text(self, text: str, *, thinking: bool) -> MultimodalBatch:
-        if not text.strip():
-            raise ValueError("prompt text must not be empty")
-        return self.process(
-            [{"role": "user", "content": text}],
-            thinking=thinking,
-        )
-
-    def decode(self, token_ids: Iterable[int], *, skip_special_tokens: bool = True) -> str:
-        return self.tokenizer.decode(list(token_ids), skip_special_tokens=skip_special_tokens)
 
 
 __all__ = ["Frontend"]

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <ninfer/targets/qwen3_6/dflash_kind.h>
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/hybrid_topology.h>
 #include <ninfer/targets/qwen3_6/vision.h>
@@ -76,25 +75,23 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 };
 
 struct DFlashConfig {
-    static constexpr bool supported           = true;
-    static constexpr qwen3_6::DFlashKind kind = qwen3_6::DFlashKind::DFlash2;
-    static constexpr int layers               = 5;
-    static constexpr int local_layers         = 5;
-    static constexpr int full_layers          = 0;
-    static constexpr int feature_layers       = 5;
-    static constexpr int feature_rows         = feature_layers * TextConfig::hidden;
-    static constexpr int hidden               = TextConfig::hidden;
-    static constexpr int intermediate         = 17408;
-    static constexpr int query_heads          = 32;
-    static constexpr int kv_heads             = 8;
-    static constexpr int head_dim             = 128;
-    static constexpr int query_size           = query_heads * head_dim;
-    static constexpr int kv_size              = kv_heads * head_dim;
-    static constexpr int local_capacity       = 2048;
-    static constexpr int mask_token           = 248070;
-    static constexpr float rms_epsilon        = 1.0e-6F;
-    static constexpr float rope_theta         = 1.0e7F;
-    static constexpr float attention_scale    = 0.08838834764831845F;
+    static constexpr bool supported        = true;
+    static constexpr int layers            = 5;
+    static constexpr int local_layers      = 5;
+    static constexpr int feature_layers    = 5;
+    static constexpr int feature_rows      = feature_layers * TextConfig::hidden;
+    static constexpr int hidden            = TextConfig::hidden;
+    static constexpr int intermediate      = 17408;
+    static constexpr int query_heads       = 32;
+    static constexpr int kv_heads          = 8;
+    static constexpr int head_dim          = 128;
+    static constexpr int query_size        = query_heads * head_dim;
+    static constexpr int kv_size           = kv_heads * head_dim;
+    static constexpr int local_capacity    = 2048;
+    static constexpr int mask_token        = 248070;
+    static constexpr float rms_epsilon     = 1.0e-6F;
+    static constexpr float rope_theta      = 1.0e7F;
+    static constexpr float attention_scale = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
     // Adaptive draft also captures a packed best-first draft tree of this many columns (anchor
     // included) as an arm; the picker learns per batch size when it beats the chain (W=k+1).

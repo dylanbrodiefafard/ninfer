@@ -93,9 +93,9 @@ int main(int argc, char** argv) {
     }
 
     try {
-        bool split       = false;
-        int hidden       = 5120;
-        bool have_hidden = false;
+        // The registered MTP pack domain is the Qwen3.8-27B hidden width.
+        constexpr int kHidden = 5120;
+        bool split            = false;
         std::vector<int> tokens{1, 2, 3, 4, 5, 6, 48};
         for (int index = 1; index < argc; ++index) {
             if (!std::strcmp(argv[index], "--op") && index + 1 < argc) {
@@ -104,26 +104,18 @@ int main(int argc, char** argv) {
                     throw std::invalid_argument("--op must be pack or split");
                 }
                 split = operation == "split";
-            } else if (!std::strcmp(argv[index], "--d") && index + 1 < argc) {
-                hidden      = std::stoi(argv[++index]);
-                have_hidden = true;
-                if (hidden != 2048 && hidden != 5120) {
-                    throw std::invalid_argument("--d must be 2048 or 5120");
-                }
             } else if (!std::strcmp(argv[index], "--tokens") && index + 1 < argc) {
                 tokens = parse_tokens(argv[++index]);
             } else {
-                throw std::invalid_argument(
-                    "usage: ninfer_mtp_pack_bench [--op pack|split] [--d 2048|5120] "
-                    "[--tokens T[,T...]]");
+                throw std::invalid_argument("usage: ninfer_mtp_pack_bench [--op pack|split] "
+                                            "[--tokens T[,T...]]");
             }
         }
-        if (split && have_hidden) { throw std::invalid_argument("--d is only valid for pack"); }
         for (const int token_count : tokens) {
             if (split) {
                 run_split(token_count);
             } else {
-                run_pack(hidden, token_count);
+                run_pack(kHidden, token_count);
             }
         }
         return 0;

@@ -21,11 +21,8 @@
 namespace ninfer::test::linear_pair {
 namespace {
 
-constexpr std::int32_t kOutputRows       = 1024;
-constexpr std::size_t kOutputScanWords   = 1U << 20;
-constexpr std::int32_t kDFlashParentRows = 6144;
-constexpr std::int32_t kDFlashFirstRow   = 4096;
-constexpr std::int32_t kDFlashSecondRow  = 5120;
+constexpr std::int32_t kOutputRows     = 1024;
+constexpr std::size_t kOutputScanWords = 1U << 20;
 
 // Both observable projections use the same A16 arithmetic profile. T and the selected pair
 // launcher never select another correctness criterion.
@@ -35,12 +32,10 @@ constexpr ReductionCriterion kLinearPairA16Tolerance{
     3.8e-3,
 };
 
+// The registered pair is two independent [1024,5120] W8 parents.
 struct PairFixture {
-    bool shared_payload;
     quantized_weight::PackedWeight first_storage;
     quantized_weight::PackedWeight second_storage;
-    std::int32_t first_row;
-    std::int32_t second_row;
 };
 
 std::size_t checked_elements(std::int32_t first, std::int32_t second, const char* label) {
@@ -92,37 +87,14 @@ std::vector<std::int32_t> conformance_tokens(const ShapeCase& shape) {
 }
 
 PairFixture make_pair_fixture(std::int32_t k, std::uint32_t seed) {
+    if (k != 5120) { throw std::invalid_argument("linear_pair test: unsupported K"); }
     const quantized_weight::PatternedWeightOptions options{
         quantized_weight::RowSplitScalePattern::Tiny};
-    if (k == 5120) {
-        return {
-            false,
-            quantized_weight::make_patterned_weight(QType::W8G32_F16S, kOutputRows, k, seed,
-                                                    options),
-            quantized_weight::make_patterned_weight(QType::W8G32_F16S, kOutputRows, k, seed + 1U,
-                                                    options),
-            0,
-            0,
-        };
-    }
-    if (k == 2048) {
-        return {
-            true,
-            quantized_weight::make_patterned_weight(QType::W8G32_F16S, kDFlashParentRows, k, seed,
-                                                    options),
-            {},
-            kDFlashFirstRow,
-            kDFlashSecondRow,
-        };
-    }
-    throw std::invalid_argument("linear_pair test: unsupported K");
-}
-
-std::vector<std::int32_t> physical_rows(std::span<const std::int32_t> logical_rows,
-                                        std::int32_t row_begin) {
-    std::vector<std::int32_t> result(logical_rows.begin(), logical_rows.end());
-    for (std::int32_t& row : result) { row += row_begin; }
-    return result;
+    return {
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, kOutputRows, k, seed, options),
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, kOutputRows, k, seed + 1U,
+                                                options),
+    };
 }
 
 std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed) {
@@ -239,17 +211,11 @@ int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
     const std::int32_t maximum_t = tokens.back();
 
     const std::vector<std::int32_t> oracle_rows = sampled_indices(kOutputRows);
-    PairFixture fixture                         = make_pair_fixture(shape.k, shape.seed);
-    const quantized_weight::PackedWeight& second_storage =
-        fixture.shared_payload ? fixture.first_storage : fixture.second_storage;
-    const std::vector<std::int32_t> first_physical_rows =
-        physical_rows(oracle_rows, fixture.first_row);
-    const std::vector<std::int32_t> second_physical_rows =
-        physical_rows(oracle_rows, fixture.second_row);
+    const PairFixture fixture                   = make_pair_fixture(shape.k, shape.seed);
     const std::vector<float> first_oracle =
-        quantized_weight::materialize_rows_fp32(fixture.first_storage, first_physical_rows);
+        quantized_weight::materialize_rows_fp32(fixture.first_storage, oracle_rows);
     const std::vector<float> second_oracle =
-        quantized_weight::materialize_rows_fp32(second_storage, second_physical_rows);
+        quantized_weight::materialize_rows_fp32(fixture.second_storage, oracle_rows);
     const std::vector<std::uint16_t> activation =
         make_activation(shape.k, maximum_t, shape.seed + 2U);
 
@@ -258,19 +224,14 @@ int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
     test::GuardedDeviceBuffer first_device_weight(fixture.first_storage.payload.size());
     first_device_weight.copy_from_host(fixture.first_storage.payload.data(),
                                        fixture.first_storage.payload.size());
-    test::GuardedDeviceBuffer second_device_weight(
-        fixture.shared_payload ? 1U : fixture.second_storage.payload.size());
-    if (!fixture.shared_payload) {
-        second_device_weight.copy_from_host(fixture.second_storage.payload.data(),
-                                            fixture.second_storage.payload.size());
-    }
+    test::GuardedDeviceBuffer second_device_weight(fixture.second_storage.payload.size());
+    second_device_weight.copy_from_host(fixture.second_storage.payload.data(),
+                                        fixture.second_storage.payload.size());
 
-    void* const second_payload =
-        fixture.shared_payload ? first_device_weight.data() : second_device_weight.data();
-    const Weight first_weight = fixture.first_storage.device_row_view(
-        first_device_weight.data(), fixture.first_row, kOutputRows);
+    const Weight first_weight =
+        fixture.first_storage.device_row_view(first_device_weight.data(), 0, kOutputRows);
     const Weight second_weight =
-        second_storage.device_row_view(second_payload, fixture.second_row, kOutputRows);
+        fixture.second_storage.device_row_view(second_device_weight.data(), 0, kOutputRows);
 
     int failures = 0;
     for (const std::int32_t t : tokens) {
@@ -317,9 +278,7 @@ int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
 
     failures += device_activation.verify_guards("linear_pair activation");
     failures += first_device_weight.verify_guards("linear_pair first weight");
-    if (!fixture.shared_payload) {
-        failures += second_device_weight.verify_guards("linear_pair second weight");
-    }
+    failures += second_device_weight.verify_guards("linear_pair second weight");
     failures += verify_preserved(
         device_activation,
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(activation.data()),
@@ -327,10 +286,8 @@ int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
         "linear_pair activation");
     failures += verify_preserved(first_device_weight, fixture.first_storage.payload,
                                  "linear_pair first weight");
-    if (!fixture.shared_payload) {
-        failures += verify_preserved(second_device_weight, fixture.second_storage.payload,
-                                     "linear_pair second weight");
-    }
+    failures += verify_preserved(second_device_weight, fixture.second_storage.payload,
+                                 "linear_pair second weight");
     return failures;
 }
 

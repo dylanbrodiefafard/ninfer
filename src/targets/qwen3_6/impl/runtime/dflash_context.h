@@ -7,14 +7,12 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
-#include <optional>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 struct DFlashPersistentState {
     CyclicKVCache local;
     CyclicKVCache staging_local;
-    std::optional<qwen3_6::PagedKVCache> full;
     Tensor prefill_features;
     Tensor prefill_positions;
     Tensor pending_features;
@@ -22,7 +20,6 @@ struct DFlashPersistentState {
     DFlashPersistentState(DeviceSpan backing, const DFlashPersistentLayout& layout);
 
     [[nodiscard]] CyclicKVCacheLayerView local_layer(std::uint32_t layer) const;
-    [[nodiscard]] PagedKVBatchLayerView full_batch_layer(std::uint32_t layer) const;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

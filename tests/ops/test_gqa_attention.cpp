@@ -92,13 +92,11 @@ struct Geometry {
 
 constexpr Geometry kGeometries[] = {
     {"qwen3_6_27b", 24, 4},
-    {"qwen3_6_35b_a3b", 16, 2},
 };
 
 // `--sanitizer` scope (tests/ops/sanitizer_scope.h): the qwen3.8-27b geometry with exact NVFP4-G16
-// KV (DType::U8), the only attention layout the DFlash2 flow dispatches by default. Other
-// geometries and KV formats, the sage route, and the sparse-attention options return without
-// launching.
+// KV (DType::U8), the only attention layout the DFlash2 flow dispatches by default. Other KV
+// formats, the sage route, and the sparse-attention options return without launching.
 bool g_sanitizer_scope = false;
 
 [[nodiscard]] bool outside_sanitizer_scope(const Geometry& geometry, DType dtype) {
@@ -4188,11 +4186,11 @@ int run_tree_verify_cases(bool full) {
                 failures += run_tree_verify_case(geometry, dtype, 12, star_tree_parent(12), "star");
             }
             failures += run_tree_verify_batch_isolation_case(geometry, dtype);
-            if (geometry.q_heads == 24 && dtype == DType::U8) {
+            if (dtype == DType::U8) {
                 failures +=
                     run_tree_verify_batch_isolation_case(geometry, dtype, 8, 128, 16256, true);
             }
-            if (dtype == DType::U8 && (full || geometry.q_heads == 24)) {
+            if (dtype == DType::U8) {
                 // The real Qwen3.8 DFlash regression reaches this short-context frontier with
                 // W=2 and W=5. Packed tree verification and ordinary T=1 are independently
                 // reduced schedules, so compare both directly under the NVFP4 oracle rather
@@ -4226,7 +4224,7 @@ int run_batch_cases(bool full) {
     failures += run_batch_case(kGeometries[0], DType::BF16,
                                {1, {63, 2048}, {1, 1}, {1, 0}, MappingPattern::Fragmented, 501u});
     if (full) {
-        failures += run_batch_case(kGeometries[1], DType::I8,
+        failures += run_batch_case(kGeometries[0], DType::I8,
                                    {1,
                                     {0, 31, 63, 127, 511, 1023, 2047, 4095},
                                     {1, 1, 1, 1, 1, 1, 1, 1},
@@ -4234,7 +4232,7 @@ int run_batch_cases(bool full) {
                                     MappingPattern::Identity,
                                     502u});
     } else {
-        failures += run_batch_case(kGeometries[1], DType::I8,
+        failures += run_batch_case(kGeometries[0], DType::I8,
                                    {1,
                                     {0, 31, 63, 127, 511},
                                     {1, 1, 1, 1, 1},
@@ -4256,7 +4254,7 @@ int run_batch_cases(bool full) {
     failures +=
         run_batch_case(kGeometries[0], DType::U8,
                        {6, {9000, 12000}, {6, 3}, {1, 0}, MappingPattern::Fragmented, 508u});
-    failures += run_batch_case(kGeometries[1], DType::BF16,
+    failures += run_batch_case(kGeometries[0], DType::BF16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
     // Masked B=1 context-split prompts require the merge to zero every invalid output column.
     failures += run_batch_case(kGeometries[0], DType::U8,
@@ -4268,7 +4266,7 @@ int run_batch_cases(bool full) {
             run_batch_case(kGeometries[0], DType::U8,
                            {width, {context}, {77}, {0}, MappingPattern::Fragmented, 1111u}, true);
     }
-    failures += run_batch_case(kGeometries[1], DType::U8,
+    failures += run_batch_case(kGeometries[0], DType::U8,
                                {300, {1800}, {211}, {0}, MappingPattern::Fragmented, 510u});
     // 27B DFlash k=6/7 verify batches (W=7/8) on the small-T route, with masked short rows.
     failures += run_batch_case(
@@ -4388,10 +4386,8 @@ int run_geometry(const Geometry& geometry, bool full) {
         if (dtype == DType::U8 && !sage_only) {
             failures +=
                 run_a1_case(geometry, dtype, {128, 64, 256, 210u}, MappingPattern::Identity);
-            if (geometry.q_heads == 24) {
-                failures += run_a1_case(geometry, dtype, {129, 512, 641, 1103u},
-                                        MappingPattern::Fragmented);
-            }
+            failures +=
+                run_a1_case(geometry, dtype, {129, 512, 641, 1103u}, MappingPattern::Fragmented);
             if (full) {
                 failures +=
                     run_a1_case(geometry, dtype, {129, 64, 256, 211u}, MappingPattern::Identity);
@@ -4492,7 +4488,7 @@ int run_geometry(const Geometry& geometry, bool full) {
             }
         }
 
-        if (geometry.q_heads == 24 && !sage_only) {
+        if (!sage_only) {
             // DFlash chain verify W=7/8 (k=6/7) on the three-row-tile small-T route: short, 2K
             // dynamic-arena, 8K and pipelined (8198, 32768] windows.
             failures += run_a1_case(geometry, dtype, {8, 61, 69, 420u}, MappingPattern::Fragmented);
@@ -4510,17 +4506,6 @@ int run_geometry(const Geometry& geometry, bool full) {
                     run_a3_case(geometry, dtype, {8, 33000, 33008, 426u}, MappingPattern::Identity);
             }
         }
-
-        if (geometry.q_heads == 16 && !sage_only) {
-            failures += run_a1_case(geometry, dtype, {7, 17, 513, 401u}, MappingPattern::Identity);
-            failures += run_a3_case(geometry, dtype, {7, 17, 513, 402u}, MappingPattern::Identity);
-            if (full) {
-                failures +=
-                    run_a3_case(geometry, dtype, {16, 17, 1024, 403u}, MappingPattern::Identity);
-                failures +=
-                    run_a3_case(geometry, dtype, {16, 17, 1025, 404u}, MappingPattern::Identity);
-            }
-        }
     }
     return failures;
 }
@@ -4530,19 +4515,20 @@ int verify_workspace_capacity_contract() {
     for (const DType dtype : {DType::BF16, DType::I8, DType::U8}) {
         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
         const std::size_t interval =
-            ops::gqa_attention_workspace_capacity_bytes(16, dtype, envelope, 1, 1, 17);
+            ops::gqa_attention_workspace_capacity_bytes(24, dtype, envelope, 1, 1, 17);
         std::size_t witness = 0;
         for (std::int32_t tokens = 1; tokens <= 17; ++tokens) {
             witness = std::max(witness, ops::gqa_attention_workspace_capacity_bytes(
-                                            16, dtype, envelope, 1, tokens, tokens));
+                                            24, dtype, envelope, 1, tokens, tokens));
         }
         if (interval != witness) {
             std::cerr << "gqa_attention interval capacity has no exact route witness\n";
             ++failures;
         }
     }
-    for (const std::int32_t q_heads : {24, 16}) {
+    {
         // Context-split partials peak at an interior W, not at the interval end.
+        constexpr std::int32_t q_heads = 24;
         constexpr ops::GqaExecutionEnvelope envelope{1, 8192};
         const std::size_t interval =
             ops::gqa_attention_workspace_capacity_bytes(q_heads, DType::U8, envelope, 1, 1, 1536);
@@ -4558,7 +4544,7 @@ int verify_workspace_capacity_contract() {
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
+            24, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
     } catch (const std::invalid_argument&) {
         std::cerr << "gqa_attention rejected its maximum visible-key envelope\n";
         ++failures;
@@ -4566,24 +4552,24 @@ int verify_workspace_capacity_contract() {
     failures += expect_invalid_argument(
         [&] {
             return ops::gqa_attention_workspace_capacity_bytes(
-                16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
+                24, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
         },
         "gqa_attention accepted an envelope outside the launcher domain");
     {
         constexpr ops::GqaExecutionEnvelope xenv{128, 512};
         const std::size_t dense =
-            ops::gqa_attention_workspace_capacity_bytes(16, DType::U8, xenv, 1, 128, 128);
+            ops::gqa_attention_workspace_capacity_bytes(24, DType::U8, xenv, 1, 128, 128);
         const std::size_t xattn = ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::U8, xenv, 1, 128, 128, 1.0f, false, 0.9f);
+            24, DType::U8, xenv, 1, 128, 128, 1.0f, false, 0.9f);
         if (xattn <= dense) {
             std::cerr << "gqa_attention xattn_tau workspace was not accounted (dense=" << dense
                       << " xattn=" << xattn << ")\n";
             ++failures;
         }
         const std::size_t bf16_xattn = ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::BF16, xenv, 1, 128, 128, 1.0f, false, 0.9f);
+            24, DType::BF16, xenv, 1, 128, 128, 1.0f, false, 0.9f);
         const std::size_t bf16_dense =
-            ops::gqa_attention_workspace_capacity_bytes(16, DType::BF16, xenv, 1, 128, 128);
+            ops::gqa_attention_workspace_capacity_bytes(24, DType::BF16, xenv, 1, 128, 128);
         if (bf16_xattn != bf16_dense) {
             std::cerr << "gqa_attention xattn_tau added workspace on a non-NVFP4 cache\n";
             ++failures;

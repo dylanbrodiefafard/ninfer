@@ -278,14 +278,9 @@ void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& position
         float, std::int32_t, GqaS3PrefillDump*, void*, GqaExecutionEnvelope)
 
 NINFER_SPARSE_PREFILL_INSTANTIATE(Gqa27Geometry, PagedKVLayerView, GqaPrefillDirectMetadata);
-NINFER_SPARSE_PREFILL_INSTANTIATE(Gqa35Geometry, PagedKVLayerView, GqaPrefillDirectMetadata);
 NINFER_SPARSE_PREFILL_INSTANTIATE(Gqa27Geometry, PagedKVBatchLayerView,
                                   GqaPrefillBatchMetadata<false>);
 NINFER_SPARSE_PREFILL_INSTANTIATE(Gqa27Geometry, PagedKVBatchLayerView,
-                                  GqaPrefillBatchMetadata<true>);
-NINFER_SPARSE_PREFILL_INSTANTIATE(Gqa35Geometry, PagedKVBatchLayerView,
-                                  GqaPrefillBatchMetadata<false>);
-NINFER_SPARSE_PREFILL_INSTANTIATE(Gqa35Geometry, PagedKVBatchLayerView,
                                   GqaPrefillBatchMetadata<true>);
 
 #undef NINFER_SPARSE_PREFILL_INSTANTIATE

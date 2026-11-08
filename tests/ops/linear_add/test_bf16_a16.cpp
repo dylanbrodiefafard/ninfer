@@ -16,7 +16,6 @@
 namespace {
 
 using ninfer::test::linear_add::ShapeCase;
-using ninfer::test::linear_add::WeightFormat;
 
 template <class Callable>
 int expect_invalid(Callable&& callable, const char* label) {
@@ -62,8 +61,7 @@ int bf16_a16_conformance() {
         4, 5, 8, 10, 15, 16, 20, 24, 28, 32, 36, 44, 48, 52, 60, 64, 127, 128, 129, 1024, 1536,
     };
     return ninfer::test::linear_add::run_shape(
-               "BF16_A16 LinearAdd", WeightFormat::BF16,
-               ShapeCase{5120, 6144, 431U, kRouteStarts, kRouteInteriors}) +
+               "BF16_A16 LinearAdd", ShapeCase{5120, 6144, 431U, kRouteStarts, kRouteInteriors}) +
            bf16_a16_rejections();
 }
 

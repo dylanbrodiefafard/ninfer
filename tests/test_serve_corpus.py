@@ -26,7 +26,7 @@ def test_summary_retains_one_canonical_weights_id() -> None:
     records = [{"weights_id": "nvfp4", "metrics": {}}]
     row = summary_row(
         "context_profile",
-        "qwen3_6_27b",
+        "qwen3_8_27b",
         "fixture",
         "fixture",
         "ordinary",
@@ -38,10 +38,10 @@ def test_summary_retains_one_canonical_weights_id() -> None:
     with pytest.raises(CampaignError):
         summary_row(
             "context_profile",
-            "qwen3_6_27b",
+            "qwen3_8_27b",
             "fixture",
             "fixture",
             "ordinary",
             "greedy",
-            [*records, {"weights_id": "groupwise-int", "metrics": {}}],
+            [*records, {"weights_id": "selective-fp8", "metrics": {}}],
         )

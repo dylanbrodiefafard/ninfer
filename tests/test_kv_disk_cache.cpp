@@ -634,7 +634,7 @@ disk_config(const fs::path& location, q36::detail::KVRamCache& ram, ninfer::Page
     cfg.max_context    = max_context;
     cfg.ram            = &ram;
     cfg.fingerprint    = q36::detail::make_disk_fingerprint(
-        "qwen3.6-27b", "groupwise-int", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
+        "qwen3.8-27b", "nvfp4", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
         speculative, text, backend, gdn, cyclic);
     cfg.text_pool          = &text;
     cfg.backend_pool       = backend;
@@ -858,7 +858,7 @@ int test_lock_and_fingerprint(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
         threw = std::string(e.what()).find("model_id") != std::string::npos;
     }
     if (!threw) { return fail("fingerprint mismatch did not name model_id"); }
-    cfg.fingerprint.model_id                 = "qwen3.6-27b";
+    cfg.fingerprint.model_id                 = "qwen3.8-27b";
     cfg.fingerprint.artifact_tensor_identity = "different-file-same-model-and-weights";
     threw                                    = false;
     try {
@@ -1568,7 +1568,7 @@ int test_dflash_cyclic(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     auto cfg        = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::DFlash,
                                   32ULL << 20, 4096);
     cfg.fingerprint = q36::detail::make_disk_fingerprint(
-        "qwen3.6-27b", "groupwise-int", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
+        "qwen3.8-27b", "nvfp4", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
         ninfer::SpeculativeBackend::DFlash, pool, nullptr, nullptr, &cyclic);
     {
         q36::detail::KVDiskCache disk(cfg);
@@ -1595,7 +1595,7 @@ int test_dflash_cyclic(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     ninfer::CyclicKVCache destination({destination_arena.base(), destination_arena.capacity()},
                                       destination_layout);
     cfg.fingerprint = q36::detail::make_disk_fingerprint(
-        "qwen3.6-27b", "groupwise-int", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
+        "qwen3.8-27b", "nvfp4", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
         ninfer::SpeculativeBackend::DFlash, pool, nullptr, nullptr, &destination);
     q36::detail::KVDiskCache reopened(cfg);
     const auto match = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
@@ -2968,7 +2968,7 @@ int test_disk_match_filters_unready_heads(ninfer::DeviceContext& ctx, ninfer::Pa
                                  ? SpeculativeBackend::DFlash
                                  : SpeculativeBackend::Mtp;
         const q36::detail::ReuseBackendPolicy policy{backend, backend == SpeculativeBackend::Mtp,
-                                                     backend == SpeculativeBackend::DFlash, false};
+                                                     backend == SpeculativeBackend::DFlash};
         auto cfg =
             disk_config(dir.path, ram, pool, backend == SpeculativeBackend::None ? nullptr : &pool,
                         backend, 64ULL << 20, 4096);
@@ -10317,7 +10317,7 @@ int test_fingerprint_and_location_file(ninfer::DeviceContext& ctx, ninfer::Paged
         out << "x";
     }
     q36::detail::DiskOpenConfig file_cfg = cfg;
-    file_cfg.fingerprint.weights_id      = "groupwise-int";
+    file_cfg.fingerprint.weights_id      = "nvfp4";
     file_cfg.location                    = file_path;
     threw                                = false;
     try {
@@ -14071,8 +14071,7 @@ int test_mtp_frontier_beyond_valid_backend_is_not_reused(ninfer::DeviceContext& 
     ram.wait_pending_copies();
     auto cfg = disk_config(dir.path, ram, text, &backend, ninfer::SpeculativeBackend::Mtp,
                            64ULL << 20, 4096);
-    const q36::detail::ReuseBackendPolicy policy{ninfer::SpeculativeBackend::Mtp, true, false,
-                                                 false};
+    const q36::detail::ReuseBackendPolicy policy{ninfer::SpeculativeBackend::Mtp, true, false};
     {
         q36::detail::KVDiskCache disk(std::move(cfg));
         disk.note_ram_resident(*id, 0);

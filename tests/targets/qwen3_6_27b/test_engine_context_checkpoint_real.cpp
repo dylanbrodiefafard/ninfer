@@ -278,8 +278,7 @@ int wait_committed_decode(ninfer::Engine& engine, std::uint64_t minimum, const c
 
 int verify_loaded(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
-    const bool ok_target = (load.target == "qwen3_8_27b" || load.target == "qwen3_6_27b") &&
-                           (load.weights_id == "nvfp4" || load.weights_id == "groupwise-int");
+    const bool ok_target           = load.target == "qwen3_8_27b" && load.weights_id == "nvfp4";
     if (!ok_target || load.host_to_device_bytes == 0) {
         std::cerr << "Engine construction has an invalid load summary: target=" << load.target
                   << " weights=" << load.weights_id << '\n';

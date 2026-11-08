@@ -54,12 +54,9 @@ int main() {
     int failures = 0;
     failures += run_case("rmsnorm offset [5120,1]", {5120, 1}, true, 1101U);
     failures += run_case("rmsnorm offset [5120,128]", {5120, 128}, true, 1102U);
-    failures += run_case("rmsnorm offset [2048,7]", {2048, 7}, true, 1103U);
     failures += run_case("rmsnorm offset [256,24,7]", {256, 24, 7}, true, 1104U);
     failures += run_case("rmsnorm offset [256,2,1]", {256, 2}, true, 1105U);
     failures += run_case("rmsnorm offset [256,4,48]", {256, 4, 48}, true, 1106U);
-    failures += run_case("rmsnorm plain [2048,1]", {2048, 1}, false, 1201U);
-    failures += run_case("rmsnorm plain [2048,128]", {2048, 128}, false, 1202U);
     failures += run_case("rmsnorm plain [128,32,7]", {128, 32, 7}, false, 1203U);
     failures += run_case("rmsnorm plain [128,8,128]", {128, 8, 128}, false, 1204U);
     failures += run_case("rmsnorm offset unaligned [128,32]", {128, 32}, true, 1301U, 4.0F, true);

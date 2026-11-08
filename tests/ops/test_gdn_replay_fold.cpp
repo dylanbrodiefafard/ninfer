@@ -1,12 +1,10 @@
 #include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/gdn_replay.h"
 
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "ops/gdn_ref.h"
-#include "ops/input_projection_test_common.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -489,231 +487,6 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     return failures;
 }
 
-int run_record_fold_rounds() {
-    using ninfer::test::input_projection::DevicePackedWeight;
-    using ninfer::test::input_projection::make_bf16_activation;
-
-    constexpr FoldProfile kProfile{30, 32, 8192};
-    constexpr std::int32_t kHidden       = 2048;
-    constexpr std::int32_t kValueRows    = 4096;
-    constexpr std::int32_t kZRows        = 4096;
-    constexpr std::int32_t kParentRows   = 12288;
-    constexpr std::int32_t kWidth        = 2;
-    constexpr std::int32_t kStateSlots   = 3;
-    constexpr std::int32_t kInitialSlot  = 2;
-    constexpr std::int32_t kSnapshotBase = 0;
-    const float kScale                   = 1.0F / std::sqrt(128.0F);
-
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::W8G32_F16S, kParentRows, kHidden, 1901U));
-    const std::vector<float> activation = make_bf16_activation(kHidden, kWidth, 1903U);
-    DeviceBuffer device_x               = to_device_bf16(activation);
-    std::vector<std::uint16_t> conv_weight_bits(static_cast<std::size_t>(kProfile.conv_channels) *
-                                                4);
-    for (std::size_t index = 0; index < conv_weight_bits.size(); ++index) {
-        conv_weight_bits[index] = bf16_pattern(1907U + static_cast<std::uint32_t>(index), 0.02F);
-    }
-    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
-    DeviceBuffer device_initial     = to_device(std::vector<std::int32_t>{kInitialSlot});
-    DeviceBuffer device_snapshot    = to_device(std::vector<std::int32_t>{kSnapshotBase});
-
-    LayoutBuilder record_builder;
-    const GdnReplayRecordLayout record_layout =
-        plan_gdn_replay_records(record_builder, {.layers          = kProfile.layers,
-                                                 .record_capacity = 1,
-                                                 .width           = kWidth,
-                                                 .conv_channels   = kProfile.conv_channels,
-                                                 .qk_heads        = kQkHeads,
-                                                 .value_heads     = kProfile.value_heads,
-                                                 .key_dim         = kStateDim,
-                                                 .value_dim       = kStateDim});
-    DeviceBuffer record_storage(record_builder.finish(256));
-    record_storage.fill(0xff);
-    GdnReplayRecords records({record_storage.p, record_storage.bytes}, record_layout);
-
-    LayoutBuilder state_builder;
-    const LinearAttentionStatePoolLayout state_layout = plan_linear_attention_state_pool(
-        state_builder, {.layers         = static_cast<std::uint32_t>(kProfile.layers),
-                        .conv_channels  = kProfile.conv_channels,
-                        .conv_width     = 3,
-                        .value_heads    = kProfile.value_heads,
-                        .value_head_dim = kStateDim,
-                        .key_head_dim   = kStateDim,
-                        .slot_count     = kStateSlots,
-                        .conv_dtype     = DType::BF16});
-    DeviceBuffer state_storage(state_builder.finish(256));
-    state_storage.fill(0);
-    LinearAttentionStatePool state_pool({state_storage.p, state_storage.bytes}, state_layout);
-
-    const std::size_t recurrent_slot_elements =
-        static_cast<std::size_t>(kStateDim) * kStateDim * kProfile.value_heads;
-    const std::size_t conv_slot_elements = static_cast<std::size_t>(kProfile.conv_channels) * 3;
-    for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
-        const float initial_value = signed_pattern(1911U + layer * 47U, 0.01F);
-        const std::vector<float> recurrent(recurrent_slot_elements, initial_value);
-        const Tensor recurrent_slot =
-            state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), kInitialSlot);
-        cuda_check(cudaMemcpy(recurrent_slot.data, recurrent.data(), recurrent_slot.bytes(),
-                              cudaMemcpyHostToDevice),
-                   "upload pair initial recurrent state");
-
-        std::vector<std::uint16_t> conv(conv_slot_elements);
-        for (std::int32_t history = 0; history < 3; ++history) {
-            for (std::int32_t channel = 0; channel < kProfile.conv_channels; ++channel) {
-                conv[static_cast<std::size_t>(history) * kProfile.conv_channels + channel] =
-                    bf16_pattern(1913U + layer * 53U + history * 11U + channel, 0.04F);
-            }
-        }
-        const Tensor conv_slot =
-            state_pool.conv_slot(static_cast<std::uint32_t>(layer), kInitialSlot);
-        cuda_check(
-            cudaMemcpy(conv_slot.data, conv.data(), conv_slot.bytes(), cudaMemcpyHostToDevice),
-            "upload pair initial conv state");
-    }
-
-    DeviceBuffer snapshot_q(static_cast<std::size_t>(2048) * kWidth * sizeof(std::uint16_t));
-    DeviceBuffer snapshot_k(static_cast<std::size_t>(2048) * kWidth * sizeof(std::uint16_t));
-    DeviceBuffer snapshot_v(static_cast<std::size_t>(kValueRows) * kWidth * sizeof(std::uint16_t));
-    DeviceBuffer snapshot_z(static_cast<std::size_t>(kZRows) * kWidth * sizeof(std::uint16_t));
-    DeviceBuffer record_q(snapshot_q.bytes);
-    DeviceBuffer record_k(snapshot_k.bytes);
-    DeviceBuffer record_v(snapshot_v.bytes);
-    DeviceBuffer record_z(snapshot_z.bytes);
-    DeviceBuffer snapshot_out(snapshot_v.bytes);
-    DeviceBuffer record_out(snapshot_v.bytes);
-    DeviceBuffer device_g(static_cast<std::size_t>(kProfile.value_heads) * kWidth * sizeof(float));
-    DeviceBuffer device_beta(device_g.bytes);
-
-    Tensor x(device_x.p, DType::BF16, {kHidden, kWidth, 1});
-    Tensor conv_weight(device_conv_weight.p, DType::BF16, {kProfile.conv_channels, 4});
-    Tensor initial_selector(device_initial.p, DType::I32, {1});
-    Tensor snapshot_selector(device_snapshot.p, DType::I32, {1});
-    Tensor valid;
-    Tensor snapshot_query(snapshot_q.p, DType::BF16, {2048, kWidth, 1});
-    Tensor snapshot_key(snapshot_k.p, DType::BF16, {2048, kWidth, 1});
-    Tensor snapshot_value(snapshot_v.p, DType::BF16, {kValueRows, kWidth, 1});
-    Tensor snapshot_z_tensor(snapshot_z.p, DType::BF16, {kZRows, kWidth, 1});
-    Tensor record_query(record_q.p, DType::BF16, {2048, kWidth, 1});
-    Tensor record_key(record_k.p, DType::BF16, {2048, kWidth, 1});
-    Tensor record_value(record_v.p, DType::BF16, {kValueRows, kWidth, 1});
-    Tensor record_z_tensor(record_z.p, DType::BF16, {kZRows, kWidth, 1});
-    Tensor snapshot_output(snapshot_out.p, DType::BF16,
-                           {kStateDim, kProfile.value_heads, kWidth, 1});
-    Tensor record_output(record_out.p, DType::BF16, {kStateDim, kProfile.value_heads, kWidth, 1});
-    Tensor g(device_g.p, DType::FP32, {kProfile.value_heads, kWidth, 1});
-    Tensor beta(device_beta.p, DType::FP32, {kProfile.value_heads, kWidth, 1});
-
-    const std::size_t snapshot_workspace_bytes =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, kValueRows, 1,
-                                                                   kWidth, kWidth);
-    const std::size_t record_workspace_bytes =
-        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, kValueRows, 1, kWidth,
-                                                                 kWidth);
-    WorkspaceArena snapshot_workspace(std::max<std::size_t>(256, snapshot_workspace_bytes));
-    WorkspaceArena record_workspace(std::max<std::size_t>(256, record_workspace_bytes));
-
-    int failures = 0;
-    for (std::int32_t round = 0; round < 2; ++round) {
-        std::vector<float> g_host(static_cast<std::size_t>(kProfile.value_heads) * kWidth);
-        std::vector<float> beta_host(g_host.size());
-        for (std::size_t index = 0; index < g_host.size(); ++index) {
-            g_host[index] =
-                -0.04F -
-                static_cast<float>((index + static_cast<std::size_t>(round) * 17) % 80) / 100.0F;
-            beta_host[index] =
-                0.08F +
-                static_cast<float>((index * 7 + static_cast<std::size_t>(round) * 13) % 80) /
-                    100.0F;
-        }
-        device_g.copy_from_host(g_host.data(), device_g.bytes);
-        device_beta.copy_from_host(beta_host.data(), device_beta.bytes);
-
-        for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
-            GdnReplayRecordLayer layer_records = records.layer(layer, 1);
-            Tensor& conv_states                = state_pool.conv[static_cast<std::size_t>(layer)];
-            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv_weight, conv_states, valid,
-                                              initial_selector, snapshot_selector, snapshot_query,
-                                              snapshot_key, snapshot_value, snapshot_z_tensor,
-                                              snapshot_workspace, nullptr);
-            ops::gdn_input_proj_conv_record(x, parent.view(), conv_weight, conv_states, valid,
-                                            initial_selector, layer_records.conv, record_query,
-                                            record_key, record_value, record_z_tensor,
-                                            record_workspace, nullptr);
-
-            Tensor snapshot_q_view = snapshot_query.view({kStateDim, kQkHeads, kWidth, 1});
-            Tensor snapshot_k_view = snapshot_key.view({kStateDim, kQkHeads, kWidth, 1});
-            Tensor snapshot_v_view =
-                snapshot_value.view({kStateDim, kProfile.value_heads, kWidth, 1});
-            Tensor record_q_view = record_query.view({kStateDim, kQkHeads, kWidth, 1});
-            Tensor record_k_view = record_key.view({kStateDim, kQkHeads, kWidth, 1});
-            Tensor record_v_view = record_value.view({kStateDim, kProfile.value_heads, kWidth, 1});
-            Tensor& recurrent_states = state_pool.recurrent[static_cast<std::size_t>(layer)];
-            ops::gated_delta_net_snapshot(snapshot_q_view, snapshot_k_view, snapshot_v_view, g,
-                                          beta, kScale, true, recurrent_states, valid,
-                                          initial_selector, snapshot_selector, snapshot_output,
-                                          nullptr);
-            ops::gated_delta_net_replay_record(record_q_view, record_k_view, record_v_view, g, beta,
-                                               kScale, recurrent_states, valid, initial_selector,
-                                               layer_records.key, layer_records.value,
-                                               layer_records.gate, record_output, nullptr);
-            cuda_synchronize();
-
-            const std::string label = "record-fold pair round=" + std::to_string(round) +
-                                      " layer=" + std::to_string(layer);
-            const auto compare_bf16 = [&](const DeviceBuffer& lhs, const DeviceBuffer& rhs,
-                                          std::size_t elements, const char* field) {
-                if (from_device<std::uint16_t>(lhs, elements) !=
-                    from_device<std::uint16_t>(rhs, elements)) {
-                    std::cerr << label << " " << field << " differs\n";
-                    return 1;
-                }
-                return 0;
-            };
-            failures += compare_bf16(snapshot_q, record_q, static_cast<std::size_t>(2048) * kWidth,
-                                     "query");
-            failures +=
-                compare_bf16(snapshot_k, record_k, static_cast<std::size_t>(2048) * kWidth, "key");
-            failures += compare_bf16(snapshot_v, record_v,
-                                     static_cast<std::size_t>(kValueRows) * kWidth, "value");
-            failures +=
-                compare_bf16(snapshot_z, record_z, static_cast<std::size_t>(kZRows) * kWidth, "z");
-            failures +=
-                compare_bf16(snapshot_out, record_out,
-                             static_cast<std::size_t>(kValueRows) * kWidth, "recurrent output");
-            if (failures != 0) { return failures; }
-        }
-
-        const std::int32_t commit = round + 1;
-        const std::array fold_rows{ops::GdnReplayFoldRow{kInitialSlot, commit}};
-        ops::gdn_replay_fold(records, state_pool.all_layers_view(), fold_rows, nullptr);
-        cuda_synchronize();
-        for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
-            const Tensor folded_recurrent =
-                state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), kInitialSlot);
-            const Tensor snapshot_recurrent =
-                state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), commit - 1);
-            if (from_device<float>(folded_recurrent.data, recurrent_slot_elements) !=
-                from_device<float>(snapshot_recurrent.data, recurrent_slot_elements)) {
-                std::cerr << "record-fold recurrent mismatch round=" << round << " layer=" << layer
-                          << "\n";
-                return failures + 1;
-            }
-            const Tensor folded_conv =
-                state_pool.conv_slot(static_cast<std::uint32_t>(layer), kInitialSlot);
-            const Tensor snapshot_conv =
-                state_pool.conv_slot(static_cast<std::uint32_t>(layer), commit - 1);
-            if (from_device<std::uint16_t>(folded_conv.data, conv_slot_elements) !=
-                from_device<std::uint16_t>(snapshot_conv.data, conv_slot_elements)) {
-                std::cerr << "record-fold conv mismatch round=" << round << " layer=" << layer
-                          << "\n";
-                return failures + 1;
-            }
-        }
-    }
-    failures += parent.verify_preserved("record-fold W8 parent weight");
-    return failures;
-}
-
 int run_path_fold_case() {
     constexpr FoldProfile kProfile{48, 48, 10240};
     constexpr std::int32_t kWidth     = 6;
@@ -1129,12 +902,8 @@ int main() {
     failures += run_case({48, 48, 10240}, 6, 4, {6, 4, 1, 5}, 1821U);
     failures += run_case({48, 48, 10240}, 5, 5, {5, 0, 3, 1, 4}, 1823U);
     failures += run_case({48, 48, 10240}, 6, 6, {6, 4, 1, 5, 0, 2}, 1827U);
-    failures += run_case({30, 32, 8192}, 2, 1, {2}, 1831U);
-    failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
-    failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
     failures += run_case({48, 48, 10240}, 8, 7, {8, 7, 1, 5, 0, 2, 6}, 1861U);
     failures += run_case({48, 48, 10240}, 16, 8, {16, 7, 1, 5, 0, 2, 6, 15}, 1871U);
-    failures += run_record_fold_rounds();
     failures += run_path_fold_case();
     failures += run_identity_path_matches_prefix_fold();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";

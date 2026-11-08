@@ -299,8 +299,7 @@ class Artifact:
             magic, json_bytes = PREFIX.unpack(prefix)
             if magic == _V1_MAGIC:
                 raise ArtifactError(
-                    "NInfer artifact v1 is no longer supported; migrate it with: "
-                    "python3 -m tools.artifact.migrate_v1_to_v2 <artifact>"
+                    "NInfer artifact v1 is not supported; reconvert it with the current converter"
                 )
             if magic != MAGIC:
                 raise ArtifactError("artifact magic is not NInfer v2")

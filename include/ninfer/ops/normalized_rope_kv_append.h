@@ -1,8 +1,24 @@
 #pragma once
 
-#include "ninfer/ops/kv_cache_append_prefix.h"
+#include "core/cyclic_kv_cache.h"
+#include "core/tensor.h"
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
 
 namespace ninfer::ops {
+
+/**
+ * Host execution-resource promise for normalized_rope_kv_append.
+ *
+ * Every device count must remain in this inclusive interval on every replay. The envelope fixes
+ * launch resources; it does not select or publish committed frontiers.
+ */
+struct KVCacheAppendPrefixExecutionEnvelope {
+    std::uint32_t min_count = 0;
+    std::uint32_t max_count = 0;
+};
 
 /**
  * Op: normalize and rotate K, then append device-selected K/V prefixes to a BF16 cyclic cache.

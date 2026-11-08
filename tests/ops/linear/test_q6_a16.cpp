@@ -15,27 +15,6 @@ constexpr Invocation convenience(std::int32_t t) { return {t, CallForm::A16Conve
 int q6_a16_conformance() {
     int failures = 0;
 
-    constexpr std::array kN248320K5120{
-        a16(1),  a16(4),  a16(5),  a16(6),  a16(7),  a16(8),  a16(9),
-        a16(12), a16(16), a16(17), a16(18), a16(24), a16(25), a16(26),
-        a16(32), a16(33), a16(34), a16(48), a16(49), a16(50), a16(128),
-    };
-    failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6g64_f16s_weight,
-                          {248320, 5120, 191U, Comparison::Sampled, false, kN248320K5120});
-    constexpr std::array<std::int32_t, 2> kLmHeadPackedCol0{8, 12};
-    failures += run_packed_column0_matches_decode(
-        "Q6_A16 packed-col0 [248320,5120]", make_q6g64_f16s_weight, 248320, 5120, 191U,
-        ninfer::ops::LinearPolicy::A16Only, kLmHeadPackedCol0);
-
-    constexpr std::array kN248320K2048{
-        a16(1),  a16(3),   a16(4),   a16(5),   a16(16),  a16(17),  a16(24),  a16(25),  a16(32),
-        a16(33), a16(40),  a16(41),  a16(48),  a16(49),  a16(56),  a16(57),  a16(64),  a16(65),
-        a16(72), a16(73),  a16(80),  a16(81),  a16(87),  a16(88),  a16(89),  a16(95),  a16(96),
-        a16(97), a16(104), a16(105), a16(111), a16(112), a16(113), a16(127), a16(128), a16(129),
-    };
-    failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6g64_f16s_weight,
-                          {248320, 2048, 193U, Comparison::Sampled, false, kN248320K2048});
-
     constexpr std::array kN1152K1536Full{
         convenience(4),
         a16(96),

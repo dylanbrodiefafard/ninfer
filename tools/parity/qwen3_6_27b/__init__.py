@@ -1,1 +1,1 @@
-"""Independent diagnostics for the Qwen3.6-27B target."""
+"""Independent Vision diagnostics for the Qwen3.8-27B target."""

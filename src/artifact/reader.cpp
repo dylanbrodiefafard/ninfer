@@ -291,8 +291,8 @@ struct Reader::Impl {
             throw ArtifactError("artifact is shorter than the v2 prefix");
         }
         if (std::equal(kV1Magic.begin(), kV1Magic.end(), file.data())) {
-            throw ArtifactError("NInfer artifact v1 is no longer supported; migrate it with: "
-                                "python3 -m tools.artifact.migrate_v1_to_v2 <artifact>");
+            throw ArtifactError("NInfer artifact v1 is not supported; reconvert it with the "
+                                "current converter");
         }
         if (!std::equal(kMagic.begin(), kMagic.end(), file.data())) {
             throw ArtifactError("artifact magic is not NInfer v2");

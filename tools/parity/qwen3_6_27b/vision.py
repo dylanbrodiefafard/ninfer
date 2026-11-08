@@ -212,14 +212,7 @@ def _vision_weight_pairs(binding: VisionArtifactBinding, model):
 def _vision_weight_report(binding: VisionArtifactBinding, model) -> dict[str, object]:
     direct = []
     quantized = []
-    store = WeightStore(
-        binding,
-        "cpu",
-        capacity=1,
-        text=False,
-        vision=True,
-        compile_codec=False,
-    )
+    store = WeightStore(binding, "cpu", compile_codec=False)
     try:
         for block, source in _vision_weight_pairs(binding, model):
             actual = (

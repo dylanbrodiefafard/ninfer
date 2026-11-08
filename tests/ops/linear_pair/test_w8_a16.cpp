@@ -16,18 +16,6 @@ int w8_a16_conformance() {
     failures += ninfer::test::linear_pair::run_w8_a16_shape(
         "W8_A16 LinearPair", ShapeCase{5120, 431U, kK5120RouteStarts, kK5120RouteInteriors});
 
-    constexpr std::array<std::int32_t, 36> kK2048RouteStarts{
-        2,    33,   49,   65,   81,   89,   97,   105,  113,  129,  161,  193,
-        385,  481,  641,  642,  673,  681,  785,  897,  961,  977,  1281, 1317,
-        1345, 1346, 1441, 1467, 1681, 1709, 1921, 1923, 2017, 2019, 2209, 2271,
-    };
-    constexpr std::array<std::int32_t, 37> kK2048RouteInteriors{
-        1,    16,   40,   56,   72,   84,   92,   100,  108,  120,  144,  176,  288,
-        432,  560,  641,  656,  676,  736,  840,  928,  968,  1120, 1296, 1332, 1345,
-        1392, 1456, 1576, 1696, 1816, 1921, 1968, 2017, 2112, 2240, 4096,
-    };
-    failures += ninfer::test::linear_pair::run_w8_a16_shape(
-        "W8_A16 LinearPair", ShapeCase{2048, 433U, kK2048RouteStarts, kK2048RouteInteriors});
     return failures;
 }
 

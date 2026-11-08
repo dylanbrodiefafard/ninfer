@@ -47,23 +47,7 @@ LoadedModel::~LoadedModel() = default;
 namespace ninfer::targets::qwen3_6_27b {
 namespace {
 
-// General-task presets published with each exact model. Keep the registrations separate even
-// while their values agree so an upstream model-specific change has one obvious owner.
-constexpr ModelSamplingDefaults kQwen3_6Defaults{
-    .thinking     = {.temperature       = 1.0F,
-                     .top_k             = 20,
-                     .top_p             = 0.95F,
-                     .min_p             = 0.0F,
-                     .presence_penalty  = 0.0F,
-                     .frequency_penalty = 0.0F},
-    .non_thinking = {.temperature       = 0.7F,
-                     .top_k             = 20,
-                     .top_p             = 0.80F,
-                     .min_p             = 0.0F,
-                     .presence_penalty  = 1.5F,
-                     .frequency_penalty = 0.0F},
-};
-
+// General-task presets published with the exact model.
 constexpr ModelSamplingDefaults kQwen3_8Defaults{
     .thinking     = {.temperature       = 2.0F,
                      .top_k             = 20,
@@ -82,8 +66,7 @@ constexpr ModelSamplingDefaults kQwen3_8Defaults{
 } // namespace
 
 ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
-    if (model == model_id) { return kQwen3_6Defaults; }
-    if (model == qwen3_8_model_id) { return kQwen3_8Defaults; }
+    if (model == model_id) { return kQwen3_8Defaults; }
     throw std::runtime_error("model '" + std::string(model) +
                              "' has no sampling defaults in target package '" +
                              std::string(target_key) + "'");
@@ -91,16 +74,7 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity,
                                                  const artifact::Binder& binder) {
-    if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
-        return WeightsProfile::GroupwiseInt;
-    }
-    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-int") {
-        return WeightsProfile::GroupwiseIntW8Endpoints;
-    }
     if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
-        return WeightsProfile::Nvfp4;
-    }
-    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         const auto* object = binder.find("text/token_embedding");
         const auto* tensor =
             object == nullptr ? nullptr : std::get_if<artifact::TensorDescriptor>(object);

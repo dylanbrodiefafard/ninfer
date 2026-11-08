@@ -178,7 +178,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
     summary.tensor_count         = stats.tensor_count;
     summary.resource_count       = stats.resource_count;
-    return ConstructedTarget{.active            = ActiveTarget(std::move(instance)),
+    return ConstructedTarget{.active            = std::move(instance),
                              .load              = std::move(summary),
                              .sampling_defaults = sampling_defaults};
 }
@@ -203,25 +203,6 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
-LoadedQwen3_6_35BA3B::LoadedQwen3_6_35BA3B(
-    std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model)
-    : model(std::move(stable_model)), frontend(Qwen3_6_35BA3B::make_frontend(*model)) {}
-
-LoadedQwen3_6_35BA3B::~LoadedQwen3_6_35BA3B() = default;
-
-Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
-                                               runtime::KvCapacityResolution resolution,
-                                               Qwen3_6_35BA3B::SequencePlan sequence_plan,
-                                               DeviceContext& device,
-                                               std::unique_ptr<HostPinnedArena> kv_ram_arena)
-    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
-      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
-      capacity(sequence_plan.capacity()),
-      program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device,
-                                             std::move(kv_ram_arena))) {}
-
-Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
-
 ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& device) {
     validate_options(options);
     const auto load_start = Clock::now();
@@ -231,14 +212,6 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start, Qwen3_6_27B::target_key);
-    }
-    if (identity.model_id == Qwen3_6_27B::qwen3_8_model_id) {
-        return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::qwen3_8_target_key);
-    }
-    if (identity.model_id == Qwen3_6_35BA3B::model_id) {
-        return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
-            options, device, reader, load_start, Qwen3_6_35BA3B::target_key);
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");

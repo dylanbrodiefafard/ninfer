@@ -27,20 +27,11 @@ Installing dependencies does not download the Qwen model or create a `.ninfer` a
 See [`configs/capability-suite.yaml`](configs/capability-suite.yaml) for the initial AIME25,
 AIME26, GPQA-Diamond, and BFCL-v4 suites, and [`configs/mock-suite.yaml`](configs/mock-suite.yaml)
 for a network-free example.
-[`configs/qwen3_6_27b_reasoning.yaml`](configs/qwen3_6_27b_reasoning.yaml) and
-[`configs/qwen3_8_27b_reasoning.yaml`](configs/qwen3_8_27b_reasoning.yaml) are the published
-AIME25, AIME26, and GPQA-Diamond reasoning suites for those 27B identities.
+[`configs/qwen3_8_27b_reasoning.yaml`](configs/qwen3_8_27b_reasoning.yaml) is the published
+AIME25, AIME26, and GPQA-Diamond reasoning suite for the `qwen3.8-27b` identity.
 [`configs/qwen3_8_27b_p_less_aime_temp.yaml`](configs/qwen3_8_27b_p_less_aime_temp.yaml) is the
 AIME25/AIME26 temperature sweep used to compare opt-out production sampling against default
 p-less sampling (see [P-less AIME temperature sweep](#p-less-aime-temperature-sweep)).
-
-[`configs/qwen3_6_35b_needle_haystack.yaml`](configs/qwen3_6_35b_needle_haystack.yaml)
-defines the 35B-A3B Needle-in-a-Haystack profiles separately: `standard` preserves EvalScope's
-1K--32K, ten-length, ten-depth English/Chinese matrix (200 samples), while `native_long` evaluates
-the exact 64K, 128K, and safe 260K prompt profiles at eleven depths in both languages (66 samples).
-The 260K profile uses the exact local 35B tokenizer and leaves more than 2K native context tokens
-for chat framing and its bounded 512-token answer. All profiles use rule scoring and explicitly
-disable thinking so the observable answer is the retrieved needle.
 
 A target defines the model service:
 
@@ -49,7 +40,7 @@ targets:
   model_api:
     protocol: openai_chat
     base_url: http://127.0.0.1:18080/v1
-    model: qwen3.6-27b
+    model: qwen3.8-27b
     api_key_env: MODEL_API_KEY   # optional; omit for an unauthenticated endpoint
     max_concurrency: 1
     request:

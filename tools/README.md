@@ -12,12 +12,9 @@ for the selected tool.
 
 | Task | Location |
 |---|---|
-| Build the 27B artifact | [`convert/qwen3_6_27b/`](convert/qwen3_6_27b/) |
-| Build the Qwen3.8-27B artifact | [`convert/qwen3_8_27b/`](convert/qwen3_8_27b/) |
-| Build the 35B-A3B artifact | [`convert/qwen3_6_35b_a3b/`](convert/qwen3_6_35b_a3b/) |
+| Extend or re-encode a Qwen3.8-27B NVFP4 artifact | [`convert/qwen3_8_27b/`](convert/qwen3_8_27b/), over the shared family helpers in [`convert/qwen3_6_27b/`](convert/qwen3_6_27b/) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
-| Run the 27B Python reference | [`reference/qwen3_6_27b/`](reference/qwen3_6_27b/README.md) |
-| Run the 35B-A3B Python reference | [`reference/qwen3_6_35b_a3b/`](reference/qwen3_6_35b_a3b/README.md) |
+| Artifact-native Python Vision reference | [`reference/qwen3_6_27b/`](reference/qwen3_6_27b/) |
 | Compare 27B artifact/source Vision activations | [`parity/qwen3_6_27b/`](parity/qwen3_6_27b/README.md) |
 | Kernel iteration (bound / MMA probe / Op loop) | [`kdev/`](kdev/README.md) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
@@ -26,18 +23,11 @@ for the selected tool.
 
 ## Artifact workflow
 
-The converters consume an official local BF16 checkpoint and write one complete `.ninfer`
-artifact. The paths below are placeholders for the maintainer's local checkpoint checkouts:
+The converters read an existing `qwen3.8-27b/nvfp4` artifact plus official local source
+checkpoints and write one complete `.ninfer` artifact. The paths below are placeholders for the
+maintainer's local checkpoint checkouts:
 
 ```bash
-python3 -m tools.convert.qwen3_6_27b.convert \
-  --model /path/to/Qwen3.6-27B \
-  --out out/qwen3_6_27b.ninfer
-
-python3 -m tools.convert.qwen3_8_27b.convert \
-  --model /path/to/Qwen3.8-27B \
-  --out out/qwen3_8_27b.ninfer
-
 # Optional DFlash2 append onto an existing qwen3.8-27b/nvfp4 file (not the
 # Qwen3.8-27B Text checkpoint). NVFP4 draft matrices + BF16 selector codebooks.
 hf download Ostfralla/Qwen3.8-27B-NVFP4-NInfer \
@@ -52,38 +42,25 @@ python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
   --dflash-format nvfp4 \
   --out out/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   --device cuda
-
-python3 -m tools.convert.qwen3_6_35b_a3b.convert \
-  --model /path/to/Qwen3.6-35B-A3B-base \
-  --dflash-model /path/to/Qwen3.6-35B-A3B-DFlash \
-  --out out/qwen3_6_35b_a3b.ninfer
 ```
 
-Inspect either result:
+Inspect the result:
 
 ```bash
-python3 -m tools.artifact.inspect out/qwen3_6_27b.ninfer --objects
+python3 -m tools.artifact.inspect out/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer --objects
 ```
 
-The exact source revisions, inventories, formats, and conversion recipes are recorded in
-[`docs/maintainer/`](../docs/maintainer/). Published users download the completed artifacts from
+The selective FP8 and NVFP4 MTP converters, exact source revisions, inventories, formats, and
+conversion recipes are recorded in
+[`docs/maintainer/qwen3.8-27b-artifact.md`](../docs/maintainer/qwen3.8-27b-artifact.md). Published users download the completed artifacts from
 Hugging Face instead of running these workflows.
 
 ## Python references and parity
 
-```bash
-python3 -m tools.reference.qwen3_6_27b \
-  --weights out/qwen3_6_27b.ninfer \
-  --prompt "请简短介绍一下你自己。" --decode 128
-
-python3 -m tools.reference.qwen3_6_35b_a3b \
-  --weights out/qwen3_6_35b_a3b.ninfer \
-  --prompt "请简短介绍一下你自己。" --decode 128
-```
-
-The Python implementations are independent diagnostic references, not alternate public inference
-products or generated-token goldens for the C++ engine. See the parity README for the direct 27B
-artifact/source Vision comparison command.
+`reference/qwen3_6_27b/` holds the artifact-native Python Vision implementation and its artifact
+binding. It is an independent diagnostic reference, not an alternate public inference product or a
+generated-token golden for the C++ engine. The [parity README](parity/qwen3_6_27b/README.md)
+gives the direct artifact/source Vision comparison command.
 
 ## Benchmark orchestration
 
@@ -105,7 +82,7 @@ After starting `ninfer-serve` in another terminal:
 ```bash
 python3 -m tools.smoke.serve_contract \
   --base-url http://127.0.0.1:18080 \
-  --model qwen3.6-27b
+  --model qwen3.8-27b
 ```
 
 The client exercises OpenAI, Anthropic, streaming, usage, multimodal, and tool-call response
@@ -116,5 +93,5 @@ real server and consumes the repository fixture:
 
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact out/qwen3_6_27b.ninfer --backend mtp
+  --artifact out/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer --backend dflash
 ```

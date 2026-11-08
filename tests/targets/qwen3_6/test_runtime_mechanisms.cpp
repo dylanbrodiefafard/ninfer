@@ -642,13 +642,6 @@ void test_prefix_hash_and_dflash_gate() {
     const auto digest_chain                = q36::detail::prefix_hash_chain(changed_digest);
     expect(digest_chain[2] == chain[2] && digest_chain[3] != chain[3],
            "completing vision item changes the hash at its end");
-
-    expect(q36::detail::dflash_rewrite_checkpoint_ready(true, 16, 16),
-           "RAM DFlash checkpoint with backend_image_present must not FullReset");
-    expect(!q36::detail::dflash_rewrite_checkpoint_ready(false, 16, 16),
-           "missing backend image FullResets a DFlash checkpoint view");
-    expect(!q36::detail::dflash_rewrite_checkpoint_ready(true, 15, 16),
-           "short DFlash context frontier FullResets a checkpoint view");
 }
 
 void test_prefill_context_marks() {
@@ -1177,8 +1170,8 @@ struct ResidentReuseFixture {
 
     ResidentReuseFixture()
         : prompt(text_prompt(6)), ledger(text_prompt(4).token_ids),
-          state{&ledger, &identity, 4,     false, q36::RewriteCheckpointKind::TurnClosure, 0, 0,
-                0,       false,     false, {}} {
+          state{&ledger, &identity, 4, false, q36::RewriteCheckpointKind::TurnClosure,
+                0,       0,         0, false, {}} {
         identity.assign(text_prompt(4));
     }
 };
@@ -1186,9 +1179,9 @@ struct ResidentReuseFixture {
 q36::detail::PrefillReuseSelection decide(const q36::detail::ResidentReuseState& state,
                                           const q36::PreparedPromptData& prompt,
                                           ninfer::SpeculativeBackend backend, bool mtp_cache = true,
-                                          bool dflash = false, bool dflash_full_layers = false) {
+                                          bool dflash = false) {
     return q36::detail::decide_resident_reuse(state, prompt, q36::detail::prefix_hash_chain(prompt),
-                                              backend, mtp_cache, dflash, dflash_full_layers);
+                                              backend, mtp_cache, dflash);
 }
 
 // Speculative cancellation folds GDN back to E but cannot restore current tail
@@ -1251,8 +1244,8 @@ void test_recovery_prefix_reuse() {
     auto candidate_ids = prefix.token_ids;
     candidate_ids.insert(candidate_ids.end(), {42, 43, 44});
     const auto prompt = text_ids(candidate_ids);
-    q36::detail::ResidentReuseState state{
-        &ledger, &identity, P + 4, true, Kind::ResponseReplay, P, 0, 0, true, false, {}};
+    q36::detail::ResidentReuseState state{&ledger, &identity, P + 4, true, Kind::ResponseReplay,
+                                          P,       0,         0,     true, {}};
 
     {
         const auto sel = decide(state, prompt, Backend::None);
@@ -1305,7 +1298,6 @@ void test_recovery_prefix_reuse() {
             0,
             0,
             true,
-            false,
             {}};
         const auto sel = decide(stacked_state, candidate, Backend::None);
         expect(sel.path == Path::RestoreResponseCheckpoint && sel.frontier == S1,
@@ -1410,9 +1402,8 @@ void test_resident_reuse_decision() {
     }
     state.context_checkpoints.resize(1);
     state.dflash_context_frontier = 3;
-    state.backend_image_present   = true;
     {
-        const auto sel = decide(state, prompt, Backend::DFlash, true, true, true);
+        const auto sel = decide(state, prompt, Backend::DFlash, true, true);
         expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 2,
                "unready longer DFlash rewrite does not shadow ready staged head");
     }
@@ -1429,22 +1420,21 @@ void test_resident_reuse_decision() {
                "ResponseReplay rewrite replays through the response restore path");
     }
 
-    // DFlash gates the append on its context frontier; a short context still FullResets a
-    // selected rewrite restore even with the backend image present.
+    // DFlash gates the append on its context frontier; a short context FullResets a selected
+    // rewrite restore.
     state                         = fixture.state;
     state.rewrite_valid           = true;
     state.rewrite_frontier        = 4;
     state.dflash_context_frontier = 3;
-    state.backend_image_present   = true;
     {
-        const auto sel = decide(state, prompt, Backend::DFlash, true, /*dflash=*/true, true);
+        const auto sel = decide(state, prompt, Backend::DFlash, true, /*dflash=*/true);
         expect(sel.path == Path::FullReset, "short DFlash context FullResets a rewrite restore");
     }
 
     // A context between the rewrite frontier and the execution frontier keeps the restore.
     state.rewrite_frontier = 2;
     {
-        const auto sel = decide(state, prompt, Backend::DFlash, true, /*dflash=*/true, true);
+        const auto sel = decide(state, prompt, Backend::DFlash, true, /*dflash=*/true);
         expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == 2,
                "DFlash context past the rewrite frontier keeps the restore");
     }
@@ -1454,9 +1444,9 @@ void test_resident_reuse_decision() {
     state.rewrite_frontier        = 2;
     state.dflash_context_frontier = 2;
     {
-        const auto sel = decide(state, prompt, Backend::DFlash, true, /*dflash=*/true, false);
+        const auto sel = decide(state, prompt, Backend::DFlash, true, /*dflash=*/true);
         expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == 2,
-               "without full layers the DFlash tail check skips the backend image");
+               "DFlash context at the rewrite frontier keeps the restore");
     }
 
     // A checkpoint frontier beyond the prompt is not a candidate.

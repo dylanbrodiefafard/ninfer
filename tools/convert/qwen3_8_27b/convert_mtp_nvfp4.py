@@ -39,10 +39,10 @@ from tools.convert.common.nvfp4_quantize import ENCODER_PROFILE, encode_nvfp4_fr
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
+from tools.convert.qwen3_6.common.inventory import W8
 from tools.convert.qwen3_6.common.recipe import materialize_recipe, preflight_source_reader
 from tools.convert.qwen3_6_27b import convert as qwen3_6_convert
 from tools.convert.qwen3_6_27b import recipe
-from tools.convert.qwen3_6_27b.inventory import W8
 from tools.convert.qwen3_8_27b.inventory_dflash2 import BLOCK_SCALE_LAYOUT, NVFP4
 
 RECIPE_ID = "qwen3_8_27b_nvfp4_mtp_nvfp4-v2"

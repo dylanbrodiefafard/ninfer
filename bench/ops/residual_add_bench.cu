@@ -99,8 +99,8 @@ int main(int argc, char** argv) {
             tokens = {parse_number<int>(argv[++i], "--patches")};
         } else if (!std::strcmp(argv[i], "--d") && i + 1 < argc) {
             d = parse_number<int>(argv[++i], "--d");
-            if (d != 1152 && d != 2048 && d != 5120) {
-                std::fprintf(stderr, "D must be 1152, 2048, or 5120\n");
+            if (d != 1152 && d != 5120) {
+                std::fprintf(stderr, "D must be 1152 or 5120\n");
                 return 2;
             }
         } else if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
             control = true;
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--d 1152|2048|5120] [--tokens T[,T...] | --patches P] "
+                         "usage: %s [--d 1152|5120] [--tokens T[,T...] | --patches P] "
                          "[--control]\n",
                          argv[0]);
             return 2;

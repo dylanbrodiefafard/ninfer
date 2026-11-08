@@ -1,4 +1,4 @@
-// Performance bench for silu_mul at the real Qwen3.6-27B MLP shape
+// Performance bench for silu_mul at the real Qwen3.8-27B MLP shape
 // (intermediate = 17408). This binary is the ncu/nsys target; the GB/s it
 // prints is informational only -- the gate is ncu sustained DRAM %% (see
 // docs/op-development.md §8).

@@ -1,4 +1,4 @@
-// Qualification benchmark for the Qwen3.6-35B G1 argmax domains.
+// Qualification benchmark for the Qwen3.8-27B G1 argmax domains.
 //
 //   ./ninfer_argmax_bench
 //   ./ninfer_argmax_bench --shape full --cols 1

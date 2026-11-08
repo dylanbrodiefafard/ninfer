@@ -15,10 +15,6 @@ namespace ninfer::ops::detail {
 
 enum class Bf16GdnGatingScheduleId {
     MmaCooperativeSplit40,
-    SimtWarpRowC4,
-    SimtWarpRowC8,
-    MmaCooperativeSplit32,
-    MmaCooperativeSplit16,
     MmaCooperativeSplit8,
     MmaCooperativeSplit4,
     MmaCooperativeSplit2,
@@ -37,24 +33,13 @@ struct Bf16GdnGatingPlan {
     std::size_t workspace_bytes;
 };
 
-enum class Bf16GdnNormGatingScheduleId {
-    Composed,
-    MmaCooperativeSplit32,
-};
-
-struct Bf16GdnNormGatingPlan {
-    Bf16GdnNormGatingScheduleId schedule;
-    Bf16GdnGatingPlan control;
-    std::size_t workspace_bytes;
-};
-
 const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noexcept;
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept;
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
                                                     const Bf16GdnGatingProblem& problem);
-// Small 27B panels and packed verify with T<=48 use the same split-40 MMA reduction.
+// Small panels and packed verify with T<=48 use the same split-40 MMA reduction.
 // Token tiling changes neither the K partition nor the order of the final reduction.
 inline constexpr std::int32_t kBf16GdnGatingPackedMaxCols  = 48;
 inline constexpr std::int32_t kBf16GdnGatingPackedMaxBatch = 8;
@@ -69,12 +54,6 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_packed_plan(const Bf16GdnGatingProblem
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
                                                      std::int32_t min_cols, std::int32_t max_cols);
-const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId schedule) noexcept;
-Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
-std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
-                                                          std::int32_t input_rows,
-                                                          std::int32_t min_cols,
-                                                          std::int32_t max_cols);
 std::size_t bf16_gdn_norm_gating_packed_sequences_capacity_workspace_bytes(
     std::int32_t sequence_width, std::int32_t min_batch, std::int32_t max_batch);
 
@@ -97,9 +76,6 @@ struct Bf16GdnHiddenActivation {
     A8Activation* a8 = nullptr;
     A4Activation* a4 = nullptr;
 };
-
-// A quantized h output requires the composed (27B) schedule, whose normalization is a
-// standalone RMSNorm; other schedules throw.
 
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
                                    Bf16GdnHiddenActivation h_activation, const Weight& a_weight,

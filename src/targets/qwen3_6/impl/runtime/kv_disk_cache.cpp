@@ -4424,8 +4424,7 @@ std::optional<DiskMatch> KVDiskCache::plan_match(const PreparedPromptData& promp
         state.tail_hidden_valid =
             meta.tail_hidden_valid &&
             !checkpoint_missing_hidden(meta.current_hidden_id, config_.hidden_bytes);
-        state.backend_image_present = !meta.backend_page_ids.empty();
-        const auto hash_hits        = [&](std::uint32_t frontier, PrefixHash128 hash) {
+        const auto hash_hits = [&](std::uint32_t frontier, PrefixHash128 hash) {
             return frontier > 0 && frontier < hash_chain.size() && hash_chain[frontier] == hash;
         };
         const bool frontier_hash =

@@ -560,10 +560,6 @@ int main() {
         failures += split_case(T, 3000U + static_cast<std::uint32_t>(T));
     }
 
-    // The peer 35B-A3B geometry is a separate real channel extent.
-    constexpr std::int32_t kQwen35Channels = 8192;
-    failures += ordinary_case(kQwen35Channels, 257, StateCall::InPlaceEntry, 3257U);
-
     // Snapshot decode, small-T boundary/interior, sequence route, slot 0 initialization, and
     // continuation from selected slots. A nonzero destination base proves that snapshots are not
     // hard-wired to physical slots [0,T); selected source slots may overlap the destination range.
@@ -572,15 +568,15 @@ int main() {
     failures += snapshot_case(kQwen27Channels, 7, 9, 3, 1, 4007U);
     failures += snapshot_case(kQwen27Channels, 15, 18, 14, 1, 4015U);
     failures += snapshot_case(kQwen27Channels, 16, 18, 17, 1, 4016U);
-    failures += snapshot_case(kQwen35Channels, 17, 20, 16, 1, 4017U);
+    failures += snapshot_case(kQwen27Channels, 17, 20, 16, 1, 4017U);
 
-    failures += batched_snapshot_case(kQwen35Channels, 1, {8, 9, 10, 11, 12, 13, 14, 15},
+    failures += batched_snapshot_case(kQwen27Channels, 1, {8, 9, 10, 11, 12, 13, 14, 15},
                                       {0, 1, 2, 3, 4, 5, 6, 7}, {}, 16, 5001U);
     failures +=
         batched_snapshot_case(kQwen27Channels, 6, {18, 19, 20}, {0, 6, 12}, {6, 3, 1}, 21, 5006U);
     // Row 0 reads slot 15 and overwrites it only after the final valid column. This is the
     // production same-row alias pattern; row 1 remains fully disjoint.
-    failures += batched_snapshot_case(kQwen35Channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 5016U);
+    failures += batched_snapshot_case(kQwen27Channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 5016U);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " causal_conv1d_silu\n";
     return failures == 0 ? 0 : 1;

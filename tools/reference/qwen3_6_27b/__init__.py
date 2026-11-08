@@ -1,26 +1,15 @@
-"""Qwen3.6-27B reference target."""
+"""Qwen3.8-27B artifact-native Vision reference."""
 
-from .bindings import (
-    ArtifactBinding,
-    AxisView,
-    BindingError,
-    BoundResource,
-    LogicalRowView,
-    PhysicalBlock,
-    WeightObject,
-)
-from .model import RefModel
-from .weights import MemoryPlan, WeightStore
+from .bindings import BindingError, PhysicalBlock, VisionArtifactBinding
+from .vision import VisionEncoder, VisionOutput, VisionStats
+from .weights import WeightStore
 
 __all__ = [
-    "ArtifactBinding",
-    "AxisView",
     "BindingError",
-    "BoundResource",
-    "LogicalRowView",
-    "MemoryPlan",
     "PhysicalBlock",
-    "RefModel",
-    "WeightObject",
+    "VisionArtifactBinding",
+    "VisionEncoder",
+    "VisionOutput",
+    "VisionStats",
     "WeightStore",
 ]

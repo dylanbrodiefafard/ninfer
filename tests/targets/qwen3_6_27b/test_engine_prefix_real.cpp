@@ -54,17 +54,6 @@ std::vector<std::uint8_t> gradient_ppm() {
     return ppm;
 }
 
-ninfer::PromptInput chinese_chat(bool enable_thinking) {
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
-    message.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = "你好，简单介绍一下你自己。", .media = {}});
-    ninfer::PromptInput input;
-    input.messages.push_back(std::move(message));
-    input.options.enable_thinking = enable_thinking;
-    return input;
-}
-
 const char* reuse_path_name(ninfer::PrefixReusePath path) {
     switch (path) {
     case ninfer::PrefixReusePath::FullReset:
@@ -427,18 +416,6 @@ int exercise_cancel_ladder_heads(const char* artifact) {
          pin_after.prefix_reuse_path != ninfer::PrefixReusePath::RestoreTurnRollback) ||
         pin_after.reused_prompt_tokens == 0) {
         std::cerr << "cancel after rollback pin did not keep the previous turn\n";
-        return 1;
-    }
-    return 0;
-}
-
-int exercise_registered_frontend(const ninfer::Engine& engine) {
-    if (engine.count_tokens(chinese_chat(true)) != 16) {
-        std::cerr << "registered tokenizer/chat template changed the thinking prompt golden\n";
-        return 1;
-    }
-    if (engine.count_tokens(chinese_chat(false)) != 18) {
-        std::cerr << "registered tokenizer/chat template changed the no-thinking prompt golden\n";
         return 1;
     }
     return 0;
@@ -984,8 +961,7 @@ int exercise_vision(ninfer::Engine& engine) {
 
 int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
-    if ((load.target != "qwen3_6_27b" && load.target != "qwen3_8_27b") ||
-        (load.weights_id != "groupwise-int" && load.weights_id != "nvfp4") ||
+    if (load.target != "qwen3_8_27b" || load.weights_id != "nvfp4" ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "Engine construction has an invalid load summary: target=" << load.target
                   << " weights=" << load.weights_id << '\n';
@@ -1021,14 +997,6 @@ int exercise_artifact(const char* artifact) {
         }
         if (const int result = exercise_prefill_cancel_keeps_checkpoint(engine); result != 0) {
             return result;
-        }
-        if (engine.load_summary().target == "qwen3_6_27b") {
-            if (const int result = exercise_registered_frontend(engine); result != 0) {
-                return result;
-            }
-        } else {
-            std::cerr << "skip registered frontend goldens for " << engine.load_summary().target
-                      << '\n';
         }
         if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
         if (const int result = exercise_prefix(engine); result != 0) { return result; }

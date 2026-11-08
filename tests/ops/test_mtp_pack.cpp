@@ -149,9 +149,6 @@ int main() {
     failures += pack_case(5120, 1);
     failures += pack_case(5120, 6);
     failures += pack_case(5120, 48);
-    failures += pack_case(2048, 1);
-    failures += pack_case(2048, 6);
-    failures += pack_case(2048, 48);
     failures += split_case(1);
     failures += split_case(6);
     failures += split_case(48);

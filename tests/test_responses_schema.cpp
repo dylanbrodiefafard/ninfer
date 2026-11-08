@@ -93,7 +93,7 @@ Json parse_event(const std::string& event) {
 }
 
 int test_basic_request() {
-    const Json body                = {{"model", "qwen3.6-27b"},
+    const Json body                = {{"model", "qwen3.8-27b"},
                                       {"input", "hello"},
                                       {"instructions", "be concise"},
                                       {"previous_response_id", "resp_previous"},
@@ -104,7 +104,7 @@ int test_basic_request() {
                                       {"metadata", Json{{"trace", "abc"}}}};
     const ResponsesRequest request = parse_responses_request(body, limits());
     int failures                   = 0;
-    failures += check(request.generation.model == "qwen3.6-27b", "model parsed");
+    failures += check(request.generation.model == "qwen3.8-27b", "model parsed");
     failures += check(request.input_turns.size() == 1 &&
                           request.input_turns[0].role == ninfer::ChatRole::User &&
                           request.input_turns[0].content[0].text == "hello",
@@ -276,7 +276,7 @@ int test_typed_items_and_tools() {
                            {"parameters", Json{{"type", "object"}, {"properties", Json::object()}}},
                            {"strict", false}};
     const Json body     = {
-        {"model", "qwen3.6-27b"},
+        {"model", "qwen3.8-27b"},
         {"input",
          Json::array({Json{{"id", "rs_old"},
                            {"type", "reasoning"},
@@ -332,7 +332,7 @@ int test_typed_items_and_tools() {
 }
 
 int test_explicit_rejections() {
-    const Json base = {{"model", "qwen3.6-27b"}, {"input", "hello"}, {"max_output_tokens", 32}};
+    const Json base = {{"model", "qwen3.8-27b"}, {"input", "hello"}, {"max_output_tokens", 32}};
     int failures    = 0;
 
     Json strict     = base;
@@ -440,7 +440,7 @@ GenerationOutcome sample_outcome() {
 }
 
 int test_response_object() {
-    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
+    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.8-27b"},
                                                             {"input", "hello"},
                                                             {"max_output_tokens", 32},
                                                             {"reasoning", Json{{"effort", "low"}}},
@@ -499,7 +499,7 @@ int test_response_object() {
 int test_logprobs() {
     int failures          = 0;
     const auto parse_with = [](const Json& extra) {
-        Json body = {{"model", "qwen3.6-27b"}, {"input", "hello"}, {"max_output_tokens", 32}};
+        Json body = {{"model", "qwen3.8-27b"}, {"input", "hello"}, {"max_output_tokens", 32}};
         body.update(extra);
         return parse_responses_request(body, limits());
     };
@@ -591,7 +591,7 @@ int test_logprobs() {
 }
 
 int test_sse_sequence() {
-    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
+    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.8-27b"},
                                                             {"input", "hello"},
                                                             {"max_output_tokens", 32},
                                                             {"stream", true}},
@@ -633,7 +633,7 @@ int test_sse_sequence() {
 }
 
 int test_sse_function_call() {
-    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
+    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.8-27b"},
                                                             {"input", "weather"},
                                                             {"max_output_tokens", 32},
                                                             {"stream", true}},
@@ -671,7 +671,7 @@ int test_sse_function_call() {
 
 int test_input_tokens_schema() {
     const ResponsesRequest request = parse_response_input_tokens_request(
-        Json{{"model", "qwen3.6-27b"}, {"input", "hello"}}, limits());
+        Json{{"model", "qwen3.8-27b"}, {"input", "hello"}}, limits());
     int failures = 0;
     failures += check(!request.store && !request.stream, "input_tokens request is stateless");
     failures += check(Json::parse(make_response_input_tokens_body(9)) ==
@@ -680,18 +680,18 @@ int test_input_tokens_schema() {
     failures +=
         check(api_code([&] {
                   (void)parse_response_input_tokens_request(
-                      Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"instructions", "x"}},
+                      Json{{"model", "qwen3.8-27b"}, {"input", "hello"}, {"instructions", "x"}},
                       limits());
               }) == "unknown_parameter",
               "input_tokens accepts only model and input");
     failures += check(
         !parse_response_input_tokens_request(
-             Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"ninfer", nullptr}}, limits())
+             Json{{"model", "qwen3.8-27b"}, {"input", "hello"}, {"ninfer", nullptr}}, limits())
              .generation.capture_context_checkpoint,
         "input_tokens allows ninfer null");
     failures += check(throws_api([&] {
                           (void)parse_response_input_tokens_request(
-                              Json{{"model", "qwen3.6-27b"},
+                              Json{{"model", "qwen3.8-27b"},
                                    {"input", "hello"},
                                    {"ninfer", Json{{"capture_context_checkpoint", true}}}},
                               limits());

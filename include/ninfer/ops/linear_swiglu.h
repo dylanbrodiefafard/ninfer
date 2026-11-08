@@ -26,7 +26,7 @@ namespace ninfer::ops {
                                                                  std::int32_t max_tokens);
 
 /**
- * Policy-bearing capacity query. Q4/W8 admit A16Only. NVFP4 admits A16Only through T=20 and
+ * Policy-bearing capacity query. NVFP4 admits A16Only through T=20 and
  * AllowA4/AllowA8 for every positive T. AllowA4 covers whichever qualified A16 or A4 route the
  * private resolver selects across the requested interval. NVFP4 AllowA8 selects row-scaled E4M3
  * activation compute at T>=2 and A16 below that; its separately scaled K16 partials preserve the
@@ -45,13 +45,11 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   ideal[i,t] = SiLU(gate_up[i,t]) * gate_up[M+i,t].
  *
  * Logical shapes / supported domain:
- *   T may be any positive value. The registered RowSplit profiles are:
- *   - Q4G64_F16S weight [34816,5120], x [5120,T], out [17408,T];
- *   - W8G32_F16S weight [12288,2048], x [2048,T], out [6144,T];
- *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T].
+ *   T may be any positive value. The registered profiles are:
+ *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
  *   - FP8_E4M3FN_ROW_BF16S RowScale [34816,5120], x [5120,T], out [17408,T].
  *     FP8 has exact BF16 row multipliers and admits A16Only or AllowA8 for every positive T.
- *   Inputs and output are contiguous BF16. Q4/W8 scales are FP16; NVFP4 scales are E4M3FN.
+ *   Inputs and output are contiguous BF16. NVFP4 scales are E4M3FN.
  *
  * Numeric:
  *   The oracle exact-decodes the registered weight and evaluates `ideal` naively in FP64 from the
@@ -65,15 +63,14 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. W8 and fused NVFP4 A16 require zero bytes; NVFP4 W4A4/W4A8 routes use it
- *   for the quantized activation, and Q4 A16 routes for their materialized gate/up projection.
- *   There is no persistent state side effect.
+ *   scoped to the call. Fused NVFP4 A16 requires zero bytes; NVFP4 W4A4/W4A8 and FP8 A8 routes
+ *   use it for the quantized activation. There is no persistent state side effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream);
 
 /**
- * A16-only convenience form. Q4/W8 retain their complete positive-T domain. NVFP4 is admitted
+ * A16-only convenience form. FP8 retains its complete positive-T domain. NVFP4 is admitted
  * only through T=20; larger NVFP4 extents require the policy-bearing AllowA4 or AllowA8 form.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,

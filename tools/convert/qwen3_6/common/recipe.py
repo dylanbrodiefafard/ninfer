@@ -10,13 +10,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import prod
-from pathlib import Path
 
 import torch
 
 from tools.convert.common.safetensors import ShardReader
 
-from .inventory import FP32, VISION_LAYERS, TensorSpec
+from .inventory import FP32, VISION_LAYERS
 
 SOURCE_DTYPE = "BF16"
 
@@ -252,24 +251,6 @@ def build_vision_recipes(text_width: int) -> tuple[TensorRecipe, ...]:
     return tuple(recipes)
 
 
-def validate_recipe_coverage(
-    recipes: Sequence[TensorRecipe],
-    tensor_specs: Sequence[TensorSpec],
-) -> None:
-    inventory_names = tuple(spec.name for spec in tensor_specs)
-    recipe_names = tuple(recipe.object_name for recipe in recipes)
-    if recipe_names != inventory_names:
-        raise ValueError("recipe order or coverage does not match the tensor inventory")
-    if len({recipe.object_name for recipe in recipes}) != len(recipes):
-        raise ValueError("more than one recipe targets the same artifact object")
-    inventory_by_name = {spec.name: spec for spec in tensor_specs}
-    for recipe in recipes:
-        expected = inventory_by_name[recipe.object_name].shape
-        actual = expression_shape(recipe.expression)
-        if actual != expected:
-            raise ValueError(f"{recipe.object_name}: recipe shape {actual} != inventory {expected}")
-
-
 def source_requirements(
     recipes: Sequence[TensorRecipe],
 ) -> dict[str, SourceTensor]:
@@ -280,14 +261,6 @@ def source_requirements(
             if previous != requirement:
                 raise ValueError(f"inconsistent source declaration for {requirement.name}")
     return requirements
-
-
-def preflight_sources(
-    model_dir: str | Path,
-    recipes: Sequence[TensorRecipe],
-) -> SourcePreflight:
-    with ShardReader(model_dir) as reader:
-        return preflight_source_reader(reader, recipes)
 
 
 def preflight_source_reader(
@@ -403,8 +376,6 @@ __all__ = [
     "materialize_expression",
     "materialize_recipe",
     "preflight_source_reader",
-    "preflight_sources",
     "source",
     "source_requirements",
-    "validate_recipe_coverage",
 ]

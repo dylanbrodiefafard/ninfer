@@ -1065,7 +1065,6 @@ std::optional<RamMatch> KVRamCache::plan_match(const PreparedPromptData& prompt,
             .mtp_kv_valid            = host.mtp_kv_valid,
             .dflash_context_frontier = host.dflash_context_frontier,
             .tail_hidden_valid       = host.tail_hidden_valid,
-            .backend_image_present   = host.backend_image_present,
         };
         RamMatch candidate;
         candidate.entry_id  = id;

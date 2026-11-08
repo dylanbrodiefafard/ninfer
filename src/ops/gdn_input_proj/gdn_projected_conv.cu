@@ -176,16 +176,14 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
         return;
     }
 
-    if constexpr (Channels == 10240) {
-        if (width == 4 && batch == 1) {
-            constexpr int kT4Threads = 64;
-            gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 4>
-                <<<(Channels + kT4Threads - 1) / kT4Threads, kT4Threads, 0, stream>>>(
-                    projected_ptr, weight_ptr, state_ptr, valid_ptr, initial_ptr, query_ptr,
-                    key_ptr, value_ptr, width, publish);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
+    if (width == 4 && batch == 1) {
+        constexpr int kT4Threads = 64;
+        gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 4>
+            <<<(Channels + kT4Threads - 1) / kT4Threads, kT4Threads, 0, stream>>>(
+                projected_ptr, weight_ptr, state_ptr, valid_ptr, initial_ptr, query_ptr, key_ptr,
+                value_ptr, width, publish);
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
     const dim3 grid((Channels + kDefaultThreads - 1) / kDefaultThreads,
                     static_cast<unsigned>(batch));
@@ -206,13 +204,6 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
         launch<10240, 2048, 2048, 6144>(projected, conv_weight, state_read, valid_columns,
                                         initial_state_slots, parent_index, query, key, value,
                                         publish, stream);
-        return;
-    }
-    if (projected.ne[0] == 8192 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
-        value.ne[0] == 4096) {
-        launch<8192, 2048, 2048, 4096>(projected, conv_weight, state_read, valid_columns,
-                                       initial_state_slots, parent_index, query, key, value,
-                                       publish, stream);
         return;
     }
     throw std::invalid_argument("GDN projected-conv received an unregistered geometry");

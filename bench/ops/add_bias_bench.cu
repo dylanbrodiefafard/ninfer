@@ -106,7 +106,7 @@ void run_matrix(bool control) {
     for (int d : {1152, 3456, 4304}) {
         for (int p : patches) { run(d, p, control); }
     }
-    for (int d : {2048, 4608}) {
+    for (int d : {4608, 5120}) {
         for (int v : merged) { run(d, v, control); }
     }
 }

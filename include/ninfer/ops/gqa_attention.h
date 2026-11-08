@@ -89,7 +89,7 @@ struct GqaS3PrefillDump;
  *   probability   = softmax_x(score)
  *   ideal[:,h,j,b] = sum_x probability[x] * V_cache[b][:,x,kvh].
  *
- * The registered geometries are `[256,24|4,W,B]` group 6 and `[256,16|2,W,B]` group 8.
+ * The registered geometry is `[256,24|4,W,B]` (q/out 24 heads, k/v 4 heads, group 6).
  * q/k/v/out are contiguous BF16 in request-major order, positions is contiguous I32 [W,B], and
  * kv_table_rows is contiguous I32 [B]. valid_columns is either contiguous I32 [B], or an empty
  * Tensor meaning every row has exactly W valid columns. This dense/masked choice is part of the
@@ -142,7 +142,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                    const Tensor& ancestor_mask = {}, const Tensor& prefix_lengths = {});
 
 /**
- * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
+ * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4,T]`, positions is
  * contiguous sequential I32 [T], and every addressed code and quantized scale is overwritten. It
  * reads no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
  */
@@ -186,7 +186,7 @@ struct GqaS3DecodeRankDump {
 // decode lane; width > 1 (MTP verify) never engages the skip.
 /**
  * A3: compute causal attention from an already populated cache without accepting new K/V or
- * mutating any cache plane. q/out are contiguous BF16 `[256,24|16,T]`, positions is contiguous
+ * mutating any cache plane. q/out are contiguous BF16 `[256,24,T]`, positions is contiguous
  * sequential I32 [T], and the mathematical formula and execution-envelope contract are identical
  * to A1. Caller workspace is reported by gqa_attention_workspace_capacity_bytes().
  */

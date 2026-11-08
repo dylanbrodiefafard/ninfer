@@ -1,21 +1,18 @@
 #pragma once
 
-// SM120 BF16 GDN gating projection for the two exact registered geometries:
+// SM120 BF16 GDN gating projection for the exact registered geometry
 //
-//   Qwen3.6-27B:     a/b = W[48,5120] @ x[5120,T]
-//   Qwen3.6-35B-A3B: a/b = W[32,2048] @ x[2048,T]
+//   a/b = W[48,5120] @ x[5120,T].
 //
 // A CTA computes the same 16 output rows from both weights over a token tile.
-// Narrow 27B execution uses 8/16/32/48 columns and one warp per eight columns;
-// long-context 27B and 35B execution use 128 and 64 columns respectively.
-// Split-K routes use a tuned warp count and an
-// in-kernel cooperative grid reduction; the unsplit long-context route uses
-// eight warps for more independent MMA accumulators. Both preserve a single
-// kernel launch.
+// Narrow execution uses 8/16/32/48 columns and one warp per eight columns;
+// long-context execution uses 128 columns. Split-K routes use a tuned warp
+// count and an in-kernel cooperative grid reduction; the unsplit long-context
+// route uses eight warps for more independent MMA accumulators. Both preserve a
+// single kernel launch.
 
 #include "ops/common/math.cuh"
 #include "ops/common/rowsplit_mma.cuh"
-#include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
 #include <cooperative_groups.h>
@@ -43,27 +40,18 @@ struct Bf16Gdn27Geometry {
     static constexpr int kBlockN = 128;
 };
 
-struct Bf16Gdn35Geometry {
-    static constexpr int kHeads  = 32;
-    static constexpr int kHidden = 2048;
-    static constexpr int kBlockN = 64;
-};
-
 static_assert(Bf16Gdn27Geometry::kHidden % kBf16GdnBlockK == 0);
-static_assert(Bf16Gdn35Geometry::kHidden % kBf16GdnBlockK == 0);
 
 __device__ __forceinline__ int bf16_gdn_swizzle(int row, int col) {
     return (col & ~63) + gemm_swz64(row, col & 63);
 }
 
-template <class Geometry, int SplitK, bool FullTokens, int Warps, bool NormalizeInput = false,
-          int NormTokenCapacity = 0>
+template <class Geometry, int SplitK, bool FullTokens, int Warps>
 __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight,
-    __nv_bfloat16* __restrict__ normalized_x, float norm_eps,
-    const __nv_bfloat16* __restrict__ a_weight, const __nv_bfloat16* __restrict__ b_weight,
-    const float* __restrict__ A_log, const float* __restrict__ dt_bias, float* __restrict__ partial,
-    float* __restrict__ g, float* __restrict__ beta, std::int32_t t) {
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
+    const __nv_bfloat16* __restrict__ b_weight, const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias, float* __restrict__ partial, float* __restrict__ g,
+    float* __restrict__ beta, std::int32_t t) {
     constexpr int kBf16GdnHeads       = Geometry::kHeads;
     constexpr int kBf16GdnHidden      = Geometry::kHidden;
     constexpr int kBf16GdnBlockN      = Geometry::kBlockN;
@@ -95,40 +83,6 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
     const int split    = static_cast<int>(blockIdx.z);
     const int kt_begin = split * kTilesPerSplit;
 
-    if constexpr (NormalizeInput) {
-        static_assert(SplitK == 32, "fused input normalization is tuned for split-32");
-        static_assert(NormTokenCapacity > 0 && NormTokenCapacity <= 16);
-        constexpr int kLocalPairs     = kBf16GdnBlockK / 2;
-        const auto* x2                = reinterpret_cast<const __nv_bfloat162*>(x);
-        const int token_count         = min(kBf16GdnBlockN, t - token0);
-        float sums[NormTokenCapacity] = {};
-        // One warp from row tile zero contributes a 64-element norm slice. The existing post-MMA
-        // cooperative handoff reduces the 32 slices, so normalization adds no grid-wide barrier.
-        if (blockIdx.y == 0 && warp == 0) {
-            for (int pair = lane; pair < kLocalPairs; pair += kWarpSize) {
-#pragma unroll
-                for (int token_local = 0; token_local < NormTokenCapacity; ++token_local) {
-                    if (token_local >= token_count) { continue; }
-                    const std::int64_t row_base =
-                        static_cast<std::int64_t>(token0 + token_local) * (kBf16GdnHidden / 2);
-                    const int global_pair = kt_begin * (kBf16GdnBlockK / 2) + pair;
-                    const float2 value    = __bfloat1622float2(x2[row_base + global_pair]);
-                    sums[token_local] += value.x * value.x + value.y * value.y;
-                }
-            }
-#pragma unroll
-            for (int token_local = 0; token_local < NormTokenCapacity; ++token_local) {
-                sums[token_local] = warp_reduce_sum(sums[token_local]);
-                if (lane == 0 && token_local < token_count) {
-                    float* norm_partial =
-                        partial + static_cast<std::int64_t>(SplitK) * t * kBf16GdnLogicalRows;
-                    norm_partial[static_cast<std::int64_t>(split) * t + token0 + token_local] =
-                        sums[token_local];
-                }
-            }
-        }
-    }
-
     float a_acc[kBf16GdnMFragments][kNFragments][4] = {};
     float b_acc[kBf16GdnMFragments][kNFragments][4] = {};
 
@@ -144,26 +98,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
             __nv_bfloat16* dst =
                 &xs[stage * kBf16GdnBlockN * kBf16GdnBlockK + token_local * kBf16GdnBlockK +
                     bf16_gdn_swizzle(token_local, kk)];
-            if constexpr (NormalizeInput) {
-                const bool valid = FullTokens || token < t;
-                if (valid) {
-                    const auto* source = reinterpret_cast<const __nv_bfloat162*>(
-                        &x[static_cast<std::int64_t>(token) * kBf16GdnHidden + k0 + kk]);
-                    const auto* gain =
-                        reinterpret_cast<const __nv_bfloat162*>(&norm_weight[k0 + kk]);
-                    auto* target = reinterpret_cast<__nv_bfloat162*>(dst);
-#pragma unroll
-                    for (int pair = 0; pair < 4; ++pair) {
-                        const float2 value              = __bfloat1622float2(source[pair]);
-                        const float2 weight             = __bfloat1622float2(gain[pair]);
-                        const __nv_bfloat162 normalized = __floats2bfloat162_rn(
-                            value.x * (1.0f + weight.x), value.y * (1.0f + weight.y));
-                        target[pair] = normalized;
-                    }
-                } else {
-                    *reinterpret_cast<uint4*>(dst) = uint4{0, 0, 0, 0};
-                }
-            } else if constexpr (FullTokens) {
+            if constexpr (FullTokens) {
                 cp_async<16, Cache::cg>(
                     dst, &x[static_cast<std::int64_t>(token) * kBf16GdnHidden + k0 + kk]);
             } else {
@@ -302,24 +237,6 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
         const int grid_threads = static_cast<int>(gridDim.x) * static_cast<int>(gridDim.y) *
                                  static_cast<int>(gridDim.z) * kThreads;
         const int elems        = kBf16GdnHeads * t;
-        if constexpr (NormalizeInput) {
-            const float* norm_partial =
-                partial + static_cast<std::int64_t>(SplitK) * t * kBf16GdnLogicalRows;
-            const int hidden_elems = kBf16GdnHidden * t;
-            for (int i = block_linear * kThreads + tid; i < hidden_elems; i += grid_threads) {
-                const int k     = i % kBf16GdnHidden;
-                const int token = i / kBf16GdnHidden;
-                float sum       = 0.0F;
-#pragma unroll
-                for (int s = 0; s < SplitK; ++s) {
-                    sum += norm_partial[static_cast<std::int64_t>(s) * t + token];
-                }
-                const float inv    = rsqrtf(sum / static_cast<float>(kBf16GdnHidden) + norm_eps);
-                const float value  = __bfloat162float(x[i]);
-                const float weight = __bfloat162float(norm_weight[k]);
-                normalized_x[i]    = __float2bfloat16_rn(value * inv * (1.0F + weight));
-            }
-        }
         for (int i = block_linear * kThreads + tid; i < elems; i += grid_threads) {
             const int row   = i % kBf16GdnHeads;
             const int token = i / kBf16GdnHeads;
@@ -331,18 +248,6 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
                     (static_cast<std::int64_t>(s) * t + token) * kBf16GdnLogicalRows;
                 av += partial[base + row];
                 bv += partial[base + kBf16GdnHeads + row];
-            }
-            if constexpr (NormalizeInput) {
-                const float* norm_partial =
-                    partial + static_cast<std::int64_t>(SplitK) * t * kBf16GdnLogicalRows;
-                float sum = 0.0F;
-#pragma unroll
-                for (int s = 0; s < SplitK; ++s) {
-                    sum += norm_partial[static_cast<std::int64_t>(s) * t + token];
-                }
-                const float inv = rsqrtf(sum / static_cast<float>(kBf16GdnHidden) + norm_eps);
-                av *= inv;
-                bv *= inv;
             }
             g[i]    = -expf(A_log[row]) * softplus(av + dt_bias[row]);
             beta[i] = sigmoid(bv);

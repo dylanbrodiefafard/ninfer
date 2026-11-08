@@ -38,8 +38,7 @@ namespace ninfer::ops {
  *   ideal[:,t] = residual[:,t] + Linear(x,w)[:,t].
  *
  * Logical shapes:
- *   Contiguous BF16 x [K,T] and residual [N,T]. Registered weights are Q5G64_F16S RowSplit
- *   [5120,17408] or [5120,6144], W8G32_F16S RowSplit [2048,4096] or [2048,6144], and NVFP4
+ *   Contiguous BF16 x [K,T] and residual [N,T]. Registered weights are NVFP4
  *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], or BF16_CTRL Contiguous [5120,6144].
  *   T may be any positive value.
  *   FP8_E4M3FN_ROW_BF16S RowScale [5120,6144] and [5120,17408] also admit every positive T;
@@ -54,7 +53,7 @@ namespace ninfer::ops {
  *   staging, and workspace precision; those private choices are not semantic rounding boundaries.
  *
  * Compute policy:
- *   Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8; AllowA4
+ *   BF16_CTRL admits only A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8; AllowA4
  * permits the private resolver to select a qualified A16 or A4 route at every positive T. NVFP4
  * AllowA8 selects row-scaled E4M3 activation compute at T>=2 and A16 below that; exact weight-code
  * expansion and FP32 per16-scale accumulation preserve the stored weights. FP8 admits A16Only and

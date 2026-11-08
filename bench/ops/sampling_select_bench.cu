@@ -1,4 +1,4 @@
-// Qualification benchmark for Qwen3.6-35B G2 sampling and G3 MTP accept.
+// Qualification benchmark for Qwen3.8-27B G2 sampling and G3 MTP accept.
 //
 //   ./ninfer_sampling_select_bench --sample --batch 8 --mode stochastic
 //   ./ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5

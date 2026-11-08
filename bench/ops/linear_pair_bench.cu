@@ -1,4 +1,4 @@
-// Cold-cache CUDA Graph benchmark for the public DFlash LinearPair contract.
+// Cold-cache CUDA Graph benchmark for the public W8 [1024,5120] LinearPair contract.
 
 #include "ninfer/ops/linear_pair.h"
 
@@ -24,11 +24,8 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kParentRows  = 6144;
-constexpr std::int32_t kFirstRow    = 4096;
-constexpr std::int32_t kSecondRow   = 5120;
 constexpr std::int32_t kRows        = 1024;
-constexpr std::int32_t kHidden      = 2048;
+constexpr std::int32_t kHidden      = 5120;
 constexpr double kRtx5090ReadGBs    = 1674.5;
 constexpr double kRtx5090Bf16Tflops = 209.5;
 
@@ -186,12 +183,14 @@ int main(int argc, char** argv) {
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * maximum_tokens);
         DeviceBuffer first_output(static_cast<std::size_t>(kRows) * maximum_tokens * 2);
         DeviceBuffer second_output(static_cast<std::size_t>(kRows) * maximum_tokens * 2);
-        bench::PackedQuantizedWeight parent = bench::make_row_split_weight(
-            QType::W8G32_F16S, kParentRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
-        const Weight first_weight  = bench::row_view(parent.weight, kFirstRow, kRows);
-        const Weight second_weight = bench::row_view(parent.weight, kSecondRow, kRows);
+        const bench::PackedQuantizedWeight first_parent = bench::make_row_split_weight(
+            QType::W8G32_F16S, kRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
+        const bench::PackedQuantizedWeight second_parent = bench::make_row_split_weight(
+            QType::W8G32_F16S, kRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
+        const Weight& first_weight  = first_parent.weight;
+        const Weight& second_weight = second_parent.weight;
 
-        std::printf("# gpu=%s public=linear_pair shape=two_adjacent_W8[1024,2048] "
+        std::printf("# gpu=%s public=linear_pair shape=two_W8[1024,5120] "
                     "execution=graph_replay cache=cold read_reference=%.1f_GB/s "
                     "bf16_tc_reference=%.1f_TFLOP/s\n",
                     properties.name, kRtx5090ReadGBs, kRtx5090Bf16Tflops);
