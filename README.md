@@ -233,18 +233,18 @@ still has its own `--max-context` ceiling.
 
 Measured on the RTX 5090 with the recommended DFlash2 artifact, 262,144-token context,
 4,096-token prefill chunks, adaptive drafting up to seven tokens, the optimized proposal head,
-CUDA Graphs, NVFP4 KV and 32 MiB headroom. Vision and RAM/SSD tiers were off (2026-11-07).
+CUDA Graphs, NVFP4 KV and 32 MiB headroom. Vision and RAM/SSD tiers were off (2026-11-08).
 
 | Startup concurrency (C) | Shared KV capacity (tokens, total) |
 |---:|---:|
 | 1 | 262,144 |
 | 2 | 524,288 |
-| 3 | 741,632 |
-| 4 | 723,520 |
-| 5 | 705,920 |
-| 6 | 688,128 |
-| 7 | 670,144 |
-| 8 | 651,968 |
+| 3 | 742,208 |
+| 4 | 724,096 |
+| 5 | 706,496 |
+| 6 | 688,704 |
+| 7 | 670,720 |
+| 8 | 652,544 |
 
 These are shared totals across active and retained histories. C1 and C2 reach the concurrency cap;
 C3–C8 are limited by VRAM. Available memory and enabled features can change the result. See the

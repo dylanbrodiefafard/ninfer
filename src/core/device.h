@@ -15,7 +15,7 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 // 170 SMs), so the limit is sized to the largest kernel stack frame rather than the 1024-byte
 // default. A launch that needs more silently grows the reservation outside the Automatic KV
 // capacity plan, so every compiled kernel must fit; ninfer_device_stack_limit_test enforces it.
-inline constexpr std::size_t kDeviceStackBytesPerThread = 416;
+inline constexpr std::size_t kDeviceStackBytesPerThread = 384;
 
 struct DeviceContext {
     int device               = 0;

@@ -2416,8 +2416,8 @@ build/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
 ```
 
 CUDA Graphs and prefix reuse were on; Vision and RAM/SSD caches were off. Each row records the
-resolved shared token pool after startup. Free device memory after weights was 15,811,280,896 bytes
-at every C, with the 416-byte device stack limit. After startup, one request per lane decoded 64
+resolved shared token pool after startup. Free device memory after weights was 15,821,766,656 bytes
+at every C, with the 384-byte device stack limit. After startup, one request per lane decoded 64
 tokens, lane 0 after an 18,400-token prompt; all requests completed. These are startup capacity
 measurements, not C simultaneous full-length requests: each request is limited to 262,144 tokens,
 and retained histories share the same pool. The upper bound is C times the page-rounded per-request limit.
@@ -2426,12 +2426,12 @@ and retained histories share the same pool. The upper bound is C times the page-
 |---:|---:|---:|
 | 1 | 262,144 | 42 / 73 |
 | 2 | 524,288 | 100 / 130 |
-| 3 | 741,632 | 150 / 187 |
-| 4 | 723,520 | 204 / 244 |
-| 5 | 705,920 | 248 / 291.5 |
-| 6 | 688,128 | 294 / 339 |
-| 7 | 670,144 | 350 / 386.5 |
-| 8 | 651,968 | 396 / 434 |
+| 3 | 742,208 | 150 / 187 |
+| 4 | 724,096 | 204 / 244 |
+| 5 | 706,496 | 248 / 291.5 |
+| 6 | 688,704 | 294 / 339 |
+| 7 | 670,720 | 350 / 386.5 |
+| 8 | 652,544 | 396 / 434 |
 
 C1 and C2 reach that upper bound. C3–C8 use the available VRAM after reserving request state,
 DFlash2 state, workspace, graph allowances and 32 MiB headroom. Increasing C therefore reduces the

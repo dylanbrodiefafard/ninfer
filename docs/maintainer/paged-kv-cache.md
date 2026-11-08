@@ -191,8 +191,8 @@ hints at this option.
 The driver reserves local memory of per-thread stack size for every resident thread (about 0.25 MiB
 per byte on the 170 SMs of the RTX 5090), and this is counted in the context's usage before the
 weights are loaded. Before any allocation, `DeviceContext` sets `cudaLimitStackSize` to
-`kDeviceStackBytesPerThread` (416 B, the largest compiled kernel stack frame) instead of the 1024 B
-default, saving about 150 MiB. When a kernel that needs a larger frame is first launched, the
+`kDeviceStackBytesPerThread` (384 B, the largest compiled kernel stack frame) instead of the 1024 B
+default, saving about 160 MiB. When a kernel that needs a larger frame is first launched, the
 driver silently enlarges the reservation, bypassing the capacity plan;
 `ninfer_device_stack_limit_test` uses `cuobjdump` to inspect every library that contains device
 code, and fails if any kernel exceeds this value.
