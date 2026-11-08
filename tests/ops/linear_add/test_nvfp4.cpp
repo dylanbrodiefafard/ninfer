@@ -1,4 +1,5 @@
 #include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/a4_activation.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -7,7 +8,6 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -117,7 +117,7 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool sanitizer = false) {
-    const std::array invocations{
+    std::vector<Invocation> invocations{
         Invocation{2, ops::LinearPolicy::AllowA8},    Invocation{9, ops::LinearPolicy::AllowA8},
         Invocation{4, ops::LinearPolicy::AllowA8},    Invocation{8, ops::LinearPolicy::AllowA8},
         Invocation{16, ops::LinearPolicy::AllowA8},   Invocation{5, ops::LinearPolicy::AllowA8},
@@ -129,33 +129,28 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool sanitizer
         Invocation{49, ops::LinearPolicy::AllowA8},   Invocation{56, ops::LinearPolicy::AllowA8},
         Invocation{63, ops::LinearPolicy::AllowA8},   Invocation{64, ops::LinearPolicy::AllowA8},
         Invocation{112, ops::LinearPolicy::AllowA8},  Invocation{128, ops::LinearPolicy::AllowA8},
-        Invocation{48, ops::LinearPolicy::AllowA8},   Invocation{1, ops::LinearPolicy::A16Only},
-        Invocation{2, ops::LinearPolicy::A16Only},    Invocation{4, ops::LinearPolicy::A16Only},
-        Invocation{5, ops::LinearPolicy::A16Only},    Invocation{6, ops::LinearPolicy::A16Only},
-        Invocation{8, ops::LinearPolicy::A16Only},    Invocation{10, ops::LinearPolicy::A16Only},
-        Invocation{12, ops::LinearPolicy::A16Only},   Invocation{14, ops::LinearPolicy::A16Only},
-        Invocation{15, ops::LinearPolicy::A16Only},   Invocation{16, ops::LinearPolicy::A16Only},
-        Invocation{17, ops::LinearPolicy::A16Only},   Invocation{20, ops::LinearPolicy::A16Only},
-        Invocation{24, ops::LinearPolicy::A16Only},   Invocation{28, ops::LinearPolicy::A16Only},
-        Invocation{32, ops::LinearPolicy::A16Only},   Invocation{33, ops::LinearPolicy::A16Only},
-        Invocation{36, ops::LinearPolicy::A16Only},   Invocation{44, ops::LinearPolicy::A16Only},
-        Invocation{48, ops::LinearPolicy::A16Only},   Invocation{52, ops::LinearPolicy::A16Only},
-        Invocation{60, ops::LinearPolicy::A16Only},   Invocation{64, ops::LinearPolicy::A16Only},
-        Invocation{1, ops::LinearPolicy::AllowA4},    Invocation{2, ops::LinearPolicy::AllowA4},
-        Invocation{3, ops::LinearPolicy::AllowA4},    Invocation{4, ops::LinearPolicy::AllowA4},
-        Invocation{5, ops::LinearPolicy::AllowA4},    Invocation{6, ops::LinearPolicy::AllowA4},
-        Invocation{8, ops::LinearPolicy::AllowA4},    Invocation{10, ops::LinearPolicy::AllowA4},
-        Invocation{12, ops::LinearPolicy::AllowA4},   Invocation{15, ops::LinearPolicy::AllowA4},
-        Invocation{18, ops::LinearPolicy::AllowA4},   Invocation{24, ops::LinearPolicy::AllowA4},
-        Invocation{36, ops::LinearPolicy::AllowA4},   Invocation{64, ops::LinearPolicy::AllowA4},
-        Invocation{65, ops::LinearPolicy::AllowA4},   Invocation{100, ops::LinearPolicy::AllowA4},
-        Invocation{120, ops::LinearPolicy::AllowA4},  Invocation{200, ops::LinearPolicy::AllowA4},
-        Invocation{512, ops::LinearPolicy::AllowA4},  Invocation{513, ops::LinearPolicy::AllowA4},
-        Invocation{752, ops::LinearPolicy::AllowA4},  Invocation{777, ops::LinearPolicy::AllowA4},
-        Invocation{1024, ops::LinearPolicy::AllowA4}, Invocation{1025, ops::LinearPolicy::AllowA4},
-        Invocation{1279, ops::LinearPolicy::AllowA4}, Invocation{1500, ops::LinearPolicy::AllowA4},
-        Invocation{2048, ops::LinearPolicy::AllowA4}, Invocation{4096, ops::LinearPolicy::AllowA4},
+        Invocation{48, ops::LinearPolicy::AllowA8},   Invocation{1, ops::LinearPolicy::AllowA4},
+        Invocation{2, ops::LinearPolicy::AllowA4},    Invocation{3, ops::LinearPolicy::AllowA4},
+        Invocation{4, ops::LinearPolicy::AllowA4},    Invocation{5, ops::LinearPolicy::AllowA4},
+        Invocation{6, ops::LinearPolicy::AllowA4},    Invocation{8, ops::LinearPolicy::AllowA4},
+        Invocation{10, ops::LinearPolicy::AllowA4},   Invocation{12, ops::LinearPolicy::AllowA4},
+        Invocation{15, ops::LinearPolicy::AllowA4},   Invocation{18, ops::LinearPolicy::AllowA4},
+        Invocation{24, ops::LinearPolicy::AllowA4},   Invocation{36, ops::LinearPolicy::AllowA4},
+        Invocation{64, ops::LinearPolicy::AllowA4},   Invocation{65, ops::LinearPolicy::AllowA4},
+        Invocation{100, ops::LinearPolicy::AllowA4},  Invocation{120, ops::LinearPolicy::AllowA4},
+        Invocation{200, ops::LinearPolicy::AllowA4},  Invocation{512, ops::LinearPolicy::AllowA4},
+        Invocation{513, ops::LinearPolicy::AllowA4},  Invocation{752, ops::LinearPolicy::AllowA4},
+        Invocation{777, ops::LinearPolicy::AllowA4},  Invocation{1024, ops::LinearPolicy::AllowA4},
+        Invocation{1025, ops::LinearPolicy::AllowA4}, Invocation{1279, ops::LinearPolicy::AllowA4},
+        Invocation{1500, ops::LinearPolicy::AllowA4}, Invocation{2048, ops::LinearPolicy::AllowA4},
+        Invocation{4096, ops::LinearPolicy::AllowA4},
     };
+    // A16Only is registered at T=1 and below the W4A4 cutover.
+    const std::int32_t first_w4a4 =
+        k == 6144 ? ops::kA4Residual6144MinTokens : ops::kA4Residual17408MinTokens;
+    for (std::int32_t tokens = 1; tokens < first_w4a4; ++tokens) {
+        invocations.push_back(Invocation{tokens, ops::LinearPolicy::A16Only});
+    }
     constexpr std::int32_t kMaximumTokens = 4096;
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
@@ -194,8 +189,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool sanitizer
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
 
         const bool a4 =
-            invocation.policy == ops::LinearPolicy::AllowA4 &&
-            ((k == 6144 && invocation.tokens >= 5) || (k == 17408 && invocation.tokens >= 3));
+            invocation.policy == ops::LinearPolicy::AllowA4 && invocation.tokens >= first_w4a4;
         const bool a8           = invocation.policy == ops::LinearPolicy::AllowA8;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
                                   std::to_string(k) + "] " + (a8 ? "A8" : (a4 ? "A4" : "A16")) +

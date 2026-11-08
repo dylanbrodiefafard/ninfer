@@ -4,6 +4,7 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/dflash2_path_select.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -13,38 +14,58 @@
 
 namespace ninfer::ops::detail {
 
-enum class Nvfp4GdnConvScheduleId {
-    DecodeFusedA16,
-    SmallTFusedA16,
-    Materialized,
-};
+// The NVFP4 GDN conv snapshot serves ordinary decode, one column per request (W=1) for
+// B=1..kNvfp4GdnSnapshotMaxBatch, on the fused T=1 GEMV under every policy.
+inline constexpr std::int32_t kNvfp4GdnSnapshotMaxBatch = 8;
 
-struct Nvfp4GdnConvPlan {
-    Nvfp4GdnConvScheduleId schedule;
-};
-
-// A8 record launches whose W*B fits one M48 W4A8 tile write the conv record from the MMA
-// epilogue; larger launches stage the FP32 projection and run the grouped conv separately.
-inline constexpr std::int32_t kNvfp4GdnA8FusedRecordMaxWidth  = 16;
+// The NVFP4 GDN conv record serves DFlash2 verification under AllowA8 (W4A8). A8 record launches
+// whose W*B fits one M48 W4A8 tile write the conv record from the MMA epilogue; larger launches
+// stage the FP32 projection and run the convolution separately.
+inline constexpr std::int32_t kNvfp4GdnA8FusedRecordMaxWidth  = kDflash2TreeMaxWidth;
 inline constexpr std::int32_t kNvfp4GdnA8FusedRecordMaxTokens = 48;
 
-inline constexpr bool nvfp4_gdn_record_uses_quantized(LinearPolicy policy,
-                                                      std::int32_t width) noexcept {
-    return ((policy == LinearPolicy::AllowA4 && width >= 5) ||
-            (policy == LinearPolicy::AllowA8 && width >= kNvfp4FirstA8)) &&
-           width <= 16;
+// Record widths per verify form: a chain verifies k + 1 columns and a tree k + 2 through
+// kDflash2TreeMaxWidth columns, for a draft window k in [1, kDflash2MaxDraftTokens].
+[[nodiscard]] constexpr bool nvfp4_gdn_record_width_registered(std::int32_t width,
+                                                               bool tree) noexcept {
+    return tree ? width >= kDflash2MinTreeWidth && width <= kNvfp4GdnA8FusedRecordMaxWidth
+                : width >= kNvfp4FirstA8 && width <= kDflash2MaxChainWidth;
 }
 
+// Whether some batch B in [1, kDflash2MaxBatch] of a registered width runs the fused record
+// (W*B <= kNvfp4GdnA8FusedRecordMaxTokens) with this W4A8 wide-path panel count.
+[[nodiscard]] constexpr bool nvfp4_gdn_a8_fused_record_panels(std::int32_t width, bool tree,
+                                                              int panels) noexcept {
+    if (!nvfp4_gdn_record_width_registered(width, tree)) { return false; }
+    for (std::int32_t batch = 1;
+         batch <= kDflash2MaxBatch && width * batch <= kNvfp4GdnA8FusedRecordMaxTokens; ++batch) {
+        if (nvfp4_w4a8_wide_panels(width * batch) == panels) { return true; }
+    }
+    return false;
+}
+
+// The staged A8 record projection covers launches wider than the fused tile, up to the widest
+// registered width at the batch bound; these are the panel counts it selects.
+[[nodiscard]] constexpr bool nvfp4_gdn_a8_staged_record_panels(int panels) noexcept {
+    for (std::int32_t tokens = kNvfp4GdnA8FusedRecordMaxTokens + 1;
+         tokens <= kNvfp4GdnA8FusedRecordMaxWidth * kDflash2MaxBatch; ++tokens) {
+        if (nvfp4_w4a8_wide_panels(tokens) == panels) { return true; }
+    }
+    return false;
+}
+
+// The AllowA8 record of a BF16 [5120, W, B] input: quantizes it into workspace, then runs
+// nvfp4_gdn_record_a8_input_launch.
 void nvfp4_gdn_record_quantized_launch(const Tensor& x, const Weight& weight,
                                        const Tensor& conv_weight, const Tensor& conv_states,
                                        const Tensor& valid_columns, const Tensor& initial_slot,
                                        Tensor& conv_record, Tensor& query, Tensor& key,
-                                       Tensor& value, Tensor& z, LinearPolicy policy,
-                                       WorkspaceArena& workspace, cudaStream_t stream,
-                                       const std::int32_t* parent_index);
+                                       Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                                       cudaStream_t stream, const std::int32_t* parent_index);
 
-// The AllowA8 quantized record (width in [kNvfp4FirstA8, 16]) of an already quantized
-// [5120, width*batch] activation; otherwise identical to nvfp4_gdn_record_quantized_launch.
+// The AllowA8 record of an already quantized [5120, width*batch] activation. parent_index is
+// non-null exactly for tree verification. Throws std::invalid_argument for a width/tree pair
+// outside nvfp4_gdn_record_width_registered or a batch outside [1, kDflash2MaxBatch].
 void nvfp4_gdn_record_a8_input_launch(Fp8A8Workspace activation, std::int32_t width,
                                       std::int32_t batch, const Weight& weight,
                                       const Tensor& conv_weight, const Tensor& conv_states,
@@ -53,14 +74,9 @@ void nvfp4_gdn_record_a8_input_launch(Fp8A8Workspace activation, std::int32_t wi
                                       Tensor& value, Tensor& z, WorkspaceArena& workspace,
                                       cudaStream_t stream, const std::int32_t* parent_index);
 
-Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
-                                             std::int32_t batch_size);
-
-[[nodiscard]] std::size_t nvfp4_gdn_decode_columns_workspace_bytes();
-
-[[nodiscard]] std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
-                                                                      std::int32_t min_tokens,
-                                                                      std::int32_t max_tokens);
+// Throws std::invalid_argument unless width is 1 and batch_size is in
+// [1, kNvfp4GdnSnapshotMaxBatch].
+void nvfp4_gdn_snapshot_validate(std::int32_t width, std::int32_t batch_size);
 
 [[nodiscard]] std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy,
                                                                     std::int32_t batch_size,
@@ -72,80 +88,5 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& valid_columns, const Tensor& initial_slot,
                                       const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
                                       Tensor& value, Tensor& z, cudaStream_t stream);
-
-void nvfp4_gdn_record_decode_launch(const Tensor& x, const Weight& weight,
-                                    const Tensor& conv_weight, const Tensor& conv_states,
-                                    const Tensor& valid_columns, const Tensor& initial_slot,
-                                    Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                    Tensor& z, cudaStream_t stream);
-
-void nvfp4_gdn_snapshot_decode_columns(const Tensor& x, const Weight& weight,
-                                       const Tensor& conv_weight, Tensor& conv_states,
-                                       const Tensor& valid_columns, const Tensor& initial_slot,
-                                       const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
-                                       Tensor& value, Tensor& z, WorkspaceArena& workspace,
-                                       cudaStream_t stream);
-
-void nvfp4_gdn_record_decode_columns(const Tensor& x, const Weight& weight,
-                                     const Tensor& conv_weight, const Tensor& conv_states,
-                                     const Tensor& valid_columns, const Tensor& initial_slot,
-                                     Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                     Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
-
-void nvfp4_gdn_snapshot_small_t_launch(const Tensor& x, const Weight& weight,
-                                       const Tensor& conv_weight, Tensor& conv_states,
-                                       const Tensor& valid_columns, const Tensor& initial_slot,
-                                       const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
-                                       Tensor& value, Tensor& z, cudaStream_t stream);
-
-void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
-                                     const Tensor& conv_weight, const Tensor& conv_states,
-                                     const Tensor& valid_columns, const Tensor& initial_slot,
-                                     Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                     Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
-                                     const std::int32_t* parent_index = nullptr);
-
-// Compile-time superset of the grouped-replay widths; it gates which grouped kernels are
-// instantiated.
-inline constexpr bool nvfp4_gdn_record_width_groups(std::int32_t width) noexcept {
-    return width == 2 || width == 5 || width == 6;
-}
-
-// Packed T=2..16 record: B=1 W=5/6, B>1 W=2/5, and B=2/4 W=6 group requests per
-// SmallT weight pass (including one W=5 C=3 group) and materialize only the private
-// FP32 projection. B=1 W=4 uses fused SmallT; other B=1 widths retain T=1 GEMV+FP32
-// conv, and other B>1 widths use request-indexed CTAs.
-inline constexpr bool nvfp4_gdn_record_uses_grouped_replay(std::int32_t width,
-                                                           std::int32_t batch_size) noexcept {
-    return nvfp4_gdn_record_width_groups(width) &&
-           ((batch_size == 1 && width != 2) ||
-            (batch_size > 1 && (width != 6 || batch_size == 2 || batch_size == 4)));
-}
-
-inline constexpr bool nvfp4_gdn_record_uses_small_t(std::int32_t width,
-                                                    std::int32_t batch_size) noexcept {
-    return batch_size > 1 ||
-           (batch_size == 1 &&
-            (width == 4 || nvfp4_gdn_record_uses_grouped_replay(width, batch_size)));
-}
-
-void nvfp4_gdn_record_t1_fused_launch(const Tensor& x, const Weight& weight,
-                                      const Tensor& conv_weight, const Tensor& conv_states,
-                                      const Tensor& valid_columns, const Tensor& initial_slot,
-                                      Tensor& conv_record, Tensor& query, Tensor& key,
-                                      Tensor& value, Tensor& z, cudaStream_t stream,
-                                      const std::int32_t* parent_index = nullptr);
-
-void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_weight,
-                                    Tensor& conv_states, const Tensor& valid_columns,
-                                    const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                    Tensor& query, Tensor& key, Tensor& value, cudaStream_t stream);
-
-void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                                 Tensor& conv_states, const Tensor& valid_columns,
-                                 const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                 LinearPolicy policy, WorkspaceArena& workspace,
-                                 cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

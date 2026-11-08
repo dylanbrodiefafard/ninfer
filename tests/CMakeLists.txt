@@ -493,13 +493,8 @@ ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
-ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
-ninfer_add_linear_test(ninfer_linear_nvfp4_a8_test ops/linear/test_nvfp4_a8.cpp)
 ninfer_add_op_test(ninfer_nvfp4_codec_test SOURCES ops/test_nvfp4_codec.cu LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_linear_bf16_a16_test
-  SOURCES ops/linear/test_bf16_a16.cpp
-  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_attn_input_proj_test
   SOURCES ops/test_attn_input_proj.cpp
   LIBRARIES ninfer_ops)
@@ -605,8 +600,6 @@ set(ninfer_sanitizer_memcheck_only_tests
   ninfer_gdn_input_proj_conv_record_test
   ninfer_linear_nvfp4_a16_test
   ninfer_linear_nvfp4_a4_test
-  ninfer_linear_nvfp4_a8_test
-  ninfer_linear_bf16_a16_test
   ninfer_linear_w8_a16_test
   ninfer_linear_q4_a16_test
   ninfer_linear_add_nvfp4_test

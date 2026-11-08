@@ -1,11 +1,10 @@
 #include "ninfer/ops/gdn_input_proj.h"
 #include "core/device.h"
 
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 #include "ops/input_projection_test_common.h"
-#include "ops/nvfp4_activation_ref.h"
 #include "ops/fp8_activation_ref.h"
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+#include "ninfer/ops/dflash2_path_select.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -33,13 +32,13 @@ constexpr ReductionCriterion kNvfp4RecordA16Tolerance{3.15e-3, 4.0e-3, 3.2e-3};
 // BF16 final storage permits up to 1/256 relative rounding. In the outlier fixture,
 // FP64 SiLU=16.9366 rounds correctly to BF16=16.875 (0.00364 relative error);
 // a carried-history output 74.2587 rounds to 74.5 (0.00325 relative error).
-// Keep the original A16 criterion unchanged; the A4 codec residual has this explicit
+// Keep the original A16 criterion unchanged; the A8 codec residual has this explicit
 // storage bound plus the same absolute allowance for convolution-history rounding.
-constexpr ReductionCriterion kNvfp4RecordA4ResidualTolerance{1.0 / 256.0, 4.0e-3, 1.0 / 256.0};
+constexpr ReductionCriterion kNvfp4RecordA8ResidualTolerance{1.0 / 256.0, 4.0e-3, 1.0 / 256.0};
 using OracleGroups                      = std::vector<std::vector<double>>;
-double maximum_a4_canonical_relative_l2 = 0;
-double maximum_a4_codec_relative_l2     = 0;
-double maximum_a4_residual_relative_l2  = 0;
+double maximum_a8_canonical_relative_l2 = 0;
+double maximum_a8_codec_relative_l2     = 0;
+double maximum_a8_residual_relative_l2  = 0;
 
 double silu_fp64(double value) {
     if (value >= 0.0) { return value / (1.0 + std::exp(-value)); }
@@ -144,15 +143,15 @@ int verify_record_oracle(
             allowed.gross_absolute = distortion.maximum_absolute_error + criterion.gross_absolute +
                                      criterion.gross_relative_to_max_reference * maximum;
             allowed.gross_relative_to_max_reference = 0;
-            maximum_a4_codec_relative_l2 =
-                std::max(maximum_a4_codec_relative_l2, distortion.relative_l2);
-            maximum_a4_canonical_relative_l2 =
-                std::max(maximum_a4_canonical_relative_l2,
+            maximum_a8_codec_relative_l2 =
+                std::max(maximum_a8_codec_relative_l2, distortion.relative_l2);
+            maximum_a8_canonical_relative_l2 =
+                std::max(maximum_a8_canonical_relative_l2,
                          compute_reduction_stats(actual.data(), expected.data(), expected.size())
                              .relative_l2);
         } else if (oracle_outputs) {
-            maximum_a4_residual_relative_l2 =
-                std::max(maximum_a4_residual_relative_l2,
+            maximum_a8_residual_relative_l2 =
+                std::max(maximum_a8_residual_relative_l2,
                          compute_reduction_stats(actual.data(), expected.data(), expected.size())
                              .relative_l2);
         }
@@ -238,451 +237,16 @@ int verify_record_oracle(
     return failures;
 }
 
-int verify_conv_record(std::string_view label, const std::vector<std::uint16_t>& snapshot_state,
-                       const std::vector<std::uint16_t>& record, std::int32_t channels,
-                       std::int32_t width, std::int32_t batch,
-                       const std::vector<std::int32_t>& valid_columns,
-                       const std::vector<std::int32_t>& snapshot_bases) {
-    const std::size_t slot_stride = static_cast<std::size_t>(channels) * 3;
-    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
-        for (std::int32_t token = 0; token < valid_columns[static_cast<std::size_t>(batch_row)];
-             ++token) {
-            const std::size_t snapshot =
-                static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(batch_row)] +
-                                         token) *
-                    slot_stride +
-                2ULL * channels;
-            const std::size_t record_column =
-                static_cast<std::size_t>(batch_row * width + token) * channels;
-            if (!std::equal(snapshot_state.begin() + static_cast<std::ptrdiff_t>(snapshot),
-                            snapshot_state.begin() +
-                                static_cast<std::ptrdiff_t>(snapshot + channels),
-                            record.begin() + static_cast<std::ptrdiff_t>(record_column))) {
-                std::cerr << label << ": conv record differs from snapshot newest column\n";
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
-template <class SnapshotLaunch, class RecordLaunch>
-int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_rows,
-             std::int32_t z_rows, std::int32_t width, std::int32_t batch,
-             std::vector<std::int32_t> valid_columns, std::size_t snapshot_workspace_bytes,
-             std::size_t record_workspace_bytes, SnapshotLaunch&& snapshot_launch,
-             RecordLaunch&& record_launch, std::uint32_t seed) {
-    const std::int32_t channels          = kQueryRows + kKeyRows + value_rows;
-    const std::int32_t aggregate_columns = width * batch;
-    const std::int32_t slots             = aggregate_columns + batch + 1;
-    const bool dense                     = valid_columns.empty();
-    if (valid_columns.empty()) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
-
-    const std::vector<float> activation = make_bf16_activation(hidden, aggregate_columns, seed);
-    const std::vector<std::uint16_t> conv_weight_bits =
-        make_bf16_bits(static_cast<std::size_t>(channels) * 4, seed + 1, -0.02F, 0.02F);
-    const std::vector<std::uint16_t> state_before =
-        make_bf16_bits(static_cast<std::size_t>(channels) * 3 * slots, seed + 2, -0.05F, 0.05F);
-
-    std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
-    std::vector<std::int32_t> snapshot_bases(static_cast<std::size_t>(batch));
-    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
-        snapshot_bases[static_cast<std::size_t>(batch_row)] = batch_row * width;
-        initial_slots[static_cast<std::size_t>(batch_row)]  = aggregate_columns + batch_row;
-    }
-
-    DeviceBuffer device_x           = to_device_bf16(activation);
-    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
-    DeviceBuffer snapshot_state     = to_device(state_before);
-    DeviceBuffer record_state       = to_device(state_before);
-    DeviceBuffer device_valid;
-    if (!dense) { device_valid = to_device(valid_columns); }
-    DeviceBuffer device_initial  = to_device(initial_slots);
-    DeviceBuffer device_snapshot = to_device(snapshot_bases);
-
-    GuardedBf16Tensor snapshot_query(kQueryRows, aggregate_columns);
-    GuardedBf16Tensor snapshot_key(kKeyRows, aggregate_columns);
-    GuardedBf16Tensor snapshot_value(value_rows, aggregate_columns);
-    GuardedBf16Tensor snapshot_z(z_rows, aggregate_columns);
-    GuardedBf16Tensor record_query(kQueryRows, aggregate_columns);
-    GuardedBf16Tensor record_key(kKeyRows, aggregate_columns);
-    GuardedBf16Tensor record_value(value_rows, aggregate_columns);
-    GuardedBf16Tensor record_z(z_rows, aggregate_columns);
-    GuardedBf16Tensor conv_record(channels, aggregate_columns);
-
-    Tensor x(device_x.p, DType::BF16, {hidden, width, batch});
-    Tensor conv_weight(device_conv_weight.p, DType::BF16, {channels, 4});
-    Tensor snapshot_state_view(snapshot_state.p, DType::BF16, {channels, 3, slots});
-    Tensor record_state_view(record_state.p, DType::BF16, {channels, 3, slots});
-    Tensor valid;
-    if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
-    Tensor initial(device_initial.p, DType::I32, {batch});
-    Tensor snapshot_base(device_snapshot.p, DType::I32, {batch});
-    Tensor snapshot_q(snapshot_query.data(), DType::BF16, {kQueryRows, width, batch});
-    Tensor snapshot_k(snapshot_key.data(), DType::BF16, {kKeyRows, width, batch});
-    Tensor snapshot_v(snapshot_value.data(), DType::BF16, {value_rows, width, batch});
-    Tensor snapshot_z_view(snapshot_z.data(), DType::BF16, {z_rows, width, batch});
-    Tensor record_q(record_query.data(), DType::BF16, {kQueryRows, width, batch});
-    Tensor record_k(record_key.data(), DType::BF16, {kKeyRows, width, batch});
-    Tensor record_v(record_value.data(), DType::BF16, {value_rows, width, batch});
-    Tensor record_z_view(record_z.data(), DType::BF16, {z_rows, width, batch});
-    Tensor conv_record_view(conv_record.data(), DType::BF16, {channels, width, batch});
-
-    WorkspaceArena snapshot_workspace(std::max<std::size_t>(256, snapshot_workspace_bytes));
-    WorkspaceArena record_workspace(std::max<std::size_t>(256, record_workspace_bytes));
-    snapshot_launch(x, conv_weight, snapshot_state_view, valid, initial, snapshot_base, snapshot_q,
-                    snapshot_k, snapshot_v, snapshot_z_view, snapshot_workspace);
-    record_launch(x, conv_weight, record_state_view, valid, initial, conv_record_view, record_q,
-                  record_k, record_v, record_z_view, record_workspace);
-    cuda_synchronize();
-
-    int failures = 0;
-    failures +=
-        verify_equal(std::string(label) + " query", snapshot_query.bits(), record_query.bits());
-    failures += verify_equal(std::string(label) + " key", snapshot_key.bits(), record_key.bits());
-    failures +=
-        verify_equal(std::string(label) + " value", snapshot_value.bits(), record_value.bits());
-    failures += verify_equal(std::string(label) + " z", snapshot_z.bits(), record_z.bits());
-    failures += verify_zero_tail(std::string(label) + " query", record_query.bits(), kQueryRows,
-                                 width, batch, valid_columns);
-    failures += verify_zero_tail(std::string(label) + " key", record_key.bits(), kKeyRows, width,
-                                 batch, valid_columns);
-    failures += verify_zero_tail(std::string(label) + " value", record_value.bits(), value_rows,
-                                 width, batch, valid_columns);
-
-    const std::vector<std::uint16_t> snapshot_state_after =
-        from_device<std::uint16_t>(snapshot_state, state_before.size());
-    const std::vector<std::uint16_t> record_state_after =
-        from_device<std::uint16_t>(record_state, state_before.size());
-    failures += verify_conv_record(label, snapshot_state_after, conv_record.bits(), channels, width,
-                                   batch, valid_columns, snapshot_bases);
-    failures +=
-        verify_equal(std::string(label) + " source state", state_before, record_state_after);
-
-    failures += snapshot_query.verify_guards(std::string(label) + " snapshot query");
-    failures += snapshot_key.verify_guards(std::string(label) + " snapshot key");
-    failures += snapshot_value.verify_guards(std::string(label) + " snapshot value");
-    failures += snapshot_z.verify_guards(std::string(label) + " snapshot z");
-    failures += record_query.verify_guards(std::string(label) + " record query");
-    failures += record_key.verify_guards(std::string(label) + " record key");
-    failures += record_value.verify_guards(std::string(label) + " record value");
-    failures += record_z.verify_guards(std::string(label) + " record z");
-    failures += conv_record.verify_guards(std::string(label) + " conv record");
-    if (snapshot_workspace.used() != 0 ||
-        snapshot_workspace.peak_used() != snapshot_workspace_bytes) {
-        std::cerr << label << ": snapshot workspace query/execution mismatch\n";
-        ++failures;
-    }
-    if (record_workspace.used() != 0 || record_workspace.peak_used() != record_workspace_bytes) {
-        std::cerr << label << ": record workspace query/execution mismatch\n";
-        ++failures;
-    }
-    return failures;
-}
-
-int run_nvfp4() {
-    constexpr std::int32_t kHidden    = 5120;
-    constexpr std::int32_t kValueRows = 6144;
-    constexpr std::int32_t kZRows     = 6144;
-    constexpr std::int32_t kRows      = 16384;
-    quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
-    options.input_scale_divisor  = 3.5F;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 1601U, options));
-
-    int failures   = 0;
-    const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
-                         ops::LinearPolicy policy, std::uint32_t seed) {
-        std::vector<std::int32_t> valid_host = valid;
-        if (valid_host.empty()) { valid_host.assign(static_cast<std::size_t>(batch), width); }
-        const std::size_t snapshot_bytes =
-            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(QType::NVFP4, kRows, kHidden,
-                                                                       policy, 1, 1, 1);
-        const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            QType::NVFP4, kRows, kHidden, policy, batch, width, width);
-        return run_case(
-            std::string("NVFP4 ") + (policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16") +
-                " B=" + std::to_string(batch) + " T=" + std::to_string(width),
-            kHidden, kValueRows, kZRows, width, batch, std::move(valid), snapshot_bytes,
-            record_bytes,
-            [&, valid_host, policy, width,
-             batch](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
-                    const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k,
-                    Tensor& v, Tensor& z, WorkspaceArena& workspace) {
-                (void)valid_columns;
-                (void)initial;
-                (void)snapshot_base;
-                const std::int32_t hidden    = x.ne[0];
-                const std::int32_t aggregate = width * batch;
-                std::vector<std::int32_t> live(static_cast<std::size_t>(batch));
-                for (std::int32_t b = 0; b < batch; ++b) {
-                    live[static_cast<std::size_t>(b)] = aggregate + b;
-                }
-                auto column = [&](Tensor& tensor, std::int32_t b, std::int32_t t) {
-                    auto* data = static_cast<std::uint8_t*>(tensor.data) +
-                                 static_cast<std::int64_t>(b * width + t) * tensor.ne[0] *
-                                     static_cast<std::int64_t>(sizeof(std::uint16_t));
-                    return Tensor(data, DType::BF16, {tensor.ne[0], 1});
-                };
-                auto* x_bytes = static_cast<std::uint8_t*>(x.data);
-                for (std::int32_t b = 0; b < batch; ++b) {
-                    for (std::int32_t t = 0; t < width; ++t) {
-                        const std::int32_t ok = t < valid_host[static_cast<std::size_t>(b)] ? 1 : 0;
-                        const std::int32_t base   = b * width + t;
-                        DeviceBuffer device_valid = to_device(std::vector<std::int32_t>{ok});
-                        DeviceBuffer device_init =
-                            to_device(std::vector<std::int32_t>{live[static_cast<std::size_t>(b)]});
-                        DeviceBuffer device_base = to_device(std::vector<std::int32_t>{base});
-                        Tensor x1(x_bytes + static_cast<std::int64_t>(base) * hidden *
-                                                static_cast<std::int64_t>(sizeof(std::uint16_t)),
-                                  DType::BF16, {hidden, 1});
-                        Tensor q1 = column(q, b, t);
-                        Tensor k1 = column(k, b, t);
-                        Tensor v1 = column(v, b, t);
-                        Tensor z1 = column(z, b, t);
-                        Tensor valid_t(device_valid.p, DType::I32, {1});
-                        Tensor init_t(device_init.p, DType::I32, {1});
-                        Tensor base_t(device_base.p, DType::I32, {1});
-                        ops::gdn_input_proj_conv_snapshot(x1, parent.view(), conv, state, valid_t,
-                                                          init_t, base_t, q1, k1, v1, z1, policy,
-                                                          workspace, nullptr);
-                        if (ok != 0) { live[static_cast<std::size_t>(b)] = base; }
-                    }
-                }
-            },
-            [&](const Tensor& x, const Tensor& conv, const Tensor& state,
-                const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
-                Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns,
-                                                initial, record, q, k, v, z, policy, workspace,
-                                                nullptr);
-            },
-            seed);
-    };
-    failures += run(2, 1, {}, ops::LinearPolicy::A16Only, 1611U);
-    failures += run(5, 1, {}, ops::LinearPolicy::A16Only, 1617U);
-    failures += run(5, 1, {3}, ops::LinearPolicy::A16Only, 1619U);
-    failures += run(6, 1, {}, ops::LinearPolicy::A16Only, 1620U);
-    failures += run(6, 1, {4}, ops::LinearPolicy::A16Only, 1621U);
-    failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1623U);
-    failures += run(3, 1, {2}, ops::LinearPolicy::AllowA4, 1631U);
-    failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
-    failures += run(16, 1, {13}, ops::LinearPolicy::A16Only, 1651U);
-    failures += run(6, 3, {6, 4, 1}, ops::LinearPolicy::A16Only, 1661U);
-    failures += run(5, 3, {5, 5, 5}, ops::LinearPolicy::A16Only, 1666U);
-    failures += parent.verify_preserved("NVFP4 record parent weight");
-    return failures;
-}
-
-int run_nvfp4_tree_column0_matches_decode() {
-    constexpr auto policy             = ops::LinearPolicy::A16Only;
-    constexpr std::int32_t kHidden    = 5120;
-    constexpr std::int32_t kValueRows = 6144;
-    constexpr std::int32_t kZRows     = 6144;
-    constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
-    constexpr std::int32_t kRows      = 16384;
-    constexpr std::int32_t kWidth     = 12;
-    constexpr std::int32_t kSlots     = 4;
-    constexpr std::int32_t kInitial   = 3;
-    constexpr ReductionCriterion kA16{3.15e-3, 4.0e-3, 3.2e-3};
-
-    quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
-    options.input_scale_divisor  = 3.5F;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 1801U, options));
-
-    const std::vector<float> packed_x = make_bf16_activation(kHidden, kWidth, 1811U);
-    std::vector<float> decode_x(static_cast<std::size_t>(kHidden));
-    std::copy_n(packed_x.begin(), kHidden, decode_x.begin());
-    const std::vector<std::uint16_t> conv_weight_bits =
-        make_bf16_bits(static_cast<std::size_t>(kChannels) * 4, 1813U, -0.02F, 0.02F);
-    const std::vector<std::uint16_t> state_before =
-        make_bf16_bits(static_cast<std::size_t>(kChannels) * 3 * kSlots, 1815U, -0.05F, 0.05F);
-    const std::vector<std::int32_t> initial_slots{kInitial};
-    const std::vector<std::int32_t> snapshot_bases{0};
-    std::vector<std::int32_t> parent_host(static_cast<std::size_t>(kWidth), -1);
-    for (std::int32_t token = 1; token < kWidth; ++token) {
-        parent_host[static_cast<std::size_t>(token)] = token - 1;
-    }
-
-    DeviceBuffer device_packed  = to_device_bf16(packed_x);
-    DeviceBuffer device_decode  = to_device_bf16(decode_x);
-    DeviceBuffer device_conv    = to_device(conv_weight_bits);
-    DeviceBuffer snapshot_state = to_device(state_before);
-    DeviceBuffer record_state   = to_device(state_before);
-    DeviceBuffer device_initial = to_device(initial_slots);
-    DeviceBuffer device_base    = to_device(snapshot_bases);
-    DeviceBuffer device_parent  = to_device(parent_host);
-
-    GuardedBf16Tensor decode_q(kQueryRows, 1);
-    GuardedBf16Tensor decode_k(kKeyRows, 1);
-    GuardedBf16Tensor decode_v(kValueRows, 1);
-    GuardedBf16Tensor decode_z(kZRows, 1);
-    GuardedBf16Tensor tree_q(kQueryRows, kWidth);
-    GuardedBf16Tensor tree_k(kKeyRows, kWidth);
-    GuardedBf16Tensor tree_v(kValueRows, kWidth);
-    GuardedBf16Tensor tree_z(kZRows, kWidth);
-    GuardedBf16Tensor conv_record(kChannels, kWidth);
-
-    Tensor x1(device_decode.p, DType::BF16, {kHidden, 1});
-    Tensor xw(device_packed.p, DType::BF16, {kHidden, kWidth, 1});
-    Tensor conv(device_conv.p, DType::BF16, {kChannels, 4});
-    Tensor snap_state(snapshot_state.p, DType::BF16, {kChannels, 3, kSlots});
-    Tensor rec_state(record_state.p, DType::BF16, {kChannels, 3, kSlots});
-    Tensor initial(device_initial.p, DType::I32, {1});
-    Tensor snap_base(device_base.p, DType::I32, {1});
-    Tensor parent_index(device_parent.p, DType::I32, {kWidth, 1});
-    Tensor q1 = decode_q.tensor();
-    Tensor k1 = decode_k.tensor();
-    Tensor v1 = decode_v.tensor();
-    Tensor z1 = decode_z.tensor();
-    Tensor qw(tree_q.data(), DType::BF16, {kQueryRows, kWidth, 1});
-    Tensor kw(tree_k.data(), DType::BF16, {kKeyRows, kWidth, 1});
-    Tensor vw(tree_v.data(), DType::BF16, {kValueRows, kWidth, 1});
-    Tensor zw(tree_z.data(), DType::BF16, {kZRows, kWidth, 1});
-    Tensor record(conv_record.data(), DType::BF16, {kChannels, kWidth, 1});
-
-    const std::size_t snap_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, policy, 1, 1, 1);
-    const std::size_t rec_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, policy, 1, kWidth, kWidth);
-    WorkspaceArena snap_ws(std::max<std::size_t>(256, snap_bytes));
-    WorkspaceArena rec_ws(std::max<std::size_t>(256, rec_bytes));
-
-    ops::gdn_input_proj_conv_snapshot(x1, parent.view(), conv, snap_state, Tensor{}, initial,
-                                      snap_base, q1, k1, v1, z1, policy, snap_ws, nullptr);
-    ops::gdn_input_proj_conv_record(xw, parent.view(), conv, rec_state, Tensor{}, initial, record,
-                                    qw, kw, vw, zw, policy, rec_ws, nullptr, &parent_index);
-    cuda_synchronize();
-
-    int failures = 0;
-    failures += compare_column0("NVFP4 tree W=12 record query vs T=1 snapshot", tree_q, decode_q,
-                                kQueryRows, kA16);
-    failures += compare_column0("NVFP4 tree W=12 record key vs T=1 snapshot", tree_k, decode_k,
-                                kKeyRows, kA16);
-    failures += compare_column0("NVFP4 tree W=12 record value vs T=1 snapshot", tree_v, decode_v,
-                                kValueRows, kA16);
-    failures +=
-        compare_column0("NVFP4 tree W=12 record z vs T=1 snapshot", tree_z, decode_z, kZRows, kA16);
-    failures += parent.verify_preserved("NVFP4 tree W=12 parent weight");
-    return failures;
-}
-
-int run_nvfp4_compose_chain_matches_snapshot() {
-    constexpr auto policy             = ops::LinearPolicy::A16Only;
-    constexpr std::int32_t kHidden    = 5120;
-    constexpr std::int32_t kValueRows = 6144;
-    constexpr std::int32_t kZRows     = 6144;
-    constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
-    constexpr std::int32_t kRows      = 16384;
-    constexpr std::int32_t kWidth     = 12;
-    constexpr std::int32_t kSlots     = kWidth + 1;
-    constexpr std::int32_t kInitial   = kWidth;
-    constexpr ReductionCriterion kA16{3.15e-3, 4.0e-3, 3.2e-3};
-
-    quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
-    options.input_scale_divisor  = 3.5F;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 1801U, options));
-
-    const std::vector<float> packed_x = make_bf16_activation(kHidden, kWidth, 1811U);
-    const std::vector<std::uint16_t> conv_weight_bits =
-        make_bf16_bits(static_cast<std::size_t>(kChannels) * 4, 1813U, -0.02F, 0.02F);
-    const std::vector<std::uint16_t> state_before =
-        make_bf16_bits(static_cast<std::size_t>(kChannels) * 3 * kSlots, 1815U, -0.05F, 0.05F);
-    const std::vector<std::int32_t> initial_slots{kInitial};
-    std::vector<std::int32_t> parent_host(static_cast<std::size_t>(kWidth), -1);
-    for (std::int32_t token = 1; token < kWidth; ++token) {
-        parent_host[static_cast<std::size_t>(token)] = token - 1;
-    }
-
-    DeviceBuffer device_packed  = to_device_bf16(packed_x);
-    DeviceBuffer device_conv    = to_device(conv_weight_bits);
-    DeviceBuffer record_state   = to_device(state_before);
-    DeviceBuffer snapshot_state = to_device(state_before);
-    DeviceBuffer device_initial = to_device(initial_slots);
-    DeviceBuffer device_parent  = to_device(parent_host);
-
-    GuardedBf16Tensor compose_q(kQueryRows, kWidth);
-    GuardedBf16Tensor compose_k(kKeyRows, kWidth);
-    GuardedBf16Tensor compose_v(kValueRows, kWidth);
-    GuardedBf16Tensor compose_z(kZRows, kWidth);
-    GuardedBf16Tensor conv_record(kChannels, kWidth);
-
-    Tensor xw(device_packed.p, DType::BF16, {kHidden, kWidth, 1});
-    Tensor conv(device_conv.p, DType::BF16, {kChannels, 4});
-    Tensor rec_state(record_state.p, DType::BF16, {kChannels, 3, kSlots});
-    Tensor snap_state(snapshot_state.p, DType::BF16, {kChannels, 3, kSlots});
-    Tensor initial(device_initial.p, DType::I32, {1});
-    Tensor parent_index(device_parent.p, DType::I32, {kWidth, 1});
-    Tensor cq(compose_q.data(), DType::BF16, {kQueryRows, kWidth, 1});
-    Tensor ck(compose_k.data(), DType::BF16, {kKeyRows, kWidth, 1});
-    Tensor cv(compose_v.data(), DType::BF16, {kValueRows, kWidth, 1});
-    Tensor cz(compose_z.data(), DType::BF16, {kZRows, kWidth, 1});
-    Tensor record(conv_record.data(), DType::BF16, {kChannels, kWidth, 1});
-
-    const std::size_t rec_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, policy, 1, kWidth, kWidth);
-    WorkspaceArena rec_ws(std::max<std::size_t>(256, rec_bytes));
-    ops::gdn_input_proj_conv_record(xw, parent.view(), conv, rec_state, Tensor{}, initial, record,
-                                    cq, ck, cv, cz, policy, rec_ws, nullptr, &parent_index);
-    cuda_synchronize();
-
-    const std::size_t snap_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, policy, 1, 1, 1);
-    WorkspaceArena snap_ws(std::max<std::size_t>(256, snap_bytes));
-    GuardedBf16Tensor decode_q(kQueryRows, 1);
-    GuardedBf16Tensor decode_k(kKeyRows, 1);
-    GuardedBf16Tensor decode_v(kValueRows, 1);
-    GuardedBf16Tensor decode_z(kZRows, 1);
-
-    int failures = 0;
-    for (std::int32_t token = 0; token < kWidth; ++token) {
-        std::vector<float> decode_x(static_cast<std::size_t>(kHidden));
-        std::copy_n(packed_x.begin() + static_cast<std::ptrdiff_t>(token) * kHidden, kHidden,
-                    decode_x.begin());
-        DeviceBuffer device_decode        = to_device_bf16(decode_x);
-        const std::int32_t initial_slot   = token == 0 ? kInitial : token - 1;
-        const std::int32_t snapshot_base  = token;
-        DeviceBuffer device_token_initial = to_device(std::vector<std::int32_t>{initial_slot});
-        DeviceBuffer device_token_base    = to_device(std::vector<std::int32_t>{snapshot_base});
-        Tensor x1(device_decode.p, DType::BF16, {kHidden, 1});
-        Tensor token_initial(device_token_initial.p, DType::I32, {1});
-        Tensor token_base(device_token_base.p, DType::I32, {1});
-        Tensor q1 = decode_q.tensor();
-        Tensor k1 = decode_k.tensor();
-        Tensor v1 = decode_v.tensor();
-        Tensor z1 = decode_z.tensor();
-        ops::gdn_input_proj_conv_snapshot(x1, parent.view(), conv, snap_state, Tensor{},
-                                          token_initial, token_base, q1, k1, v1, z1, policy,
-                                          snap_ws, nullptr);
-        cuda_synchronize();
-        const std::string suffix = " col=" + std::to_string(token);
-        failures += compare_packed_column_to_decode("NVFP4 compose vs T=1 snapshot query" + suffix,
-                                                    compose_q, token, decode_q, kQueryRows, kA16);
-        failures += compare_packed_column_to_decode("NVFP4 compose vs T=1 snapshot key" + suffix,
-                                                    compose_k, token, decode_k, kKeyRows, kA16);
-        failures += compare_packed_column_to_decode("NVFP4 compose vs T=1 snapshot value" + suffix,
-                                                    compose_v, token, decode_v, kValueRows, kA16);
-        failures += compare_packed_column_to_decode("NVFP4 compose vs T=1 snapshot z" + suffix,
-                                                    compose_z, token, decode_z, kZRows, kA16);
-        if (failures != 0) { return failures; }
-    }
-    failures += parent.verify_preserved("NVFP4 compose vs T=1 snapshot parent weight");
-    return failures;
-}
-
+// A tree whose parents form a chain reproduces the chain record bit for bit at the widest chain
+// width, which both verify forms register.
 int run_nvfp4_tree_chain_matches_sequential_fused() {
-    constexpr auto policy             = ops::LinearPolicy::A16Only;
+    constexpr auto policy             = ops::LinearPolicy::AllowA8;
     constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
     constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
     constexpr std::int32_t kRows      = 16384;
-    constexpr std::int32_t kWidth     = 12;
+    constexpr std::int32_t kWidth     = ops::kDflash2MaxChainWidth;
     constexpr std::int32_t kSlots     = kWidth + 1;
     constexpr std::int32_t kInitial   = kWidth;
 
@@ -798,10 +362,9 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                                std::vector<std::uint16_t>* carried_state   = nullptr,
                                std::vector<std::uint16_t>* reference_state = nullptr) {
         const std::int32_t aggregate = width * batch;
-        const bool a8 = qtype == QType::NVFP4 && policy == ops::LinearPolicy::AllowA8 &&
-                        width >= ops::detail::kNvfp4FirstA8;
-        const bool quantized =
-            a8 || (qtype == QType::NVFP4 && policy == ops::LinearPolicy::AllowA4 && width >= 5);
+        // NVFP4 records under AllowA8 only; FP8 keeps A16 arithmetic under either policy.
+        const bool a8            = qtype == QType::NVFP4;
+        const bool quantized     = a8;
         const std::int32_t slots = aggregate + batch + 1;
         const bool dense         = valid_columns.empty();
         if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
@@ -868,12 +431,6 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
         GuardedBf16Tensor serial_v(kValueRows, aggregate);
         GuardedBf16Tensor serial_z(kZRows, aggregate);
         GuardedBf16Tensor serial_record(kChannels, aggregate);
-        GuardedBf16Tensor legacy_q(kQueryRows, aggregate);
-        GuardedBf16Tensor legacy_k(kKeyRows, aggregate);
-        GuardedBf16Tensor legacy_v(kValueRows, aggregate);
-        GuardedBf16Tensor legacy_z(kZRows, aggregate);
-        GuardedBf16Tensor legacy_record(kChannels, aggregate);
-        DeviceBuffer legacy_state = to_device(state_before);
 
         Tensor x(device_x.p, DType::BF16, {kHidden, width, batch});
         Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
@@ -896,12 +453,6 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
         Tensor sv(serial_v.data(), DType::BF16, {kValueRows, width, batch});
         Tensor sz(serial_z.data(), DType::BF16, {kZRows, width, batch});
         Tensor sr(serial_record.data(), DType::BF16, {kChannels, width, batch});
-        Tensor legacy_state_view(legacy_state.p, DType::BF16, {kChannels, 3, slots});
-        Tensor lq(legacy_q.data(), DType::BF16, {kQueryRows, width, batch});
-        Tensor lk(legacy_k.data(), DType::BF16, {kKeyRows, width, batch});
-        Tensor lv(legacy_v.data(), DType::BF16, {kValueRows, width, batch});
-        Tensor lz(legacy_z.data(), DType::BF16, {kZRows, width, batch});
-        Tensor lr(legacy_record.data(), DType::BF16, {kChannels, width, batch});
 
         // Exercise the adaptive interval: every A8 width is fused, so [2,6] is sized by W6.
         const bool interval = qtype == QType::NVFP4 && policy == ops::LinearPolicy::AllowA8 &&
@@ -912,13 +463,6 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
         ops::gdn_input_proj_conv_record(x, parent.view(), conv, batched_state_view, valid, initial,
                                         br, bq, bk, bv, bz, policy, batched_ws, nullptr,
                                         parent_indices.empty() ? nullptr : &parent_index);
-        if (qtype == QType::NVFP4 && !quantized && (width == 4 || width == 5 || width == 6)) {
-            ops::detail::nvfp4_gdn_record_t1_fused_launch(
-                x, parent.view(), conv, legacy_state_view, valid, initial, lr, lq, lk, lv, lz,
-                nullptr,
-                parent_indices.empty() ? nullptr
-                                       : static_cast<const std::int32_t*>(parent_index.data));
-        }
         const std::size_t serial_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             qtype, kRows, kHidden, policy, 1, width, width);
         WorkspaceArena serial_ws(std::max<std::size_t>(256, serial_bytes));
@@ -1025,55 +569,17 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                                                           a8_record.bits(), batched_record.bits(),
                                                           kChannels, width, batch, valid_columns);
                 }
-            } else {
-                const auto encoded =
-                    nvfp4_activation_reference(activation, parent.view().input_scale_divisor);
-                represented = encoded.represented;
-                WorkspaceArena codec_workspace(
-                    ops::detail::nvfp4_w4a4_workspace_capacity_bytes(aggregate, kHidden));
-                const auto scratch =
-                    ops::detail::allocate_nvfp4_w4a4_workspace(codec_workspace, aggregate, kHidden);
-                ops::detail::launch_nvfp4_w4a4_quantize(x.view({kHidden, aggregate}), parent.view(),
-                                                        scratch, nullptr);
-                // The quantizer writes [256 tokens x 16 groups] scale tiles (nvfp4_config.h) and
-                // leaves the padding token rows beyond the last 16-token fragment unspecified, so
-                // gather only the logical token rows into the reference's row-major
-                // [token, group] order.
-                constexpr std::size_t kGroups     = kHidden / 16;
-                constexpr std::size_t kTileGroups = ops::detail::kNvfp4ScaleTileGroups;
-                constexpr std::size_t kTileTokens = ops::detail::kNvfp4TmaBlockM;
-                std::vector<std::uint8_t> codes(encoded.codes.size()),
-                    scales(encoded.scales.size());
-                CUDA_CHECK(
-                    cudaMemcpy(codes.data(), scratch.codes, codes.size(), cudaMemcpyDeviceToHost));
-                const auto tokens = static_cast<std::size_t>(aggregate);
-                for (std::size_t token0 = 0; token0 < tokens; token0 += kTileTokens) {
-                    const std::size_t tile_tokens = std::min(kTileTokens, tokens - token0);
-                    for (std::size_t group0 = 0; group0 < kGroups; group0 += kTileGroups) {
-                        const std::size_t tile =
-                            token0 / kTileTokens * (kGroups / kTileGroups) + group0 / kTileGroups;
-                        CUDA_CHECK(cudaMemcpy2D(scales.data() + token0 * kGroups + group0, kGroups,
-                                                scratch.scales + tile * kTileTokens * kTileGroups,
-                                                kTileGroups, kTileGroups, tile_tokens,
-                                                cudaMemcpyDeviceToHost));
-                    }
-                }
-                if (codes != encoded.codes || scales != encoded.scales) {
-                    std::cerr << label
-                              << ": activation codec differs from exact independent reference\n";
-                    ++failures;
-                }
             }
             failures += verify_record_oracle(
                 label + " codec residual", parent.host, represented, conv_weight_bits, state_before,
                 initial_slots, valid_columns, parent_indices, batched_q, batched_k, batched_v,
                 batched_z, batched_record, kHidden, kValueRows, width, batch,
-                kNvfp4RecordA4ResidualTolerance, &quantized_oracle);
+                kNvfp4RecordA8ResidualTolerance, &quantized_oracle);
             failures += verify_record_oracle(
                 label + " canonical", parent.host, activation, conv_weight_bits, state_before,
                 initial_slots, valid_columns, parent_indices, batched_q, batched_k, batched_v,
                 batched_z, batched_record, kHidden, kValueRows, width, batch,
-                kNvfp4RecordA4ResidualTolerance, nullptr, &quantized_oracle);
+                kNvfp4RecordA8ResidualTolerance, nullptr, &quantized_oracle);
             if (reference_state) {
                 // This second residual check carries independently evolved BF16 history,
                 // rather than resetting to the candidate's represented incoming state.
@@ -1081,7 +587,7 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                     label + " carried history", parent.host, represented, conv_weight_bits,
                     *reference_state, initial_slots, valid_columns, parent_indices, batched_q,
                     batched_k, batched_v, batched_z, batched_record, kHidden, kValueRows, width,
-                    batch, kNvfp4RecordA4ResidualTolerance);
+                    batch, kNvfp4RecordA8ResidualTolerance);
                 *carried_state         = state_before;
                 const auto record_bits = batched_record.bits();
                 for (int b = 0; b < batch; ++b) {
@@ -1140,22 +646,6 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                 initial_slots, valid_columns, parent_indices, serial_q, serial_k, serial_v,
                 serial_z, serial_record, kHidden, kValueRows, width, batch, criterion);
         }
-        if (qtype == QType::NVFP4 && !quantized && (width == 4 || width == 5 || width == 6)) {
-            failures += verify_equal(label + " legacy T1 query", batched_q.bits(), legacy_q.bits());
-            failures += verify_equal(label + " legacy T1 key", batched_k.bits(), legacy_k.bits());
-            failures += verify_equal(label + " legacy T1 value", batched_v.bits(), legacy_v.bits());
-            failures += verify_equal(label + " legacy T1 z", batched_z.bits(), legacy_z.bits());
-            failures += verify_valid_record_equal(label + " legacy T1 conv_record",
-                                                  batched_record.bits(), legacy_record.bits(),
-                                                  kChannels, width, batch, valid_columns);
-            failures += verify_equal(label + " legacy T1 source state", state_before,
-                                     from_device<std::uint16_t>(legacy_state, state_before.size()));
-            failures += legacy_q.verify_guards(label + " legacy T1 query");
-            failures += legacy_k.verify_guards(label + " legacy T1 key");
-            failures += legacy_v.verify_guards(label + " legacy T1 value");
-            failures += legacy_z.verify_guards(label + " legacy T1 z");
-            failures += legacy_record.verify_guards(label + " legacy T1 conv_record");
-        }
         failures += batched_q.verify_guards(label + " batched query");
         failures += batched_k.verify_guards(label + " batched key");
         failures += batched_v.verify_guards(label + " batched value");
@@ -1203,7 +693,6 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     failures += run_shape(2, 2, {}, {}, 1983U);
     failures += run_shape(2, 3, {}, {}, 1987U);
     failures += run_shape(2, 4, {2, 2, 1, 1}, {}, 1991U);
-    failures += run_shape(2, 4, {2, 2, 2, 1}, {-1, 0, -1, 0, -1, 0, -1, 0}, 1997U);
     failures += run_shape(5, 2, {}, {}, 2011U);
     failures += run_shape(5, 3, {}, {}, 2021U);
     failures += run_shape(5, 4, {}, {}, 2031U);
@@ -1231,27 +720,18 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
             failures += run_shape(width, batch, valid, parents, 2760U + width * 8 + batch);
         }
     }
-    if (qtype == QType::NVFP4 && policy == ops::LinearPolicy::A16Only) {
-        for (int batch : {2, 3, 4}) {
-            failures += run_shape(6, batch, {}, {}, 2600U + batch);
-            std::vector<int> valid(batch), parents(static_cast<std::size_t>(batch) * 6);
-            for (int b = 0; b < batch; ++b) { valid[b] = b + 1 == batch ? 3 : 6; }
-            for (int b = 0; b < batch; ++b)
-                for (int t = 0; t < 6; ++t) parents[b * 6 + t] = t == 0 ? -1 : (t - 1) / 2;
-            failures += run_shape(6, batch, valid, parents, 2610U + batch);
-        }
-    }
-    if (qtype == QType::NVFP4 && policy != ops::LinearPolicy::A16Only) {
-        for (int width : {6, 7, 8, 16}) {
+    if (qtype == QType::NVFP4) {
+        for (int width : {6, 7, 8}) {
             for (int batch : {1, 2, 3, 4, 7, 8}) {
                 std::vector<int> valid(batch);
                 for (int b = 0; b < batch; ++b) { valid[b] = b + 1 == batch ? width - 1 : width; }
                 failures += run_shape(width, batch, valid, {}, 2300U + width * 4 + batch);
             }
         }
-        // Depth-first draft trees at the product tree widths; W*B<=48 runs the fused epilogue.
+        // Depth-first draft trees at the product tree widths; W*B<=48 runs the fused epilogue and
+        // W=16 C=4 the staged projection.
         for (int width : {12, 16}) {
-            for (int batch : {1, 2, 3}) {
+            for (int batch : {1, 2, 3, 4}) {
                 std::vector<int> valid(batch);
                 std::vector<int> tree(static_cast<std::size_t>(width) * batch);
                 for (int b = 0; b < batch; ++b) {
@@ -1264,7 +744,7 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                 failures += run_shape(width, batch, valid, tree, 2500U + width * 4 + batch);
             }
         }
-        for (int width : {4, 5, 6, 8, 16}) {
+        for (int width : {4, 5, 6, 8}) {
             std::vector<std::uint16_t> carried, independent;
             for (int prefix = 1; prefix <= width; ++prefix) {
                 std::vector<int> valid(4);
@@ -1299,47 +779,6 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     return failures;
 }
 
-int verify_nvfp4_grouped_workspace_interval() {
-    constexpr std::int32_t kParentRows = 16384;
-    constexpr std::int32_t kHidden     = 5120;
-    const auto capacity = [&](std::int32_t batch, std::int32_t first, std::int32_t last) {
-        return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            QType::NVFP4, kParentRows, kHidden, ops::LinearPolicy::A16Only, batch, first, last);
-    };
-    const std::size_t width2 = capacity(4, 2, 2);
-    const std::size_t width5 = capacity(4, 5, 5);
-    const std::size_t width6 = capacity(4, 6, 6);
-    int failures             = 0;
-    if (width2 == 0 || width5 <= width2 || capacity(4, 2, 4) != width2 || capacity(4, 3, 4) != 0 ||
-        capacity(4, 5, 16) != width6 || capacity(4, 2, 16) != width6 || capacity(3, 6, 6) != 0 ||
-        capacity(2, 4, 4) != 0 || capacity(3, 4, 4) != 0 || capacity(4, 4, 4) != 0) {
-        std::cerr << "NVFP4 grouped record workspace interval is not the minimum high-water\n";
-        ++failures;
-    }
-    return failures;
-}
-
-int verify_nvfp4_b1_grouped_workspace_interval() {
-    constexpr std::int32_t kParentRows = 16384;
-    constexpr std::int32_t kHidden     = 5120;
-    const auto capacity                = [&](std::int32_t first, std::int32_t last) {
-        return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            QType::NVFP4, kParentRows, kHidden, ops::LinearPolicy::A16Only, 1, first, last);
-    };
-    const std::size_t width5              = capacity(5, 5);
-    const std::size_t width6              = capacity(6, 6);
-    constexpr std::size_t kExpectedWidth5 = 10240ULL * 5ULL * sizeof(float);
-    constexpr std::size_t kExpectedWidth6 = 10240ULL * 6ULL * sizeof(float);
-    if (width5 != kExpectedWidth5 || width6 != kExpectedWidth6 || width6 <= width5 ||
-        capacity(2, 4) != 0 || capacity(4, 5) != width5 || capacity(4, 16) != width6 ||
-        capacity(5, 16) != width6 || capacity(6, 16) != width6 || capacity(2, 16) != width6 ||
-        capacity(7, 16) != 0) {
-        std::cerr << "NVFP4 B=1 grouped record workspace interval is not the minimum high-water\n";
-        return 1;
-    }
-    return 0;
-}
-
 } // namespace
 
 int main() {
@@ -1349,29 +788,15 @@ int main() {
     }
 
     int failures = 0;
-    failures += run_nvfp4();
-    failures += run_nvfp4_tree_column0_matches_decode();
-    failures += run_nvfp4_compose_chain_matches_snapshot();
     failures += run_nvfp4_tree_chain_matches_sequential_fused();
-    const auto report_quantization = [](const char* profile) {
-        std::cout << profile
-                  << " max group relative-L2: canonical=" << maximum_a4_canonical_relative_l2
-                  << " codec-distortion=" << maximum_a4_codec_relative_l2
-                  << " residual=" << maximum_a4_residual_relative_l2 << '\n';
-        maximum_a4_canonical_relative_l2    = maximum_a4_codec_relative_l2 =
-            maximum_a4_residual_relative_l2 = 0;
-    };
-    failures += run_batched_record_qualification(QType::NVFP4, ops::LinearPolicy::AllowA4);
-    report_quantization("A4");
     failures += run_batched_record_qualification(QType::NVFP4, ops::LinearPolicy::AllowA8);
-    report_quantization("A8");
-    failures += run_batched_record_qualification(QType::NVFP4, ops::LinearPolicy::A16Only);
+    std::cout << "A8 max group relative-L2: canonical=" << maximum_a8_canonical_relative_l2
+              << " codec-distortion=" << maximum_a8_codec_relative_l2
+              << " residual=" << maximum_a8_residual_relative_l2 << '\n';
     failures +=
         run_batched_record_qualification(QType::FP8_E4M3FN_ROW_BF16S, ops::LinearPolicy::A16Only);
     failures +=
         run_batched_record_qualification(QType::FP8_E4M3FN_ROW_BF16S, ops::LinearPolicy::AllowA8);
-    failures += verify_nvfp4_grouped_workspace_interval();
-    failures += verify_nvfp4_b1_grouped_workspace_interval();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

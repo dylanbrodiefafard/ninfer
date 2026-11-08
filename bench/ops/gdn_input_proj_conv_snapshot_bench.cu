@@ -3,6 +3,7 @@
 // The timed body is exactly one selected gdn_input_proj_conv_*() public Op call.
 // Production dispatch, kernel topology, and workspace use remain behind that contract.
 
+#include "ninfer/ops/dflash2_path_select.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "core/device.h"
@@ -80,8 +81,8 @@ struct TokenSweep {
 
 struct Options {
     TokenSweep tokens;
-    Form form                      = Form::Snapshot;
-    ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
+    Form form                      = Form::Both;
+    ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA8;
     Execution execution            = Execution::Graph;
     CacheMode cache                = CacheMode::Both;
     int warmup                     = 10;
@@ -205,8 +206,8 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
-                 "  --form snapshot|record|both  Default snapshot.\n"
-                 "  --nvfp4-policy a16|a4|a8     Default a4; A8 is record-only.\n"
+                 "  --form snapshot|record|both  Default both: snapshot at T=1, record above.\n"
+                 "  --nvfp4-policy a16|a4|a8     Default a8; the record requires a8.\n"
                  "  --tokens T                    Exact token extent.\n"
                  "  --sweep START:END[:STEP]      Token sweep (default 1:6).\n\n"
                  "  --batch B                     Snapshot [1,8], record [1,8] (default 1).\n"
@@ -277,7 +278,8 @@ Options parse_options(int argc, char** argv) {
     if (options.flush_bytes > std::numeric_limits<std::size_t>::max()) {
         throw std::invalid_argument("flush buffer does not fit size_t");
     }
-    if (options.batch > 8 || (options.batch > 1 && options.tokens.end > 16) ||
+    // The benchmark records chains (no parent index), which verify at most the widest chain.
+    if (options.batch > ops::kDflash2MaxBatch || options.tokens.end > ops::kDflash2MaxChainWidth ||
         (!options.valid_columns.empty() &&
          (options.batch == 1 || !have_tokens ||
           options.valid_columns.size() != static_cast<std::size_t>(options.batch)))) {
@@ -305,14 +307,19 @@ std::vector<Execution> selected_executions(Execution execution) {
     return {execution};
 }
 
+// NVFP4 registers the snapshot for ordinary decode (T=1) and the ReplaySSM record for verify
+// widths (T>=2).
 std::vector<Form> selected_forms(Form form, std::int32_t tokens) {
-    if (form == Form::Snapshot) return {Form::Snapshot};
+    if (form == Form::Snapshot) {
+        if (tokens != 1) { throw std::invalid_argument("the snapshot is registered for T=1"); }
+        return {Form::Snapshot};
+    }
     if (form == Form::Record) {
         if (tokens < 2) { throw std::invalid_argument("ReplaySSM Record requires T>=2"); }
         return {Form::Record};
     }
     if (tokens == 1) return {Form::Snapshot};
-    return {Form::Snapshot, Form::Record};
+    return {Form::Record};
 }
 
 const char* form_name(Form form) {

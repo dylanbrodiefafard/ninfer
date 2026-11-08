@@ -11,6 +11,17 @@
 
 namespace ninfer::ops::detail {
 
+// Widths from which AllowA8 runs the A8 residual projection. Narrower widths run A16 under either
+// policy, and A16Only is registered only there: its verify launches span at most
+// kDflash2TreeMaxWidth columns.
+inline constexpr std::int32_t kFp8LinearAddFirstA8Residual6144  = 22;
+inline constexpr std::int32_t kFp8LinearAddFirstA8Residual17408 = 25;
+
+[[nodiscard]] constexpr std::int32_t fp8_linear_add_first_a8(std::int32_t input_rows) noexcept {
+    return input_rows == 6144 ? kFp8LinearAddFirstA8Residual6144
+                              : kFp8LinearAddFirstA8Residual17408;
+}
+
 [[nodiscard]] std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
                                                                   std::int32_t input_rows,
                                                                   LinearPolicy policy,

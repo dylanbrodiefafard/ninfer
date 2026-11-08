@@ -22,6 +22,16 @@ inline constexpr int kDflash2PathSelectRngPurpose                   = 16;
 inline constexpr std::int32_t kDflash2TreeMaxWidth                  = 16;
 inline constexpr std::int32_t kDflash2VerifyWidth                   = 12;
 
+// DFlash2 round extents that the drafter and verify projections are compiled for. A draft window
+// k lies in [1, kDflash2MaxDraftTokens]; its proposal block and chain verify block hold k + 1
+// columns per request, a tree verify block holds k + 2 through kDflash2TreeMaxWidth columns, and
+// one packed launch carries at most kDflash2MaxBatch requests.
+inline constexpr std::int32_t kDflash2MaxDraftTokens = 7;
+inline constexpr std::int32_t kDflash2MaxChainWidth  = kDflash2MaxDraftTokens + 1;
+inline constexpr std::int32_t kDflash2MinTreeWidth   = 1 + 2;
+inline constexpr std::int32_t kDflash2MaxBatch       = 8;
+static_assert(kDflash2MaxChainWidth < kDflash2TreeMaxWidth);
+
 /**
  * Op: dflash2_path_select
  *

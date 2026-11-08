@@ -1,7 +1,5 @@
 #include "ninfer/ops/linear.h"
 
-#include "ops/linear/bf16/bf16_config.h"
-#include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
@@ -103,12 +101,12 @@ std::int32_t packed_sequence_group_width(const Tensor& x, const Weight& w,
         detail::is_nvfp4_dflash_w4a4_aggregate_problem(w.n, w.k, policy, sequence_width)) {
         return x.ne[1];
     }
-    // The DFlash conv projection SmallT keeps one lane reduction for every T<=32.
-    if (w.qtype == QType::NVFP4 && sequence_width >= 2 && sequence_width <= 8 &&
+    // The DFlash conv projection SmallT keeps one lane reduction for every pass width.
+    if (w.qtype == QType::NVFP4 && sequence_width >= 2 && sequence_width <= kDflash2MaxChainWidth &&
         x.ne[1] > sequence_width &&
         detail::is_nvfp4_dflash_conv_aggregate_problem(w.n, w.k, policy)) {
-        constexpr std::int32_t kSameReductionTokens = 32;
-        return std::min(x.ne[1], kSameReductionTokens / sequence_width * sequence_width);
+        constexpr std::int32_t kPassTokens = detail::kNvfp4DflashConvProjPassTokens;
+        return std::min(x.ne[1], kPassTokens / sequence_width * sequence_width);
     }
     // The Q4 27B draft head reduces every column in the same order; one pass holds 48 columns.
     if (w.qtype == QType::Q4G64_F16S && policy == LinearPolicy::A16Only && sequence_width >= 2 &&
@@ -134,15 +132,13 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::W8G32_F16S:
         detail::w8_dispatch(x, w, out, policy, stream);
         return;
-    case QType::BF16_CTRL:
-        detail::bf16_dispatch(x, w, out, policy, stream);
-        return;
     case QType::NVFP4:
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::FP8_E4M3FN_ROW_BF16S:
-        detail::fp8_dispatch(x, w, out, policy, workspace, stream);
+        detail::fp8_dispatch(x, w, out, policy, stream);
         return;
+    case QType::BF16_CTRL:
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;
@@ -177,14 +173,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         (void)detail::select_w8_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_w8_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
-    case QType::BF16_CTRL:
-        (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
-        (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
-        return 0;
     case QType::NVFP4:
         if (!detail::is_nvfp4_linear_problem(output_rows, input_rows) ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
-             policy != LinearPolicy::AllowA8)) {
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("linear workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
@@ -192,6 +183,7 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16S:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
+    case QType::BF16_CTRL:
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;

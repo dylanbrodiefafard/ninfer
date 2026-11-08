@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 
@@ -17,7 +16,9 @@ namespace ninfer::ops::detail {
                                                               std::int32_t min_tokens,
                                                               std::int32_t max_tokens);
 
+// The FP8 vocabulary projection [248320,5120]; every other FP8 problem throws
+// std::invalid_argument. It requires no workspace.
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
-                  WorkspaceArena* workspace, cudaStream_t stream);
+                  cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

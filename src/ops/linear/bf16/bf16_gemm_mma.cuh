@@ -1,6 +1,6 @@
 #pragma once
 
-// Dense BF16 x BF16 Tensor Core GEMM shared by pure Linear and semantic Ops.
+// Dense BF16 x BF16 Tensor Core GEMM shared by the fused BF16 attention-input and Linear-add Ops.
 //
 //   C[M,N] = A[M,K] * B[K,N]
 //
@@ -87,15 +87,6 @@ struct Bf16MmaOutputTile {
     __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
                                           float value) const {
         *at(parent_row, token) = __float2bfloat16_rn(value);
-    }
-};
-
-struct Bf16MmaContiguousOutput {
-    __nv_bfloat16* data;
-    std::int32_t leading_dim;
-
-    __device__ __forceinline__ Bf16MmaOutputTile tile(std::int32_t) const {
-        return {data, leading_dim, 0};
     }
 };
 

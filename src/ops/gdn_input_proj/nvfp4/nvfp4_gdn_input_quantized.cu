@@ -1,9 +1,8 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 
-// Both quantized activation profiles preserve the FP32 current projection for record replay.
-
 #include "core/device.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh"
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
@@ -14,9 +13,15 @@ namespace {
 
 using Geometry = Nvfp4GdnInputGeometry;
 
+// FP32 q/k/v and BF16 z of the staged A8 record projection, which runs only for launches wider
+// than the fused record tile.
 struct GdnFp32ProjectionOutput {
     float* qkv;
     __nv_bfloat16* z;
+
+    static constexpr bool reachable_panels(int panels) {
+        return nvfp4_gdn_a8_staged_record_panels(panels);
+    }
 
     __device__ __forceinline__ void store_fp32(int row, int token, float value) const {
         if (row < 10240) {
@@ -44,12 +49,6 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4W4a4Workspac
 
 } // namespace
 
-void nvfp4_gdn_input_w4a8_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                      Fp8A8Workspace workspace, cudaStream_t stream) {
-    launch_fp8_a8_quantize(x, weight, workspace, stream);
-    nvfp4_gdn_input_w4a8_fp32_project(weight, x.ne[1], workspace, qkv, z, stream);
-}
-
 void nvfp4_gdn_input_w4a8_fp32_project(const Weight& weight, std::int32_t tokens,
                                        Fp8A8Workspace activation, Tensor& qkv, Tensor& z,
                                        cudaStream_t stream) {
@@ -57,22 +56,6 @@ void nvfp4_gdn_input_w4a8_fp32_project(const Weight& weight, std::int32_t tokens
         weight, tokens, activation, Nvfp4IdentityEpilogue{},
         GdnFp32ProjectionOutput{static_cast<float*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)},
         stream);
-}
-
-void nvfp4_gdn_input_w4a4_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                      Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
-    using Schedule   = Nvfp4W4a4M32N64S4;
-    const int tokens = x.ne[1];
-    const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN,
-                    (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
-    const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    launch_nvfp4_w4a4_mma<Geometry, Schedule, Nvfp4IdentityEpilogue, GdnFp32ProjectionOutput>(
-        grid, stream, Nvfp4W4a4MaterializedActivation{workspace.codes, workspace.scales},
-        static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
-        GdnFp32ProjectionOutput{static_cast<float*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)},
-        Nvfp4W4a4IdentityRows{});
 }
 
 void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,

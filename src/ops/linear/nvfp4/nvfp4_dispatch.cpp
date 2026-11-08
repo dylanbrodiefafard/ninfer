@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -16,53 +17,7 @@ namespace {
 enum class Nvfp4LinearRoute : std::uint8_t {
     A16,
     W4A4,
-    W4A8,
 };
-
-Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
-                               LinearPolicy policy, std::int32_t tokens) {
-    if (tokens <= 0 || !is_nvfp4_linear_problem(output_rows, input_rows)) {
-        throw std::invalid_argument("nvfp4 linear: unsupported shape");
-    }
-    if (policy == LinearPolicy::A16Only) { return Nvfp4LinearRoute::A16; }
-    if (policy == LinearPolicy::AllowA8) {
-        const auto problem = resolve_nvfp4_problem(output_rows, input_rows);
-        return tokens >= kNvfp4FirstA8 &&
-                       (problem == Nvfp4Problem::AttnInput || problem == Nvfp4Problem::GdnInput ||
-                        problem == Nvfp4Problem::MlpGateUp ||
-                        problem == Nvfp4Problem::Residual6144 ||
-                        problem == Nvfp4Problem::Residual17408)
-                   ? Nvfp4LinearRoute::W4A8
-                   : Nvfp4LinearRoute::A16;
-    }
-    if (policy != LinearPolicy::AllowA4) {
-        throw std::invalid_argument("nvfp4 linear: unsupported policy");
-    }
-
-    switch (resolve_nvfp4_problem(output_rows, input_rows)) {
-    case Nvfp4Problem::AttnInput:
-        return tokens >= kNvfp4FirstW4a4AttnInput ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
-    case Nvfp4Problem::GdnInput:
-        return tokens >= kNvfp4FirstW4a4GdnInput ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
-    case Nvfp4Problem::MlpGateUp:
-        return tokens >= kNvfp4FirstW4a4MlpGateUp ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
-    case Nvfp4Problem::Residual6144:
-        return tokens >= kNvfp4FirstW4a4Residual6144 ? Nvfp4LinearRoute::W4A4
-                                                     : Nvfp4LinearRoute::A16;
-    case Nvfp4Problem::Residual17408:
-        return tokens >= kNvfp4FirstW4a4Residual17408 ? Nvfp4LinearRoute::W4A4
-                                                      : Nvfp4LinearRoute::A16;
-    case Nvfp4Problem::DflashFeature:
-    case Nvfp4Problem::DflashQkv:
-    case Nvfp4Problem::DflashAttnOut:
-    case Nvfp4Problem::DflashConvProj:
-    case Nvfp4Problem::DflashSelector:
-        return Nvfp4LinearRoute::A16;
-    case Nvfp4Problem::MtpFc:
-        return tokens >= kNvfp4FirstW4a4MtpFc ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
-    }
-    throw std::logic_error("unreachable NVFP4 linear problem");
-}
 
 // DFlash qkv, attention-output and feature projections run BF16 activations on tensor cores for
 // T>=2; T=1 keeps the GEMV decode kernel.
@@ -70,6 +25,62 @@ bool a16_uses_mma(Nvfp4Problem problem, std::int32_t tokens) {
     return tokens >= 2 &&
            (problem == Nvfp4Problem::DflashQkv || problem == Nvfp4Problem::DflashAttnOut ||
             problem == Nvfp4Problem::DflashFeature);
+}
+
+// Width from which AllowA4 selects W4A4 for problem; the DFlash2-only problems never do.
+std::int32_t first_w4a4_tokens(Nvfp4Problem problem) {
+    switch (problem) {
+    case Nvfp4Problem::AttnInput:
+        return kNvfp4FirstW4a4AttnInput;
+    case Nvfp4Problem::GdnInput:
+        return kNvfp4FirstW4a4GdnInput;
+    case Nvfp4Problem::MlpGateUp:
+        return kNvfp4FirstW4a4MlpGateUp;
+    case Nvfp4Problem::Residual6144:
+        return kNvfp4FirstW4a4Residual6144;
+    case Nvfp4Problem::Residual17408:
+        return kNvfp4FirstW4a4Residual17408;
+    case Nvfp4Problem::MtpFc:
+        return kNvfp4FirstW4a4MtpFc;
+    case Nvfp4Problem::DflashFeature:
+    case Nvfp4Problem::DflashQkv:
+    case Nvfp4Problem::DflashAttnOut:
+    case Nvfp4Problem::DflashConvProj:
+    case Nvfp4Problem::DflashSelector:
+        return std::numeric_limits<std::int32_t>::max();
+    }
+    throw std::logic_error("unreachable NVFP4 linear problem");
+}
+
+// Whether the A16 route has a kernel for every launch it splits tokens into: the T=1 GEMV, the
+// DFlash A16 MMA, or kNvfp4LastSmallT-column SmallT chunks plus one remainder.
+bool a16_tokens_registered(Nvfp4Problem problem, std::int32_t tokens) {
+    if (tokens == 1 || a16_uses_mma(problem, tokens)) { return true; }
+    const std::int32_t full_chunks = tokens / kNvfp4LastSmallT;
+    const std::int32_t remainder   = tokens % kNvfp4LastSmallT;
+    return (full_chunks == 0 || nvfp4_linear_small_t_admitted(problem, kNvfp4LastSmallT)) &&
+           (remainder <= 1 || nvfp4_linear_small_t_admitted(problem, remainder));
+}
+
+Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
+                               LinearPolicy policy, std::int32_t tokens) {
+    if (tokens <= 0 || !is_nvfp4_linear_problem(output_rows, input_rows)) {
+        throw std::invalid_argument("nvfp4 linear: unsupported shape");
+    }
+    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
+        throw std::invalid_argument("nvfp4 linear: unsupported policy");
+    }
+    const Nvfp4Problem problem = resolve_nvfp4_problem(output_rows, input_rows);
+    if (policy == LinearPolicy::AllowA4 && tokens >= first_w4a4_tokens(problem)) {
+        if (!nvfp4_linear_w4a4_admitted(problem, tokens)) {
+            throw std::invalid_argument("nvfp4 linear: W4A4 is not registered for this problem/T");
+        }
+        return Nvfp4LinearRoute::W4A4;
+    }
+    if (!a16_tokens_registered(problem, tokens)) {
+        throw std::invalid_argument("nvfp4 linear: A16 is not registered for this problem/T");
+    }
+    return Nvfp4LinearRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -113,7 +124,7 @@ bool is_nvfp4_dflash_w4a4_aggregate_problem(std::int32_t output_rows, std::int32
     }
     const Nvfp4Problem problem = resolve_nvfp4_problem(output_rows, input_rows);
     return (problem == Nvfp4Problem::MlpGateUp || problem == Nvfp4Problem::Residual17408) &&
-           resolve_route(output_rows, input_rows, policy, sequence_width) == Nvfp4LinearRoute::W4A4;
+           sequence_width >= first_w4a4_tokens(problem);
 }
 
 bool is_nvfp4_dflash_conv_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
@@ -129,9 +140,6 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
         throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
     }
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
-    if (resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearRoute::W4A8) {
-        return fp8_a8_workspace_capacity_bytes(max_tokens, input_rows);
-    }
     return resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearRoute::W4A4
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows)
                : 0;
@@ -146,13 +154,6 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
 
     if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearRoute::A16) {
         launch_a16(x, weight, out, stream);
-        return;
-    }
-    if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearRoute::W4A8) {
-        if (!workspace) { throw std::invalid_argument("NVFP4 A8 requires workspace"); }
-        auto scope   = workspace->scope();
-        auto scratch = allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k);
-        launch_nvfp4_w4a8(x, weight, out, scratch, stream);
         return;
     }
     if (workspace == nullptr) {

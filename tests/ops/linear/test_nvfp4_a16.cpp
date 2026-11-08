@@ -1,6 +1,7 @@
 #include "ops/linear/linear_test_common.h"
 
 #include <array>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 
@@ -10,17 +11,18 @@ using namespace ninfer;
 using namespace ninfer::test::linear;
 
 int run_nvfp4_a16() {
-    constexpr std::array attn_invocations{
+    // Every registered problem keeps the T=1 GEMV; the Text projections run no other generic A16
+    // width.
+    constexpr std::array decode_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    // The DFlash MLP down runs A16 SmallT only at the k=1 proposal width.
+    constexpr std::array down_invocations{
         Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{2, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{20, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
-    constexpr std::array new_problem_invocations{
+    // The DFlash feature, QKV and attention-output projections run the A16 MMA at every T>=2.
+    constexpr std::array mma_invocations{
         Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{5, CallForm::Policy, ops::LinearPolicy::A16Only},
@@ -31,6 +33,8 @@ int run_nvfp4_a16() {
         Invocation{20, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{30, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{56, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{64, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
     // One width inside every DFlash feature-projection prefill tier
     // (nvfp4_dflash_feature_a16_tile).
@@ -43,32 +47,73 @@ int run_nvfp4_a16() {
         Invocation{600, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{1000, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
+    // Conv projection passes: m blocks of a W=2..8 proposal width within one 32-column pass.
+    constexpr std::array conv_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{2, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{5, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{10, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{15, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{20, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{30, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    // The selector projection runs at T=k for a draft window k=1..7.
+    constexpr std::array selector_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{2, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{5, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{7, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    // MTP fc keeps every A16 SmallT width.
+    constexpr std::array mtp_fc_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{5, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{10, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{15, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{20, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{30, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
     int failures = 0;
+
+    struct TextProblem {
+        std::int32_t n;
+        std::int32_t k;
+        std::uint32_t seed;
+    };
+
+    for (const TextProblem problem :
+         {TextProblem{14336, 5120, 701U}, TextProblem{16384, 5120, 703U},
+          TextProblem{34816, 5120, 704U}, TextProblem{5120, 6144, 705U}}) {
+        failures += run_shape(
+            "NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+            {problem.n, problem.k, problem.seed, Comparison::Sampled, true, decode_invocations});
+    }
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {14336, 5120, 701U, Comparison::Sampled, true, attn_invocations});
+                          {5120, 17408, 707U, Comparison::Sampled, true, down_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {16384, 5120, 703U, Comparison::Sampled, true, new_problem_invocations});
-    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {34816, 5120, 704U, Comparison::Sampled, true, new_problem_invocations});
-    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {5120, 6144, 705U, Comparison::Sampled, true, new_problem_invocations});
-    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
-    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {5120, 25600, 709U, Comparison::Sampled, true, new_problem_invocations});
+                          {5120, 25600, 709U, Comparison::Sampled, true, mma_invocations});
     failures +=
         run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                   {5120, 25600, 710U, Comparison::Sampled, true, feature_prefill_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {6144, 5120, 711U, Comparison::Sampled, true, new_problem_invocations});
+                          {6144, 5120, 711U, Comparison::Sampled, true, mma_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {5120, 4096, 713U, Comparison::Sampled, true, new_problem_invocations});
+                          {5120, 4096, 713U, Comparison::Sampled, true, mma_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {1280, 5120, 719U, Comparison::Sampled, true, new_problem_invocations});
+                          {1280, 5120, 719U, Comparison::Sampled, true, conv_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {256, 5120, 721U, Comparison::Sampled, true, new_problem_invocations});
+                          {256, 5120, 721U, Comparison::Sampled, true, selector_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                          {5120, 10240, 723U, Comparison::Sampled, true, new_problem_invocations});
+                          {5120, 10240, 723U, Comparison::Sampled, true, mtp_fc_invocations});
     constexpr std::array<std::int32_t, 5> dflash_batches{2, 3, 4, 5, 6};
     // W=1 must remain GEMV panels; widths 2..6 share the same MMA reduction.
     for (const std::int32_t width : {1, 2, 3, 4, 5, 6}) {

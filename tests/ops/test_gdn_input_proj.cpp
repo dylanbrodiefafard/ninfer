@@ -153,8 +153,9 @@ int run_nvfp4() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 607U, options));
     int failures = 0;
+    // A16Only is registered at T=1 and below the W4A4 cutover.
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
-    failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
+    failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::A16Only);
     for (const std::int32_t tokens :
          {1,   2,   3,   4,   5,   6,   8,   10,  12,   15,   18,   24,   36,
           100, 240, 255, 256, 257, 400, 600, 777, 1024, 1025, 1279, 2048, 4096}) {

@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 
@@ -51,27 +52,30 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_exact<Geometry, kFp8FirstSmallT + static_cast<int>(Offsets)>...};
 }
 
+// One launcher per A16 width below the projection's A8 width.
 template <class Geometry>
-const auto& launchers() {
+void launch_below_a8(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
+    constexpr std::int32_t kFirstA8 = fp8_linear_add_first_a8(Geometry::kInputRows);
+    static_assert(kFirstA8 - 1 <= kFp8LastSmallT);
     static constexpr auto kLaunchers =
-        make_launchers<Geometry>(std::make_index_sequence<kFp8LastSmallT - kFp8FirstSmallT + 1>{});
-    return kLaunchers;
+        make_launchers<Geometry>(std::make_index_sequence<kFirstA8 - kFp8FirstSmallT>{});
+    const std::int32_t tokens = x.ne[1];
+    if (tokens < kFp8FirstSmallT || tokens >= kFirstA8) {
+        throw std::invalid_argument("fp8 linear_add small-T: T is at or above the A8 width");
+    }
+    kLaunchers[static_cast<std::size_t>(tokens - kFp8FirstSmallT)](x, weight, residual, stream);
 }
 
 } // namespace
 
 void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                    cudaStream_t stream) {
-    if (x.ne[1] < kFp8FirstSmallT || x.ne[1] > kFp8LastSmallT) {
-        throw std::invalid_argument("fp8 linear_add small-T: unsupported T");
-    }
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT);
     switch (resolve_fp8_problem(weight.n, weight.k)) {
     case Fp8Problem::Residual6144:
-        launchers<Fp8Residual6144Geometry>()[index](x, weight, residual, stream);
+        launch_below_a8<Fp8Residual6144Geometry>(x, weight, residual, stream);
         return;
     case Fp8Problem::Residual17408:
-        launchers<Fp8Residual17408Geometry>()[index](x, weight, residual, stream);
+        launch_below_a8<Fp8Residual17408Geometry>(x, weight, residual, stream);
         return;
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:

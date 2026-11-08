@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/a4_activation.h"
+#include "ninfer/ops/dflash2_path_select.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -323,6 +324,15 @@ static_assert(nvfp4_w4a4_route(Nvfp4Problem::Residual17408, kNvfp4W4a4LastMmaTok
 static_assert(nvfp4_w4a4_route(Nvfp4Problem::MtpFc, kNvfp4W4a4LastMmaTokens + 1) ==
               Nvfp4W4a4Route::Tma);
 
+// The W4A8 MMA's wide path (N > 6144) compiles its eight-token panel count per launch; widths
+// above kNvfp4W4a8WideMaxPanels panels repeat the 64-token tile.
+inline constexpr int kNvfp4W4a8WideMaxPanels = 8;
+
+[[nodiscard]] constexpr int nvfp4_w4a8_wide_panels(std::int32_t tokens) {
+    const int panels = (tokens + 7) / 8;
+    return panels < kNvfp4W4a8WideMaxPanels ? panels : kNvfp4W4a8WideMaxPanels;
+}
+
 // Token tiles of the BF16-activation (A16) MMA for the DFlash context projections above 48 tokens,
 // which run once per prefill chunk: the feature projection [5120, 25600] and the context K/V
 // projection (the K and V row blocks of [6144, 5120], 2048 rows). Narrow keeps the narrow
@@ -334,8 +344,10 @@ enum class Nvfp4A16PrefillTile : std::uint8_t { Narrow, M64N32, M64N64, M64N128 
 // SM), so each width picks the tile whose CTA count fills those waves best. The tables are the
 // per-width winners measured on the RTX 5090 with cold L2 (ninfer_linear_bench,
 // ninfer_linear_kv_projection_bench).
+inline constexpr std::int32_t kNvfp4DflashFeatureLastNarrowTokens = 48;
+
 [[nodiscard]] constexpr Nvfp4A16PrefillTile nvfp4_dflash_feature_a16_tile(std::int32_t tokens) {
-    if (tokens <= 48) { return Nvfp4A16PrefillTile::Narrow; }
+    if (tokens <= kNvfp4DflashFeatureLastNarrowTokens) { return Nvfp4A16PrefillTile::Narrow; }
     if (tokens <= 64) { return Nvfp4A16PrefillTile::M64N32; }
     if (tokens <= 128) { return Nvfp4A16PrefillTile::M64N64; }
     if (tokens <= 256) { return Nvfp4A16PrefillTile::M64N128; }
@@ -344,6 +356,18 @@ enum class Nvfp4A16PrefillTile : std::uint8_t { Narrow, M64N32, M64N64, M64N128 
     if (tokens <= 640) { return Nvfp4A16PrefillTile::M64N64; }
     return Nvfp4A16PrefillTile::M64N128;
 }
+
+// The feature table keeps only widths through kNvfp4DflashFeatureLastNarrowTokens on the narrow
+// family, so the feature projection never instantiates the narrow family's 64-token tile. The
+// table is constant above its last breakpoint, which this check covers.
+[[nodiscard]] constexpr bool nvfp4_dflash_feature_narrow_only_through_last() {
+    for (std::int32_t tokens = kNvfp4DflashFeatureLastNarrowTokens + 1; tokens <= 1024; ++tokens) {
+        if (nvfp4_dflash_feature_a16_tile(tokens) == Nvfp4A16PrefillTile::Narrow) { return false; }
+    }
+    return true;
+}
+
+static_assert(nvfp4_dflash_feature_narrow_only_through_last());
 
 [[nodiscard]] constexpr Nvfp4A16PrefillTile nvfp4_dflash_kv_a16_tile(std::int32_t tokens) {
     if (tokens <= 64) { return Nvfp4A16PrefillTile::Narrow; }
@@ -386,38 +410,119 @@ inline constexpr std::int32_t kNvfp4FirstW4a4MtpFc         = 8;
 // AllowA8 is the verification policy: every verify width (W>=2) and aggregate uses W4A8, so a
 // request's arithmetic does not depend on its draft width or batch. T=1 stays on the A16 GEMV.
 inline constexpr std::int32_t kNvfp4FirstA8 = 2;
-// Tree/chain verify is W<=16. AllowA8 conv-record is W4A8 at every width; under A16, packed
-// GDN conv-record uses fused SmallT for B=1 W=4,
-// grouped SmallT replay for B=1 W=5/6 and B=2..6 W=2/5, fused T=1-reduction
-// GEMV+FP32 conv for other B=1 widths, and one same-reduction request-indexed SmallT
-// grid for other B>1 widths. Snapshot T=2..16 stays fused SmallT. W4A4 Materialized
-// compose is prefill.
-inline constexpr std::int32_t kNvfp4LastPackedGdnConvSmallT = 16;
 
-// RTX 5090 cold-cache winners for contiguous Linear output. T=2..4 amortizes activation loads
-// through shared staging; T=5..32 keeps one packed activation tile per warp. The warp-count changes
-// are measured occupancy/register crossovers, not semantic frontiers.
+// Generic NVFP4 Linear serves the DFlash2 drafter (whose packed proposal launches span at most
+// kNvfp4DflashMaxProposalTokens columns) and MTP fc; Text projections run through their fused
+// Ops. The predicates below are the token counts those callers launch, and dispatchers
+// instantiate only kernels for them.
+inline constexpr std::int32_t kNvfp4DflashMaxProposalTokens =
+    kDflash2MaxChainWidth * kDflash2MaxBatch;
+// The DFlash conv projection packs proposal blocks into passes of at most this many columns, the
+// widest SmallT instance, so every pass keeps the lane reduction of its per-request panels.
+inline constexpr std::int32_t kNvfp4DflashConvProjPassTokens = kNvfp4LastSmallT;
+
+// Whether some packed DFlash conv projection pass has T columns: m blocks of W = k + 1 columns,
+// with m at most the batch bound and the blocks that fit one pass.
+[[nodiscard]] constexpr bool nvfp4_dflash_conv_proj_pass_tokens(std::int32_t tokens) {
+    for (std::int32_t width = 2; width <= kDflash2MaxChainWidth; ++width) {
+        const std::int32_t max_blocks = kDflash2MaxBatch < kNvfp4DflashConvProjPassTokens / width
+                                            ? kDflash2MaxBatch
+                                            : kNvfp4DflashConvProjPassTokens / width;
+        if (tokens % width == 0 && tokens / width <= max_blocks) { return true; }
+    }
+    return false;
+}
+
+// Token counts in [kNvfp4FirstSmallT, kNvfp4LastSmallT] at which generic Linear launches the A16
+// SmallT kernel: the DFlash MLP down at the k=1 proposal width (wider blocks take W4A4), the conv
+// projection passes, the selector projection at T=k, and MTP fc. The DFlash feature, QKV and
+// attention-output projections run the A16 MMA at T>=2 instead.
+[[nodiscard]] constexpr bool nvfp4_linear_small_t_admitted(Nvfp4Problem problem,
+                                                           std::int32_t tokens) {
+    if (tokens < kNvfp4FirstSmallT || tokens > kNvfp4LastSmallT) { return false; }
+    switch (problem) {
+    case Nvfp4Problem::Residual17408:
+        return tokens < kNvfp4FirstW4a4Residual17408;
+    case Nvfp4Problem::DflashConvProj:
+        return nvfp4_dflash_conv_proj_pass_tokens(tokens);
+    case Nvfp4Problem::DflashSelector:
+        return tokens <= kDflash2MaxDraftTokens;
+    case Nvfp4Problem::MtpFc:
+        return true;
+    case Nvfp4Problem::AttnInput:
+    case Nvfp4Problem::GdnInput:
+    case Nvfp4Problem::MlpGateUp:
+    case Nvfp4Problem::Residual6144:
+    case Nvfp4Problem::DflashFeature:
+    case Nvfp4Problem::DflashQkv:
+    case Nvfp4Problem::DflashAttnOut:
+        return false;
+    }
+    return false;
+}
+
+// Token counts at which generic Linear under AllowA4 launches W4A4: the DFlash MLP gate/up and
+// down from their cutovers through the widest packed proposal, and MTP fc from its cutover.
+[[nodiscard]] constexpr bool nvfp4_linear_w4a4_admitted(Nvfp4Problem problem, std::int32_t tokens) {
+    switch (problem) {
+    case Nvfp4Problem::MlpGateUp:
+        return tokens >= kNvfp4FirstW4a4MlpGateUp && tokens <= kNvfp4DflashMaxProposalTokens;
+    case Nvfp4Problem::Residual17408:
+        return tokens >= kNvfp4FirstW4a4Residual17408 && tokens <= kNvfp4DflashMaxProposalTokens;
+    case Nvfp4Problem::MtpFc:
+        return tokens >= kNvfp4FirstW4a4MtpFc;
+    case Nvfp4Problem::AttnInput:
+    case Nvfp4Problem::GdnInput:
+    case Nvfp4Problem::Residual6144:
+    case Nvfp4Problem::DflashFeature:
+    case Nvfp4Problem::DflashQkv:
+    case Nvfp4Problem::DflashAttnOut:
+    case Nvfp4Problem::DflashConvProj:
+    case Nvfp4Problem::DflashSelector:
+        return false;
+    }
+    return false;
+}
+
+// Whether some width admitted by generic Linear selects route for problem. The generic W4A4
+// dispatcher instantiates only these schedules.
+[[nodiscard]] constexpr bool nvfp4_linear_w4a4_route_reachable(Nvfp4Problem problem,
+                                                               Nvfp4W4a4Route route) {
+    for (std::int32_t tokens = 1; tokens <= kNvfp4W4a4LastMmaTokens + 1; ++tokens) {
+        if (nvfp4_linear_w4a4_admitted(problem, tokens) &&
+            nvfp4_w4a4_route(problem, tokens) == route) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static_assert(nvfp4_linear_w4a4_route_reachable(Nvfp4Problem::MlpGateUp, Nvfp4W4a4Route::M32N128));
+static_assert(!nvfp4_linear_w4a4_route_reachable(Nvfp4Problem::MlpGateUp, Nvfp4W4a4Route::Tma));
+
+// RTX 5090 cold-cache winner for contiguous Linear output at the DFlash selector widths
+// (T=2..kDflash2MaxDraftTokens). T=2..4 amortizes activation loads through shared staging; wider
+// panels keep one packed activation tile per warp.
 template <class Geometry, int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta   = ActiveTokens >= 17 ? 4 : (ActiveTokens >= 13 ? 16 : 8);
-    static constexpr int kValuesPerLane = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
+    static_assert(ActiveTokens <= kDflash2MaxDraftTokens);
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
-    using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+    using Type = Nvfp4SmallTSchedule<8, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
-// The DFlash conv projection packs W=2..6 verify requests into passes of up to 32 columns, so
-// every T keeps the 16-value lane reduction of its per-request panels.
+// The DFlash conv projection packs proposal blocks into passes of up to
+// kNvfp4DflashConvProjPassTokens columns, so every T keeps the 16-value lane reduction of its
+// per-request panels. The warp-count changes are measured occupancy/register crossovers, not
+// semantic frontiers.
 template <int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule<Nvfp4DflashConvProjGeometry, ActiveTokens> {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
+    static_assert(ActiveTokens <= kNvfp4DflashConvProjPassTokens);
     static constexpr int kWarpsPerCta = ActiveTokens >= 17 ? 4 : (ActiveTokens >= 13 ? 16 : 8);
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
@@ -427,60 +532,39 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4DflashConvProjGeometry, ActiveTo
                                      Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
-// G1's wider N benefits from keeping four warps per CTA throughout the A16 policy boundary. Only
-// T=2 amortizes activation traffic enough for shared staging to win.
+// The A16 GDN input projection runs only below its W4A4 cutover. It keeps the T=1 GDN GEMV's
+// 8-warp StagedRaw reduction with four accumulator chains and stages its activation columns in
+// shared memory.
 template <int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule<Nvfp4GdnInputGeometry, ActiveTokens> {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    // Same 8-warp / StagedRaw reduction as T=1 GDN GEMV. 4 accumulator chains match
-    // decode through packed verify (T<=16); the A16-only tail keeps one chain.
-    static constexpr int kWarpsPerCta       = 8;
-    static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
-    static constexpr int kAccumulatorChains = ActiveTokens <= 16 ? 4 : 1;
-    static constexpr auto kActivationAccess = ActiveTokens == 2
-                                                  ? Nvfp4SmallTActivationAccess::SharedPhase
-                                                  : Nvfp4SmallTActivationAccess::TokenPacked;
+    static_assert(ActiveTokens < kNvfp4FirstW4a4GdnInput);
     using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, kAccumulatorChains,
-                            kActivationAccess, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default,
-                            1, Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
-};
-
-// At N=5120, R1 needs the larger CTA only for the last three A16 token counts. The unoptimized
-// A16-only tail keeps the established generic schedule.
-// T=2..4: PhaseUnroll=4 is bit-exact; cold +10% / warm ~flat (geometry_sweep_v5).
-template <int ActiveTokens>
-struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Geometry, ActiveTokens> {
-    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta = ActiveTokens <= 16 ? (ActiveTokens >= 14 ? 16 : 4) : 4;
-    // T=20 is the W=5 C=4 aggregate and must retain the T=5 panel reduction association.
-    static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 19 ? 8 : 16;
-    static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
-    static constexpr int kPhaseUnroll       = ActiveTokens <= 4 ? 4 : 1;
-    using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, kPhaseUnroll,
+        Nvfp4SmallTSchedule<8, 1, 2, 16, ActiveTokens, 4, Nvfp4SmallTActivationAccess::SharedPhase,
+                            Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 1,
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
-// R2's longer K moves the stable four-to-sixteen-warp crossover to T=8.
-// T=2..4: PhaseUnroll=4 is bit-exact and wins both cold and warm microbench
-// (ninfer_nvfp4_mlp_down_t4_explore_v5).
+// The residual projections run A16 SmallT only below their W4A4 cutovers (T<=4 at K=6144, T=2 at
+// K=17408), where four-warp CTAs win at N=5120. PhaseUnroll=4 is bit-exact and wins cold on the
+// RTX 5090 at both K.
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Geometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
+    static_assert(ActiveTokens < kNvfp4FirstW4a4Residual6144);
+    using Type =
+        Nvfp4SmallTSchedule<4, 1, 2, 16, ActiveTokens, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+};
+
 template <int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTokens> {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta = ActiveTokens <= 16 ? (ActiveTokens >= 8 ? 16 : 4) : 4;
-    // T=18/20 are W=6 C=3 / W=5 C=4 aggregates and retain their panel reduction association.
-    static constexpr int kValuesPerLane =
-        ActiveTokens >= 17 && ActiveTokens <= 19 && ActiveTokens != 18 ? 8 : 16;
-    static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
-    static constexpr int kPhaseUnroll       = ActiveTokens <= 4 ? 4 : 1;
+    static_assert(ActiveTokens < kNvfp4FirstW4a4Residual17408);
     using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, kPhaseUnroll,
+        Nvfp4SmallTSchedule<4, 1, 2, 16, ActiveTokens, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 

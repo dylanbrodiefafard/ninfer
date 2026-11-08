@@ -2020,14 +2020,6 @@ const char* cache_name(DType dtype) {
     return "int8-g64";
 }
 
-// Sage decode defaults to strict (BF16) P/PV; NINFER_S3_STRICT_PV=0 restores FP4-P.
-// Strict uses the exact dequantized ideal, not the S3 recipe emulation (FP4-P floor
-// sits ~0.05 rel_L2 away from it).
-bool s3_strict_pv() {
-    const char* e = std::getenv("NINFER_S3_STRICT_PV");
-    return e == nullptr || e[0] != '0';
-}
-
 ReductionCriterion attention_criterion(DType dtype, bool sage = false, bool strict_pv = false) {
     if (dtype == DType::BF16) { return kAttentionBf16Criterion; }
     if (dtype == DType::U8) {
@@ -2281,10 +2273,9 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const HostCache initial = make_cache(geometry, dtype, max_context, test_case.seed + 10u, sage);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
-    // Strict P/PV is the sage decode default (small-T widths). Prefill-routed
-    // sage cases keep the S3 FP4-PV recipe, so the strict reference/criterion apply
-    // to the decode cases only. NINFER_S3_STRICT_PV=0 restores FP4-P decode.
-    const bool strict_pv = s3_strict_pv() && test_case.tokens <= geometry.small_t_tokens();
+    // Sage decode (small-T widths) keeps BF16 P/PV and is checked against the exact
+    // dequantized ideal; prefill-routed sage cases use the S3 FP4-PV recipe.
+    const bool strict_pv                = test_case.tokens <= geometry.small_t_tokens();
     const std::vector<double> reference = (sage && !strict_pv)
                                               ? sage_ideal_attention(q, expected, positions)
                                               : ideal_attention(q, expected, positions);
@@ -3230,7 +3221,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
         // signed codes and stored scales rather than comparing to unquantized KV.
         append_cache(cache_host, captured_k, captured_v, captured_positions);
     }
-    const bool strict_pv = s3_strict_pv() && test_case.tokens <= geometry.small_t_tokens();
+    const bool strict_pv                = test_case.tokens <= geometry.small_t_tokens();
     const std::vector<double> reference = (sage && !strict_pv)
                                               ? sage_ideal_attention(q, cache_host, positions)
                                               : ideal_attention(q, cache_host, positions);

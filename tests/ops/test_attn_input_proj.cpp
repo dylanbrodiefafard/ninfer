@@ -1,4 +1,5 @@
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/a4_activation.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
 
@@ -307,7 +308,7 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
 }
 
 int run_nvfp4_panels(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t panel,
-                     ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
+                     ops::LinearPolicy policy) {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQRows       = 6144;
     constexpr std::int32_t kKvRows      = 1024;
@@ -430,13 +431,9 @@ int run_nvfp4_target() {
         quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, kHidden, 331U, options));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 10, 15, 16, 20, 32, 33}) {
+    // A16 serves T=1 and the widths below the W4A4 cutover (kA4AttnInputMinTokens).
+    for (std::int32_t tokens = 1; tokens < ops::kA4AttnInputMinTokens; ++tokens) {
         failures += run_nvfp4_target_case(parent, tokens);
-    }
-    for (const std::int32_t panel : {4, 5, 6}) {
-        for (std::int32_t batch = 2; batch <= 4; ++batch) {
-            failures += run_nvfp4_panels(parent, panel * batch, panel);
-        }
     }
     // Every verify width uses A8; aggregates across C<=8 equal their W-panels.
     for (const std::int32_t panel : {2, 3, 4, 5, 6, 7, 8}) {

@@ -3,6 +3,7 @@
 #include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/dflash2_path_select.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -82,6 +83,10 @@ constexpr std::int32_t kMaximumAggregateVerifyTokens =
     kMaximumAggregateVerifyWidth * static_cast<std::int32_t>(kMaximumConcurrency);
 static_assert(kMaximumAggregateVerifyWidth >=
               static_cast<std::int32_t>(kMaximumDFlashDraftTokens) + 1);
+// The DFlash2 drafter and verify Ops compile only the round extents of ninfer/ops.
+static_assert(static_cast<std::int32_t>(kMaximumDFlashDraftTokens) == ops::kDflash2MaxDraftTokens);
+static_assert(static_cast<std::int32_t>(kMaximumConcurrency) <= ops::kDflash2MaxBatch);
+static_assert(kMaximumAggregateVerifyWidth == ops::kDflash2TreeMaxWidth);
 
 bool aggregate_verify_extent(qwen3_6::TextPhase phase, std::int32_t route_tokens,
                              std::int32_t aggregate_tokens) {
@@ -149,47 +154,16 @@ bool gdn_record_consumes_a8(const GdnProjectionPayload& weights, qwen3_6::TextPh
     return phase == qwen3_6::TextPhase::Verify && weights.query_key_value_z.qtype == QType::NVFP4;
 }
 
-// Packed verify launches Linear at T=width*B. Pin the C=1 width's NVFP4 family so a
-// C>1 aggregate does not flip A16↔W4A4 vs the sequential round. Thresholds match
-// ops/linear/nvfp4/nvfp4_config.h (attn-in 4, residual-6144 5, residual-17408 3).
-ops::LinearPolicy attn_input_packed_policy(const Weight& weight, qwen3_6::TextPhase phase,
-                                           std::int32_t route_tokens,
-                                           std::int32_t aggregate_tokens) {
-    const ops::LinearPolicy policy =
-        text_policy(weight, phase, route_tokens > 0 ? route_tokens : aggregate_tokens);
-    if (route_tokens > 0 && route_tokens < 4 && weight.qtype == QType::NVFP4 &&
-        policy == ops::LinearPolicy::AllowA4) {
-        return ops::LinearPolicy::A16Only;
-    }
-    return policy;
-}
-
-ops::LinearPolicy residual_packed_policy(const Weight& weight, qwen3_6::TextPhase phase,
-                                         std::int32_t route_tokens, std::int32_t aggregate_tokens) {
-    const ops::LinearPolicy policy =
-        text_policy(weight, phase, route_tokens > 0 ? route_tokens : aggregate_tokens);
-    if (route_tokens <= 0 || weight.qtype != QType::NVFP4 || policy != ops::LinearPolicy::AllowA4) {
-        return policy;
-    }
-    // The residual-6144 class covers both attention o_proj (K = query_size) and GDN out_proj
-    // (K = value_dim); this target fixes both widths to one K.
-    static_assert(TextConfig::query_size == TextConfig::value_dim);
-    if (weight.n == TextConfig::hidden && weight.k == TextConfig::query_size && route_tokens < 5) {
-        return ops::LinearPolicy::A16Only;
-    }
-    if (weight.n == TextConfig::hidden && weight.k == TextConfig::intermediate &&
-        route_tokens < 3) {
-        return ops::LinearPolicy::A16Only;
-    }
-    return policy;
+// A packed verify launch at T=width*B selects the C=1 width's policy (route_tokens when nonzero).
+ops::LinearPolicy packed_policy(const Weight& weight, qwen3_6::TextPhase phase,
+                                std::int32_t route_tokens, std::int32_t aggregate_tokens) {
+    return text_policy(weight, phase, route_tokens > 0 ? route_tokens : aggregate_tokens);
 }
 
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
-// Under A16, NVFP4 packed verify B=1 W=4 uses fused SmallT. B=1 W=5/6 and qualified B=2..6
-// W=2/5 and B=2/4 W=6 group requests per weight pass (W=5, B=3 uses one group)
-// and keep the projection in private FP32 workspace. Other B=1 widths retain the
-// fused T=1-reduction route; the other B>1 widths retain request-indexed CTAs.
+// The NVFP4 AllowA8 record needs its activation codes/scales, plus a staged FP32 projection when
+// W*B exceeds the fused record tile.
 std::size_t nvfp4_gdn_record_leaf_bytes(std::int32_t batch, std::int32_t min_width,
                                         std::int32_t max_width) {
     return std::max(kMinimumLeafWorkspaceBytes,
@@ -384,9 +358,8 @@ void Variant::attention_projection(const Tensor& residual, const Tensor& norm_we
         }
         return;
     }
-    const ops::LinearPolicy policy =
-        aggregate ? text_policy(fused, phase, route_tokens)
-                  : attn_input_packed_policy(fused, phase, route_tokens, tokens);
+    const ops::LinearPolicy policy = aggregate ? text_policy(fused, phase, route_tokens)
+                                               : packed_policy(fused, phase, route_tokens, tokens);
     ops::attn_input_proj(hidden, fused, query, gate, key, value, policy, workspace, stream);
 }
 
@@ -426,7 +399,7 @@ void Variant::attention_output_projection(const Tensor& gate, Tensor& attention,
     ops::linear_add(attention, weight, residual,
                     aggregate_verify_residuals(weight.qtype, phase, route_tokens, tokens)
                         ? text_policy(weight, phase, route_tokens)
-                        : residual_packed_policy(weight, phase, route_tokens, tokens),
+                        : packed_policy(weight, phase, route_tokens, tokens),
                     workspace, stream);
 }
 
@@ -492,10 +465,10 @@ void Variant::mtp_attention_output(const Tensor& attention, const Weight& weight
                                    WorkspaceArena& workspace, cudaStream_t stream,
                                    std::int32_t route_tokens) {
     if (weight.qtype == QType::NVFP4) {
-        ops::linear_add(attention, weight, residual,
-                        residual_packed_policy(weight, qwen3_6::TextPhase::Verify, route_tokens,
-                                               attention.ne[1]),
-                        workspace, stream);
+        ops::linear_add(
+            attention, weight, residual,
+            packed_policy(weight, qwen3_6::TextPhase::Verify, route_tokens, attention.ne[1]),
+            workspace, stream);
         return;
     }
     auto scope     = workspace.scope();
@@ -614,7 +587,7 @@ void Variant::gdn_output_projection(const Tensor& output, const Tensor& norm_wei
     ops::linear_add(hidden, weight, residual,
                     aggregate_verify_residuals(weight.qtype, phase, route_tokens, tokens)
                         ? text_policy(weight, phase, route_tokens)
-                        : residual_packed_policy(weight, phase, route_tokens, tokens),
+                        : packed_policy(weight, phase, route_tokens, tokens),
                     workspace, stream);
 }
 
@@ -681,8 +654,7 @@ void Variant::post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidd
         ops::rmsnorm_a4(residual, norm_weight, norm_eps, nullptr, normalized, stream);
         ops::linear_swiglu(normalized, weights.gate_up, activation, stream);
         ops::linear_add(activation, weights.down, residual,
-                        residual_packed_policy(weights.down, phase, route_tokens, T), workspace,
-                        stream);
+                        packed_policy(weights.down, phase, route_tokens, T), workspace, stream);
         return;
     }
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, T});
@@ -744,8 +716,8 @@ void Variant::post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidd
     }
     swiglu(hidden, activation, hidden.ne[1]);
     ops::linear_add(activation, weights.down, residual,
-                    residual_packed_policy(weights.down, phase, route_tokens, hidden.ne[1]),
-                    workspace, stream);
+                    packed_policy(weights.down, phase, route_tokens, hidden.ne[1]), workspace,
+                    stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
@@ -757,10 +729,10 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
         Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
         ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up),
                            workspace, stream);
-        ops::linear_add(activation, weights.down, residual,
-                        residual_packed_policy(weights.down, qwen3_6::TextPhase::Verify,
-                                               route_tokens, hidden.ne[1]),
-                        workspace, stream);
+        ops::linear_add(
+            activation, weights.down, residual,
+            packed_policy(weights.down, qwen3_6::TextPhase::Verify, route_tokens, hidden.ne[1]),
+            workspace, stream);
         return;
     }
     Tensor gate_up = workspace.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, cols});

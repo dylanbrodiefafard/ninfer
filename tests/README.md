@@ -88,20 +88,13 @@ presets.
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
 weight decoding.
 
-`ninfer_linear_nvfp4_a8_test` checks NVFP4-storage/E4M3-activation execution at the five
-principal text geometries and verification extents (including W4 at C1–4), with CUDA Graph replay with changed
-inputs. The canonical FP64 dot-product oracle uses the original BF16 activations and decoded
-weights. Independent E4M3 activation encoding supplies a supplementary codec-distortion and
-arithmetic/storage-residual check; its distortion-derived bound is not a model-quality budget.
-The existing attention-input, LinearAdd and LinearSwiGLU suites also check their A8 routes
-directly against their complete mathematical oracles.
+The attention-input, LinearAdd and LinearSwiGLU suites check their NVFP4 A8 (E4M3-activation)
+routes directly against their complete mathematical oracles.
 
-`ninfer_gdn_input_proj_conv_record_test` qualifies both A4 and A8 projections against the
-independent projection/convolution/history oracle and reports each profile separately. It
-checks exact activation encoding, zero rows, outliers, chain/tree parents, valid-prefix tails
-and carried BF16 history, including every retained prefix at the A8 W4 boundary.
-A16 W6 request pairing at C2/C4 is additionally required to match
-the legacy T1 outputs exactly; C3 retains the request-indexed route. The optional existing
+`ninfer_gdn_input_proj_conv_record_test` qualifies the NVFP4 A8 projection against the
+independent projection/convolution/history oracle at the chain and tree verify widths, fused and
+staged. It checks exact activation encoding, zero rows, outliers, chain/tree parents, valid-prefix
+tails and carried BF16 history, including every retained prefix at W4. The optional existing
 `NINFER_GDN_REAL_ACTIVATIONS` input supplies represented real-model activations while the
 fixture weights remain patterned test weights.
 

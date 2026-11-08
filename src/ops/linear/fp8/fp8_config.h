@@ -252,24 +252,6 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual6144Geometry> = kFp
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual17408Geometry> = kFp8LastSmallT;
 
-inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
-    switch (problem) {
-    case Fp8Problem::AttnInput:
-        return kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
-    case Fp8Problem::GdnInput:
-        return kFp8LinearSmallTMax<Fp8GdnInputGeometry>;
-    case Fp8Problem::MlpGateUp:
-        return kFp8LinearSmallTMax<Fp8MlpGateUpGeometry>;
-    case Fp8Problem::Vocabulary:
-        break;
-    case Fp8Problem::Residual6144:
-        return kFp8LinearSmallTMax<Fp8Residual6144Geometry>;
-    case Fp8Problem::Residual17408:
-        return kFp8LinearSmallTMax<Fp8Residual17408Geometry>;
-    }
-    throw std::logic_error("FP8 vocabulary uses its A16 MMA route");
-}
-
 // RTX 5090 cold-cache winners for contiguous Linear output. Each geometry owns its measured
 // schedule ranges; fused semantic Ops reuse the mainloop but retain independent route frontiers.
 template <class Geometry, int ActiveTokens>

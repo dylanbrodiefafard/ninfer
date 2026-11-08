@@ -468,23 +468,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q_heads, width, cache_dtype, envelope);
-        const std::int32_t launch_batch = batch_size;
         WorkspaceLayoutBuilder layout;
-        (void)allocate_small_t_workspace(layout, q_heads, width, splits, launch_batch);
-        // Sparge-decode tile-skip scratch (rank keep set): only a T=1 step on a
-        // sage (U8) cache with keep_frac < 1 allocates the rank scratch, so only
-        // that width carries the addition. Dry-run the same three allocations
-        // through the layout builder so the arena's 256B alignment padding is
-        // modeled exactly (a flat byte sum undercounts and overflows the arena).
-        if (keep_frac < 1.0f && cache_dtype == DType::U8 && width == 1) {
-            const std::int32_t kv_rows =
-                launch_batch * kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-            const std::int32_t max_keep =
-                (static_cast<std::int32_t>(envelope.max_visible_keys) + 31) / 32;
-            (void)layout.alloc(DType::I32, {kv_rows, max_keep});
-            (void)layout.alloc(DType::I32, {kv_rows});
-            (void)layout.alloc(DType::I32, {kv_rows, splits + 1});
-        }
+        (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
         return layout.peak_bytes(1);
     };
     const auto route_capacity = [&](std::int32_t width, detail::GqaAttentionRoute route) {
@@ -622,11 +607,10 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
             detail::gqa_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
-        // Decode/SmallT is always exact. Prefill skip flags on the card are ignored.
-        detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
-                                             scale, cache, envelope, 0, width, partial.acc,
-                                             partial.m, partial.l, out, stream, ancestor_mask,
-                                             prefix_lengths, 1.0f, {});
+        // SmallT is always dense; the prefill skip flags apply to the Prompt route only.
+        detail::gqa_attention_small_t_launch(
+            q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope, 0, width,
+            partial.acc, partial.m, partial.l, out, stream, ancestor_mask, prefix_lengths);
         return;
     }
     void* xattn_scratch = nullptr;
@@ -705,7 +689,7 @@ void gqa_kv_compact_path(PagedKVBatchLayerView cache, const Tensor& kv_table_row
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
-                          float keep_frac, GqaS3DecodeRankDump* rank_dump) {
+                          float keep_frac) {
     constexpr const char* op = "gqa_attention_cached";
     if (keep_frac <= 0.0f || keep_frac > 1.0f) {
         throw std::invalid_argument("gqa_attention_cached: keep_frac must be in (0, 1]");
@@ -724,8 +708,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);
         detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
-                                                    partial.acc, partial.m, partial.l, out, stream,
-                                                    1.0f, {}, rank_dump);
+                                                    partial.acc, partial.m, partial.l, out, stream);
         return;
     }
     detail::GqaPromptSplit split;

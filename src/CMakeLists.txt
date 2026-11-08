@@ -140,17 +140,12 @@ add_library(ninfer_ops STATIC
   ops/gdn_input_proj/fp8/fp8_gdn_input_plan.cpp
   ops/gdn_input_proj/fp8/fp8_gdn_conv_fused.cu
   ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.cpp
+  ops/gdn_input_proj/nvfp4/nvfp4_gdn_record_a8.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_small_t.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
   ops/gdn_input_proj/gdn_projected_conv.cu
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
-  ops/linear/bf16/bf16_gemv.cu
-  ops/linear/bf16/bf16_gemm_mma.cu
-  ops/linear/bf16/bf16_small_t.cu
-  ops/linear/bf16/bf16_dispatch.cpp
   ops/common/memory_evict.cu
   ops/linear/nvfp4/nvfp4_format.cpp
   ops/linear/nvfp4/nvfp4_gemv.cu
@@ -198,8 +193,6 @@ add_library(ninfer_ops STATIC
   ops/linear/linear_kv_projection.cpp
   ops/linear/nvfp4/nvfp4_kv_projection.cu
   ops/linear/fp8/fp8_format.cpp
-  ops/linear/fp8/fp8_gemv.cu
-  ops/linear/fp8/fp8_small_t.cu
   ops/linear/fp8/fp8_a16_small_t_mma.cu
   ops/linear/fp8/fp8_a16_gemm_mma.cu
   ops/linear/fp8/fp8_a8.cu

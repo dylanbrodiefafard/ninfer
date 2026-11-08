@@ -13,8 +13,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using TmaM256N128   = Nvfp4W4a4TmaSchedule<256, 3, 1>;
-using TmaM256N128S2 = Nvfp4W4a4TmaSchedule<256, 2, 1>;
+using TmaM256N128 = Nvfp4W4a4TmaSchedule<256, 3, 1>;
 
 constexpr std::int32_t kQueryRows  = 6144;
 constexpr std::int32_t kKeyRows    = 1024;
@@ -78,56 +77,17 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Geometry>
-void launch_linear(const std::uint8_t* activation_codes, const std::uint8_t* activation_scales,
-                   const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
-                   __nv_bfloat16* output, std::int32_t tokens, float alpha, cudaStream_t stream) {
-    launch_tma<Geometry, TmaM256N128>(activation_codes, activation_scales, weight_codes,
-                                      weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
-                                      Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
-}
-
 } // namespace
 
-void launch_nvfp4_w4a4_tma_linear(Nvfp4Problem problem, const std::uint8_t* activation_codes,
+void launch_nvfp4_w4a4_tma_mtp_fc(const std::uint8_t* activation_codes,
                                   const std::uint8_t* activation_scales,
                                   const std::uint8_t* weight_codes,
                                   const std::uint8_t* weight_scales, __nv_bfloat16* output,
                                   std::int32_t tokens, float alpha, cudaStream_t stream) {
-    switch (problem) {
-    case Nvfp4Problem::AttnInput:
-        launch_linear<Nvfp4AttnInputGeometry>(activation_codes, activation_scales, weight_codes,
-                                              weight_scales, output, tokens, alpha, stream);
-        return;
-    case Nvfp4Problem::GdnInput:
-        launch_linear<Nvfp4GdnInputGeometry>(activation_codes, activation_scales, weight_codes,
-                                             weight_scales, output, tokens, alpha, stream);
-        return;
-    case Nvfp4Problem::MlpGateUp:
-        launch_tma<Nvfp4MlpGateUpGeometry, TmaM256N128S2>(
-            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
-            Nvfp4IdentityEpilogue{},
-            Nvfp4ContiguousOutput{output, Nvfp4MlpGateUpGeometry::kOutputRows}, stream);
-        return;
-    case Nvfp4Problem::Residual6144:
-        launch_linear<Nvfp4Residual6144Geometry>(activation_codes, activation_scales, weight_codes,
-                                                 weight_scales, output, tokens, alpha, stream);
-        return;
-    case Nvfp4Problem::Residual17408:
-        launch_linear<Nvfp4Residual17408Geometry>(activation_codes, activation_scales, weight_codes,
-                                                  weight_scales, output, tokens, alpha, stream);
-        return;
-    case Nvfp4Problem::MtpFc:
-        launch_linear<Nvfp4MtpFcGeometry>(activation_codes, activation_scales, weight_codes,
-                                          weight_scales, output, tokens, alpha, stream);
-        return;
-    case Nvfp4Problem::DflashFeature:
-    case Nvfp4Problem::DflashQkv:
-    case Nvfp4Problem::DflashAttnOut:
-    case Nvfp4Problem::DflashConvProj:
-    case Nvfp4Problem::DflashSelector:
-        return;
-    }
+    launch_tma<Nvfp4MtpFcGeometry, TmaM256N128>(
+        activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+        Nvfp4IdentityEpilogue{}, Nvfp4ContiguousOutput{output, Nvfp4MtpFcGeometry::kOutputRows},
+        stream);
 }
 
 void launch_nvfp4_w4a4_tma_attention(const std::uint8_t* activation_codes,

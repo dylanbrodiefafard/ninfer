@@ -9,7 +9,9 @@
 
 namespace ninfer::ops::detail {
 
-void launch_nvfp4_w4a4_tma_linear(Nvfp4Problem problem, const std::uint8_t* activation_codes,
+// Generic Linear W4A4 TMA route; MTP fc [5120,10240] is the only Linear problem whose admitted
+// widths select it.
+void launch_nvfp4_w4a4_tma_mtp_fc(const std::uint8_t* activation_codes,
                                   const std::uint8_t* activation_scales,
                                   const std::uint8_t* weight_codes,
                                   const std::uint8_t* weight_scales, __nv_bfloat16* output,

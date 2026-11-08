@@ -7,6 +7,8 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <stdexcept>
 #include <utility>
 
 namespace ninfer::ops::detail {
@@ -39,13 +41,18 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 }
 
 constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+    make_launchers(std::make_index_sequence<kNvfp4FirstW4a4GdnInput - kNvfp4FirstSmallT>{});
 
 } // namespace
 
 void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream) {
-    kLaunchers[x.ne[1] - kNvfp4FirstSmallT](x, weight, qkv, z, stream);
+    const std::int32_t tokens = x.ne[1];
+    if (tokens < kNvfp4FirstSmallT || tokens >= kNvfp4FirstW4a4GdnInput) {
+        throw std::invalid_argument(
+            "nvfp4 gdn_input_proj SmallT: T is at or above the W4A4 cutover");
+    }
+    kLaunchers[static_cast<std::size_t>(tokens - kNvfp4FirstSmallT)](x, weight, qkv, z, stream);
 }
 
 } // namespace ninfer::ops::detail

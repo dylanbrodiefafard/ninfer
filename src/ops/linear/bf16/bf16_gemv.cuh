@@ -85,14 +85,6 @@ __device__ __forceinline__ void accumulate_bf16_packs(const Bf16GemvPack<Values>
     }
 }
 
-struct Bf16ContiguousOutput {
-    __nv_bfloat16* data;
-
-    __device__ __forceinline__ void store(std::int32_t parent_row, __nv_bfloat16 value) const {
-        data[parent_row] = value;
-    }
-};
-
 struct Bf16StoreEpilogue {
     template <class Output>
     __device__ __forceinline__ void operator()(const Output& output, std::int32_t parent_row,

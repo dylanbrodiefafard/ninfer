@@ -18,6 +18,8 @@ inline constexpr std::int32_t kNvfp4GdnChannels =
 inline constexpr std::int32_t kNvfp4GdnZRows      = 6144;
 inline constexpr std::int32_t kNvfp4GdnParentRows = kNvfp4GdnChannels + kNvfp4GdnZRows;
 
+// Conv/record publication of the projected parent rows of request conv.batch_row: the q/k/value
+// channels enter the convolution epilogue and z is stored directly.
 template <int Tokens, class Publish, bool Tree = false>
 struct Nvfp4GdnConvOutput {
     GdnConvEpilogue<Publish, Tree> conv;
@@ -25,7 +27,7 @@ struct Nvfp4GdnConvOutput {
 
     __device__ __forceinline__ void store_row(std::int32_t parent_row,
                                               const float (&projected)[Tokens]) const {
-        const int batch = gridDim.y > 1 ? static_cast<int>(blockIdx.x) : conv.batch_row;
+        const int batch = conv.batch_row;
         if (parent_row < kNvfp4GdnChannels) {
             auto epilogue      = conv;
             epilogue.batch_row = batch;

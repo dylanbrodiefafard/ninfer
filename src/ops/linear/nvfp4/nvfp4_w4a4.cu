@@ -40,20 +40,26 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4W4a4Works
         weight.input_scale_divisor));
 }
 
+// Generic Linear W4A4 for one admitted problem. Only the routes its admitted widths select are
+// instantiated (nvfp4_linear_w4a4_route_reachable).
 template <Nvfp4Problem Problem, class Geometry>
 void launch_problem(Nvfp4W4a4Route route, const Weight& weight, Tensor& out,
                     Nvfp4W4a4Workspace workspace, std::int32_t tokens, cudaStream_t stream) {
-    if (route == Nvfp4W4a4Route::Tma) {
-        const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-        launch_nvfp4_w4a4_tma_linear(Problem, workspace.codes, workspace.scales,
-                                     static_cast<const std::uint8_t*>(weight.qdata),
-                                     static_cast<const std::uint8_t*>(weight.scales),
-                                     static_cast<__nv_bfloat16*>(out.data), tokens, alpha, stream);
-        return;
+    if constexpr (nvfp4_linear_w4a4_route_reachable(Problem, Nvfp4W4a4Route::Tma)) {
+        static_assert(Problem == Nvfp4Problem::MtpFc);
+        if (route == Nvfp4W4a4Route::Tma) {
+            const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+            launch_nvfp4_w4a4_tma_mtp_fc(
+                workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales),
+                static_cast<__nv_bfloat16*>(out.data), tokens, alpha, stream);
+            return;
+        }
     }
-    visit_nvfp4_w4a4_mma_schedule<Problem>(route, [&]<class Schedule>() {
-        launch_gemm<Geometry, Schedule>(weight, out, workspace, tokens, stream);
-    });
+    visit_nvfp4_w4a4_mma_schedule<Problem, &nvfp4_linear_w4a4_route_reachable>(
+        route, [&]<class Schedule>() {
+            launch_gemm<Geometry, Schedule>(weight, out, workspace, tokens, stream);
+        });
 }
 
 } // namespace
@@ -85,24 +91,15 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens  = x.ne[1];
     const Nvfp4Problem problem = resolve_nvfp4_problem(weight.n, weight.k);
+    if (!nvfp4_linear_w4a4_admitted(problem, tokens)) {
+        throw std::invalid_argument("nvfp4 W4A4 linear: T is not registered for this problem");
+    }
     const Nvfp4W4a4Route route = nvfp4_w4a4_route(problem, tokens);
     launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
     switch (problem) {
-    case Nvfp4Problem::AttnInput:
-        launch_problem<Nvfp4Problem::AttnInput, Nvfp4AttnInputGeometry>(route, weight, out,
-                                                                        workspace, tokens, stream);
-        return;
-    case Nvfp4Problem::GdnInput:
-        launch_problem<Nvfp4Problem::GdnInput, Nvfp4GdnInputGeometry>(route, weight, out, workspace,
-                                                                      tokens, stream);
-        return;
     case Nvfp4Problem::MlpGateUp:
         launch_problem<Nvfp4Problem::MlpGateUp, Nvfp4MlpGateUpGeometry>(route, weight, out,
                                                                         workspace, tokens, stream);
-        return;
-    case Nvfp4Problem::Residual6144:
-        launch_problem<Nvfp4Problem::Residual6144, Nvfp4Residual6144Geometry>(
-            route, weight, out, workspace, tokens, stream);
         return;
     case Nvfp4Problem::Residual17408:
         launch_problem<Nvfp4Problem::Residual17408, Nvfp4Residual17408Geometry>(
@@ -112,6 +109,9 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
         launch_problem<Nvfp4Problem::MtpFc, Nvfp4MtpFcGeometry>(route, weight, out, workspace,
                                                                 tokens, stream);
         return;
+    case Nvfp4Problem::AttnInput:
+    case Nvfp4Problem::GdnInput:
+    case Nvfp4Problem::Residual6144:
     case Nvfp4Problem::DflashFeature:
     case Nvfp4Problem::DflashQkv:
     case Nvfp4Problem::DflashAttnOut:
@@ -119,7 +119,7 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     case Nvfp4Problem::DflashSelector:
         break;
     }
-    throw std::invalid_argument("nvfp4 W4A4 linear: DFlash2 problems are A16-only");
+    throw std::logic_error("nvfp4 W4A4 linear: admitted problem without a launcher");
 }
 
 } // namespace ninfer::ops::detail

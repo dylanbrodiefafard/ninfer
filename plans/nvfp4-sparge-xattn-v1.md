@@ -40,7 +40,7 @@ XAttention, keep Sparge as a control, or drop skip.
 | Exact NVFP4 prefill | `src/ops/kernel/gqa_attention_prefill_nvfp4.cuh` | No skip. Dense tile loop. Production. |
 | Exact NVFP4 decode | `src/ops/kernel/gqa_attention_decode_nvfp4.cuh` | No skip. Leave it. |
 | S3 prefill + Sparge | `src/ops/kernel/gqa_attention_prefill_nvfp4s3.cuh` | `keep_frac<1` + `k_mean` ranks tiles; ExactT template vs approx. |
-| S3 decode + Sparge | `src/ops/kernel/gqa_attention_decode_nvfp4s3.cuh` | T=1 only; `keep_frac<1` needs `k_mean`. |
+| S3 decode | `src/ops/kernel/gqa_attention_decode_nvfp4s3.cuh` | Dense only (decode tile-skip and rank kernel removed). |
 | S3 TMA prefill | `src/ops/kernel/gqa_attention_nvfp4s3_tma.cuh` | Already refuses skip (`keep_frac` unused; launcher requires `keep_frac==1`). |
 | Launchers (split in progress) | `gqa_attention_prefill.cu`, `gqa_attention_prefill_s3.cu`, `gqa_attention_decode.cu`, `gqa_attention_decode_s3.cu` | Dispatch: `dtype==U8 && sage_pv` → S3; else exact NVFP4. |
 | `k_mean` plane | `PagedKVLayerView::k_mean_pages`, filled only on sage fill | Comment: "sage_pv only". |
@@ -132,12 +132,11 @@ exact (`keep_frac` forced 1, `xattn_tau` ignored).
 
 ### 1. Make S3 exact-only
 
-Strip tile-skip from S3 prefill and S3 decode:
+Strip tile-skip from S3 prefill (S3 decode is already dense-only):
 
 - `keep_frac != 1.0f` + `sage_pv` → throw (or ignore with a one-time stderr, then
   throw — prefer throw so PPL cannot silently drop skip).
-- Delete or dead-code the `approx` branch / `gqa_attention_decode_rank_nvfp4s3_kernel`
-  once nothing calls it.
+- Delete or dead-code the prefill `approx` branch once nothing calls it.
 - `attn-sage` and `attn-tma` PPL cells must remain bit-identical to today at
   `keep_frac=1`.
 

@@ -33,8 +33,6 @@ void launch_tc_partial_nvfp4s3(const Tensor& q, CacheInput input, const Tensor& 
                                PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                                std::int32_t logical_capacity, std::int32_t implementation_window,
                                std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
-                               Tensor& partial_l, cudaStream_t stream, float keep_frac,
-                               const Tensor& keep_tiles, const Tensor& keep_count,
-                               const Tensor& split_off, std::int32_t keep_stride);
+                               Tensor& partial_l, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

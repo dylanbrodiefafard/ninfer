@@ -79,7 +79,7 @@ Runtime checkers are opt-in because they are slow:
 ./scripts/run-unit-tests.sh --compute-sanitizer memcheck  -L sanitizer   # the sanitizer set
 ./scripts/run-unit-tests.sh --compute-sanitizer initcheck -L sanitizer   # also synccheck
 ./scripts/run-unit-tests.sh --compute-sanitizer racecheck -L racecheck   # its racecheck part
-./scripts/run-unit-tests.sh --compute-sanitizer racecheck -R ninfer_linear_nvfp4_a8_test
+./scripts/run-unit-tests.sh --compute-sanitizer racecheck -R ninfer_linear_nvfp4_a4_test
 
 cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON \
   -DNINFER_SANITIZE=address,undefined

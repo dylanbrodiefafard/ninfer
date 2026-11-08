@@ -61,9 +61,13 @@ using Nvfp4W4a4M64N128S3         = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 3, 1
 using Nvfp4W4a4M128N128Pipelined = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using Nvfp4W4a4M128N128Resident  = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
-template <Nvfp4Problem Problem, Nvfp4W4a4Route Route, class Schedule, class Visitor>
+// Route predicate of a W4A4 dispatcher: whether some width it launches selects the route.
+using Nvfp4W4a4RouteReachable = bool (*)(Nvfp4Problem, Nvfp4W4a4Route);
+
+template <Nvfp4Problem Problem, Nvfp4W4a4RouteReachable Reachable, Nvfp4W4a4Route Route,
+          class Schedule, class Visitor>
 bool nvfp4_w4a4_visit_reachable(Nvfp4W4a4Route route, const Visitor& visitor) {
-    if constexpr (nvfp4_w4a4_route_reachable(Problem, Route)) {
+    if constexpr (Reachable(Problem, Route)) {
         if (route == Route) {
             visitor.template operator()<Schedule>();
             return true;
@@ -73,21 +77,27 @@ bool nvfp4_w4a4_visit_reachable(Nvfp4W4a4Route route, const Visitor& visitor) {
 }
 
 // Calls visitor.template operator()<Schedule>() with the schedule of an MMA route of Problem's
-// table. Only the schedules that table can select are instantiated. Throws for any other route,
-// including Nvfp4W4a4Route::Tma, which the caller dispatches to its TMA launcher first.
-template <Nvfp4Problem Problem, class Visitor>
+// table. Only the schedules Reachable admits are instantiated: by default every schedule the
+// table can select, or a narrower set for a dispatcher that launches only some widths. Throws for
+// any other route, including Nvfp4W4a4Route::Tma, which the caller dispatches to its TMA launcher
+// first.
+template <Nvfp4Problem Problem, Nvfp4W4a4RouteReachable Reachable = &nvfp4_w4a4_route_reachable,
+          class Visitor>
 void visit_nvfp4_w4a4_mma_schedule(Nvfp4W4a4Route route, const Visitor& visitor) {
     using enum Nvfp4W4a4Route;
     const bool launched =
-        nvfp4_w4a4_visit_reachable<Problem, M32N64S3, Nvfp4W4a4M32N64S3>(route, visitor) ||
-        nvfp4_w4a4_visit_reachable<Problem, M32N64S4, Nvfp4W4a4M32N64S4>(route, visitor) ||
-        nvfp4_w4a4_visit_reachable<Problem, M32N128, Nvfp4W4a4M32N128>(route, visitor) ||
-        nvfp4_w4a4_visit_reachable<Problem, M64N64, Nvfp4W4a4M64N64>(route, visitor) ||
-        nvfp4_w4a4_visit_reachable<Problem, M64N128S3, Nvfp4W4a4M64N128S3>(route, visitor) ||
-        nvfp4_w4a4_visit_reachable<Problem, M128N128Pipelined, Nvfp4W4a4M128N128Pipelined>(
-            route, visitor) ||
-        nvfp4_w4a4_visit_reachable<Problem, M128N128Resident, Nvfp4W4a4M128N128Resident>(route,
-                                                                                         visitor);
+        nvfp4_w4a4_visit_reachable<Problem, Reachable, M32N64S3, Nvfp4W4a4M32N64S3>(route,
+                                                                                    visitor) ||
+        nvfp4_w4a4_visit_reachable<Problem, Reachable, M32N64S4, Nvfp4W4a4M32N64S4>(route,
+                                                                                    visitor) ||
+        nvfp4_w4a4_visit_reachable<Problem, Reachable, M32N128, Nvfp4W4a4M32N128>(route, visitor) ||
+        nvfp4_w4a4_visit_reachable<Problem, Reachable, M64N64, Nvfp4W4a4M64N64>(route, visitor) ||
+        nvfp4_w4a4_visit_reachable<Problem, Reachable, M64N128S3, Nvfp4W4a4M64N128S3>(route,
+                                                                                      visitor) ||
+        nvfp4_w4a4_visit_reachable<Problem, Reachable, M128N128Pipelined,
+                                   Nvfp4W4a4M128N128Pipelined>(route, visitor) ||
+        nvfp4_w4a4_visit_reachable<Problem, Reachable, M128N128Resident, Nvfp4W4a4M128N128Resident>(
+            route, visitor);
     if (!launched) {
         throw std::invalid_argument("nvfp4 W4A4: the route has no MMA schedule for this problem");
     }

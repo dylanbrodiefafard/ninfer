@@ -21,7 +21,7 @@ candidate, kernel, or route forcing options.
 Q4/Q5/Q6/W8 LinearAdd, LinearSwiGLU, LinearPair, and other fused Ops do not belong to this
 benchmark. They continue to be measured independently by their own benchmarks.
 
-Q4/Q5/Q6/W8 and BF16_CTRL use the existing A16 route. The following NVFP4 exact problems support
+Q4/Q5/Q6/W8 use the existing A16 route. The following NVFP4 exact problems support
 both the A16 and A4 policies and serve as a permanent development surface; they are not added
 to the model suites:
 
@@ -56,14 +56,6 @@ Specify the weight type, `N`, `K`, and `T` explicitly to measure one production 
 The numbers `(N,K)` are the primary entry. The benchmark does not copy the full shape admission
 table of the production selector; unsupported points are rejected by the public `linear()` and
 its format selector.
-
-The command for a BF16 decode exact point is:
-
-```bash
-./build/bench/ninfer_linear_bench \
-  --qtype bf16 --policy a16 \
-  --n 14336 --k 5120 --t 1
-```
 
 The permanent NVFP4 A16 decode point is:
 
@@ -283,7 +275,6 @@ read:
 | Q6G64_F16S | 64 | `32 low + 16 high + 2 scale` | `groups * 50` |
 | W8G32_F16S | 32 | `32 code + 2 scale` | `groups * 34` |
 | NVFP4 | 16 | `8 code + 1 E4M3 scale` | `groups * 9` |
-| BF16_CTRL | — | direct BF16 | `2 * N * K` |
 
 The theoretical minimum traffic of one Linear is:
 
@@ -456,31 +447,24 @@ The current implementation has been verified as follows:
    instance produced by one public Linear call;
 5. the weight-byte result for Q4 `[6144,5120], T=1` is `16711680`, equal to
    `6144*5120*(4/8+2/64)`; the console and the CSV use the same computation;
-6. the BF16 exact point above executes through the public Linear; the median of 500 cold-cache
-   samples across repeated runs is `95.520–97.536 us`, i.e. `1505.5–1537.3 GB/s`;
-7. relative to the `1674.5 GB/s` pure-read probe, this range is `89.91%–91.80%` of the
-   attainable read bandwidth;
-8. the DRAM read of the final single NCU capture is `146825728` bytes, while one logical pass
-   over weight plus activation reads `146810880` bytes; the extra read is only `14848` bytes,
-   with no weight replay;
-9. the output retains the route-neutral useful TFLOP/s and memory-floor metrics, and does not
-    infer the actual activation-compute profile from AllowA4;
-10. the A4 Linear of all five NVFP4 exact problems passes the same exact-decode/naive-FP64
-    oracle directly at `T=17`, the representative cp.async point, and the main `T=1024` TMA
-    point;
-11. on the RTX 5090 with CUDA 13.1 and a cold cache, the complete quantization + GEMM results
-    for the five NVFP4 A4 `T=1024` problems are:
+6. the output retains the route-neutral useful TFLOP/s and memory-floor metrics, and does not
+   infer the actual activation-compute profile from AllowA4;
+7. the A4 Linear of all five NVFP4 exact problems passes the same exact-decode/naive-FP64
+   oracle directly at `T=17`, the representative cp.async point, and the main `T=1024` TMA
+   point;
+8. on the RTX 5090 with CUDA 13.1 and a cold cache, the complete quantization + GEMM results
+   for the five NVFP4 A4 `T=1024` problems are:
 
-    | `[N,K]` | Median | Useful throughput | Dense FP4 peak |
-    |---:|---:|---:|---:|
-    | `[14336,5120]` | `152.576 us` | `985.24 TFLOP/s` | `58.79%` |
-    | `[16384,5120]` | `174.784 us` | `982.92 TFLOP/s` | `58.65%` |
-    | `[34816,5120]` | `390.112 us` | `935.81 TFLOP/s` | `55.84%` |
-    | `[5120,6144]` | `72.992 us` | `882.62 TFLOP/s` | `52.66%` |
-    | `[5120,17408]` | `197.888 us` | `922.42 TFLOP/s` | `55.04%` |
+   | `[N,K]` | Median | Useful throughput | Dense FP4 peak |
+   |---:|---:|---:|---:|
+   | `[14336,5120]` | `152.576 us` | `985.24 TFLOP/s` | `58.79%` |
+   | `[16384,5120]` | `174.784 us` | `982.92 TFLOP/s` | `58.65%` |
+   | `[34816,5120]` | `390.112 us` | `935.81 TFLOP/s` | `55.84%` |
+   | `[5120,6144]` | `72.992 us` | `882.62 TFLOP/s` | `52.66%` |
+   | `[5120,17408]` | `197.888 us` | `922.42 TFLOP/s` | `55.04%` |
 
-    The four previously registered rows retain their 5-warmup/30-sample measurements; the new
-    `[34816,5120]` row uses 5 warmups and 40 samples.
+   The four previously registered rows retain their 5-warmup/30-sample measurements; the new
+   `[34816,5120]` row uses 5 warmups and 40 samples.
 
 The benchmark does not take on numerical correctness; each weight/activation-compute profile
 remains the responsibility of the public Linear conformance suite and the unified CPU FP64 GEMM

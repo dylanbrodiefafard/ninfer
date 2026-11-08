@@ -1,5 +1,4 @@
 #include "ops/linear/linear_test_common.h"
-#include "ops/fp8_activation_ref.h"
 
 #include "core/arena.h"
 #include "core/decode_graph.h"
@@ -33,7 +32,6 @@ constexpr std::uint8_t kOutputPoisonByte  = 0xff;
 constexpr std::size_t kOutputScanWords    = 1U << 20;
 constexpr int kOracleTBlock               = 8;
 constexpr double kBf16UnitRoundoff        = 1.0 / 256.0;
-constexpr double kA8QuantizationAllowance = 0.04;
 constexpr double kA4QuantizationAllowance = 0.16;
 
 // The criterion belongs to the activation compute path, not to a private kernel, schedule, or
@@ -43,8 +41,6 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     switch (activation_compute) {
     case ActivationCompute::A16:
         return {kBf16UnitRoundoff, kBf16UnitRoundoff, 2.0 * kBf16UnitRoundoff};
-    case ActivationCompute::A8:
-        return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
     case ActivationCompute::A4:
         return {kA4QuantizationAllowance, kBf16UnitRoundoff, kA4QuantizationAllowance};
     }
@@ -407,44 +403,8 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                     cpu_linear_gemm_fp64(oracle_weight.data(), activation.data(), reference.data(),
                                          static_cast<std::int32_t>(oracle_rows.size()), shape.k,
                                          static_cast<std::int32_t>(columns.size()));
-                    if (weight.qtype == QType::NVFP4 &&
-                        invocation.policy == ops::LinearPolicy::AllowA8 && invocation.t >= 4) {
-                        const auto encoded = fp8_activation_reference(activation, shape.k);
-                        std::vector<double> quantized(reference.size());
-                        cpu_linear_gemm_fp64(oracle_weight.data(), encoded.represented.data(),
-                                             quantized.data(), static_cast<int>(oracle_rows.size()),
-                                             shape.k, static_cast<int>(columns.size()));
-                        const auto distortion = compute_reduction_stats(
-                            quantized.data(), reference.data(), reference.size());
-                        const auto residual = compute_reduction_stats(
-                            actual.selected.data(), quantized.data(), quantized.size());
-                        const auto canonical = compute_reduction_stats(
-                            actual.selected.data(), reference.data(), reference.size());
-                        auto criterion = tolerance_for(ActivationCompute::A16);
-                        failures += verify_reduction(case_label + " codec residual",
-                                                     actual.selected, quantized, criterion);
-                        double squared = 0, max_quantized = 0;
-                        for (double v : quantized) {
-                            squared += v * v;
-                            max_quantized = std::max(max_quantized, std::abs(v));
-                        }
-                        criterion.relative_l2 =
-                            distortion.relative_l2 +
-                            criterion.relative_l2 * std::sqrt(squared / quantized.size()) /
-                                std::max(distortion.reference_root_mean_square, 1e-30);
-                        criterion.gross_absolute +=
-                            distortion.maximum_absolute_error +
-                            criterion.gross_relative_to_max_reference * max_quantized;
-                        criterion.gross_relative_to_max_reference = 0;
-                        failures += verify_reduction(case_label + " canonical", actual.selected,
-                                                     reference, criterion);
-                        std::cout << case_label << " canonical=" << canonical.relative_l2
-                                  << " codec=" << distortion.relative_l2
-                                  << " residual=" << residual.relative_l2 << '\n';
-                    } else {
-                        failures += compare_output(case_label, actual.selected, reference,
-                                                   activation_compute);
-                    }
+                    failures +=
+                        compare_output(case_label, actual.selected, reference, activation_compute);
                 }
                 if (replay == 1) {
                     std::vector<std::uint16_t> after(activation_bits.size());

@@ -152,7 +152,7 @@ int main() {
             static_cast<std::size_t>(256)));
         WorkspaceArena ws_dn(
             std::max(ops::linear_workspace_capacity_bytes(QType::NVFP4, kDownOut, kInter,
-                                                          ops::LinearPolicy::A16Only, kT, kT),
+                                                          ops::LinearPolicy::AllowA4, kT, kT),
                      static_cast<std::size_t>(256)));
 
         Tensor x(xin.p, DType::BF16, {kHidden, kT});
@@ -197,7 +197,7 @@ int main() {
             };
             auto pair = [&](cudaStream_t s) {
                 sw(s);
-                ops::linear(m, down.weight, o, ops::LinearPolicy::A16Only, ws_dn, s);
+                ops::linear(m, down.weight, o, ops::LinearPolicy::AllowA4, ws_dn, s);
             };
 
             const double sw_c = bench::measure_cold_launch(sw, flush, stream, 4, 20).median_us;

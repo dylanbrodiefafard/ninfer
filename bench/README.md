@@ -92,7 +92,7 @@ subsequent calibration and shutdown work when analyzing the owner window.
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-W8, registered BF16 weights, and the registered NVFP4 problems. Existing formats use
+W8, FP8, and the registered NVFP4 problems. Existing formats use
 `--policy a16`; NVFP4 additionally supports `--policy a4`, which lets the production resolver
 select the qualified route for each exact geometry and T. LinearAdd, LinearSwiGLU,
 LinearPair, and Attention/GDN projections remain separate semantic Ops and are not benchmark modes
@@ -311,12 +311,12 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 ## GDN input projection/convolution/snapshot Op benchmark
 
 `ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.8-27B NVFP4
-`gdn_input_proj_conv_snapshot` form for exact `B=1..8` and record-producing forms for the product
-domain `B=1..8`. The timed body is exactly one complete public Op call; the benchmark does not
-include private launchers, candidate selection, duplicated compositions, or route labels. Its
-default `T=1..6` sweep is the dormant private MTP verification interval. NVFP4 accepts
-the public `a16` and `a4` policies; the reported profile names the caller policy, not a private
-resolved route.
+`gdn_input_proj_conv_snapshot` form at T=1 (ordinary decode) and the chain
+`gdn_input_proj_conv_record` form at the DFlash2 chain-verify widths T=2..8, both for `B=1..8`.
+The timed body is exactly one complete public Op call; the benchmark does not include private
+launchers, candidate selection, duplicated compositions, or route labels. The default sweep is
+`T=1..6`. The default `a8` policy is the one the record admits; the reported profile names the
+caller policy, not a private resolved route.
 
 CUDA Graph replay is the default execution mode. The graph contains external timing event nodes
 around the complete Op body, while L2 eviction stays outside the timed interval. Cold-cache results
@@ -327,14 +327,14 @@ published snapshot slots, so repeated replay does not introduce a benchmark-only
 ```bash
 cmake --build build --parallel --target ninfer_gdn_input_proj_conv_snapshot_bench
 ./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
-  --nvfp4-policy a4 --sweep 1:17 --execution graph --cache both \
+  --sweep 1:8 --execution graph --cache both \
   --warmup 10 --repeat 100 \
   --csv-out profiles/bench/gdn_input_proj_conv_snapshot.csv
 ./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
-  --tokens 16 --batch 8 \
+  --tokens 8 --batch 8 \
   --execution graph --cache cold --warmup 10 --repeat 100
 ./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
-  --tokens 6 --batch 3 --valid-columns 6,3,1 \
+  --tokens 6 --batch 3 --valid-columns 6,3,1 --form record \
   --execution graph --cache cold --warmup 10 --repeat 100
 ```
 

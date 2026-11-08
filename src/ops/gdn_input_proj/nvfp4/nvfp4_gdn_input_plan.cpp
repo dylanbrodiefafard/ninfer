@@ -2,7 +2,6 @@
 
 #include "ops/linear/nvfp4/nvfp4_config.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
@@ -14,39 +13,28 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
     W4A4,
 };
 
+// The prefill GDN input projection runs A16 below the W4A4 cutover under either policy and W4A4
+// from the cutover under AllowA4.
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
-    if (policy == LinearPolicy::A16Only) { return Nvfp4GdnInputRoute::A16; }
-    if (policy == LinearPolicy::AllowA4) {
-        return tokens >= kNvfp4FirstW4a4GdnInput ? Nvfp4GdnInputRoute::W4A4
-                                                 : Nvfp4GdnInputRoute::A16;
+    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
+        throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
     }
-    throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
+    if (tokens < kNvfp4FirstW4a4GdnInput) { return Nvfp4GdnInputRoute::A16; }
+    if (policy != LinearPolicy::AllowA4) {
+        throw std::invalid_argument(
+            "nvfp4 gdn_input_proj: A16 is registered only below the W4A4 cutover");
+    }
+    return Nvfp4GdnInputRoute::W4A4;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                 cudaStream_t stream) {
-    constexpr std::int32_t kChunk   = kNvfp4LastSmallT;
-    constexpr std::int32_t kQkvRows = 10240;
-    constexpr std::int32_t kZRows   = 6144;
-    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
-        const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
-        auto* input = static_cast<std::uint8_t*>(x.data) +
-                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
-        auto* qkv_output =
-            static_cast<std::uint8_t*>(qkv.data) +
-            static_cast<std::int64_t>(token_begin) * kQkvRows * sizeof(std::uint16_t);
-        auto* z_output = static_cast<std::uint8_t*>(z.data) +
-                         static_cast<std::int64_t>(token_begin) * kZRows * sizeof(std::uint16_t);
-        Tensor input_chunk(input, DType::BF16, {weight.k, active});
-        Tensor qkv_chunk(qkv_output, DType::BF16, {kQkvRows, active});
-        Tensor z_chunk(z_output, DType::BF16, {kZRows, active});
-        if (active == 1) {
-            nvfp4_gdn_input_decode_launch(input_chunk, weight, qkv_chunk, z_chunk, stream);
-        } else {
-            nvfp4_gdn_input_small_t_launch(input_chunk, weight, qkv_chunk, z_chunk, stream);
-        }
+    if (x.ne[1] == 1) {
+        nvfp4_gdn_input_decode_launch(x, weight, qkv, z, stream);
+        return;
     }
+    nvfp4_gdn_input_small_t_launch(x, weight, qkv, z, stream);
 }
 
 } // namespace

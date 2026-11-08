@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <stdexcept>
 #include <type_traits>
 
 #include "core/device.h"
@@ -388,6 +389,18 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
     }
 }
 
+// Whether a launch with Output compiles the wide-path panel count. An Output declaring
+// `static constexpr bool reachable_panels(int)` registers the panel counts its callers' widths
+// select (nvfp4_w4a8_wide_panels); every other Output compiles all of them.
+template <class Output>
+[[nodiscard]] constexpr bool nvfp4_w4a8_output_panels_reachable(int panels) {
+    if constexpr (requires { Output::reachable_panels(panels); }) {
+        return Output::reachable_panels(panels);
+    } else {
+        return true;
+    }
+}
+
 template <class Geometry, class Epilogue, class Output, class RowPolicy = Nvfp4W4a4IdentityRows,
           bool PairRows = false, class Activation = Fp8A8Workspace,
           int OutputRows = Geometry::kOutputRows>
@@ -483,34 +496,46 @@ void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspac
             launch.template operator()<32, 0>();
         } else if (tokens <= 48) {
             launch.template operator()<48, 0>();
+        } else if constexpr (kDflashFeature) {
+            static_assert(kNvfp4DflashFeatureLastNarrowTokens <= 48);
+            throw std::logic_error("nvfp4 DFlash feature A16: a prefill tile serves T>48");
         } else {
             launch.template operator()<64, 0>();
         }
     } else {
-        switch (std::min((tokens + 7) / 8, 8)) {
+        // An Output that registers its wide-path panel counts compiles only those.
+        const auto launch_panels = [&]<int BM, int Panels>() {
+            if constexpr (nvfp4_w4a8_output_panels_reachable<Output>(Panels)) {
+                launch.template operator()<BM, Panels>();
+            } else {
+                throw std::invalid_argument(
+                    "nvfp4 W4A8: T selects a panel count the output does not register");
+            }
+        };
+        switch (nvfp4_w4a8_wide_panels(tokens)) {
         case 1:
-            launch.template operator()<16, 1>();
+            launch_panels.template operator()<16, 1>();
             break;
         case 2:
-            launch.template operator()<16, 2>();
+            launch_panels.template operator()<16, 2>();
             break;
         case 3:
-            launch.template operator()<32, 3>();
+            launch_panels.template operator()<32, 3>();
             break;
         case 4:
-            launch.template operator()<32, 4>();
+            launch_panels.template operator()<32, 4>();
             break;
         case 5:
-            launch.template operator()<48, 5>();
+            launch_panels.template operator()<48, 5>();
             break;
         case 6:
-            launch.template operator()<48, 6>();
+            launch_panels.template operator()<48, 6>();
             break;
         case 7:
-            launch.template operator()<64, 7>();
+            launch_panels.template operator()<64, 7>();
             break;
         default:
-            launch.template operator()<64, 8>();
+            launch_panels.template operator()<64, kNvfp4W4a8WideMaxPanels>();
             break;
         }
     }

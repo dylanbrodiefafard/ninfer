@@ -31,11 +31,12 @@ namespace ninfer::ops {
  *   multiplier.
  *
  * `T` is the positive token extent of the Op contract. BF16_CTRL admits only
- * LinearPolicy::A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8; AllowA4 permits the private
- * resolver to select either a qualified A16 route or activation quantization to NVFP4 at every
- * positive T. NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=4, otherwise A16. Its
- * per16-scale partial accumulation preserves the original represented NVFP4 weights. FP8 admits
- * A16Only and AllowA8 at every positive T.
+ * LinearPolicy::A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8. Its A16 route is registered
+ * at T=1 and below the W4A4 cutover (T < kA4AttnInputMinTokens); AllowA4 selects activation
+ * quantization to NVFP4 from that cutover and AllowA8 selects row-scaled E4M3 activation compute
+ * at T>=2, so both admit every positive T, while A16Only at a wider T throws
+ * std::invalid_argument. The per16-scale partial accumulation preserves the original represented
+ * NVFP4 weights. FP8 admits A16Only and AllowA8 at every positive T.
  *
  * The oracle evaluates every projection independently with naive FP64 accumulation from the
  * logical values represented by the persistent weight and BF16 activation. The final four BF16

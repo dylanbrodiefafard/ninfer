@@ -92,8 +92,6 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32_t seed) {
     std::vector<Invocation> invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
-        Invocation{2, ops::LinearPolicy::A16Only},
-        Invocation{26, ops::LinearPolicy::A16Only},
         Invocation{first_a8 - 1, ops::LinearPolicy::AllowA8},
         Invocation{first_a8, ops::LinearPolicy::AllowA8},
         Invocation{48, ops::LinearPolicy::AllowA8},
@@ -107,7 +105,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         Invocation{128, ops::LinearPolicy::AllowA8},
         Invocation{129, ops::LinearPolicy::AllowA8},
     };
-    for (int columns = 2; columns <= 24; ++columns) {
+    // A16Only is registered below the A8 width.
+    for (int columns = 2; columns < first_a8; ++columns) {
         invocations.push_back({columns, ops::LinearPolicy::A16Only});
     }
     constexpr std::int32_t kMaximumTokens = 1024;
@@ -207,7 +206,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     failures += verify_preserved(device_weight, host_weight.payload, "FP8 linear_add weight");
 
     const std::size_t a16_interval = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::A16Only, 1, 2048);
+        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::A16Only, 1, first_a8 - 1);
     const std::size_t pre_boundary = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1, first_a8 - 1);
     const std::size_t hot_interval = ops::linear_add_workspace_capacity_bytes(

@@ -11,7 +11,9 @@ using namespace ninfer;
 using namespace ninfer::test::linear;
 
 int run_nvfp4_a4() {
-    constexpr std::array invocations{
+    // The DFlash MLP gate/up and down run generic AllowA4 through the widest packed proposal,
+    // W4A4 from their cutovers (gate/up T=2, down T=3).
+    constexpr std::array dflash_mlp_invocations{
         Invocation{1, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{2, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{3, CallForm::Policy, ops::LinearPolicy::AllowA4},
@@ -27,46 +29,43 @@ int run_nvfp4_a4() {
         Invocation{20, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{24, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{36, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{56, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{64, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{64, CallForm::Policy, ops::LinearPolicy::AllowA4, true},
+    };
+    // MTP fc keeps its full A16/W4A4 table, including the TMA widths.
+    constexpr std::array mtp_fc_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{2, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{5, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{12, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{24, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{36, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{64, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{64, CallForm::Policy, ops::LinearPolicy::AllowA4, true},
         Invocation{128, CallForm::Policy, ops::LinearPolicy::AllowA4, true},
         Invocation{100, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{120, CallForm::Policy, ops::LinearPolicy::AllowA4},
-        Invocation{160, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{200, CallForm::Policy, ops::LinearPolicy::AllowA4},
-        Invocation{255, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{256, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{257, CallForm::Policy, ops::LinearPolicy::AllowA4},
-        Invocation{384, CallForm::Policy, ops::LinearPolicy::AllowA4},
-        Invocation{385, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{512, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{513, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{777, CallForm::Policy, ops::LinearPolicy::AllowA4},
-        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
-        Invocation{1025, CallForm::Policy, ops::LinearPolicy::AllowA4},
-        Invocation{1500, CallForm::Policy, ops::LinearPolicy::AllowA4},
-        Invocation{2048, CallForm::Policy, ops::LinearPolicy::AllowA4},
-        Invocation{4096, CallForm::Policy, ops::LinearPolicy::AllowA4},
     };
     constexpr std::array<std::int32_t, 1> packed_col0{2};
     int failures = 0;
     for (const auto& shape : {
-             ShapeCase{14336, 5120, 719U, Comparison::Sampled, true, invocations},
-             ShapeCase{16384, 5120, 721U, Comparison::Sampled, true, invocations},
-             ShapeCase{34816, 5120, 722U, Comparison::Sampled, true, invocations},
-             ShapeCase{5120, 6144, 723U, Comparison::Sampled, true, invocations},
-             ShapeCase{5120, 17408, 725U, Comparison::Sampled, true, invocations},
-             ShapeCase{5120, 10240, 727U, Comparison::Sampled, true, invocations},
+             ShapeCase{34816, 5120, 722U, Comparison::Sampled, true, dflash_mlp_invocations},
+             ShapeCase{5120, 17408, 725U, Comparison::Sampled, true, dflash_mlp_invocations},
+             ShapeCase{5120, 10240, 727U, Comparison::Sampled, true, mtp_fc_invocations},
          }) {
         failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight, shape);
     }
-    failures += run_packed_column0_matches_decode("NVFP4_A4 packed-col0 [14336,5120]",
-                                                  make_nvfp4_weight, 14336, 5120, 719U,
-                                                  ops::LinearPolicy::AllowA4, packed_col0);
-    failures += run_packed_column0_matches_decode("NVFP4_A4 packed-col0 [5120,6144]",
-                                                  make_nvfp4_weight, 5120, 6144, 723U,
-                                                  ops::LinearPolicy::AllowA4, packed_col0);
     failures += run_packed_column0_matches_decode("NVFP4_A4 packed-col0 [5120,17408]",
                                                   make_nvfp4_weight, 5120, 17408, 725U,
                                                   ops::LinearPolicy::AllowA4, packed_col0);

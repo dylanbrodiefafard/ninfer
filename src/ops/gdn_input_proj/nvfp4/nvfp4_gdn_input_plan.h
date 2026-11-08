@@ -30,12 +30,10 @@ void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& 
 void nvfp4_gdn_input_w4a4_project(const Weight& weight, std::int32_t tokens,
                                   Nvfp4W4a4Workspace activation, Tensor& qkv, Tensor& z,
                                   cudaStream_t stream);
-void nvfp4_gdn_input_w4a4_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                      Nvfp4W4a4Workspace workspace, cudaStream_t stream);
 
-void nvfp4_gdn_input_w4a8_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                      Fp8A8Workspace workspace, cudaStream_t stream);
-// The W4A8 FP32 q/k/v + BF16 z projection of an already quantized [5120, tokens] activation.
+// The W4A8 FP32 q/k/v + BF16 z projection of an already quantized [5120, tokens] activation for
+// the staged A8 record. It compiles only the panel counts of launches wider than
+// kNvfp4GdnA8FusedRecordMaxTokens; a narrower launch throws std::invalid_argument.
 void nvfp4_gdn_input_w4a8_fp32_project(const Weight& weight, std::int32_t tokens,
                                        Fp8A8Workspace activation, Tensor& qkv, Tensor& z,
                                        cudaStream_t stream);

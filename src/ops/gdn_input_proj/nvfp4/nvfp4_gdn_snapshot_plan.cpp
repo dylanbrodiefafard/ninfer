@@ -1,10 +1,7 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
 #include "core/layout.h"
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
-#include "ops/linear/nvfp4/nvfp4_config.h"
 
-#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -12,140 +9,35 @@ namespace {
 
 inline constexpr std::int32_t kNvfp4RecordChannels = 10240;
 
-struct Nvfp4GdnProjectedWorkspace {
-    Tensor projected;
-    DeviceSpan projection;
-};
-
-template <class Allocator>
-Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t tokens) {
-    Nvfp4GdnProjectedWorkspace out;
-    out.projected = allocator.alloc(DType::BF16, {10240, tokens}, 256);
-    const std::size_t projection_bytes =
-        nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4, tokens, tokens);
-    out.projection = allocator.alloc_bytes(projection_bytes, 256);
-    return out;
-}
-
 } // namespace
 
-Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
-                                             std::int32_t batch_size) {
-    if (tokens <= 0 || batch_size <= 0 || batch_size > 8) {
-        throw std::invalid_argument("nvfp4 gdn conv: invalid B/T domain");
+void nvfp4_gdn_snapshot_validate(std::int32_t width, std::int32_t batch_size) {
+    if (width != 1 || batch_size <= 0 || batch_size > kNvfp4GdnSnapshotMaxBatch) {
+        throw std::invalid_argument("nvfp4 gdn conv snapshot: registered only for W=1, B=1..8");
     }
-    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
-        policy != LinearPolicy::AllowA8) {
-        throw std::invalid_argument("nvfp4 gdn conv: unsupported compute policy");
-    }
-    // Width selects the fused family. Snapshot T=2..16 is SmallT GEMM+FP32 conv. Record
-    // B=1 W=4 uses fused SmallT. B=1 W=5/6, B>1 W=2/5, and B=2/4 W=6 group requests
-    // while retaining the W-local reduction and FP32 conv input. Other B=1 widths retain
-    // fused T=1 GEMV+FP32 conv; other B>1 widths use request-indexed SmallT CTAs. Do not
-    // flatten to B*W W4A4 compose.
-    if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
-    if (tokens <= kNvfp4LastPackedGdnConvSmallT) {
-        return {Nvfp4GdnConvScheduleId::SmallTFusedA16};
-    }
-    if (policy == LinearPolicy::A16Only) {
-        throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=16");
-    }
-    return {Nvfp4GdnConvScheduleId::Materialized};
-}
-
-std::size_t nvfp4_gdn_decode_columns_workspace_bytes() {
-    WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {2048 + 2048 + 6144, 3, 1});
-    (void)layout.alloc(DType::I32, {1});
-    (void)layout.alloc(DType::I32, {1});
-    return layout.peak_bytes(1);
-}
-
-std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
-                                                        std::int32_t min_tokens,
-                                                        std::int32_t max_tokens) {
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("nvfp4 gdn snapshot workspace: invalid token interval");
-    }
-    (void)nvfp4_gdn_conv_resolve_plan(policy, min_tokens, 1);
-    const Nvfp4GdnConvPlan maximum_plan = nvfp4_gdn_conv_resolve_plan(policy, max_tokens, 1);
-    if (maximum_plan.schedule != Nvfp4GdnConvScheduleId::Materialized) { return 0; }
-
-    WorkspaceLayoutBuilder layout;
-    (void)allocate_workspace(layout, max_tokens);
-    return layout.peak_bytes(1);
 }
 
 std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::int32_t batch_size,
                                                       std::int32_t min_tokens,
                                                       std::int32_t max_tokens) {
-    if (min_tokens < 2 || max_tokens < min_tokens || max_tokens > 16 || batch_size <= 0 ||
-        batch_size > 8) {
+    if (min_tokens < kNvfp4FirstA8 || max_tokens < min_tokens ||
+        max_tokens > kNvfp4GdnA8FusedRecordMaxWidth || batch_size <= 0 ||
+        batch_size > kDflash2MaxBatch) {
         throw std::invalid_argument("nvfp4 gdn record workspace: invalid B/T domain");
     }
-    (void)nvfp4_gdn_conv_resolve_plan(policy, max_tokens, batch_size);
-    if (nvfp4_gdn_record_uses_quantized(policy, max_tokens)) {
-        // Every width up to max_tokens fuses when the widest launch fits the single M48 tile.
-        if (policy == LinearPolicy::AllowA8 && max_tokens <= kNvfp4GdnA8FusedRecordMaxWidth &&
-            max_tokens * batch_size <= kNvfp4GdnA8FusedRecordMaxTokens) {
-            return fp8_a8_workspace_capacity_bytes(max_tokens * batch_size, 5120);
-        }
-        // Mirrors the launch order: A8 quantizes before staging the FP32 projection, which the
-        // A8-input form allocates alone; A4 stages the projection first.
-        WorkspaceLayoutBuilder layout;
-        if (policy == LinearPolicy::AllowA8) {
-            (void)allocate_fp8_a8_workspace(layout, max_tokens * batch_size, 5120);
-            (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, max_tokens, batch_size}, 256);
-        } else {
-            (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, max_tokens, batch_size}, 256);
-            (void)allocate_nvfp4_w4a4_workspace(layout, max_tokens * batch_size, 5120);
-        }
-        return layout.peak_bytes(1);
+    if (policy != LinearPolicy::AllowA8) {
+        throw std::invalid_argument("nvfp4 gdn record workspace: the record is registered for A8");
     }
-    std::int32_t maximum_grouped_width = 0;
-    if (min_tokens <= 2 && max_tokens >= 2 && nvfp4_gdn_record_uses_grouped_replay(2, batch_size)) {
-        maximum_grouped_width = 2;
+    // Every width up to max_tokens fuses when the widest launch fits the single M48 tile.
+    if (max_tokens * batch_size <= kNvfp4GdnA8FusedRecordMaxTokens) {
+        return fp8_a8_workspace_capacity_bytes(max_tokens * batch_size, 5120);
     }
-    if (min_tokens <= 5 && max_tokens >= 5 && nvfp4_gdn_record_uses_grouped_replay(5, batch_size)) {
-        maximum_grouped_width = 5;
-    }
-    if (min_tokens <= 6 && max_tokens >= 6 && nvfp4_gdn_record_uses_grouped_replay(6, batch_size)) {
-        maximum_grouped_width = 6;
-    }
-    if (maximum_grouped_width == 0) { return 0; }
+    // Mirrors the launch order: the activation is quantized before the staged FP32 projection,
+    // which the A8-input form allocates alone.
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, maximum_grouped_width, batch_size}, 256);
+    (void)allocate_fp8_a8_workspace(layout, max_tokens * batch_size, 5120);
+    (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, max_tokens, batch_size}, 256);
     return layout.peak_bytes(1);
-}
-
-void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                                 Tensor& conv_states, const Tensor& valid_columns,
-                                 const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                 LinearPolicy policy, WorkspaceArena& workspace,
-                                 cudaStream_t stream) {
-    switch (nvfp4_gdn_conv_resolve_plan(policy, x.ne[1], 1).schedule) {
-    case Nvfp4GdnConvScheduleId::DecodeFusedA16:
-        nvfp4_gdn_snapshot_decode_launch(x, weight, conv_weight, conv_states, valid_columns,
-                                         initial_slot, snapshot_base_slot, query, key, value, z,
-                                         stream);
-        return;
-    case Nvfp4GdnConvScheduleId::SmallTFusedA16:
-        nvfp4_gdn_snapshot_small_t_launch(x, weight, conv_weight, conv_states, valid_columns,
-                                          initial_slot, snapshot_base_slot, query, key, value, z,
-                                          stream);
-        return;
-    case Nvfp4GdnConvScheduleId::Materialized:
-        break;
-    }
-
-    auto scope                         = workspace.scope();
-    Nvfp4GdnProjectedWorkspace scratch = allocate_workspace(workspace, x.ne[1]);
-    WorkspaceArena projection_workspace(scratch.projection);
-    nvfp4_gdn_input_dispatch(x, weight, scratch.projected, z, LinearPolicy::AllowA4,
-                             &projection_workspace, stream);
-    nvfp4_gdn_snapshot_post_launch(scratch.projected, conv_weight, conv_states, valid_columns,
-                                   initial_slot, snapshot_base_slot, query, key, value, stream);
 }
 
 } // namespace ninfer::ops::detail

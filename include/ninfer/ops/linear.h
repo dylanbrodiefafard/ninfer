@@ -56,23 +56,32 @@ enum class LinearPolicy : std::uint8_t {
  *
  * @par Supported execution domain
  * Registered execution uses RowSplit Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights
- * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16S weights,
- * plus registered contiguous BF16_CTRL problems. FP8 shapes are [14336,5120], [16384,5120],
- * [34816,5120], [248320,5120], [5120,6144], and [5120,17408], at every positive T.
- * Their represented values are signed E4M3FN codes times exact BF16 row multipliers.
+ * with FP16 scales, block-scaled NVFP4 weights, or row-scaled FP8_E4M3FN_ROW_BF16S weights.
+ * The FP8 problem is the vocabulary head
+ * [248320,5120] at every positive T; the FP8 Text projections run through their fused Ops.
+ * Its represented values are signed E4M3FN codes times exact BF16 row multipliers.
  * Each format owns a finite registry of exact physical weight problems and selects its kernel
- * internally; a valid encoding and alignment do not imply arbitrary N/K support. The current
- * NVFP4 problems `[N,K]` in `{[14336,5120], [16384,5120], [34816,5120],
- * [5120,6144], [5120,17408], [5120,25600], [6144,5120], [5120,4096],
- * [1280,5120], [256,5120], [5120,10240]}` accept every positive T. The five
- * DFlash2-only geometries are A16-only; AllowA4 still resolves them to A16.
- * MTP `fc` `[5120,10240]` admits W4A4 at T≥8 (residual-class N; T=4/6 stay A16). Text and MTP
- * packed-weight problems accept every positive column extent T. Registered W8 problems
+ * internally; a valid encoding and alignment do not imply arbitrary N/K support. The NVFP4
+ * problems serve the DFlash2 drafter and MTP; the NVFP4 Text projections run through their fused
+ * Ops. Each NVFP4 problem admits T=1, plus the widths its callers launch (k is the draft window
+ * in [1, kDflash2MaxDraftTokens], B a batch in [1, kDflash2MaxBatch]):
+ * - `[5120,25600]`, `[6144,5120]` and `[5120,4096]` (DFlash feature, QKV and attention output):
+ *   every positive T, A16-only.
+ * - `[1280,5120]` (DFlash conv projection): A16-only passes of m proposal blocks of k + 1
+ *   columns within 32 columns, and wider extents made of such passes.
+ * - `[256,5120]` (DFlash selector): A16-only T=k.
+ * - `[34816,5120]` and `[5120,17408]` (DFlash MLP gate/up and down): AllowA4 through the widest
+ *   packed proposal, (kDflash2MaxDraftTokens + 1) * kDflash2MaxBatch columns, which selects W4A4
+ *   from T=2 (gate/up) and T=3 (down); the down projection's T=2 is A16.
+ * - `[5120,10240]` (MTP `fc`): every positive T; AllowA4 selects W4A4 at T>=8.
+ * - `[14336,5120]`, `[16384,5120]` and `[5120,6144]`: T=1 only.
+ * Other widths and policies throw std::invalid_argument. Registered W8 problems
  * `[5120,25600]`, `[5120,4096]`,
  * `[1280,5120]`, and `[256,5120]`, and registered Q4 problems `[5120,25600]`, `[5120,4096]`,
  * `[5120,17408]`, `[1280,5120]`, and `[256,5120]`, also accept every positive T. Registered Vision
  * problems accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix
- * column does not inherently represent a text token. FP32_CTRL is unsupported.
+ * column does not inherently represent a text token. BF16_CTRL, FP32_CTRL, and I32_CTRL weights are
+ * unsupported; the BF16 Text projections run through their fused Ops.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
@@ -87,17 +96,14 @@ enum class LinearPolicy : std::uint8_t {
  * @par Compute policy
  * `policy` specifies the permitted private activation-compute set. A permission does not require a
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
- * choice. BF16_CTRL admits only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
- * LinearPolicy::A16Only and LinearPolicy::AllowA8. NVFP4 admits A16Only, AllowA4 and AllowA8;
- * AllowA4 permits the private resolver to select either a qualified A16 route or activation
- * quantization to NVFP4 at every positive T. The selected route depends only on the registered
- * problem and T. NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=2 for [14336,5120],
- * [16384,5120], [34816,5120], [5120,6144], and [5120,17408]. Other NVFP4 shapes and T<2
- * retain A16. Weight codes and per16 E4M3 scales remain unchanged: exact code expansion and
- * separately scaled K16 partials introduce no additional weight quantization. The canonical
- * oracle retains original BF16 inputs; independent codec attribution supplements its check.
- * FP8 admits A16Only and AllowA8. Its vocabulary projection always uses A16 and also accepts
- * AllowA4 without enabling A4. FP8 packed sequences retain independent per-sequence routes.
+ * choice. Registered Q4/Q5/Q6/W8 formats admit
+ * LinearPolicy::A16Only and LinearPolicy::AllowA8. NVFP4 admits A16Only and AllowA4; AllowA4
+ * permits the private resolver to select either a qualified A16 route or activation quantization
+ * to NVFP4. The selected route depends only on the registered problem and T. Weight codes and
+ * per16 E4M3 scales remain unchanged: exact code expansion and separately scaled K16 partials
+ * introduce no additional weight quantization. The canonical oracle retains original BF16 inputs;
+ * independent codec attribution supplements its check. The FP8 vocabulary projection accepts
+ * every policy and always uses A16. FP8 packed sequences retain independent per-sequence routes.
  * Callers that pack B independent sequences as `T = sequence_width * B` must use
  * `linear_packed_sequences`, which preserves the C=1 route by default and owns explicitly
  * qualified aggregate exceptions.
@@ -138,8 +144,9 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
  * SmallT, Q4 draft-head, and W8/Q4 SIMT/MMA routes are specialized by exact T, so launching once
  * at `T=width*B` can select a different kernel than sequential C=1 (`T=width`). This entry
  * launches one Linear per sequence by default. Qualified exceptions aggregate the A16 W8
- * vocabulary W=2..6 profile in passes of at most 32 same-reduction columns and aggregate selected
- * NVFP4 DFlash and Q4 27B draft-head profiles. `T` must be a positive multiple of `sequence_width`.
+ * vocabulary W=2..8 profile in passes of at most 48 same-reduction columns and aggregate selected
+ * NVFP4 DFlash (the conv projection in passes of at most 32 columns) and Q4 27B draft-head
+ * profiles. `T` must be a positive multiple of `sequence_width`.
  * Tensor, weight, aliasing, policy, and workspace requirements match `linear`.
  *
  * @param[in] sequence_width Per-sequence column count (the C=1 T).

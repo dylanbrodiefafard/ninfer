@@ -21,7 +21,6 @@ namespace {
 
 // This criterion belongs to the complete A16 fused projection/conv/snapshot Op.
 constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.15e-3, 4.0e-3, 3.2e-3};
-constexpr ReductionCriterion kGdnInputProjConvSnapshotA4Tolerance{0.16, 4.0e-3, 0.16};
 
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;
@@ -477,12 +476,11 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
                 parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
                 kHidden);
         });
-    const bool a4 = policy == ops::LinearPolicy::AllowA4 && tokens >= 17;
-    const ReductionCriterion& criterion =
-        a4 ? kGdnInputProjConvSnapshotA4Tolerance : kGdnInputProjConvSnapshotA16Tolerance;
+    const ReductionCriterion& criterion = kGdnInputProjConvSnapshotA16Tolerance;
     const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens) +
-        " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(kSnapshotBaseSlot);
+        std::string(" NVFP4 A16 policy=") + std::to_string(static_cast<int>(policy)) +
+        " T=" + std::to_string(tokens) + " initial=" + std::to_string(initial_slot) +
+        " base=" + std::to_string(kSnapshotBaseSlot);
     const std::vector<std::uint16_t> state_after = state.bits();
     int failures =
         verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
@@ -523,26 +521,22 @@ int run_nvfp4() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 823U, options));
 
+    // The snapshot serves ordinary decode: W=1 under every policy, one request per GEMV.
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
-    failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
-    failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
-    failures += run_nvfp4_case(parent, 8, ops::LinearPolicy::AllowA4, 9);
-    failures += run_nvfp4_case(parent, 12, ops::LinearPolicy::AllowA4, 13);
-    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
-    failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
+    failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA8, 0);
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
     constexpr std::int32_t kChannels  = 10240;
-    constexpr std::int32_t kWidth     = 6;
-    constexpr std::int32_t kBatch     = 3;
-    const std::vector<std::int32_t> valid_columns{6, 3, 1};
+    constexpr std::int32_t kWidth     = 1;
+    constexpr std::int32_t kBatch     = 8;
+    const std::vector<std::int32_t> valid_columns(kBatch, kWidth);
     const std::vector<float> conv_weight = make_conv_weight(kChannels, 829U);
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, kWidth, kWidth);
+        QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA8, kBatch, kWidth, kWidth);
     failures += run_batched_case(
-        "NVFP4 A4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
-        conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
+        "NVFP4 A8 B=8 W=1", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns, conv_weight,
+        workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
         [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
             return quantized_weight::dot_fp64(
                 parent.host, row,
@@ -557,7 +551,7 @@ int run_nvfp4() {
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
             Tensor& z, WorkspaceArena& workspace) {
             ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
-                                              snapshot_base, q, k, v, z, ops::LinearPolicy::AllowA4,
+                                              snapshot_base, q, k, v, z, ops::LinearPolicy::AllowA8,
                                               workspace, nullptr);
         });
     failures += parent.verify_preserved("batched NVFP4 parent weight");
@@ -566,7 +560,6 @@ int run_nvfp4() {
 
 constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA16Tolerance{1.0 / 256.0, 1.0 / 256.0,
                                                                       2.0 / 256.0};
-constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
                  std::int32_t initial_slot, bool convenience = false,
@@ -633,12 +626,11 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
                 parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
                 kHidden);
         });
-    const bool uses_a8                  = policy == ops::LinearPolicy::AllowA8 && tokens > 16;
-    const ReductionCriterion& criterion = uses_a8 ? kFp8GdnInputProjConvSnapshotA8Tolerance
-                                                  : kFp8GdnInputProjConvSnapshotA16Tolerance;
+    const ReductionCriterion& criterion = kFp8GdnInputProjConvSnapshotA16Tolerance;
     const std::string suffix =
-        std::string(" FP8 ") + (uses_a8 ? "A8" : "A16") + " T=" + std::to_string(tokens) +
-        " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(snapshot_base_slot);
+        std::string(" FP8 A16 policy=") + std::to_string(static_cast<int>(policy)) +
+        " T=" + std::to_string(tokens) + " initial=" + std::to_string(initial_slot) +
+        " base=" + std::to_string(snapshot_base_slot);
     const std::vector<std::uint16_t> state_after = state.bits();
     int failures =
         verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
@@ -680,22 +672,14 @@ int run_fp8() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 929U));
 
+    // The snapshot serves ordinary decode: W=1 under either policy, one request per GEMV.
     int failures = 0;
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, 2, true, true);
-    failures += run_fp8_case(parent, 3, ops::LinearPolicy::A16Only, 4);
-    failures += run_fp8_case(parent, 4, ops::LinearPolicy::A16Only, 5);
-    failures += run_fp8_case(parent, 6, ops::LinearPolicy::A16Only, 7);
-    failures += run_fp8_case(parent, 7, ops::LinearPolicy::A16Only, 8);
-    failures += run_fp8_case(parent, 9, ops::LinearPolicy::AllowA8, 10);
-    failures += run_fp8_case(parent, 10, ops::LinearPolicy::AllowA8, 11);
-    failures += run_fp8_case(parent, 10, ops::LinearPolicy::A16Only, 11);
-    failures += run_fp8_case(parent, 11, ops::LinearPolicy::A16Only, 12);
-    failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8, 1);
+    failures += run_fp8_case(parent, 1, ops::LinearPolicy::AllowA8, 3);
 
     const auto run_batched = [&](std::int32_t width, std::int32_t batch,
                                  std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
         const std::vector<float> conv_weight = make_conv_weight(kChannels, seed);
-        const bool uses_a8                   = false; // short recurrent blocks retain A16
         const std::size_t workspace_bytes =
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                 QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, batch,
@@ -703,9 +687,7 @@ int run_fp8() {
         return run_batched_case(
             "FP8 AllowA8 B=" + std::to_string(batch) + " W=" + std::to_string(width), kHidden,
             kValueRows, kZRows, width, batch, std::move(valid_columns), conv_weight,
-            workspace_bytes,
-            uses_a8 ? kFp8GdnInputProjConvSnapshotA8Tolerance
-                    : kFp8GdnInputProjConvSnapshotA16Tolerance,
+            workspace_bytes, kFp8GdnInputProjConvSnapshotA16Tolerance,
             [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
                 return quantized_weight::dot_fp64(
                     parent.host, row,
@@ -724,8 +706,7 @@ int run_fp8() {
                                                   ops::LinearPolicy::AllowA8, workspace, nullptr);
             });
     };
-    failures += run_batched(4, 2, {4, 2}, 937U);
-    failures += run_batched(16, 4, {16, 11, 5, 1}, 941U);
+    failures += run_batched(1, 8, std::vector<std::int32_t>(8, 1), 937U);
     failures += parent.verify_preserved("batched FP8 parent weight");
     return failures;
 }
@@ -738,18 +719,14 @@ int main() {
         return 1;
     }
 
-    int failures                  = 0;
-    const std::size_t nvfp4_a4_17 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 17, 17);
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 16) != 0 ||
-        nvfp4_a4_17 == 0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 17) != nvfp4_a4_17) {
-        std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
-        ++failures;
+    int failures = 0;
+    for (const ops::LinearPolicy policy :
+         {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4, ops::LinearPolicy::AllowA8}) {
+        if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(QType::NVFP4, 16384, 5120,
+                                                                       policy, 8, 1, 1) != 0) {
+            std::cerr << "NVFP4 W=1 snapshot reported nonzero workspace\n";
+            ++failures;
+        }
     }
     failures += run_fp8();
     failures += run_nvfp4();

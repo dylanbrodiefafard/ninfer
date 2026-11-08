@@ -53,11 +53,14 @@ namespace ninfer::ops {
  *   staging, and workspace precision; those private choices are not semantic rounding boundaries.
  *
  * Compute policy:
- *   BF16_CTRL admits only A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8; AllowA4
- * permits the private resolver to select a qualified A16 or A4 route at every positive T. NVFP4
- * AllowA8 selects row-scaled E4M3 activation compute at T>=2 and A16 below that; exact weight-code
- * expansion and FP32 per16-scale accumulation preserve the stored weights. FP8 admits A16Only and
- * AllowA8, with caller-owned A8 activation workspace.
+ *   BF16_CTRL admits only A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8. Its A16 route is
+ * registered at T=1 and below the projection's W4A4 cutover (T < kA4Residual6144MinTokens or
+ * kA4Residual17408MinTokens); AllowA4 selects the A4 route from that cutover and AllowA8 selects
+ * row-scaled E4M3 activation compute at T>=2, so both admit every positive T, while A16Only at a
+ * wider T throws std::invalid_argument. Exact weight-code expansion and FP32 per16-scale
+ * accumulation preserve the stored weights. FP8 admits AllowA8 at every positive T, with
+ * caller-owned A8 activation workspace from T=22 (K=6144) or T=25 (K=17408); its A16 route, and
+ * hence A16Only, is registered only below those widths.
  *
  * Effects:
  *   Updates the full residual tensor in place; x/weight must not alias residual.

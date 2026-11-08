@@ -16,12 +16,9 @@ namespace {
 
 using Geometry = Fp8GdnInputGeometry;
 
-using SnapshotLaunch = void (*)(const Tensor&, const Weight&, const Tensor&, Tensor&, const Tensor&,
-                                const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
-                                cudaStream_t);
-using RecordLaunch   = void (*)(const Tensor&, const Weight&, const Tensor&, const Tensor&,
-                                const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
-                                Tensor&, cudaStream_t, const std::int32_t*);
+using RecordLaunch = void (*)(const Tensor&, const Weight&, const Tensor&, const Tensor&,
+                              const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
+                              Tensor&, cudaStream_t, const std::int32_t*);
 
 template <int ActiveTokens, bool Tree = false, class Publish>
 void launch_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
@@ -45,20 +42,6 @@ void launch_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_we
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int ActiveTokens>
-void launch_snapshot_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                             Tensor& conv_states, const Tensor& valid_columns,
-                             const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                             Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                             cudaStream_t stream) {
-    launch_small_t<ActiveTokens>(
-        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
-        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
-                               static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                               kGdnChannels},
-        stream);
-}
-
 template <int ActiveTokens, bool Tree>
 void launch_record_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                            const Tensor& conv_states, const Tensor& valid_columns,
@@ -72,11 +55,34 @@ void launch_record_small_t(const Tensor& x, const Weight& weight, const Tensor& 
         stream, parent_index);
 }
 
-void launch_snapshot_decode(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                            Tensor& conv_states, const Tensor& valid_columns,
-                            const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                            Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                            cudaStream_t stream) {
+// The launcher of a fused record width, nullptr elsewhere, so only those widths instantiate.
+template <int ActiveTokens, bool Tree>
+constexpr RecordLaunch fused_record_launcher() {
+    if constexpr (fp8_gdn_fused_record_width(ActiveTokens, Tree)) {
+        return &launch_record_small_t<ActiveTokens, Tree>;
+    } else {
+        return nullptr;
+    }
+}
+
+template <bool Tree, std::size_t... Offsets>
+constexpr auto make_record_launchers(std::index_sequence<Offsets...>) {
+    return std::array<RecordLaunch, sizeof...(Offsets)>{
+        fused_record_launcher<kFp8FirstSmallT + static_cast<int>(Offsets), Tree>()...};
+}
+
+constexpr auto kTreeRecordLaunchers = make_record_launchers<true>(
+    std::make_index_sequence<kFp8LinearSmallTMax<Geometry> - kFp8FirstSmallT + 1>{});
+constexpr auto kRecordLaunchers = make_record_launchers<false>(
+    std::make_index_sequence<kFp8LinearSmallTMax<Geometry> - kFp8FirstSmallT + 1>{});
+
+} // namespace
+
+void fp8_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
+                                    const Tensor& conv_weight, Tensor& conv_states,
+                                    const Tensor& valid_columns, const Tensor& initial_slot,
+                                    const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                    Tensor& value, Tensor& z, cudaStream_t stream) {
     using Schedule        = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     fp8_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
@@ -90,55 +96,16 @@ void launch_snapshot_decode(const Tensor& x, const Weight& weight, const Tensor&
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Offsets>
-constexpr auto make_snapshot_launchers(std::index_sequence<Offsets...>) {
-    return std::array<SnapshotLaunch, sizeof...(Offsets)>{
-        &launch_snapshot_small_t<kFp8FirstSmallT + static_cast<int>(Offsets)>...};
-}
-
-template <bool Tree, std::size_t... Offsets>
-constexpr auto make_record_launchers(std::index_sequence<Offsets...>) {
-    return std::array<RecordLaunch, sizeof...(Offsets)>{
-        &launch_record_small_t<kFp8FirstSmallT + static_cast<int>(Offsets), Tree>...};
-}
-
-constexpr auto kSnapshotLaunchers = make_snapshot_launchers(
-    std::make_index_sequence<kFp8LinearSmallTMax<Geometry> - kFp8FirstSmallT + 1>{});
-constexpr auto kTreeRecordLaunchers = make_record_launchers<true>(
-    std::make_index_sequence<kFp8LinearSmallTMax<Geometry> - kFp8FirstSmallT + 1>{});
-constexpr auto kRecordLaunchers = make_record_launchers<false>(
-    std::make_index_sequence<kFp8LinearSmallTMax<Geometry> - kFp8FirstSmallT + 1>{});
-
-} // namespace
-
-void fp8_gdn_snapshot_fused_launch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                                   Tensor& conv_states, const Tensor& valid_columns,
-                                   const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                   Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                   cudaStream_t stream) {
-    if (x.ne[2] != 1 || x.ne[1] <= 0 || x.ne[1] > kFp8LinearSmallTMax<Geometry>) {
-        throw std::invalid_argument("fp8 GDN snapshot fused: unsupported B/W");
-    }
-    if (x.ne[1] == 1) {
-        launch_snapshot_decode(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                               snapshot_base_slot, query, key, value, z, stream);
-        return;
-    }
-    kSnapshotLaunchers[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](
-        x, weight, conv_weight, conv_states, valid_columns, initial_slot, snapshot_base_slot, query,
-        key, value, z, stream);
-}
-
 void fp8_gdn_record_fused_launch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                                  const Tensor& conv_states, const Tensor& valid_columns,
                                  const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
                                  Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream,
                                  const Tensor* parent_index) {
-    if (x.ne[2] != 1 || x.ne[1] < kFp8FirstSmallT || x.ne[1] > kFp8LinearSmallTMax<Geometry>) {
-        throw std::invalid_argument("fp8 GDN record fused: unsupported B/W");
-    }
     const auto* parents =
         parent_index == nullptr ? nullptr : static_cast<const std::int32_t*>(parent_index->data);
+    if (x.ne[2] != 1 || !fp8_gdn_fused_record_width(x.ne[1], parents != nullptr)) {
+        throw std::invalid_argument("fp8 GDN record fused: unregistered B/W/tree shape");
+    }
     const auto& launchers = parents == nullptr ? kRecordLaunchers : kTreeRecordLaunchers;
     launchers[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record, query, key,

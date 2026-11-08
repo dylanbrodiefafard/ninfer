@@ -52,10 +52,6 @@ ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES ops/nvfp4_linear_sw
 # sweeps live in ops/_archive/ and are not built.
 ninfer_add_op_bench(ninfer_nvfp4_swiglu_t4_explore_v5
   SOURCES ops/nvfp4_swiglu_t4_explore_v5.cu)
-ninfer_add_op_bench(ninfer_nvfp4_mlp_down_t4_explore_v5
-  SOURCES ops/nvfp4_mlp_down_t4_explore_v5.cu)
-ninfer_add_op_bench(ninfer_nvfp4_mlp_pair_cache_v5
-  SOURCES ops/nvfp4_mlp_pair_cache_v5.cu)
 ninfer_add_op_bench(ninfer_nvfp4_mlp_pair_ncu_v5
   SOURCES ops/nvfp4_mlp_pair_ncu_v5.cu)
 ninfer_add_op_bench(ninfer_nvfp4_swiglu_w4a4_tile_v5

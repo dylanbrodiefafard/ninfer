@@ -3,7 +3,6 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
@@ -16,49 +15,32 @@ enum class Nvfp4AttnInputRoute : std::uint8_t {
     W4A8,
 };
 
+// The A16 route serves T=1 and the prefill widths below the W4A4 cutover; verify takes W4A8 from
+// T=2 under AllowA8.
 Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 attn_input_proj: T must be positive"); }
-    if (policy == LinearPolicy::A16Only) { return Nvfp4AttnInputRoute::A16; }
-    if (policy == LinearPolicy::AllowA8) {
-        return tokens >= kNvfp4FirstA8 ? Nvfp4AttnInputRoute::W4A8 : Nvfp4AttnInputRoute::A16;
-    }
-    if (policy != LinearPolicy::AllowA4) {
+    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
+        policy != LinearPolicy::AllowA8) {
         throw std::invalid_argument("nvfp4 attn_input_proj: unsupported policy");
     }
-    return tokens >= kNvfp4FirstW4a4AttnInput ? Nvfp4AttnInputRoute::W4A4
-                                              : Nvfp4AttnInputRoute::A16;
+    if (policy == LinearPolicy::AllowA8 && tokens >= kNvfp4FirstA8) {
+        return Nvfp4AttnInputRoute::W4A8;
+    }
+    if (tokens < kNvfp4FirstW4a4AttnInput) { return Nvfp4AttnInputRoute::A16; }
+    if (policy != LinearPolicy::AllowA4) {
+        throw std::invalid_argument(
+            "nvfp4 attn_input_proj: A16 is registered only below the W4A4 cutover");
+    }
+    return Nvfp4AttnInputRoute::W4A4;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                 Tensor& v, cudaStream_t stream) {
-    constexpr std::int32_t kChunk  = kNvfp4LastSmallT;
-    constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
-    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
-        const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
-        auto* input = static_cast<std::uint8_t*>(x.data) +
-                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
-        auto* query = static_cast<std::uint8_t*>(q.data) +
-                      static_cast<std::int64_t>(token_begin) * kQRows * sizeof(std::uint16_t);
-        auto* output_gate = static_cast<std::uint8_t*>(gate.data) +
-                            static_cast<std::int64_t>(token_begin) * kQRows * sizeof(std::uint16_t);
-        auto* key   = static_cast<std::uint8_t*>(k.data) +
-                      static_cast<std::int64_t>(token_begin) * kKvRows * sizeof(std::uint16_t);
-        auto* value = static_cast<std::uint8_t*>(v.data) +
-                      static_cast<std::int64_t>(token_begin) * kKvRows * sizeof(std::uint16_t);
-        Tensor input_chunk(input, DType::BF16, {weight.k, active});
-        Tensor query_chunk(query, DType::BF16, {kQRows, active});
-        Tensor gate_chunk(output_gate, DType::BF16, {kQRows, active});
-        Tensor key_chunk(key, DType::BF16, {kKvRows, active});
-        Tensor value_chunk(value, DType::BF16, {kKvRows, active});
-        if (active == 1) {
-            nvfp4_attn_input_decode_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
-                                           value_chunk, stream);
-        } else {
-            nvfp4_attn_input_small_t_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
-                                            value_chunk, stream);
-        }
+    if (x.ne[1] == 1) {
+        nvfp4_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
+        return;
     }
+    nvfp4_attn_input_small_t_launch(x, weight, q, gate, k, v, stream);
 }
 
 } // namespace

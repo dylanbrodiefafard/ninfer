@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 
 namespace ninfer::ops::detail {
@@ -45,22 +46,14 @@ struct Nvfp4AttentionInputSmallTOutput {
     }
 };
 
-// The four-output epilogue shifts the measured low-T warp crossover relative to contiguous Linear,
-// so Attention owns this production mapping even though both routes share the compute body.
+// RTX 5090 cold-cache winner for the four-output epilogue at the A16 widths below the W4A4
+// cutover: eight-warp CTAs with the activation columns staged in shared memory.
 template <int ActiveTokens>
 struct Nvfp4AttentionSmallTProductionSchedule {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta = ActiveTokens >= 17 ? 4 : (ActiveTokens >= 8 ? 16 : 8);
-    static constexpr bool kW5Aggregate =
-        ActiveTokens == 10 || ActiveTokens == 15 || ActiveTokens == 20;
-    static constexpr int kValuesPerLane =
-        kW5Aggregate ? 16 : (ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16);
-    static constexpr auto kActivationAccess = ActiveTokens <= 4
-                                                  ? Nvfp4SmallTActivationAccess::SharedPhase
-                                                  : Nvfp4SmallTActivationAccess::TokenPacked;
+    static_assert(ActiveTokens < kNvfp4FirstW4a4AttnInput);
     using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
+        Nvfp4SmallTSchedule<8, 1, 2, 16, ActiveTokens, 1, Nvfp4SmallTActivationAccess::SharedPhase,
                             Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
@@ -96,13 +89,19 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 }
 
 constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+    make_launchers(std::make_index_sequence<kNvfp4FirstW4a4AttnInput - kNvfp4FirstSmallT>{});
 
 } // namespace
 
 void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
-    kLaunchers[x.ne[1] - kNvfp4FirstSmallT](x, weight, q, gate, k, v, stream);
+    const std::int32_t tokens = x.ne[1];
+    if (tokens < kNvfp4FirstSmallT || tokens >= kNvfp4FirstW4a4AttnInput) {
+        throw std::invalid_argument(
+            "nvfp4 attn_input_proj SmallT: T is at or above the W4A4 cutover");
+    }
+    kLaunchers[static_cast<std::size_t>(tokens - kNvfp4FirstSmallT)](x, weight, q, gate, k, v,
+                                                                     stream);
 }
 
 } // namespace ninfer::ops::detail

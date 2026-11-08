@@ -211,19 +211,6 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
 
 } // namespace
 
-void gdn_projected_conv_snapshot_launch(const Tensor& projected, const Tensor& conv_weight,
-                                        Tensor& conv_states, const Tensor& valid_columns,
-                                        const Tensor& initial_state_slots,
-                                        const Tensor& snapshot_base_slots, Tensor& query,
-                                        Tensor& key, Tensor& value, cudaStream_t stream) {
-    dispatch(projected, conv_weight, conv_states, valid_columns, initial_state_slots, nullptr,
-             query, key, value,
-             SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
-                                    static_cast<const std::int32_t*>(snapshot_base_slots.data),
-                                    projected.ne[0]},
-             stream);
-}
-
 void gdn_projected_conv_record_launch(const Tensor& conv_record, const Tensor& conv_weight,
                                       const Tensor& conv_states, const Tensor& valid_columns,
                                       const Tensor& initial_state_slots, Tensor& query, Tensor& key,

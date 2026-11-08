@@ -463,16 +463,13 @@ One propose block:
    taking the generic `MultiBatch=true` route; for NVFP4 KV windows up to 32K the split count is sized
    per batch to one resident wave, a rounding-only difference. ReplaySSM records
    are `layer(g, 0, B)`.
-   Packed NVFP4 GDN conv-record under A4 (W=5..16) or A8 (W=4..16) aggregates projections while
+   Packed NVFP4 GDN conv-record runs A8 at every verify width and aggregates projections while
    preserving FP32 current input to convolution and BF16 saved history. A8 uses E4M3 activations
-   and separately scaled K16 partials without requantizing the NVFP4 weights. Under A16,
-   B=1 W=4 uses a fused SmallT pass; B=1 W=5/6 and W=2/5 B=2..4 group weight replay with a
-   private FP32 projection. W=6 B=2/4 uses request pairs, while B=3 remains request-indexed.
-   Other B=1 widths use fused T=1 GEMV+FP32 conv; other B>1 widths use request-indexed SmallT
-   CTAs. The selected A8/A8 quality/performance tradeoff is recorded in the performance reference.
-   A8 W2–6 fuses projection and convolution/record publication using a CTA-local FP32 tile;
-   the tile reuses completed weight staging after the final K-loop barrier. Wider public record
-   widths retain global FP32 staging.
+   and separately scaled K16 partials without requantizing the NVFP4 weights. The selected A8/A8
+   quality/performance tradeoff is recorded in the performance reference. Launches with W*B<=48
+   fuse projection and convolution/record publication using a CTA-local FP32 tile; the tile
+   reuses completed weight staging after the final K-loop barrier. Wider launches retain global
+   FP32 staging.
    The family passes post-normalization parameters and caller-owned normalized scratch to the
    post-mixer leaf. Eligible NVFP4/A8 verification uses `rmsnorm_linear_swiglu`: RMSNorm's BF16
    rounding is preserved in registers before FP8 quantization and the gate/up projection.

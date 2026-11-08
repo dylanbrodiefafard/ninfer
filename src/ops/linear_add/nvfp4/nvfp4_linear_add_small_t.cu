@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 
@@ -38,26 +39,31 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_exact<Geometry, kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
 }
 
-template <class Geometry>
-constexpr auto make_launchers() {
-    return make_launchers<Geometry>(
-        std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+// One launcher per A16 width below each projection's W4A4 cutover.
+template <class Geometry, std::int32_t FirstW4a4>
+void launch_below_cutover(const Tensor& x, const Weight& weight, Tensor& residual,
+                          cudaStream_t stream) {
+    static constexpr auto kLaunchers =
+        make_launchers<Geometry>(std::make_index_sequence<FirstW4a4 - kNvfp4FirstSmallT>{});
+    const std::int32_t tokens = x.ne[1];
+    if (tokens < kNvfp4FirstSmallT || tokens >= FirstW4a4) {
+        throw std::invalid_argument("nvfp4 linear_add SmallT: T is at or above the W4A4 cutover");
+    }
+    kLaunchers[static_cast<std::size_t>(tokens - kNvfp4FirstSmallT)](x, weight, residual, stream);
 }
-
-constexpr auto kResidual6144Launchers  = make_launchers<Nvfp4Residual6144Geometry>();
-constexpr auto kResidual17408Launchers = make_launchers<Nvfp4Residual17408Geometry>();
 
 } // namespace
 
 void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                      cudaStream_t stream) {
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
     case Nvfp4Problem::Residual6144:
-        kResidual6144Launchers[index](x, weight, residual, stream);
+        launch_below_cutover<Nvfp4Residual6144Geometry, kNvfp4FirstW4a4Residual6144>(
+            x, weight, residual, stream);
         return;
     case Nvfp4Problem::Residual17408:
-        kResidual17408Launchers[index](x, weight, residual, stream);
+        launch_below_cutover<Nvfp4Residual17408Geometry, kNvfp4FirstW4a4Residual17408>(
+            x, weight, residual, stream);
         return;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:

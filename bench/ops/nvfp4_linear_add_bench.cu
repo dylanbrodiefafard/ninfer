@@ -27,9 +27,10 @@ constexpr std::int32_t kRows      = 5120;
 constexpr std::size_t kFlushBytes = 256ULL << 20;
 
 struct Options {
-    std::int32_t n           = 0;
-    std::int32_t k           = 0;
-    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+    std::int32_t n = 0;
+    std::int32_t k = 0;
+    // AllowA4 is registered at every T; A16Only only below the W4A4 cutover.
+    ops::LinearPolicy policy = ops::LinearPolicy::AllowA4;
     std::vector<std::int32_t> t_sweep{1, 4, 8, 16, 17, 128, 512, 1024};
     int warmup   = 5;
     int repeat   = 30;
@@ -98,7 +99,7 @@ Options parse_options(int argc, char** argv) {
             options.csv_out = next("--csv-out");
         } else if (argument == "--help" || argument == "-h") {
             std::printf(
-                "Usage: %s --n 5120 --k 6144|17408 [--policy a16|a8|a4] "
+                "Usage: %s --n 5120 --k 6144|17408 [--policy a4|a8|a16 (default a4)] "
                 "[--t-sweep 1,4,...] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                 argv[0]);
             std::exit(0);

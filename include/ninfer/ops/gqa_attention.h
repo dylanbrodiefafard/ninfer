@@ -69,9 +69,7 @@ struct GqaS3PrefillDump;
  * the GPU reserves FP32 context-split partials at the envelope maximum; sage_pv declares an S3
  * cache, which never splits. Prefill Sparge keep-lists live in kernel smem. XAttention ranker
  * scratch (packed-K / logits / mass / keep) is sized here when xattn_tau < 1 on
- * a U8 Prompt route; it is allocated from the caller workspace. keep_frac < 1.0
- * on a sage U8 cache still sizes the sparge-decode tile-skip scratch for W=1
- * cached SmallT; the default 1.0 is exact (zero added). tree_verify=true reserves decode
+ * a U8 Prompt route; it is allocated from the caller workspace. tree_verify=true reserves decode
  * small-T / chunked-small-T scratch for packed-tree A1, including B=1 W=7..16 where ordinary
  * causal A1 would use the Prompt route.
  */
@@ -161,39 +159,17 @@ void gqa_kv_compact_path(PagedKVBatchLayerView cache, const Tensor& kv_table_row
                          cudaStream_t stream);
 
 /**
- * Dev/test side-band for the sparge-decode tile-skip rank (the tools/kdev
- * op-dump tooling). Not part of the production API: the production path never
- * sees a non-null dump. The caller supplies device arrays sized [batch*KVHeads]
- * (keep_count) and [batch*KVHeads][max_tiles] (keep_tiles, max_tiles = the
- * rank's tile capacity div_up(window, 32)); after a gqa_attention_cached call
- * with keep_frac < 1 the rank kernel's keep set is copied into them, so a host
- * oracle can rebuild the exact keep set and score the kept-tile reference
- * attention.
- */
-struct GqaS3DecodeRankDump {
-    std::int32_t max_tiles;   // [kv-row] keep-list stride (>= div_up(window, 32))
-    std::int32_t* keep_tiles; // [batch*KVHeads][max_tiles] kept key-tile index
-    std::int32_t* keep_count; // [batch*KVHeads] kept key-tile count
-    std::int32_t splits;      // launch split count (0 when skip did not engage)
-    std::int32_t* split_off;  // [batch*KVHeads][splits+1] per-split keep-slice offset
-};
-
-// Runs the cached (A3) attention with an optional sparge-decode tile-skip
-// keep_frac (see gqa_attention's keep_frac docs; 1.0 = exact). With keep_frac
-// < 1 on a sage cache, the T=1 step ranks the window's key tiles with the
-// k_mean meansim proxy and computes attention over the kept tiles only
-// (sinks + recency window + top fraction). The cached route is the PPL
-// decode lane; width > 1 (MTP verify) never engages the skip.
-/**
  * A3: compute causal attention from an already populated cache without accepting new K/V or
  * mutating any cache plane. q/out are contiguous BF16 `[256,24,T]`, positions is contiguous
  * sequential I32 [T], and the mathematical formula and execution-envelope contract are identical
- * to A1. Caller workspace is reported by gqa_attention_workspace_capacity_bytes().
+ * to A1. keep_frac in (0,1] is the Prompt-route Sparge prefill fraction (see gqa_attention);
+ * small-T and chunked small-T routes stay dense. Caller workspace is reported by
+ * gqa_attention_workspace_capacity_bytes().
  */
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
-                          float keep_frac = 1.0f, GqaS3DecodeRankDump* rank_dump = nullptr);
+                          float keep_frac = 1.0f);
 
 /**
  * Dev/test side-band for the SageAttention3 (nvfp4s3) prefill kernel (the tools/kdev
