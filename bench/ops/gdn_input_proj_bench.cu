@@ -4,6 +4,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "core/device.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
 
@@ -38,9 +39,10 @@ struct Options {
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
-    int warmup   = 5;
-    int repeat   = 30;
-    bool profile = false;
+    bool tokens_explicit = false;
+    int warmup           = 5;
+    int repeat           = 30;
+    bool profile         = false;
     std::string csv_out;
 };
 
@@ -111,7 +113,8 @@ Options parse_options(int argc, char** argv) {
             else
                 usage("--nvfp4-policy expects a16 or a4");
         } else if (argument == "--tokens") {
-            options.tokens = parse_list(next("--tokens requires a value"), "--tokens");
+            options.tokens          = parse_list(next("--tokens requires a value"), "--tokens");
+            options.tokens_explicit = true;
         } else if (argument == "--cache") {
             const std::string_view value(next("--cache requires a value"));
             if (value == "cold")
@@ -134,6 +137,21 @@ Options parse_options(int argc, char** argv) {
             usage("help");
         } else {
             usage("unknown argument");
+        }
+    }
+    // NVFP4 A16 is registered only below the W4A4 cutover: the default sweep keeps those widths
+    // and an explicit wider T is a usage error.
+    if (options.nvfp4_policy == ops::LinearPolicy::A16Only) {
+        const auto too_wide = [](std::int32_t tokens) {
+            return tokens >= ops::kA4GdnInputMinTokens;
+        };
+        if (!options.tokens_explicit) {
+            std::erase_if(options.tokens, too_wide);
+        } else if (std::any_of(options.tokens.begin(), options.tokens.end(), too_wide)) {
+            const std::string message = "--nvfp4-policy a16 admits only T < " +
+                                        std::to_string(ops::kA4GdnInputMinTokens) +
+                                        ", below the W4A4 cutover";
+            usage(message.c_str());
         }
     }
     if (options.profile && (options.tokens.size() != 1 || options.cache == CacheMode::Both)) {
