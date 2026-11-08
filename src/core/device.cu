@@ -66,6 +66,13 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
         throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
     }
 
+    // Shrink the driver's local-memory reservation before any allocation so capacity planning
+    // sees the freed memory. The value covers every compiled kernel, so no launch grows it.
+    err = cudaDeviceSetLimit(cudaLimitStackSize, kDeviceStackBytesPerThread);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaDeviceSetLimit(stack) failed", err));
+    }
+
     err = cudaGetDeviceProperties(&props, device_id);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaGetDeviceProperties failed", err));

@@ -239,12 +239,12 @@ CUDA Graphs, NVFP4 KV and 32 MiB headroom. Vision and RAM/SSD tiers were off (20
 |---:|---:|
 | 1 | 262,144 |
 | 2 | 524,288 |
-| 3 | 733,120 |
-| 4 | 715,008 |
-| 5 | 697,408 |
-| 6 | 679,616 |
-| 7 | 661,632 |
-| 8 | 643,392 |
+| 3 | 741,632 |
+| 4 | 723,520 |
+| 5 | 705,920 |
+| 6 | 688,128 |
+| 7 | 670,144 |
+| 8 | 651,968 |
 
 These are shared totals across active and retained histories. C1 and C2 reach the concurrency cap;
 C3–C8 are limited by VRAM. Available memory and enabled features can change the result. See the

@@ -272,51 +272,55 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
                          const std::int32_t* parent_index, cudaStream_t stream) {
     const RecordColumnPublish publish{static_cast<__nv_bfloat16*>(conv_record.data),
                                       kNvfp4GdnChannels, ActiveTokens};
-    if (nvfp4_gdn_record_uses_grouped_replay(ActiveTokens, x.ne[2])) {
-        if constexpr (ActiveTokens == 5 || ActiveTokens == 6) {
-            if (x.ne[2] == 1) {
-                if (parent_index == nullptr) {
-                    launch_contiguous_record<ActiveTokens, 1, false>(
-                        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
-                        key, value, z, publish, workspace, stream, nullptr);
-                } else {
-                    launch_contiguous_record<ActiveTokens, 1, true>(
-                        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
-                        key, value, z, publish, workspace, stream, parent_index);
-                }
-                return;
-            }
-        }
-        if (parent_index == nullptr) {
-            if constexpr (ActiveTokens == 5) {
-                if (x.ne[2] == 3) {
-                    launch_contiguous_record<ActiveTokens, 3, false>(
-                        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
-                        key, value, z, publish, workspace, stream, nullptr);
+    // Only widths 2, 5 and 6, which the grouped-replay policy can select, instantiate the grouped
+    // kernels; the never-selectable W=10..16 panels would exceed the device stack limit.
+    if constexpr (nvfp4_gdn_record_width_groups(ActiveTokens)) {
+        if (nvfp4_gdn_record_uses_grouped_replay(ActiveTokens, x.ne[2])) {
+            if constexpr (ActiveTokens == 5 || ActiveTokens == 6) {
+                if (x.ne[2] == 1) {
+                    if (parent_index == nullptr) {
+                        launch_contiguous_record<ActiveTokens, 1, false>(
+                            x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
+                            key, value, z, publish, workspace, stream, nullptr);
+                    } else {
+                        launch_contiguous_record<ActiveTokens, 1, true>(
+                            x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
+                            key, value, z, publish, workspace, stream, parent_index);
+                    }
                     return;
                 }
             }
-            {
-                launch_grouped_record<ActiveTokens, 2, false>(
-                    x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key,
-                    value, z, publish, workspace, stream, nullptr);
-            }
-        } else {
-            if constexpr (ActiveTokens == 5) {
-                if (x.ne[2] == 3) {
-                    launch_contiguous_record<ActiveTokens, 3, true>(
+            if (parent_index == nullptr) {
+                if constexpr (ActiveTokens == 5) {
+                    if (x.ne[2] == 3) {
+                        launch_contiguous_record<ActiveTokens, 3, false>(
+                            x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
+                            key, value, z, publish, workspace, stream, nullptr);
+                        return;
+                    }
+                }
+                {
+                    launch_grouped_record<ActiveTokens, 2, false>(
+                        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
+                        key, value, z, publish, workspace, stream, nullptr);
+                }
+            } else {
+                if constexpr (ActiveTokens == 5) {
+                    if (x.ne[2] == 3) {
+                        launch_contiguous_record<ActiveTokens, 3, true>(
+                            x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
+                            key, value, z, publish, workspace, stream, parent_index);
+                        return;
+                    }
+                }
+                {
+                    launch_grouped_record<ActiveTokens, 2, true>(
                         x, weight, conv_weight, conv_states, valid_columns, initial_slot, query,
                         key, value, z, publish, workspace, stream, parent_index);
-                    return;
                 }
             }
-            {
-                launch_grouped_record<ActiveTokens, 2, true>(
-                    x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key,
-                    value, z, publish, workspace, stream, parent_index);
-            }
+            return;
         }
-        return;
     }
     if (parent_index == nullptr) {
         launch_exact<ActiveTokens, false>(x, weight, conv_weight, conv_states, valid_columns,

@@ -97,6 +97,11 @@ ninfer_add_test(ninfer_media_decode_test
   SOURCES test_media_decode.cpp
   LIBRARIES ninfer_media_decode)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
+ninfer_add_test(ninfer_device_stack_limit_test SOURCES test_device_stack_limit.cpp)
+add_dependencies(ninfer_device_stack_limit_test ninfer_core ninfer_nvfp4_tma ninfer_ops)
+target_compile_definitions(ninfer_device_stack_limit_test PRIVATE
+  NINFER_CUOBJDUMP="${CUDAToolkit_BIN_DIR}/cuobjdump"
+  NINFER_KERNEL_LIBRARIES="$<TARGET_FILE:ninfer_core>|$<TARGET_FILE:ninfer_nvfp4_tma>|$<TARGET_FILE:ninfer_ops>")
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_qwen3_6_panel_copy_test SOURCES targets/qwen3_6/test_panel_copy.cpp)
 set_property(TEST ninfer_qwen3_6_panel_copy_test APPEND PROPERTY LABELS sanitizer)

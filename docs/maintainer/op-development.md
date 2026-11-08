@@ -283,6 +283,14 @@ A family may share private launch or computation bodies across related Ops. Each
 defines its output mapping, observable fusion boundary, validation, and dispatch; sharing does not
 create a target-callable private backend.
 
+Every compiled kernel's stack frame must fit `kDeviceStackBytesPerThread` (`src/core/device.h`),
+the per-thread stack `DeviceContext` reserves for every resident thread. Optimization may change a
+kernel's stack size; `ninfer_device_stack_limit_test` fails when a frame exceeds the limit so the
+extra device memory is accounted for: reduce the frame (usually register spills), or raise the
+constant (about 0.25 MiB of device memory per byte on the RTX 5090, taken from Automatic KV
+capacity) and re-measure the published capacity tables. Instantiate only the shapes a dispatch
+predicate can select, so unreachable variants do not set the limit.
+
 ## 5. State, workspace, naming, and dependencies
 
 ### 5.1 State and execution views

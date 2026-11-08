@@ -105,15 +105,21 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
                                      const std::int32_t* parent_index = nullptr);
 
+// Compile-time superset of the grouped-replay widths; it gates which grouped kernels are
+// instantiated.
+inline constexpr bool nvfp4_gdn_record_width_groups(std::int32_t width) noexcept {
+    return width == 2 || width == 5 || width == 6;
+}
+
 // Packed T=2..16 record: B=1 W=5/6, B>1 W=2/5, and B=2/4 W=6 group requests per
 // SmallT weight pass (including one W=5 C=3 group) and materialize only the private
 // FP32 projection. B=1 W=4 uses fused SmallT; other B=1 widths retain T=1 GEMV+FP32
 // conv, and other B>1 widths use request-indexed CTAs.
 inline constexpr bool nvfp4_gdn_record_uses_grouped_replay(std::int32_t width,
                                                            std::int32_t batch_size) noexcept {
-    return (batch_size == 1 && (width == 5 || width == 6)) ||
-           (batch_size > 1 &&
-            (width == 2 || width == 5 || (width == 6 && (batch_size == 2 || batch_size == 4))));
+    return nvfp4_gdn_record_width_groups(width) &&
+           ((batch_size == 1 && width != 2) ||
+            (batch_size > 1 && (width != 6 || batch_size == 2 || batch_size == 4)));
 }
 
 inline constexpr bool nvfp4_gdn_record_uses_small_t(std::int32_t width,

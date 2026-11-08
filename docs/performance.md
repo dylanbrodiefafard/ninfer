@@ -2416,29 +2416,29 @@ build/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
 ```
 
 CUDA Graphs and prefix reuse were on; Vision and RAM/SSD caches were off. Each row records the
-resolved shared token pool after startup. Free device memory after weights was 15,653,994,496 bytes
-at every C. After startup, one request per lane decoded 64 tokens, lane 0 after an 18,400-token
-prompt; all requests completed. These are startup capacity measurements, not C simultaneous
-full-length requests: each request is limited to 262,144 tokens, and retained histories share the
-same pool. The upper bound is C times the page-rounded per-request limit.
+resolved shared token pool after startup. Free device memory after weights was 15,811,280,896 bytes
+at every C, with the 416-byte device stack limit. After startup, one request per lane decoded 64
+tokens, lane 0 after an 18,400-token prompt; all requests completed. These are startup capacity
+measurements, not C simultaneous full-length requests: each request is limited to 262,144 tokens,
+and retained histories share the same pool. The upper bound is C times the page-rounded per-request limit.
 
 | Startup concurrency (C) | Shared KV capacity (tokens, total) | Graph memory / allowance (MiB) |
 |---:|---:|---:|
 | 1 | 262,144 | 42 / 73 |
 | 2 | 524,288 | 100 / 130 |
-| 3 | 733,120 | 150 / 187 |
-| 4 | 715,008 | 204 / 244 |
-| 5 | 697,408 | 248 / 291.5 |
-| 6 | 679,616 | 294 / 339 |
-| 7 | 661,632 | 350 / 386.5 |
-| 8 | 643,392 | 396 / 434 |
+| 3 | 741,632 | 150 / 187 |
+| 4 | 723,520 | 204 / 244 |
+| 5 | 705,920 | 248 / 291.5 |
+| 6 | 688,128 | 294 / 339 |
+| 7 | 670,144 | 350 / 386.5 |
+| 8 | 651,968 | 396 / 434 |
 
 C1 and C2 reach that upper bound. C3–C8 use the available VRAM after reserving request state,
 DFlash2 state, workspace, graph allowances and 32 MiB headroom. Increasing C therefore reduces the
 shared pool after the upper bound stops being the limiting factor. Each lane costs about 18,000
 tokens: about 250 MiB of request and DFlash2 state, 48 MiB of graph allowance and 21 MiB of
 workspace. The DFlash2 graph allowance also covers 4–20 MiB of driver memory that startup consumes
-outside the arenas, so free device memory after startup stayed 51–59 MiB, above the headroom, and
+outside the arenas, so free device memory after startup stayed 49–59 MiB, above the headroom, and
 GPU memory in use grew by at most 2 MiB through prefill and decode. The GPU lock was held for each
 startup, after five seconds without GPU processes.
 
