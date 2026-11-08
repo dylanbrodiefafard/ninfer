@@ -87,6 +87,15 @@ void equal_next_token(ninfer::Engine& engine, const Tokens& history, ninfer::Tok
     }
 }
 
+// Whether a prefix reuse came from a host tier: RAM, or disk when the disk tier is enabled. With
+// the disk tier, a RAM capture evicts the oldest unpinned disk-durable entry first, and the
+// write-behind spill makes entries durable on its own schedule, so an entry seeded before the
+// wave or completed during it may be served from disk instead of RAM.
+[[nodiscard]] bool host_tier_source(ninfer::PrefixReuseSource source, bool disk_enabled) {
+    return source == ninfer::PrefixReuseSource::HostRam ||
+           (disk_enabled && source == ninfer::PrefixReuseSource::HostDisk);
+}
+
 struct DiskDirectory {
     explicit DiskDirectory(std::uint32_t concurrency)
         : path(std::filesystem::temp_directory_path() /
@@ -180,10 +189,10 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
         for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
             if (errors[lane]) { std::rethrow_exception(errors[lane]); }
             const auto& result = results[lane];
-            if (result.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
+            if (!host_tier_source(result.prefix_reuse_source, disk_enabled) ||
                 result.reused_prompt_tokens != inputs[lane].size()) {
                 throw std::runtime_error(
-                    "cancellation matrix did not restore the requested RAM source");
+                    "cancellation matrix did not restore the requested host source");
             }
             const bool cancelled = (mask & (1U << lane)) != 0;
             if (backend != ninfer::SpeculativeBackend::None && !early_cancel &&
@@ -212,9 +221,9 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
             const auto resumed =
                 engine.generate(engine.prepare_tokens(resumed_input), greedy(1, true));
             if ((mask & (1U << lane)) == 0 &&
-                (resumed.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
+                (!host_tier_source(resumed.prefix_reuse_source, disk_enabled) ||
                  resumed.reused_prompt_tokens != resumed_input.size())) {
-                throw std::runtime_error("completed peer did not survive RAM eviction/restore");
+                throw std::runtime_error("completed peer did not survive host eviction/restore");
             }
             const auto fresh =
                 engine.generate(engine.prepare_tokens(resumed_input), greedy(1, false));
