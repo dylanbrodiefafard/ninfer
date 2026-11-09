@@ -21,6 +21,110 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## C9–C12 aggregate scaling (2026-11-08)
+
+Same RTX 5090, CUDA 13.1, `sm_120a`, Release build, artifact and README runner settings as the
+C7/C8 section below (adaptive K7, optimized proposal head, NVFP4 KV, automatic capacity, maximum
+context 65,536, 2,048-token chunks, p-less temperature 1.5, 512 output tokens, one warmup and
+three measured waves). The Python-package fixture is excluded for the same reason. Lanes 10 and
+11 use the lane prefix `Benchmark Lane 0.`/`Benchmark Lane 1.`, which keeps every frozen prompt
+length; a two-digit lane number adds a token. Every measured wave completed all C requests with
+512 tokens each.
+
+Steady full-batch decode rates (tokens/s, mean ± sample standard deviation) on the final build,
+including the narrow verify tiles below; C8 is the same-day reference of the same build:
+
+| Workload | C8 | C9 | C10 | C11 | C12 |
+|---|---:|---:|---:|---:|---:|
+| English story | 972.4 ± 25.5 | 979.9 ± 30.3 | 1072.3 ± 12.3 | 1004.9 ± 9.4 | 1099.5 ± 5.3 |
+| Math reasoning | 1206.0 ± 9.8 | 1155.8 ± 26.4 | 1225.0 ± 1.3 | 1223.4 ± 31.6 | 1266.0 ± 15.6 |
+| Document summary 8K | 1032.3 ± 20.0 | 988.6 ± 11.3 | 1092.2 ± 5.1 | 1055.0 ± 10.1 | 1125.3 ± 5.4 |
+| Document summary 32K | 810.7 ± 19.5 | 822.4 ± 47.8 | 933.0 ± 18.5 | 900.4 ± 4.5 | 966.3 ± 7.7 |
+
+In the C8 32K cell and the last two C9 32K waves, adaptive drafting settled on four draft tokens
+(93% and 43% of rounds, against about 96% three-token rounds otherwise): rounds produced 6% more
+tokens per row but took 15% longer. Two repeat C8 runs of the same four-workload sequence on the
+same binary kept three draft tokens at 32K and measured 881–908 tokens/s per measured wave (896
+for a single wave, 897 mean over three). A decision trace there showed the four-token arm's predicted rate 8–10% below the
+three-token arm's; the trajectory that led to the four-token setting did not recur and is not
+attributed. The same build before the narrow-tile change measured 964/1209/1011/877 (C8),
+990/1118/1001/854 (C9), 1072/1232/1093/924 (C10), 991/1220/1038/905 (C11) and
+1071/1259/1101/939 (C12) on the same four workloads (`profiles/bench/readme-opt-c8-c12-20261108/`).
+
+**Tile quantization.** Packed A8 verify projections are tensor-issue bound at these widths and
+pay for whole token tiles: N≤6144 outputs place tokens on a 16-row MMA M tile, wider outputs on
+eight-token panels. In a fixed-K3 greedy node trace the 5120×17408 down projection costs 41.3 us
+at T=32 and 61.0/61.3 us at T=36/40; the 16384×5120 GDN input costs 38.1 us and 47.8 us. Adaptive
+drafting picks K3 in about 95% of rounds at C8–C12, so C9 (36 columns) pays C10's price and C11
+(44) pays C12's. Fixed-K greedy `ninfer_bench -pg 512,512` at C8–C12:
+
+| C | K2 | K3 | K4 |
+|---:|---:|---:|---:|
+| 8 | 945 | 956 | 863 |
+| 9 | 1010 | 945 | 923 |
+| 10 | 1064 | 1014 | 816 |
+| 11 | 1004 | 1018 | 871 |
+| 12 | 1077 | 1087 | 901 |
+
+**Changes.** (1) DFlash2 adaptive drafting also captures a k=2 chain for batches of nine or more
+(27/30 columns at C9/C10 fit one 32-column tile); the round-time model chooses it per batch size
+and content. (2) Exploration still draws a uniform captured arm one round in 32, but an arm
+whose content-neutral predicted rate is below 75% of the best runs only one draw in eight; at
+C≥8 a k=7 round costs about twice a k=3 round. (3) The deferred drafter-context append covers the
+largest commit (k+1 = 8 columns) instead of the tree-inflated pending-feature storage width (12),
+which shrinks the feature and context-KV projections; a C8 node trace showed the feature
+projection at 217 us per round on 96 columns versus 82 us on 32. Greedy adaptive decode moved
+from 882/925/980/964/1040 to 931/989/1056/1001/1083 tokens/s at C8–C12, within 0.4–2.6% of the
+best fixed K. On the README workloads C9 gains 0.3–8.8% and C10 1.9–10.3% over the same build
+without these changes. Capping the k=2 arm at B=10 recovered C12 math (1287) but lost more on
+the other cells (four-workload totals 4102 vs 4154 at C11 and 4363 vs 4370 at C12), so the arm
+runs at every batch of nine or more.
+
+**Narrow verify tiles.** The N≤6144 projections (5120×17408 down, 5120×6144 attention output)
+run 160 CTAs of 32 rows, one CTA per SM and one warp per SM sub-partition, with each warp owning
+fixed 16×8 MMA units across the whole K reduction. At T=33..40 a CTA holds ten units after
+packing tokens to eight-column panels, so one sub-partition still issues three per K step, the
+same as T=48; no token tiling below the 48-token M tile shortens that critical path without
+splitting K, which would change each output's ascending-K reduction. A sweep of the existing
+SwapAB eight-token-panel path on these geometries ran 25–50% slower at every width (fewer warps
+per SM). What did help is the K staging of the M48/M64 tiles: K512 over two stages instead of
+K256 over three (cold public Op, T=36..48: down 67.6→61.4 us, attention output 30.7→26.6–28.7
+us; T=56..96 3–9% faster). The BF16 DFlash QKV (6144 rows, 192 CTAs) keeps K256 at M48, where
+three stages fit two CTAs per SM and K512 left a second wave (41→45 us). The wide panel route
+keeps K256 (gate/up T=36: 92 us vs 111 us at K512). Accumulation order is unchanged, so outputs
+are bit-identical. Paired fixed-binary Engine runs (`ninfer_bench -pg 512,512`, greedy,
+tokens/s, previous → current):
+
+| C | K2 | K3 | Adaptive K7 |
+|---:|---:|---:|---:|
+| 8 | 946 → 944 | 955 → 954 | 923 → 918 |
+| 9 | 1010 → 1010 | 946 → 962 | 982 → 982 |
+| 10 | 1065 → 1064 | 1016 → 1031 | 1050 → 1061 |
+| 11 | 1006 → 1025 | 1021 → 1036 | 1004 → 1019 |
+| 12 | 1078 → 1097 | 1089 → 1105 | 1073 → 1081 |
+
+Widths up to 32 columns (C8, C9/C10 at K2) do not use the changed tiles. Evidence:
+`profiles/bench/narrow-k512-20261108/`.
+
+**Remaining.** C11 remains below C10: K3 packs 44 columns and K2 33, and both cost the 48-column
+critical path described above, while C10 at K2 (30 columns) fits the 32-column tile. Adaptive mode still packs GDN replay records from the live width into the
+storage width (four copies per layer, about 172 us per C8 round); removing that requires the
+record kernels and the GDN history contract to accept a per-round width.
+
+At C12, adaptive K7 startup captures its DFlash2 executables with graph memory 686 MiB against a
+752 MiB allowance; per-executable graph memory grows from B=10, so the automatic-capacity graph
+allowance charges executables with B≥10 an extra 2.5 MiB each (see
+[paged KV cache](maintainer/paged-kv-cache.md)). Before that change, C12 startup ran out of device
+memory during graph instantiation.
+
+Raw waves, commands, startup configuration and summaries are under
+`profiles/bench/readme-k512-c8-c12-20261108/` (final build) and
+`profiles/bench/readme-opt-c8-c12-20261108/` (before the narrow-tile change); the earlier
+same-day runs without the drafting changes are
+under `profiles/bench/readme-c8-c12-20261108/`, `readme-c11-c12-20261108/` and
+`readme-c12-20261108/`, the k=2 cap comparison under `readme-cap10-c11-c12-20261108/`, and traces
+under `profiles/nsys/c9-c12-20261108/`.
+
 ## C7/C8 aggregate scaling (2026-10-21)
 
 Measured on one RTX 5090 with driver 580.178.04, CUDA 13.1, `sm_120a`, Release build,
@@ -2432,14 +2536,22 @@ and retained histories share the same pool. The upper bound is C times the page-
 | 6 | 688,704 | 294 / 339 |
 | 7 | 670,720 | 350 / 386.5 |
 | 8 | 652,544 | 396 / 434 |
+| 9 | 633,600 | 452 / 491 |
+| 10 | 612,736 | 534 / 578 |
+| 11 | 591,744 | 612 / 665 |
+| 12 | 570,560 | 686 / 752 |
 
-C1 and C2 reach that upper bound. C3–C8 use the available VRAM after reserving request state,
+C1 and C2 reach that upper bound. C3–C12 use the available VRAM after reserving request state,
 DFlash2 state, workspace, graph allowances and 32 MiB headroom. Increasing C therefore reduces the
 shared pool after the upper bound stops being the limiting factor. Each lane costs about 18,000
 tokens: about 250 MiB of request and DFlash2 state, 48 MiB of graph allowance and 21 MiB of
 workspace. The DFlash2 graph allowance also covers 4–20 MiB of driver memory that startup consumes
 outside the arenas, so free device memory after startup stayed 49–59 MiB, above the headroom, and
-GPU memory in use grew by at most 2 MiB through prefill and decode. The GPU lock was held for each
+GPU memory in use grew by at most 2 MiB through prefill and decode. C9–C12 were measured on
+2026-11-08 with the C1–C12 build and the same command, after it reproduced the C8 capacity
+exactly (`profiles/kvcap-20261108/`). The ninth lane costs 18,944 tokens and each later lane
+about 21,000: from B=9 adaptive drafting also captures a two-token chain, and from B=10 each
+executable's graph allowance rises by 2.5 MiB. Free device memory after those startups was 53–77 MiB. The GPU lock was held for each
 startup, after five seconds without GPU processes.
 
 [Machine-readable results](../bench/results/readme-kv-capacity-20261107.json) preserve capacities

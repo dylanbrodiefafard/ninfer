@@ -27,7 +27,7 @@
   "disk_prefix_cache": false,
   "device_stack_bytes_per_thread": 384
  },
- "measurement": "Resolved shared token capacity after each server startup; then one request per lane (lane 0 with an 18,400-token prompt, others short) decoded 64 tokens. GPU memory used was sampled when ready and after decode.",
+ "measurement": "Resolved shared token capacity after each server startup; then one request per lane (lane 0 with an 18,400-token prompt, others short) decoded 64 tokens. GPU memory used was sampled when ready and after decode. C9-C12 were measured on the C1-C12 build with the same command; that build reproduced the C8 capacity exactly.",
  "results": [
   {
    "concurrency": 1,
@@ -108,15 +108,58 @@
    "cuda_graph_observed_bytes": 415236096,
    "available_after_startup_bytes": 53280768,
    "requests_completed": 8
+  },
+  {
+   "concurrency": 9,
+   "shared_kv_tokens": 633600,
+   "available_after_weights_bytes": 15821766656,
+   "runtime_reservation_bytes": 15787829760,
+   "cuda_graph_allowance_bytes": 514850816,
+   "cuda_graph_observed_bytes": 473956352,
+   "available_after_startup_bytes": 55377920,
+   "requests_completed": 9
+  },
+  {
+   "concurrency": 10,
+   "shared_kv_tokens": 612736,
+   "available_after_weights_bytes": 15821766656,
+   "runtime_reservation_bytes": 15787070720,
+   "cuda_graph_allowance_bytes": 606076928,
+   "cuda_graph_observed_bytes": 559939584,
+   "available_after_startup_bytes": 59572224,
+   "requests_completed": 10
+  },
+  {
+   "concurrency": 11,
+   "shared_kv_tokens": 591744,
+   "available_after_weights_bytes": 15821766656,
+   "runtime_reservation_bytes": 15787503360,
+   "cuda_graph_allowance_bytes": 697303040,
+   "cuda_graph_observed_bytes": 641728512,
+   "available_after_startup_bytes": 65863680,
+   "requests_completed": 11
+  },
+  {
+   "concurrency": 12,
+   "shared_kv_tokens": 570560,
+   "available_after_weights_bytes": 15821766656,
+   "runtime_reservation_bytes": 15787942912,
+   "cuda_graph_allowance_bytes": 788529152,
+   "cuda_graph_observed_bytes": 719323136,
+   "available_after_startup_bytes": 80543744,
+   "requests_completed": 12
   }
  ],
  "gpu_lock": "/tmp/ninfer-gpu-queue.lock",
  "validation": {
-  "startup_configurations": 8,
+  "startup_configurations": 12,
   "all_servers_healthy": true,
   "all_requests_completed": true,
   "min_free_after_startup_mib": 48.8125,
   "max_gpu_used_growth_after_decode_mib": 2
  },
- "raw_reports": "profiles/kvcap-20261107/"
+ "raw_reports": [
+  "profiles/kvcap-20261107/",
+  "profiles/kvcap-20261108/"
+ ]
 }

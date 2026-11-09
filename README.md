@@ -1,6 +1,6 @@
 # NInfer — NVIDIA GeForce RTX 5090
 
-Run **Qwen3.8-27B on one RTX 5090**, with up to **eight requests at once**.
+Run **Qwen3.8-27B on one RTX 5090**, with up to **twelve requests at once**.
 NInfer is a C++/CUDA engine with kernels and CUDA Graphs tuned for `sm_120a`.
 The recommended model combines [Ostfralla’s NVFP4 weights](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer)
 with a locally converted DFlash2 companion; setup is below.
@@ -15,10 +15,11 @@ with a locally converted DFlash2 companion; setup is below.
 - Conversation caching in GPU memory, RAM and SSD; `cache_write: false` for disposable turns.
 - Sampling controls, token log probabilities, Prometheus metrics and JSON statistics.
 
-Eight agents can work in parallel on one resident model. Additional requests wait in a bounded
+Twelve agents can work in parallel on one resident model. Additional requests wait in a bounded
 FIFO queue; idle conversations can move to RAM and resume without processing their history
 again. A twelve-session check verified cache reuse through six active lanes. Restore cost depends
-on history size and host bandwidth; the throughput benchmarks below cover one, six, seven and eight requests.
+on history size and host bandwidth; the throughput benchmarks below cover one and six through twelve
+requests.
 
 Use **NVFP4 KV cache**, the default. W4A4 is used for prefill and some generation shapes;
 generation also uses A16 and W4A8, with W4A8 used for most DFlash2 verification.
@@ -28,7 +29,7 @@ Multi-GPU execution, active-context offload and preemptive scheduling are not su
 
 ## Performance and quality
 
-Measured **2026-10-18 and 2026-10-21 on one RTX 5090**, Release build, CUDA Graphs, NVFP4 KV,
+Measured **2026-10-18, 2026-10-21 and 2026-11-08 on one RTX 5090**, Release build, CUDA Graphs, NVFP4 KV,
 Vision off and a 600 W power cap. The DFlash2 artifact uses NVFP4 matrices and BF16 selector
 codebooks, adaptive drafting up to seven tokens and the optimized proposal head.
 
@@ -50,31 +51,43 @@ preparation.
 
 **Answer generation with p-less sampling at temperature 1.5:**
 
-| Workload | Prompt tokens | 1 request, tokens/s | 6 requests, total tokens/s | 7 requests, total tokens/s | 8 requests, total tokens/s |
-|---|---:|---:|---:|---:|---:|
-| English story | 146 | 186 | 779 | 841 | 949 |
-| Python package | 171 | 312 | 1,057* | — | — |
-| Math reasoning | 346 | 287 | 970 | 1,033 | 1,150 |
-| Document summary 8K | 8,192 | 228 | 815 | 892 | 981 |
-| Document summary 32K | 32,779 | 226 | 718 | 803 | 856 |
+| Workload | Prompt tokens | C1 | C6 | C7 | C8 | C9 | C10 | C11 | C12 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| English story | 146 | 186 | 779 | 841 | 949 | 980 | 1,072 | 1,005 | 1,100 |
+| Python package | 171 | 312 | 1,057* | — | — | — | — | — | — |
+| Math reasoning | 346 | 287 | 970 | 1,033 | 1,150 | 1,156 | 1,225 | 1,223 | 1,266 |
+| Document summary 8K | 8,192 | 228 | 815 | 892 | 981 | 989 | 1,092 | 1,055 | 1,125 |
+| Document summary 32K | 32,779 | 226 | 718 | 803 | 856 | 822 | 933 | 900 | 966 |
+
+Values are tokens/s; CN is N concurrent requests, reported as a total.
 
 Each request generates 512 tokens, including reasoning. Both tables report means of three runs
 after one warmup. Generation rates exclude prompt processing: each prompt is cached before timing,
 and each concurrent total counts only intervals with all C requests decoding. Divide by C for
 the average per active request.
 
-C6/C7/C8 use matched measurements from October 21. C1, prefill and the starred Python-package
-C6 result are from October 18. Python-package retries on October 22 at C6, C7 and C8 all
-triggered the benchmark's raw `<tool_call>` output guard; no fresh Python-package results
-are reported.
+C6/C7/C8 use matched measurements from October 21 and C9–C12 matched measurements from
+November 8. C1, prefill and the starred Python-package C6 result are from October 18.
+Python-package retries on October 22 at C6, C7 and C8 all triggered the benchmark's raw
+`<tool_call>` output guard; no fresh Python-package results are reported, and C9–C12 exclude it.
 
 Across the four matched workloads, C7 improves steady decode throughput by 6.5–11.9% over C6,
 and C8 by 18.5–21.8%. Separate complete-wave measurements, including request initialization,
 HTTP overhead and partial-batch tails, improve by 7.1–14.3% and 19.6–20.8%, respectively.
 
+A same-day November 8 C8 reference on the same build measures 972, 1,206, 1,032 and 811
+tokens/s on the four workloads. Against it, on the story, math and 8K workloads, C10 improves
+steady decode throughput by 1.6–10.3% and C12 by 5.0–13.1%; C9 ranges from −4.2% to +0.8% and
+C11 from +1.4% to +3.3%. The verification projections with at most 6,144 outputs cost the same
+from 33 to 48 verify columns, so 36 or 44 columns cost as much as 48. From batch nine, adaptive
+drafting can also choose two draft tokens, which fit the 32-column cost step at C9/C10. The C8
+and C9 32K references include waves in which adaptive drafting settled on four draft tokens,
+which ran slower; the performance guide gives the repeat measurements.
+
 Prompt content and sampling affect draft acceptance and speed. These are throughput workloads;
 the 512-token budget does not complete the long story and code tasks. Settings, variation and
-reproduction commands are in the [performance guide](docs/performance.md#c7c8-aggregate-scaling-2026-10-21).
+reproduction commands are in the performance guide's [C9–C12](docs/performance.md#c9c12-aggregate-scaling-2026-11-08)
+and [C7/C8](docs/performance.md#c7c8-aggregate-scaling-2026-10-21) sections.
 [Historical machine-readable results](bench/results/readme-benchmarks-20261018.json) preserve the
 October 18 means, sample standard deviations and configuration; the performance guide records
 the October 21 report locations.
@@ -245,9 +258,13 @@ CUDA Graphs, NVFP4 KV and 32 MiB headroom. Vision and RAM/SSD tiers were off (20
 | 6 | 688,704 |
 | 7 | 670,720 |
 | 8 | 652,544 |
+| 9 | 633,600 |
+| 10 | 612,736 |
+| 11 | 591,744 |
+| 12 | 570,560 |
 
 These are shared totals across active and retained histories. C1 and C2 reach the concurrency cap;
-C3–C8 are limited by VRAM. Available memory and enabled features can change the result. See the
+C3–C12 are limited by VRAM. Available memory and enabled features can change the result. See the
 [capacity measurements](docs/performance.md#dflash2-automatic-kv-capacity) for commands and results.
 
 The 32 MiB margin suits a **headless, dedicated GPU**. If the GPU also drives a desktop or runs

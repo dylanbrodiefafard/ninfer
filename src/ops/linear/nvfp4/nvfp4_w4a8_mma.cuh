@@ -412,24 +412,30 @@ void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspac
     // OutputRows bounds the selected grid, while Geometry retains original plane strides and
     // route selection. RowPolicy maps each selected row into that original geometry.
     // Output rows are partitioned without splitting K or replaying weights. N<=6144 places tokens
-    // on MMA M (N16 tiles for T<=16, N32 above) and streams K512 of FP8 over three stages; wider
-    // projections place sixteen weight rows on MMA M (SwapAB) and compile the exact eight-token
-    // panel count, streaming K256 over three stages (M16) or two (M32). T=33..48 (C=5/6 verify)
-    // uses one M48 tile and T=49..64 (C=7/8 at W7/W8) one M64 tile, so every weight byte is read
-    // once; both stream K256 over the same stage counts (N<=6144 at K512 would exceed shared memory
-    // at three stages). Wide unpaired M64 tiles cover 128 weight rows with eight warps, one 16-row
-    // SwapAB slab each: fewer, larger CTAs run the 14336- and 16384-row projections 5-7% faster at
-    // T=56/64 than 64-row tiles on the RTX 5090. Paired gate/up rows keep 64-row tiles because the
-    // SwiGLU row policy pairs rows within a 64-row tile. Wider calls repeat M64 tiles. The DFlash
-    // context projections instead take the prefill tiles their nvfp4_config.h tables select, and
-    // fall back to these tiles only for the widths those tables leave on the narrow route. BF16
-    // activations halve BK to keep the same staged bytes. Every schedule keeps each output's
-    // ascending K order, so neither tile height nor panel count changes an output.
+    // on MMA M (N16 tiles for T<=16, N32 above); wider projections place sixteen weight rows on MMA
+    // M (SwapAB) and compile the exact eight-token panel count, streaming K256 over three stages
+    // (M16) or two (M32 and above). T=33..48 uses one M48 tile and T=49..64 one M64 tile, so every
+    // weight byte is read once. Narrow tiles stream K512, over three stages at M16/M32 and two at
+    // M48/M64: halving the K-loop iterations makes the 5120-row M48 tile 7-12% faster than K256
+    // over three stages on the RTX 5090 (down, o_proj and DFlash attention-output projections).
+    // The exception is a BF16 M48 grid wider than one CTA per SM (the 6144-row DFlash QKV): there
+    // K256 over three stages fits two CTAs per SM and keeps all 192 CTAs resident, where K512
+    // leaves a second wave (10% slower). Wide tiles keep K256, which beats K512 (gate/up T=36:
+    // K256 92 us, K512 111 us). Wide unpaired M64 tiles cover 128 weight rows with eight warps, one
+    // 16-row SwapAB slab each: fewer, larger CTAs run the 14336- and 16384-row projections 5-7%
+    // faster at T=56/64 than 64-row tiles on the RTX 5090. Paired gate/up rows keep 64-row tiles
+    // because the SwiGLU row policy pairs rows within a 64-row tile. Wider calls repeat M64 tiles.
+    // The DFlash context projections instead take the prefill tiles their nvfp4_config.h tables
+    // select, and fall back to these tiles only for the widths those tables leave on the narrow
+    // route. BF16 activations halve BK to keep the same staged bytes. Every schedule keeps each
+    // output's ascending K order, so neither tile height nor panel count changes an output.
     const auto launch = [&]<int BM, int Panels>() {
         constexpr bool narrow = Geometry::kOutputRows <= 6144;
         constexpr int BN      = narrow ? (BM == 16 ? 16 : 32) : (BM == 64 && !PairRows ? 128 : 64);
-        constexpr int BK      = (BM >= 48 || !narrow ? 256 : 512) / kActivationBytes;
-        constexpr int S       = narrow || BM == 16 ? 3 : 2;
+        constexpr bool narrow_k512 =
+            narrow && (BM != 48 || !kBf16 || OutputRows / BN <= kNvfp4Rtx5090SmCount);
+        constexpr int BK      = (narrow_k512 ? 512 : 256) / kActivationBytes;
+        constexpr int S       = BM == 16 || (narrow && (BM == 32 || !narrow_k512)) ? 3 : 2;
         constexpr int WarpsN  = BN == 16 ? 2 : (BN == 128 ? 8 : 4);
         using Schedule        = Nvfp4W4a4MmaSchedule<BM, BN, BK, 1, WarpsN, S, 1>;
         constexpr auto kernel = nvfp4_w4a8_mma_kernel < Geometry, Schedule, Epilogue, Output,

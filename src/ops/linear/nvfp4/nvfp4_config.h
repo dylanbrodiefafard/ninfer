@@ -324,6 +324,9 @@ static_assert(nvfp4_w4a4_route(Nvfp4Problem::Residual17408, kNvfp4W4a4LastMmaTok
 static_assert(nvfp4_w4a4_route(Nvfp4Problem::MtpFc, kNvfp4W4a4LastMmaTokens + 1) ==
               Nvfp4W4a4Route::Tma);
 
+// RTX 5090 SM count, the CTAs one wave holds at one resident CTA per SM.
+inline constexpr std::int32_t kNvfp4Rtx5090SmCount = 170;
+
 // The W4A8 MMA's wide path (N > 6144) compiles its eight-token panel count per launch; widths
 // above kNvfp4W4a8WideMaxPanels panels repeat the 64-token tile.
 inline constexpr int kNvfp4W4a8WideMaxPanels = 8;
