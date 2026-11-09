@@ -13,7 +13,7 @@ inline constexpr std::int32_t kNvfp4RecordChannels = 10240;
 
 void nvfp4_gdn_snapshot_validate(std::int32_t width, std::int32_t batch_size) {
     if (width != 1 || batch_size <= 0 || batch_size > kNvfp4GdnSnapshotMaxBatch) {
-        throw std::invalid_argument("nvfp4 gdn conv snapshot: registered only for W=1, B=1..8");
+        throw std::invalid_argument("nvfp4 gdn conv snapshot: registered only for W=1, B=1..12");
     }
 }
 

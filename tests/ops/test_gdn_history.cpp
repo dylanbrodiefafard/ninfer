@@ -1050,7 +1050,7 @@ int main(int argc, char** argv) {
             fixture.lifecycle();
         }
         if (argc == 1) {
-            for (const int wide_batch : {7, 8}) {
+            for (const int wide_batch : {7, 8, 12}) {
                 AcceptedHistoryFixture wide(wide_batch, 8, false);
                 wide.qualify(false);
                 wide.qualify(true);

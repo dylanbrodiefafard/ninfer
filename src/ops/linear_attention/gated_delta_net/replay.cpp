@@ -21,7 +21,7 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kStateDim    = detail::gated_delta_net::kStateDim;
-constexpr std::int32_t kMaximumRows = 8;
+constexpr std::int32_t kMaximumRows = 12;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -311,7 +311,7 @@ void validate_history_layer(const GdnHistoryLayer& history, std::int32_t rows, s
     constexpr const char* op = "gated_delta_net_history_record";
     const auto slots         = history.counts.ne[0];
     const auto ceiling       = history.provisional_key.ne[2];
-    if (slots < 1 || slots > 8 || width > ceiling || ceiling > 16) {
+    if (slots < 1 || slots > kMaximumRows || width > ceiling || ceiling > 16) {
         throw std::invalid_argument("GDN history layer extent is invalid");
     }
     const auto capacity = history.key.ne[2];
@@ -333,7 +333,7 @@ void validate_history(const GdnHistory& history, const GdnReplayRecords& records
                       LinearAttentionStateAllLayersView states) {
     constexpr const char* op = "gdn_history_commit";
     const auto& spec         = history.spec;
-    if (spec.layers != 48 || spec.slots < 1 || spec.slots > 8 || spec.capacity <= 0 ||
+    if (spec.layers != 48 || spec.slots < 1 || spec.slots > kMaximumRows || spec.capacity <= 0 ||
         spec.qk_heads != 16 || spec.value_heads != 48 || spec.key_dim != 128 ||
         spec.value_dim != 128 || spec.width != records.spec.width ||
         spec.slots != records.spec.record_capacity || states.spec.layers != 48 ||
@@ -539,8 +539,9 @@ void gdn_history_reset_slot(const GdnHistory& history, std::int32_t slot, cudaSt
 }
 
 void gdn_history_reset_all(const GdnHistory& history, cudaStream_t stream) {
-    if (history.spec.slots < 1 || history.spec.slots > 8 || history.counts.dtype != DType::I32 ||
-        history.counts.ne[0] != history.spec.slots || history.counts.data == nullptr) {
+    if (history.spec.slots < 1 || history.spec.slots > kMaximumRows ||
+        history.counts.dtype != DType::I32 || history.counts.ne[0] != history.spec.slots ||
+        history.counts.data == nullptr) {
         throw std::invalid_argument("GDN history reset extent is invalid");
     }
     CUDA_CHECK(cudaMemsetAsync(history.counts.data, 0, history.counts.bytes(), stream));

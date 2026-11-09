@@ -51,15 +51,29 @@ inline constexpr std::uint32_t kDFlashTreeVerifyWidth =
 inline constexpr std::uint32_t kDFlashTreeVerifyMaxTokens =
     static_cast<std::uint32_t>(DFlashConfig::tree_verify_max_tokens);
 
-// One captured DFlash round shape: draft window k, packed verify width, and the largest batch
-// that runs it. W == k+1 is the chain; a wider W verifies a packed best-first tree. arm is the
-// adaptive arm id (adaptive_tree_arm(k) for the adaptive tree arm, k otherwise).
+// One captured DFlash round shape: draft window k, packed verify width, and the inclusive batch
+// range that runs it. W == k+1 is the chain; a wider W verifies a packed best-first tree. arm is
+// the adaptive arm id (adaptive_tree_arm(k) for the adaptive tree arm, k otherwise).
 struct DFlashRoundShape {
     std::uint32_t k            = 0;
     std::uint32_t verify_width = 0;
     std::uint32_t max_batch    = 0;
     std::uint32_t arm          = 0;
+    std::uint32_t min_batch    = 1;
+
+    [[nodiscard]] constexpr bool runs_batch(std::uint32_t batch_size) const noexcept {
+        return batch_size >= min_batch && batch_size <= max_batch;
+    }
 };
+
+// Adaptive short chain arm. Packed A8 verify projections are tensor-issue bound and pay for whole
+// token tiles: a 16-token MMA M tile for N<=6144 outputs and 8-token panels above. From B=9, the
+// k=3 chain packs 36-48 columns into 48-column tiles, while k=2 packs 27-30 columns at B=9..10
+// into one 32-column tile (RTX 5090 greedy C9/C10: k=2 +6.8%/+4.9% over k=3; C8 and C11-12
+// within 1.4% either way). The picker measures the arm per batch size, so it is captured from
+// B=9 through the configured maximum and left to the round-time model.
+inline constexpr std::uint32_t kDFlashShortArmK        = 2;
+inline constexpr std::uint32_t kDFlashShortArmMinBatch = 9;
 
 [[nodiscard]] inline constexpr bool dflash_uses_tree_verify(std::uint32_t k,
                                                             std::uint32_t verify_width) {
@@ -68,8 +82,8 @@ struct DFlashRoundShape {
 
 // Captured round shapes. Every captured k verifies its chain at every batch size, except that an
 // explicit width pins the draft window's shape (W=k+1 is chain-only). Adaptive draft without an
-// explicit width also captures the packed-tree arm of the full draft window for every batch whose
-// packed extent fits kDFlashTreeVerifyMaxTokens.
+// explicit width also captures the short k=2 chain from kDFlashShortArmMinBatch and the packed-tree
+// arm of the full draft window for every batch whose packed extent fits kDFlashTreeVerifyMaxTokens.
 [[nodiscard]] inline std::vector<DFlashRoundShape>
 dflash_round_shapes(std::span<const std::uint32_t> captured_ks, std::uint32_t draft_window,
                     std::uint32_t override_width, std::uint32_t max_concurrency, bool adaptive) {
@@ -78,6 +92,11 @@ dflash_round_shapes(std::span<const std::uint32_t> captured_ks, std::uint32_t dr
         shapes.push_back({draft_window, override_width != 0 ? override_width : draft_window + 1U,
                           max_concurrency, draft_window});
     } else {
+        if (adaptive && override_width == 0 && captured_ks.size() > 1 &&
+            max_concurrency >= kDFlashShortArmMinBatch && captured_ks.front() > kDFlashShortArmK) {
+            shapes.push_back({kDFlashShortArmK, kDFlashShortArmK + 1U, max_concurrency,
+                              kDFlashShortArmK, kDFlashShortArmMinBatch});
+        }
         for (const std::uint32_t k : captured_ks) {
             shapes.push_back({k, override_width != 0 && k == draft_window ? override_width : k + 1U,
                               max_concurrency, k});
@@ -101,7 +120,7 @@ dflash_round_shapes(std::span<const std::uint32_t> captured_ks, std::uint32_t dr
 dflash_batch_arms(std::span<const DFlashRoundShape> shapes, std::uint32_t batch_size) {
     std::vector<std::uint32_t> arms;
     for (const DFlashRoundShape& shape : shapes) {
-        if (shape.max_batch >= batch_size) { arms.push_back(shape.arm); }
+        if (shape.runs_batch(batch_size)) { arms.push_back(shape.arm); }
     }
     return arms;
 }
@@ -113,6 +132,16 @@ dflash_arm_shape(std::span<const DFlashRoundShape> shapes, std::uint32_t arm) {
         if (shape.arm == arm) { return shape; }
     }
     throw std::logic_error("DFlash round shape for the selected arm was not captured");
+}
+
+// Largest number of tokens one round commits per row: the accepted drafts plus the bonus token,
+// k + 1 for a chain and for a tree's accepted root path alike. Tree commits gather their path
+// into the pending-feature prefix, so the next round's context append never reads beyond it.
+[[nodiscard]] inline std::uint32_t
+dflash_max_commit_width(std::span<const DFlashRoundShape> shapes) {
+    std::uint32_t width = 0;
+    for (const DFlashRoundShape& shape : shapes) { width = std::max(width, shape.k + 1U); }
+    return width;
 }
 
 // Storage / ReplaySSM / pending-features width: the widest captured shape.

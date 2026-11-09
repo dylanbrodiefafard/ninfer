@@ -55,7 +55,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..8>]
+          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..12>]
            [--spec <dflash>] [--draft-tokens <1..7>] [--dflash-verify-width <2..16>]
            [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
@@ -191,7 +191,7 @@ cmake --build build --parallel 4 --target ninfer_linear_kv_projection_bench \
 ```
 
 `linear_kv_projection` uses an original NVFP4 `[6144,5120]` weight and writes
-separate contiguous K/V `[1024,W*B]` outputs. `--batch` accepts 1..8;
+separate contiguous K/V `[1024,W*B]` outputs. `--batch` accepts 1..12;
 `--widths` accepts widths 1..2048. `--mode` selects eager or captured execution.
 `--cold` flushes L2 outside the event interval; otherwise buffers remain resident.
 `--layers 5` measures five distinct weights with the same output storage reused.
@@ -211,7 +211,7 @@ qualification lives in the corresponding Op tests.
 
 `ninfer_embedding_bench` measures the registered quantized public `embedding()` table, W8
 `[248320,5120]`. With no token override, it enumerates the exact aggregate Decode domain for
-`B=1..8` through `T=48`.
+`B=1..12` through `T=72`.
 
 Each interval contains one public Op call and receives one 256 MiB L2 eviction before timing; the
 eviction itself is excluded. Effective bandwidth counts the selected encoded rows, their scales,
@@ -234,7 +234,7 @@ and `--candidate mma-split40` screens the narrow small-T schedule. Every row rep
 selected route and transient workspace after a 256 MiB L2 flush.
 
 For the 27B norm/control profile, `--packed-width W` measures the public packed-independent-
-sequence entry with each listed `T` interpreted as `W*B` for B=1..8. It is valid only with
+sequence entry with each listed `T` interpreted as `W*B` for B=1..12. It is valid only with
 `--norm-control --candidate auto`; private candidate bit-exact screening remains a separate mode.
 
 ```bash
@@ -254,7 +254,7 @@ cmake --build build --parallel --target ninfer_gdn_gating_proj_bench
 
 `ninfer_gated_delta_net_bench` measures the BF16 Gated DeltaNet contract with state/head dimension
 128, production Q/K normalization, and any positive, divisible `value_heads >= qk_heads` mapping.
-Running/chunked modes use batch 1; snapshot mode accepts exact `B=1..8` and optional mixed valid
+Running/chunked modes use batch 1; snapshot mode accepts exact `B=1..12` and optional mixed valid
 prefixes. Every measurement is a CUDA Graph replay preceded by a 256 MiB L2 flush outside the timed
 interval.
 
@@ -312,7 +312,7 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 
 `ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.8-27B NVFP4
 `gdn_input_proj_conv_snapshot` form at T=1 (ordinary decode) and the chain
-`gdn_input_proj_conv_record` form at the DFlash2 chain-verify widths T=2..8, both for `B=1..8`.
+`gdn_input_proj_conv_record` form at the DFlash2 chain-verify widths T=2..8, both for `B=1..12`.
 The timed body is exactly one complete public Op call; the benchmark does not include private
 launchers, candidate selection, duplicated compositions, or route labels. The default sweep is
 `T=1..6`. The default `a8` policy is the one the record admits; the reported profile names the

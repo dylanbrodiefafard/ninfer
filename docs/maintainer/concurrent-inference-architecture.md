@@ -24,7 +24,7 @@ runtime, operator, and qualification documents.
 ### 1.1 Supported workload
 
 - Single GPU, single resident model instance;
-- `max_concurrency=C` is fixed at startup, and `C=1..8` is supported;
+- `max_concurrency=C` is fixed at startup, and `C=1..12` is supported;
 - `0..C` admitted requests at run time;
 - Text and image/video prompts;
 - ordinary decoding and engine-wide speculative decoding;
@@ -37,21 +37,21 @@ runtime, operator, and qualification documents.
 Startup concurrency determines the lane pool, replay/history capacity, graph frontier, and
 per-row metadata. Compact batch rows are transient: physical state-slot identities survive
 batch growth, cancellation, and compaction. FIFO admission and one packed decode batch per
-round boundary apply through C8.
+round boundary apply through C12.
 
-Ordinary decode has at most eight rows. DFlash chain verification packs B sequences of width W
-into T=B×W columns: K7 uses W8 and reaches T64; explicit W16 reaches T128. The target aggregate
-projection/workspace budget is 128 columns, independent of the 48-column automatic-tree policy.
+Ordinary decode has at most twelve rows. DFlash chain verification packs B sequences of width W
+into T=B×W columns: K7 uses W8 and reaches T96; explicit W16 reaches T192. The target aggregate
+projection/workspace budget is 192 columns, independent of the 48-column automatic-tree policy.
 Existing tiled A8 attention, residual, and SwiGLU projections cover the aggregate budget.
 The fused GDN projection/record tile remains limited to 48 columns; larger aggregates use the
 materialized FP32 projection path. Packed gating similarly retains its 48-column aggregate
 route and uses the per-sequence path above that boundary. These are dispatch boundaries rather
 than request-concurrency limits.
 
-Accepted-history and replay descriptors hold eight distinct state slots and preserve FP32
+Accepted-history and replay descriptors hold twelve distinct state slots and preserve FP32
 recurrent state, BF16 convolution history, accepted-prefix semantics, and stable graph addresses.
-The shared KV budget follows actual allocations and request reservations; eight lanes do not
-imply capacity for eight maximum-length contexts. The adaptive draft controller selects its
+The shared KV budget follows actual allocations and request reservations; twelve lanes do not
+imply capacity for twelve maximum-length contexts. The adaptive draft controller selects its
 existing captured arms from measured throughput, without a concurrency-specific forced width.
 
 ### 1.2 Non-goals

@@ -103,8 +103,8 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("unknown option");
             }
         }
-        if (batch < 1 || batch > 8 || width < 1 || width > 16 || repeat < 1 || repeat > 100000) {
-            throw std::invalid_argument("requires B=1..8, T=1..16, repeat=1..100000");
+        if (batch < 1 || batch > 12 || width < 1 || width > 16 || repeat < 1 || repeat > 100000) {
+            throw std::invalid_argument("requires B=1..12, T=1..16, repeat=1..100000");
         }
         run(batch, width, repeat);
         return 0;

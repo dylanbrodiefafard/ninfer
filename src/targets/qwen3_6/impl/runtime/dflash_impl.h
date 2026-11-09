@@ -876,15 +876,24 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         state.execution.work.reset();
         const std::int32_t w_ceil = frame.verify_ids.ne[0];
         const bool compact = vw < w_ceil; // LLD Capture/run: no extra nodes when W(k)==W_ceil
-        // pending_features is stored at W_ceil. The previous round may have used a longer k, so
-        // its committed prefix can exceed the live W(k): append the full W_ceil ragged prefix.
-        Tensor prepare_positions =
-            frame.append_positions.slice(0, 0, w_ceil).slice(1, 0, batch_size);
+        // pending_features is stored at W_ceil, but the previous round committed at most the
+        // append envelope's columns (the largest captured k + 1; tree commits gather their path
+        // into the prefix). That round may have used a longer k than this one, so the append
+        // covers the full commit width rather than the live W(k).
+        const auto w_append = static_cast<std::int32_t>(envelopes.append.max_count);
+        if (w_append <= 0 || w_append > w_ceil) {
+            throw std::logic_error("DFlash context append width exceeds the pending features");
+        }
+        // The append positions are round scratch: view the panel's storage as dense [W_append,B].
+        if (static_cast<std::int64_t>(w_append) * batch_size > frame.append_positions.numel()) {
+            throw std::logic_error("DFlash append positions exceed their round-state panel");
+        }
+        Tensor prepare_positions(frame.append_positions.data, DType::I32, {w_append, batch_size});
         Tensor prefix_features = state.execution.work.alloc(
-            DType::BF16, {Variant::DFlashConfig::feature_rows, w_ceil, batch_size});
-        ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
-                                   frontiers, prefix_features, prepare_positions, append_counts,
-                                   state.execution.device.stream);
+            DType::BF16, {Variant::DFlashConfig::feature_rows, w_append, batch_size});
+        ops::prepare_ragged_prefix(dflash_state(state).pending_features.slice(1, 0, w_append),
+                                   lanes, context_starts, frontiers, prefix_features,
+                                   prepare_positions, append_counts, state.execution.device.stream);
         append_context_impl<Variant>(state, prefix_features, prepare_positions, append_counts,
                                      lanes, envelopes.append);
 

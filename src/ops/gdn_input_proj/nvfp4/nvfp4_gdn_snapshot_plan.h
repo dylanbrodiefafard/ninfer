@@ -16,7 +16,7 @@ namespace ninfer::ops::detail {
 
 // The NVFP4 GDN conv snapshot serves ordinary decode, one column per request (W=1) for
 // B=1..kNvfp4GdnSnapshotMaxBatch, on the fused T=1 GEMV under every policy.
-inline constexpr std::int32_t kNvfp4GdnSnapshotMaxBatch = 8;
+inline constexpr std::int32_t kNvfp4GdnSnapshotMaxBatch = 12;
 
 // The NVFP4 GDN conv record serves DFlash2 verification under AllowA8 (W4A8). A8 record launches
 // whose W*B fits one M48 W4A8 tile write the conv record from the MMA epilogue; larger launches

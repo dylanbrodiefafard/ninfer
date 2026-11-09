@@ -17,7 +17,7 @@ namespace ninfer::ops {
 
 // FP8 single-parent domain: FP8_E4M3FN_ROW_BF16S RowScale [16384,5120], ordered
 // [Q(2048),K(2048),V(6144),Z(6144)], exact BF16 row multipliers. Projection admits
-// A16Only/AllowA8 at every positive T. Snapshot and record admit B=1..8; the snapshot is
+// A16Only/AllowA8 at every positive T. Snapshot and record admit B=1..12; the snapshot is
 // registered for W=1 and the record for W=2..16 (a tree record for W>=3), both with A16
 // arithmetic under either policy. Record preserves the optional tree-parent operand in fused and
 // materialized routes. Complete FP64 projection/convolution/SiLU and represented persistent state
@@ -92,7 +92,7 @@ void gdn_input_proj(const A4Activation& x, const Weight& query_key_value_z_weigh
  * Logical shapes:
  *   x [5120,W,B], one q/k/value/z parent [16384,5120], conv_weight [10240,4], conv_states
  *   [10240,3,Slots], query/key [2048,W,B], value/z [6144,W,B], and I32 selectors [B]. The
- *   registered domain is ordinary decode: W=1 and B=1..8. `valid_columns` is empty for a dense
+ *   registered domain is ordinary decode: W=1 and B=1..12. `valid_columns` is empty for a dense
  *   invocation or I32 [B] for a mixed-width batch. A mixed-width invocation has B>=1 and every
  *   valid extent lies in [1,W].
  *
@@ -127,7 +127,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
                                   cudaStream_t stream);
 
 /**
- * Applies the A16-only single-parent form over the same W=1, B=1..8 domain.
+ * Applies the A16-only single-parent form over the same W=1, B=1..12 domain.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
@@ -157,7 +157,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * representation to conv_record [C,T,B] for subsequent history/replay. Query, key, and value are
  * zero in each row's invalid tail; z is projected for every physical column.
  *
- * The execution domain is B=1..8 and the DFlash2 verify widths: T=2..kDflash2MaxChainWidth
+ * The execution domain is B=1..12 and the DFlash2 verify widths: T=2..kDflash2MaxChainWidth
  * without `parent_index` (a chain) and T=kDflash2MinTreeWidth..kDflash2TreeMaxWidth with it (a
  * tree); FP8 also admits chains through T=16. valid_columns is empty for dense input or device
  * I32 [B], with each caller-supplied extent in [1,T]. conv_states is a read-only BF16 [C,3,S]

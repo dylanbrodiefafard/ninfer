@@ -22,11 +22,11 @@ namespace ninfer::ops::detail {
                                                                   std::int32_t min_width,
                                                                   std::int32_t max_width);
 
-// The FP8 GDN conv snapshot serves ordinary decode: one column per request (W=1) for B=1..8 on
+// The FP8 GDN conv snapshot serves ordinary decode: one column per request (W=1) for B=1..12 on
 // the fused T=1 GEMV. The FP8 conv record keeps A16 arithmetic for every verify width: short
 // recurrent blocks amplify activation-quantization error through cancellation in the four-tap
 // convolution (A8 exceeded the complete public-input FP64 criterion at B=2/3 W=5 and W=11).
-inline constexpr std::int32_t kFp8GdnConvMaxBatch = 8;
+inline constexpr std::int32_t kFp8GdnConvMaxBatch = 12;
 
 // Record widths whose A16 projection and convolution fuse into one SmallT launch per request;
 // the other widths materialize the BF16 projection first.

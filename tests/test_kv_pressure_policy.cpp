@@ -35,10 +35,10 @@ int main() {
     policy.observe(active, true);
     failures += check(!policy.pressure_needed() && !policy.draining(),
                       "single blocked lane disturbed runnable peers");
-    failures += check(policy.ranked_victims(active, KvPressureReason::Growth).count == 0,
+    failures += check(policy.ranked_victims(active, KvPressureReason::Growth).sets.empty(),
                       "single blocked lane triggered growth eviction");
     auto victims = policy.ranked_victims(active, KvPressureReason::WaitingReplacement);
-    failures += check(victims.count == 1 && victims.sets[0].mask == 1,
+    failures += check(victims.sets.size() == 1 && victims.sets[0].mask == 1,
                       "queued replacement evicted an unblocked or completion member");
     failures += check(policy.oldest_incumbent() == 1 && policy.incumbent_ids().size() == 3,
                       "pressure did not freeze original incumbent identities");
@@ -74,7 +74,7 @@ int main() {
     failures += check(pressure.draining() && pressure.pressure_needed(),
                       "second blocked request did not open evacuation drain");
     victims = pressure.ranked_victims(rows, KvPressureReason::Growth);
-    failures += check(victims.count == 7 && victims.sets[0].mask == 2 &&
+    failures += check(victims.sets.size() == 7 && victims.sets[0].mask == 2 &&
                           victims.sets[1].mask == 1 && victims.sets[2].mask == 4,
                       "victims did not prefer minimal blocked captures by transfer cost");
     // Exact geometry is deliberately external. Simulate only a two-victim post-transition
@@ -125,7 +125,7 @@ int main() {
     single[0].completion_member = true;
     alone.observe(single, false);
     failures += check(alone.draining() && !alone.allows_ingress(1, false) &&
-                          alone.ranked_victims(single, KvPressureReason::Growth).count == 0,
+                          alone.ranked_victims(single, KvPressureReason::Growth).sets.empty(),
                       "single protected member tried to spill instead of using exclusive growth");
 
     return failures == 0 ? 0 : 1;

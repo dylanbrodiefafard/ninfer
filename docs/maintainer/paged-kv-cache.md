@@ -18,7 +18,7 @@ algorithm and the CUDA kernel code are not specified here.
 
 ## 1. Requirements
 
-- Active requests with `max_concurrency=1..8` share every kind of growing KV capacity;
+- Active requests with `max_concurrency=1..12` share every kind of growing KV capacity;
 - A single request may use most of the capacity of the main KV pool; capacity is not split evenly
   per slot;
 - The physical KV of different requests need not be contiguous;
@@ -164,11 +164,14 @@ For single-schedule graph families (ordinary, MTP, DFlash2), the CUDA Graph allo
 the number `n` of `(K, B, topology)` executables, including their reachable definitions. Ordinary
 and MTP count `min(12n, 24+6n)` MiB: the measured total is a fixed warm-up part plus about 4 MiB
 per executable (RTX 5090 serve benches: at most 46 MiB for 4 executables, 146 MiB for 30). DFlash2
-counts `16+4.75n` MiB, covering the measured graph amount plus the driver memory that Instance
-construction consumes outside the arena (about `2+2.3C` MiB, not inside the graph measurement
-window): at 262144-token context with adaptive K7, the C=1..8 serve startups (12-88 executables)
-measured 42-396 MiB for graphs, 46-416 MiB in total outside the arena, and the allowance is 17-27
-MiB above each total, so Automatic capacity keeps the full `R` free after startup. All definitions
+counts `16+4.75n+2.5w` MiB, where `w` of the `n` executables have batch size 10 or more. It covers
+the measured graph amount plus the driver memory that Instance construction consumes outside the
+arena (about `2+2.3C` MiB, not inside the graph measurement window): with adaptive K7, the C=1..8
+serve startups at 262144-token context (12-88 executables) measured 42-396 MiB for graphs and
+46-416 MiB in total outside the arena, 17-27 MiB below the allowance. Executables grow by about
+52 MiB per added batch size through B=9 and about 70 MiB from B=10; the C=8..12 startups at
+65536-token context, including the k=2 chain arm from B=9, measured 414-716 MiB in total, 16-36
+MiB below the allowance. Automatic capacity therefore keeps the full `R` free after startup. All definitions
 and executables are established at startup. The measured value is the device-wide free-memory
 difference before and after preparation, which accounts for allocations/frees by other processes on
 the same GPU, so it

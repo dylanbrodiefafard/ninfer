@@ -3,6 +3,7 @@
 // Every measurement is exactly one ninfer::ops::embedding call. L2 eviction
 // completes before the timed interval.
 #include "ninfer/ops/embedding.h"
+#include "ninfer/types.h"
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
@@ -113,8 +114,9 @@ std::vector<std::int32_t> parse_tokens(const char* raw) {
 
 std::vector<std::int32_t> production_tokens(const ProfileSpec& spec) {
     std::set<std::int32_t> values;
-    for (std::int32_t batch = 1; batch <= 8; ++batch) values.insert(batch);
-    for (std::int32_t batch = 1; batch <= 8; ++batch) {
+    for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(kMaximumConcurrency); ++batch)
+        values.insert(batch);
+    for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(kMaximumConcurrency); ++batch) {
         for (std::int32_t k = 1; k <= spec.max_proposal_k; ++k) { values.insert(batch * (k + 1)); }
     }
     return {values.begin(), values.end()};

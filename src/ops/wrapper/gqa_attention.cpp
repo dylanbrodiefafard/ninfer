@@ -22,7 +22,7 @@ constexpr std::int32_t kNvfp4Group                = 16;
 constexpr std::int32_t kNvfp4CodeWidth            = 128;
 constexpr float kExpectedScale                    = 0.0625f;
 constexpr std::int32_t kMaximumVerifyTokens       = 16;
-constexpr std::int32_t kMaximumBatchSize          = 8;
+constexpr std::int32_t kMaximumBatchSize          = 12;
 constexpr std::int32_t kMaximumChunkedPromptWidth = 60;
 
 constexpr std::int32_t kQHeads  = 24;

@@ -206,7 +206,7 @@ Options parse_options(int argc, char** argv) {
     if (options.qk_norm == "composed" && options.mode != Mode::Snapshot) {
         fail("--qk-norm composed is a snapshot comparison");
     }
-    if (options.batch > 8 ||
+    if (options.batch > 12 ||
         (options.mode != Mode::Snapshot &&
          (options.batch != 1 || !options.valid_columns.empty())) ||
         (!options.valid_columns.empty() &&
@@ -233,7 +233,7 @@ void print_help(const char* program) {
                 "                     chunked: 60,64,100,128,256,512,1024,4096\n"
                 "  --qk-heads N       Q/K heads (default: 16)\n"
                 "  --value-heads N    divisible value heads >= Q/K heads (default: 48)\n"
-                "  --batch B          exact snapshot batch in [1,8] (default: 1)\n"
+                "  --batch B          exact snapshot batch in [1,12] (default: 1)\n"
                 "  --valid-columns V  optional snapshot prefix lengths, comma-separated\n"
                 "  --qk-norm MODE     snapshot normalization: fused or composed (default: fused)\n"
                 "\n"

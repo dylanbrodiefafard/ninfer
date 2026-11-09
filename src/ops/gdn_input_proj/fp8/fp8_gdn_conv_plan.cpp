@@ -23,7 +23,7 @@ void require_policy(LinearPolicy policy, const char* operation) {
 void require_snapshot_domain(LinearPolicy policy, std::int32_t width, std::int32_t batch_size) {
     require_policy(policy, "fp8 GDN snapshot");
     if (width != 1 || batch_size <= 0 || batch_size > kFp8GdnConvMaxBatch) {
-        throw std::invalid_argument("fp8 GDN snapshot: registered only for W=1, B=1..8");
+        throw std::invalid_argument("fp8 GDN snapshot: registered only for W=1, B=1..12");
     }
 }
 

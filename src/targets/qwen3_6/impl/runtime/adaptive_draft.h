@@ -159,7 +159,8 @@ adaptive_draft_ks(SpeculativeBackend backend, std::uint32_t n, bool adaptive,
         return out.empty() ? std::vector<std::uint32_t>{n} : out;
     }
     // k=1/2 never beat k=3 at any C=1..6 on the A8 verify routes: C=1 round time is nearly flat
-    // in k, and at C>=4 a k=4 round is cheaper than a k=1 round.
+    // in k, and at C>=4 a k=4 round is cheaper than a k=1 round. DFlash2 adds a k=2 chain shape
+    // from batch 9 (kDFlashShortArmK in instance.h), where packed verify tiles favor it.
     if (n < 5) { return {n}; }
     for (std::uint32_t k = 3; k <= n && k <= dflash_maximum_adaptive_k; ++k) { out.push_back(k); }
     return out.empty() ? std::vector<std::uint32_t>{n} : out;
@@ -396,10 +397,15 @@ inline void t_lookup(const AdaptiveRoundTimeState* st, std::uint32_t arm, std::u
 }
 
 // The arm itself when its draft window fits the budget, else the largest captured chain arm that
-// fits (the smallest chain arm when none does).
+// fits (the smallest chain arm when none does). A chain arm this batch size does not capture,
+// such as the k=2 arm carried from a batch of at least kDFlashShortArmMinBatch, first snaps to
+// the nearest captured chain arm above it.
 [[nodiscard]] inline std::uint32_t clamp_to_budget(std::span<const std::uint32_t> captured,
                                                    std::uint32_t arm, std::uint32_t budget) {
     if (captured.empty()) { return std::min(arm, budget); }
+    if (!adaptive_arm_is_tree(arm) && !captured_contains(captured, arm)) {
+        arm = adaptive_snap_captured_k(captured, arm);
+    }
     if (captured_contains(captured, arm) && adaptive_arm_k(arm) <= budget) { return arm; }
     std::uint32_t down     = 0;
     std::uint32_t smallest = 0;
@@ -529,23 +535,60 @@ inline void adaptive_record_round(AdaptiveDraftState& state, std::uint32_t accep
     if (round_k < 16) { state.rounds_hist[round_k] += 1; }
 }
 
-// One round in kAdaptiveExploreEvery overrides the picked k with a uniform captured k <= cap_k,
-// once every such k has T measured for this batch size. Returns 0 for an ordinary round.
-[[nodiscard]] inline std::uint32_t adaptive_explore_k(AdaptiveHopRates& rates,
-                                                      std::span<const std::uint32_t> captured_ks,
-                                                      const AdaptiveRoundTimeState& round_time,
-                                                      std::uint32_t cap_k) {
+// One round in kAdaptiveExploreEvery draws a uniform captured arm within cap_k, once every such
+// arm has T measured for this batch size, and runs it as a one-round override. Returns 0 for an
+// ordinary round.
+//
+// A drawn arm whose content-neutral predicted rate is below kAdaptiveExploreBand of the best
+// arm's runs only one draw in kAdaptiveDominatedExploreDivisor. The rate is the sum over rows of
+// E[Y] from the engine-global hazards with every content factor at 1 (each row keeps its
+// sampling law and budget cap), divided by T(arm,C,L). A dominated arm's round costs up to twice
+// a short round at C>=8 for k=7; thinning it keeps its T and hazards refreshed, so a bad estimate
+// still recovers, at an eighth of the cost. The trigger and the draw depend only on the decision
+// counter; the thinning depends on engine-global hazards, round time, sampling laws, budgets and
+// length, never on a request's content factors.
+inline constexpr float kAdaptiveExploreBand                     = 0.75f;
+inline constexpr std::uint32_t kAdaptiveDominatedExploreDivisor = 8;
+
+[[nodiscard]] inline std::uint32_t
+adaptive_explore_k(AdaptiveHopRates& rates, std::span<const std::uint32_t> captured_ks,
+                   const AdaptiveRoundTimeState& round_time, std::uint32_t cap_k,
+                   std::span<const AdaptiveDraftLaw> row_laws,
+                   std::span<const std::uint32_t> row_cap, std::uint32_t length_tokens) {
     std::uint32_t candidates[kAdaptiveTBins] = {};
+    float rate[kAdaptiveTBins]               = {};
     std::uint32_t count                      = 0;
+    float best_rate                          = 0.0f;
     for (std::uint32_t arm : captured_ks) {
         if (adaptive_arm_k(arm) > cap_k || arm >= kAdaptiveTBins) { continue; }
         if (!adaptive_t_measured(round_time, arm)) { return 0; }
-        candidates[count++] = arm;
+        float t       = 0.0f;
+        bool measured = false;
+        detail::t_lookup(&round_time, arm, length_tokens, t, measured);
+        float e = 0.0f;
+        for (std::size_t row = 0; row < row_laws.size(); ++row) {
+            const std::uint32_t extent = row < row_cap.size()
+                                             ? std::min(adaptive_arm_k(arm), row_cap[row])
+                                             : adaptive_arm_k(arm);
+            if (extent == 0) { continue; }
+            AdaptiveDraftState neutral;
+            seed_adaptive_draft_state(neutral, 0, row_laws[row]);
+            e += detail::hop_expected_tokens(neutral, rates, arm, extent);
+        }
+        rate[count]       = measured && t > 0.0f ? e / t : 0.0f;
+        best_rate         = std::max(best_rate, rate[count]);
+        candidates[count] = arm;
+        ++count;
     }
     if (count < 2) { return 0; }
     const std::uint64_t h = adaptive_explore_hash(rates.decisions++);
     if ((h % kAdaptiveExploreEvery) != 0) { return 0; }
-    return candidates[(h >> 32) % count];
+    const std::uint64_t pick = (h >> 32) % count;
+    if (rate[pick] < kAdaptiveExploreBand * best_rate &&
+        ((h >> 16) % kAdaptiveDominatedExploreDivisor) != 0) {
+        return 0;
+    }
+    return candidates[pick];
 }
 
 // The arm when its draft window fits cap_k, else the largest captured chain arm that does.

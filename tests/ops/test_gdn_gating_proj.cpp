@@ -701,7 +701,7 @@ int verify_packed_workspace_rejections() {
     expect_invalid(0, 1, 1);
     expect_invalid(5, 0, 1);
     expect_invalid(5, 3, 2);
-    expect_invalid(5, 1, 9);
+    expect_invalid(5, 1, 13);
     return failures;
 }
 
@@ -767,6 +767,12 @@ int main() {
             failures += run_norm_packed_columns_match_decode(kQwen27, width * batch,
                                                              0x6400u + width * batch, width);
         }
+    }
+    // C=12: W=4 packs exactly the 48-column aggregate; W=5 and W=8 use per-request panels.
+    for (const int width : {4, 5, 8}) {
+        failures += run_norm_projection_case(kQwen27, width * 12, 0x6500u + width, width);
+        failures +=
+            run_norm_packed_columns_match_decode(kQwen27, width * 12, 0x6600u + width, width);
     }
     failures += run_norm_projection_case(kQwen27, 1, 0x3001u);
     failures += run_norm_projection_case(kQwen27, 5, 0x3005u);

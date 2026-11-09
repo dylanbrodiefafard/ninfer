@@ -210,7 +210,7 @@ void usage(const char* argv0) {
                  "  --nvfp4-policy a16|a4|a8     Default a8; the record requires a8.\n"
                  "  --tokens T                    Exact token extent.\n"
                  "  --sweep START:END[:STEP]      Token sweep (default 1:6).\n\n"
-                 "  --batch B                     Snapshot [1,8], record [1,8] (default 1).\n"
+                 "  --batch B                     Snapshot [1,12], record [1,12] (default 1).\n"
                  "  --valid-columns V0,V1,...     Mixed valid prefixes; requires exact tokens.\n\n"
                  "Measurement:\n"
                  "  --execution graph|eager|both  Default graph.\n"

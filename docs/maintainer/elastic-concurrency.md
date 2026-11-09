@@ -60,9 +60,10 @@ RAM (DFlash), outside `--kv-ram-capacity`.
 ## C. Graph allowance matched to measurement — implemented
 
 Ordinary and MTP graphs charge `min(12n, 24+6n)` MiB for `n` executables (historical maximum
-46 MiB at `n=4`, 146 MiB at `n=30`). DFlash2 charges `16+4.75n` MiB for graph memory plus the
-driver memory startup consumes outside the arenas: adaptive K7 startups at C=1..8 (`n=12..88`)
-consumed 46–416 MiB outside the arenas, 17–27 MiB below the allowance.
+46 MiB at `n=4`, 146 MiB at `n=30`). DFlash2 charges `16+4.75n+2.5w` MiB, where `w` executables
+have batch size 10 or more, for graph memory plus the driver memory startup consumes outside the
+arenas: adaptive K7 startups at C=1..12 consumed 46–716 MiB outside the arenas, 16–36 MiB below
+the allowance.
 
 ## B. Elastic lanes by VMM aliasing — open, not recommended now
 

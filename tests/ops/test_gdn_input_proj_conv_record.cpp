@@ -703,9 +703,10 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     failures += run_shape(5, 3, {5, 3, 2}, {-1, 0, 0, 1, 1, -1, 0, 1, 1, 3, -1, 0, 0, 2, 2}, 2077U);
     failures += run_shape(5, 4, {5, 4, 3, 2},
                           {-1, 0, 0, 1, 1, -1, 0, 1, 1, 3, -1, 0, 0, 2, 2, -1, 0, 1, 2, 3}, 2081U);
-    // C=5..8 verify covers every chain width, plus ragged tree rows at the widest aggregates
-    // (A8 W=8 B=6 is the 48-token single-tile boundary).
-    for (int batch : {5, 6, 7, 8}) {
+    // C=5..12 verify covers every chain width, plus ragged tree rows at the widest aggregates
+    // (A8 W=8 B=6 and W=4 B=12 are 48-token single-tile boundaries; W=5 B=10 is the narrowest
+    // staged aggregate).
+    for (int batch : {5, 6, 7, 8, 10, 12}) {
         for (int width : {2, 3, 4, 5, 6, 7, 8}) {
             failures += run_shape(width, batch, {}, {}, 2700U + width * 8 + batch);
         }

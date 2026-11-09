@@ -211,14 +211,15 @@ schedule::MtpGqaEnvelopes mtp_gqa_envelopes(std::uint32_t max_frontier, std::uin
     return out;
 }
 
-// The context append commits the previous round's accepted prefix, which an adaptive switch from
-// a longer k leaves wider than the current W(k); every round therefore admits up to W_ceil.
+// The context append carries the previous round's committed prefix. An adaptive switch from a
+// longer k leaves it wider than the current W(k), so every round admits up to commit_width
+// columns, the largest captured k plus the bonus token.
 schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
-                                           std::uint32_t verify_width_ceiling) {
+                                           std::uint32_t commit_width) {
     (void)min_frontier;
     return schedule::DFlashEnvelopes{
         .local  = {0, max_frontier},
-        .append = {0, verify_width_ceiling},
+        .append = {0, commit_width},
     };
 }
 
@@ -4358,10 +4359,11 @@ void ProgramImplCore::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::DFlash) {
         std::uint32_t max_planned = 0;
         for (const DFlashRoundShape& shape : dflash_shapes) {
-            for (std::uint32_t batch_size = 1; batch_size <= shape.max_batch; ++batch_size) {
+            for (std::uint32_t batch_size = shape.min_batch; batch_size <= shape.max_batch;
+                 ++batch_size) {
                 const auto planned_profiles =
                     dflash_graph_profiles(capacity, shape.k, batch_size, shape.verify_width);
-                if (batch_size == 1) {
+                if (batch_size == shape.min_batch) {
                     validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
                 }
                 for (const GraphExecutionProfile planned : planned_profiles) {
@@ -4385,22 +4387,22 @@ void ProgramImplCore::prepare_graphs() {
         device.synchronize();
         schedule::dflash_decode_batch(
             dflash_state, 1, warm_k, warm_w,
-            dflash_envelopes(code_warm.min, code_warm.max, dflash_verify_width), code_warm_target,
-            false, nullptr);
+            dflash_envelopes(code_warm.min, code_warm.max, dflash_max_commit_width(dflash_shapes)),
+            code_warm_target, false, nullptr);
         device.synchronize();
 
         std::size_t dflash_profile_count = 0;
         for (const DFlashRoundShape& shape : dflash_shapes) {
             dflash_profile_count +=
                 dflash_graph_profiles(capacity, shape.k, 1, shape.verify_width).size() *
-                shape.max_batch * qwen3_6::kGrammarExchangeVariants;
+                (shape.max_batch - shape.min_batch + 1U) * qwen3_6::kGrammarExchangeVariants;
         }
         dflash_graphs.profiles.reserve(dflash_profile_count);
         for (std::uint32_t shape_index = 0; shape_index < dflash_shapes.size(); ++shape_index) {
             const std::uint32_t k  = dflash_shapes[shape_index].k;
             const std::uint32_t wk = dflash_shapes[shape_index].verify_width;
-            for (std::uint32_t batch_size = 1; batch_size <= dflash_shapes[shape_index].max_batch;
-                 ++batch_size) {
+            for (std::uint32_t batch_size = dflash_shapes[shape_index].min_batch;
+                 batch_size <= dflash_shapes[shape_index].max_batch; ++batch_size) {
                 const auto planned_profiles = dflash_graph_profiles(capacity, k, batch_size, wk);
                 validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
                 for (std::uint32_t variant = 0; variant < qwen3_6::kGrammarExchangeVariants;
@@ -4428,7 +4430,8 @@ void ProgramImplCore::prepare_graphs() {
                         device.synchronize();
                         schedule::capture_dflash_decode_batch(
                             dflash_state, static_cast<std::int32_t>(batch_size), k, wk,
-                            dflash_envelopes(planned.min, planned.max, dflash_verify_width),
+                            dflash_envelopes(planned.min, planned.max,
+                                             dflash_max_commit_width(dflash_shapes)),
                             target_envelope, profile.definition);
                     }
                 }
@@ -5424,7 +5427,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             sequence.kv->text.bound_row() < 0 || sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
-            sequence.execution_frontier - sequence.dflash_context_frontier > width ||
+            sequence.execution_frontier - sequence.dflash_context_frontier >
+                dflash_max_commit_width(dflash_shapes) ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.prefix_identity.size() != sequence.ledger_frontier) {
@@ -5481,7 +5485,14 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             batch_arm = qwen3_6::adaptive_clamp_arm(arms, batch_st.live_k, cap_k);
         }
         // Exploration: a content-independent one-round override that leaves the incumbent arm.
-        explore_k = qwen3_6::adaptive_explore_k(adaptive_hop_rates, arms, t_state, cap_k);
+        std::array<qwen3_6::AdaptiveDraftLaw, kMaximumConcurrency> row_laws{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            row_laws[row] = dflash_row_states[row]->law;
+        }
+        explore_k = qwen3_6::adaptive_explore_k(
+            adaptive_hop_rates, arms, t_state, cap_k,
+            std::span<const qwen3_6::AdaptiveDraftLaw>(row_laws.data(), lanes.size()), caps,
+            maximum_frontier);
         if (explore_k != 0) { batch_arm = explore_k; }
     }
     const DFlashRoundShape& round_shape = dflash_arm_shape(dflash_shapes, batch_arm);
@@ -5500,7 +5511,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
     try {
         DecodeGraphExecutable* executable   = nullptr;
-        schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, width);
+        const std::uint32_t commit_width    = dflash_max_commit_width(dflash_shapes);
+        schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, commit_width);
         ops::GqaExecutionEnvelope target_envelope{maximum_frontier + 1, maximum_target_tokens};
         // A mixed round's owner chunk has no captured graph; it runs eagerly.
         if (use_cuda_graph && owner == nullptr) {
@@ -5509,7 +5521,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 "DFlash batch", batch_k, dflash_exchange, live_w);
             executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
             envelopes       = dflash_envelopes(profile.min_execution_frontier,
-                                               profile.max_execution_frontier, width);
+                                               profile.max_execution_frontier, commit_width);
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity,

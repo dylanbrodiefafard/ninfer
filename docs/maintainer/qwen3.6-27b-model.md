@@ -493,7 +493,8 @@ One propose block:
    A cycle exclusion affects hop 0 only. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
    single-request recommendation is k=4 (W=5, one SmallT GQA tile); concurrent long-reasoning
    settings are measured in [performance.md](../performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22).
-   Maximum k=7 (W=8). `--adaptive-draft` picks live k in `{3..N}` for `--draft-tokens N>=5` as in
+   Maximum k=7 (W=8). `--adaptive-draft` picks live k in `{3..N}` for `--draft-tokens N>=5`, plus
+   k=2 at batch sizes of nine or more, as in
    [§8.1](#81-adaptive-draft-length). Frozen
    `--draft-tokens 4` stays `{4}`. CUDA graphs capture one graph per k; the next k is chosen
    after the round (lagged one round, no post-draft host seam).
@@ -510,7 +511,7 @@ the **next** round. “Lock” means: do not mix k as a bandit; take the current
 
 | State | Lifetime | Role |
 |---|---|---|
-| CUDA graphs for DFlash arms (chains `{3..N}` plus the tree arm) or MTP `{3,4,5}` | once per Engine launch | the captured round shapes; DFlash below a configured maximum of 5 stays fixed (chain `N` plus the tree arm) |
+| CUDA graphs for DFlash arms (chains `{3..N}`, a k=2 chain from batch 9, and the tree arm) or MTP `{3,4,5}` | once per Engine launch | the captured round shapes; DFlash below a configured maximum of 5 stays fixed (chain `N` plus the tree arm) |
 | `T(k,C,L)` | Engine lifetime, one table per concurrency C | seconds for a k-round at this batch size and length |
 | DFlash hop hazards `H[law][k][i]` | Engine lifetime | block-length acceptance, learned from exploration rounds |
 | content factors `c_i` (DFlash) / hop chances `r_i` (MTP) | one request | how far down the draft this prompt still matches |
@@ -600,6 +601,11 @@ measurement per arm, the warm-server start, and shared batch k. DFlash captures
 never beat k=3 at any C=1..6 (C=1 round time
 is nearly flat in k, 14.6 ms at k=1 to 15.3–15.8 ms at k=3–5; at C≥4 a k=4 round is cheaper than a
 k=1 round), see [performance.md](../performance.md#adaptive-draft-start-and-k-set-2026-09-27).
+From batch 9 the packed verify width decides instead: the projections are tensor-issue bound and
+pay for whole 16-token (N<=6144) or 8-token token tiles, so k=3 at B=9/10 (36/40 columns) costs a
+48-column tile while k=2 (27/30) fits one 32-column tile. DFlash2 therefore also captures a k=2
+chain for B>=9 and lets the round-time model choose; see
+[performance.md](../performance.md#c9c12-aggregate-scaling-2026-11-08).
 Under p-less the block length also moves the best proposal temperature (the drafter's
 bidirectional block attention flattens per-position selector laws at k=6/7); §8.2 calibrates it per
 draft length, and `ρ_k` absorbs the remaining differences.

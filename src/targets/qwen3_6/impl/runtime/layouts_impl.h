@@ -88,14 +88,20 @@ std::size_t graph_executables_allowance(std::size_t executables, const char* lab
 
 // Startup device memory outside the planned arenas for DFlash2 (K, B, topology) executables:
 // prepare_graphs' measured graph memory plus the driver memory that Instance construction
-// consumes outside that window (about 2 + 2.3*C MiB). Adaptive K7 serve startups at
-// 262144-token context (RTX 5090, 12 to 88 executables for C=1..8) consumed 46 to 416 MiB in
-// total, 42 to 396 MiB of it inside the graph window. 16 MiB + 4.75 MiB per executable stays
-// 17 to 27 MiB above every measured total, so Automatic capacity keeps its full headroom free;
-// n=88 is the largest reachable count (K7 adaptive, C=8).
-std::size_t dflash2_graph_executables_allowance(std::size_t executables) {
+// consumes outside that window (about 2 + 2.3*C MiB). Adaptive K7 serve startups on the RTX 5090
+// consume about 52 MiB more per added batch size through B=9 and about 70 MiB per batch size
+// from B=10: 414 MiB in total at C=8 and 716 MiB at C=12 with the k=2 arm from B=9. Charging
+// 16 MiB + 4.75 MiB per executable plus 2.5 MiB per executable whose batch is at least
+// kDflash2WideGraphBatch stays 16 to 36 MiB above every measured C=8..12 total, so Automatic
+// capacity keeps its full headroom free.
+inline constexpr std::uint32_t kDflash2WideGraphBatch = 10;
+
+std::size_t dflash2_graph_executables_allowance(std::size_t executables,
+                                                std::size_t wide_batch_executables) {
     constexpr const char* label = "DFlash2 graph allowance";
-    return checked_add(16ULL * kMiB, checked_mul(19ULL * kMiB / 4ULL, executables, label), label);
+    const std::size_t base =
+        checked_add(16ULL * kMiB, checked_mul(19ULL * kMiB / 4ULL, executables, label), label);
+    return checked_add(base, checked_mul(5ULL * kMiB / 2ULL, wide_batch_executables, label), label);
 }
 
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
@@ -266,7 +272,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto dflash_batch_width = [&](std::int32_t batch) {
         std::uint32_t width = 0;
         for (const DFlashRoundShape& shape : plan.dflash_shapes) {
-            if (shape.max_batch >= static_cast<std::uint32_t>(batch)) {
+            if (shape.runs_batch(static_cast<std::uint32_t>(batch))) {
                 width = std::max(width, shape.verify_width);
             }
         }
@@ -275,7 +281,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto dflash_batch_tree = [&](std::int32_t batch) {
         bool tree = false;
         for (const DFlashRoundShape& shape : plan.dflash_shapes) {
-            tree = tree || (shape.max_batch >= static_cast<std::uint32_t>(batch) &&
+            tree = tree || (shape.runs_batch(static_cast<std::uint32_t>(batch)) &&
                             dflash_uses_tree_verify(shape.k, shape.verify_width));
         }
         return tree;
@@ -655,6 +661,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 }
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
+                // Compact selector ids (I32) and q (FP32) [16,k,B] panels stay live through the
+                // proposal head and path/tree selection whenever the round-state view is strided.
+                {
+                    const std::int32_t selector_columns = drafts * batch;
+                    matrix(layout, DType::I32, ops::kDflash2PathSelectTopK, selector_columns);
+                    matrix(layout, DType::FP32, ops::kDflash2PathSelectTopK, selector_columns);
+                }
                 if (plan.proposal_head == ProposalHead::Optimized) {
                     matrix(layout, DType::BF16, Variant::draft_head_rows, drafts * batch);
                 } else {
@@ -680,10 +693,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                               QType::Q4G64_F16S, drafts, drafts, batch),
                                           ops::dflash2_path_select_workspace_capacity_bytes(
                                               QType::NVFP4, drafts, drafts, batch)}));
-                scratch(layout, static_cast<std::size_t>(ops::kDflash2PathSelectTopK) *
-                                    static_cast<std::size_t>(drafts) *
-                                    static_cast<std::size_t>(batch) *
-                                    (sizeof(std::int32_t) + sizeof(float)));
                 if constexpr (DFlashConfig::two_block_first > 0) {
                     {
                         auto attention = layout.scope();
@@ -754,7 +763,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 if (plan.adaptive_draft) {
                     std::size_t panel_bytes = 0;
                     for (const DFlashRoundShape& shape : plan.dflash_shapes) {
-                        if (shape.max_batch < static_cast<std::uint32_t>(batch)) { continue; }
+                        if (!shape.runs_batch(static_cast<std::uint32_t>(batch))) { continue; }
                         const std::uint32_t k = shape.k;
                         const auto wk         = static_cast<std::int32_t>(shape.verify_width);
                         if (wk >= batch_verify) { continue; }
@@ -854,7 +863,7 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         throw std::invalid_argument("mixed_forward_rounds must be at least 1");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("max_concurrency must be in [1,8]");
+        throw std::invalid_argument("max_concurrency must be in [1,12]");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
@@ -1036,7 +1045,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         } else {
             std::uint32_t max_planned = 0;
             for (const DFlashRoundShape& shape : impl->dflash_shapes) {
-                for (std::uint32_t batch_size = 1; batch_size <= shape.max_batch; ++batch_size) {
+                for (std::uint32_t batch_size = shape.min_batch; batch_size <= shape.max_batch;
+                     ++batch_size) {
                     for (const GraphExecutionProfile profile : dflash_graph_profiles(
                              impl->capacity, shape.k, batch_size, shape.verify_width)) {
                         max_planned = std::max(max_planned, profile.topology_class);
@@ -1046,10 +1056,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             const std::uint32_t k_stride =
                 qwen3_6::adaptive_k_stride(impl->max_concurrency, max_planned);
             std::vector<GraphExecutionProfile> expanded;
+            std::vector<GraphExecutionProfile> wide_batch_expanded;
             for (std::uint32_t shape_index = 0; shape_index < impl->dflash_shapes.size();
                  ++shape_index) {
                 const DFlashRoundShape& shape = impl->dflash_shapes[shape_index];
-                for (std::uint32_t batch_size = 1; batch_size <= shape.max_batch; ++batch_size) {
+                for (std::uint32_t batch_size = shape.min_batch; batch_size <= shape.max_batch;
+                     ++batch_size) {
                     const auto profiles = dflash_graph_profiles(impl->capacity, shape.k, batch_size,
                                                                 shape.verify_width);
                     for (const GraphExecutionProfile planned : profiles) {
@@ -1062,6 +1074,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                             folded.topology_class =
                                 qwen3_6::grammar_exchange_topology(topology, variant == 1);
                             expanded.push_back(folded);
+                            if (batch_size >= kDflash2WideGraphBatch) {
+                                wide_batch_expanded.push_back(folded);
+                            }
                         }
                     }
                 }
@@ -1069,8 +1084,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // Each DFlash2 graph captures one parallel proposal/verify schedule; its
             // definitions share one executable per (K, B, topology), like the other graph
             // families.
-            impl->graph_allowance_bytes =
-                dflash2_graph_executables_allowance(graph_topology_count(expanded));
+            impl->graph_allowance_bytes = dflash2_graph_executables_allowance(
+                graph_topology_count(expanded), graph_topology_count(wide_batch_expanded));
         }
     }
 

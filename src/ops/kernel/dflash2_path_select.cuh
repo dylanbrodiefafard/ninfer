@@ -21,7 +21,6 @@ inline constexpr int kDflash2PathSelectSuccStride       = kDflash2PathSelectRank
 inline constexpr int kDflash2PathSelectGemmBlock        = 256;
 inline constexpr int kDflash2PathSelectRngPurposeDevice = 16;
 inline constexpr int kDflash2PathSelectTopkSplits       = 32;
-inline constexpr int kDflash2PathSelectMaxBatchDevice   = 8;
 // Mirrors kDflash2TreeMaxWidth in the public header, which this device header cannot include.
 inline constexpr int kDflash2TreeMaxWidthDevice = 16;
 

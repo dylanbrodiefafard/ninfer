@@ -707,6 +707,7 @@ int run_fp8() {
             });
     };
     failures += run_batched(1, 8, std::vector<std::int32_t>(8, 1), 937U);
+    failures += run_batched(1, 12, std::vector<std::int32_t>(12, 1), 941U);
     failures += parent.verify_preserved("batched FP8 parent weight");
     return failures;
 }

@@ -591,6 +591,14 @@ void test_hop_model_warm_server_new_request_is_not_locked_short() {
     expect(state.live_k == 5, "once every drafted hop accepts, the deeper hops pull k back up");
 }
 
+// One greedy row with an unconstrained budget at length 512, the planted T length.
+std::uint32_t explore_one_row(q36::AdaptiveHopRates& rates, std::span<const std::uint32_t> ks,
+                              const q36::AdaptiveRoundTimeState& t, std::uint32_t cap_k) {
+    const q36::AdaptiveDraftLaw laws[] = {q36::AdaptiveDraftLaw::Greedy};
+    const std::uint32_t caps[]         = {cap_k};
+    return q36::adaptive_explore_k(rates, ks, t, cap_k, laws, caps, 512);
+}
+
 void test_exploration_trigger_is_uniform_and_capped() {
     q36::AdaptiveRoundTimeState t;
     for (std::uint32_t k = 3; k <= 7; ++k) { plant_t(t, k, 0.015f); }
@@ -599,7 +607,7 @@ void test_exploration_trigger_is_uniform_and_capped() {
     std::array<std::uint32_t, 8> hits{};
     std::uint32_t total = 0;
     for (int i = 0; i < 64000; ++i) {
-        const std::uint32_t k = q36::adaptive_explore_k(rates, ks, t, 5);
+        const std::uint32_t k = explore_one_row(rates, ks, t, 5);
         if (k != 0) {
             expect(k >= 3 && k <= 5, "exploration stays within the cap");
             ++hits[k];
@@ -612,18 +620,32 @@ void test_exploration_trigger_is_uniform_and_capped() {
     q36::AdaptiveHopRates again;
     bool same = true;
     for (int i = 0; i < 1000; ++i) {
-        same = same && q36::adaptive_explore_k(replay, ks, t, 7) ==
-                           q36::adaptive_explore_k(again, ks, t, 7);
+        same = same && explore_one_row(replay, ks, t, 7) == explore_one_row(again, ks, t, 7);
     }
     expect(same, "the trigger is a deterministic function of the decision counter");
     q36::AdaptiveRoundTimeState partial;
     plant_t(partial, 3, 0.015f);
     q36::AdaptiveHopRates probe;
     std::uint32_t during_probe = 0;
-    for (int i = 0; i < 4000; ++i) {
-        during_probe += q36::adaptive_explore_k(probe, ks, partial, 7);
-    }
+    for (int i = 0; i < 4000; ++i) { during_probe += explore_one_row(probe, ks, partial, 7); }
     expect(during_probe == 0, "no exploration while a k within the cap is unmeasured");
+}
+
+void test_exploration_thins_dominated_arms() {
+    // k=7 costs three k=3 rounds. Under the neutral hazard prior its expected tokens rise only
+    // about 18%, so its rate is about 40% of k=3's: it still explores, to keep its T and hazards
+    // refreshed, but at an eighth of a competitive arm's share.
+    q36::AdaptiveRoundTimeState t;
+    for (std::uint32_t k = 3; k <= 5; ++k) { plant_t(t, k, 0.015f); }
+    plant_t(t, 7, 0.045f);
+    const std::uint32_t ks[] = {3, 4, 5, 7};
+    q36::AdaptiveHopRates rates;
+    std::array<std::uint32_t, 8> hits{};
+    for (int i = 0; i < 256000; ++i) { ++hits[explore_one_row(rates, ks, t, 7)]; }
+    expect(hits[3] > 1600 && hits[4] > 1600 && hits[5] > 1600,
+           "competitive arms keep a uniform exploration share");
+    expect(hits[7] > 100 && hits[7] * 4 < hits[3],
+           "a dominated arm explores at a thinned, nonzero rate");
 }
 
 void test_content_sums_decay_before_adding() {
@@ -706,6 +728,12 @@ void test_arm_budget_clamp_and_snap() {
     expect(q36::adaptive_clamp_arm(captured, tree, 5) == 5,
            "a tree arm beyond budget falls back to the largest affordable chain");
     expect(q36::adaptive_snap_captured_k(captured, 7) == 7, "snapping never selects a tree arm");
+    // A k=2 live arm carried from a batch of nine or more runs the nearest captured chain at a
+    // batch size without the short arm, not the largest one.
+    expect(q36::adaptive_clamp_arm(captured, 2, 7) == 3,
+           "an uncaptured chain arm snaps up to the nearest captured chain");
+    expect(q36::adaptive_clamp_arm(captured, 2, 2) == 3,
+           "an uncaptured chain arm below every budget falls back to the smallest chain");
 }
 
 void test_round_time_forgets_old_level() {
@@ -814,6 +842,7 @@ int main() {
     test_hop_easy_content_does_not_saturate_unseen_hops();
     test_hop_model_warm_server_new_request_is_not_locked_short();
     test_exploration_trigger_is_uniform_and_capped();
+    test_exploration_thins_dominated_arms();
     test_content_sums_decay_before_adding();
     test_tree_arm_starts_at_its_chain_hazard();
     test_tree_cells_learn_from_ordinary_tree_rounds_only();

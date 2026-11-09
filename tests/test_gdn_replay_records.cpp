@@ -161,7 +161,7 @@ int main() {
         [&] {
             ninfer::LayoutBuilder invalid;
             (void)ninfer::plan_gdn_replay_records(invalid, {.layers          = 1,
-                                                            .record_capacity = 9,
+                                                            .record_capacity = 13,
                                                             .width           = 2,
                                                             .conv_channels   = 1,
                                                             .qk_heads        = 1,

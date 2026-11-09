@@ -29,7 +29,7 @@ namespace {
 
 constexpr std::int32_t kStateDim       = 128;
 constexpr std::int32_t kQkHeads        = 16;
-constexpr std::int32_t kRecordCapacity = 8;
+constexpr std::int32_t kRecordCapacity = 12;
 constexpr std::size_t kGuardBytes      = 256;
 
 std::uint32_t mix(std::uint32_t value) {
@@ -114,7 +114,7 @@ int verify_fold_oracle(const FoldProfile profile, std::int32_t commit, std::uint
 
 std::vector<std::int32_t> selected_slots(std::int32_t rows) {
     if (rows == 1) { return {2}; }
-    std::vector<std::int32_t> slots{10, 2, 8, 0, 6, 4, 9, 1};
+    std::vector<std::int32_t> slots{10, 2, 8, 0, 6, 4, 9, 1, 14, 3, 12, 5};
     slots.resize(static_cast<std::size_t>(rows));
     return slots;
 }
@@ -122,7 +122,7 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
              const std::vector<std::int32_t>& commits, std::uint32_t seed) {
     const std::vector<std::int32_t> slots = selected_slots(rows);
-    const std::int32_t slot_count         = rows == 1 ? 3 : 11;
+    const std::int32_t slot_count         = rows == 1 ? 3 : 15;
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * profile.value_heads;
     const std::size_t recurrent_slot_bytes = recurrent_slot_elements * sizeof(float);
@@ -904,6 +904,7 @@ int main() {
     failures += run_case({48, 48, 10240}, 6, 6, {6, 4, 1, 5, 0, 2}, 1827U);
     failures += run_case({48, 48, 10240}, 8, 7, {8, 7, 1, 5, 0, 2, 6}, 1861U);
     failures += run_case({48, 48, 10240}, 16, 8, {16, 7, 1, 5, 0, 2, 6, 15}, 1871U);
+    failures += run_case({48, 48, 10240}, 8, 12, {8, 7, 1, 5, 0, 2, 6, 3, 8, 4, 1, 6}, 1881U);
     failures += run_path_fold_case();
     failures += run_identity_path_matches_prefix_fold();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";

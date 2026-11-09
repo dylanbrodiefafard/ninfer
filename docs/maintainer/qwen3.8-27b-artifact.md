@@ -710,14 +710,14 @@ match C=1 DFlash of the same k and output budget. Comparisons against target-onl
 decode are diagnostic: packed/T1 greedy flips do not by themselves establish row mixing.
 Actual-verifier logit licensing checks candidate choices separately. Product k=4 and k=5
 chain widths are T=5/T=6 SmallT, so they are not required to match MTP k=3 token-for-token.
-NVFP4 GDN conv-record runs A8 at every registered verify width (chain W=2..8, tree W=3..16, B=1..8)
+NVFP4 GDN conv-record runs A8 at every registered verify width (chain W=2..8, tree W=3..16, B=1..12)
 and aggregates projection across B requests without introducing a BF16 current-projection
 intermediate. Convolution consumes FP32 current projection and BF16 three-tap history; saved
 records/history remain BF16. A8 uses row-scaled E4M3 activations, exact expansion of the stored
 E2M1 codes and separately scaled K16 partials. It neither changes the artifact nor requantizes its
 weights. Launches with W*B<=48 fuse projection with convolution and record publication through a
 CTA-local FP32 tile and need only activation-quantization workspace; wider launches retain the
-global FP32 intermediate. The NVFP4 GDN conv-snapshot serves ordinary decode only (W=1, B=1..8) on
+global FP32 intermediate. The NVFP4 GDN conv-snapshot serves ordinary decode only (W=1, B=1..12) on
 the fused T=1 GEMV. Independent record tests cover dense/ragged/tree inputs, carried history and
 every valid prefix; quantized projection checks use their own mathematical oracle.
 Packed GDN recurrent then carries register-resident state through the width-one transition for `out`. DFlash C>1

@@ -36,6 +36,15 @@ def post(port: int, payload: dict) -> dict:
         connection.close()
 
 
+def lane_marker(lane: int) -> str:
+    """Distinct lane prefix with the frozen workload's token count.
+
+    The tokenizer splits digits individually, so a two-digit lane adds a token; lanes 10 and 11
+    capitalize the word instead, which keeps every frozen prompt length.
+    """
+    return f"Benchmark lane {lane}." if lane < 10 else f"Benchmark Lane {lane - 10}."
+
+
 def prepare_workloads(manifest: Path, concurrency: int) -> list[dict]:
     definitions = json.loads(manifest.read_text())
     workloads = []
@@ -48,7 +57,7 @@ def prepare_workloads(manifest: Path, concurrency: int) -> list[dict]:
                 else json.loads((ROOT / item["messages_file"]).read_text())
             )
             messages[0]["content"] = messages[0]["content"].replace(
-                "Benchmark lane 0.", f"Benchmark lane {lane}.", 1
+                "Benchmark lane 0.", lane_marker(lane), 1
             )
             lanes.append({"messages": messages, "enable_thinking": item["enable_thinking"]})
         workloads.append({"name": item["name"], "definition": item, "lanes": lanes})
@@ -140,13 +149,13 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18082)
     args = parser.parse_args()
     if (
-        any(not 1 <= c <= 8 for c in args.concurrency)
+        any(not 1 <= c <= 12 for c in args.concurrency)
         or args.tokens < 128
         or args.repetitions < 1
         or args.warmup < 0
     ):
         parser.error(
-            "require C=1..8, at least 128 output tokens, positive repetitions and nonnegative warmup"
+            "require C=1..12, at least 128 output tokens, positive repetitions and nonnegative warmup"
         )
     args.output.mkdir(parents=True, exist_ok=False)
     provenance = {

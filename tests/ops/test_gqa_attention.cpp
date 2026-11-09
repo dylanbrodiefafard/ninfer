@@ -4283,6 +4283,21 @@ int run_batch_cases(bool full) {
                                 {7, 0, 6, 1, 5, 2, 4, 3},
                                 MappingPattern::Fragmented,
                                 519u});
+    // C=12 K3/K7 verify: twelve ragged rows over permuted KV table rows.
+    failures += run_batch_case(kGeometries[0], DType::U8,
+                               {4,
+                                {37, 61, 127, 128, 256, 511, 1024, 2048, 300, 5000, 64, 900},
+                                {4, 3, 2, 1, 4, 4, 3, 2, 1, 4, 2, 3},
+                                {11, 0, 10, 1, 9, 2, 8, 3, 7, 4, 6, 5},
+                                MappingPattern::Fragmented,
+                                520u});
+    failures += run_batch_case(kGeometries[0], DType::U8,
+                               {8,
+                                {37, 61, 127, 128, 256, 511, 1024, 2048, 300, 5000, 64, 900},
+                                {8, 7, 6, 5, 4, 3, 2, 1, 8, 8, 5, 7},
+                                {5, 11, 0, 10, 1, 9, 2, 8, 3, 7, 4, 6},
+                                MappingPattern::Fragmented,
+                                521u});
     // Ragged 27B verify batches retain the long row while short rows have different valid tails.
     failures += run_batch_case(kGeometries[0], DType::U8,
                                {8,

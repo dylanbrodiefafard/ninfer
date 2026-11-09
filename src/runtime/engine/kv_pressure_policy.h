@@ -1,7 +1,8 @@
 #pragma once
 
+#include "ninfer/types.h"
+
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -40,13 +41,13 @@ struct KvPressureVictims {
     std::uint64_t oldest_queue_order = 0;
 };
 
-struct KvPressureVictimOrder {
-    std::array<KvPressureVictims, 255> sets{};
-    std::size_t count = 0;
+static_assert(kMaximumConcurrency <= 16, "KvPressureVictims::mask holds one bit per resident");
 
-    [[nodiscard]] std::span<const KvPressureVictims> candidates() const noexcept {
-        return {sets.data(), count};
-    }
+// Every nonempty subset of the eligible residents, ranked: at most 2^kMaximumConcurrency - 1.
+struct KvPressureVictimOrder {
+    std::vector<KvPressureVictims> sets;
+
+    [[nodiscard]] std::span<const KvPressureVictims> candidates() const noexcept { return sets; }
 };
 
 // Worker-local RAM-on policy. Resource geometry, image reservations, transfer ownership and
@@ -55,7 +56,8 @@ class KvPressurePolicy {
 public:
     KvPressurePolicy(std::uint32_t concurrency, std::size_t max_outstanding)
         : concurrency_(concurrency), max_outstanding_(max_outstanding) {
-        if (concurrency == 0 || concurrency > 8 || max_outstanding < concurrency) {
+        if (concurrency == 0 || concurrency > kMaximumConcurrency ||
+            max_outstanding < concurrency) {
             throw std::invalid_argument("invalid KV pressure request bounds");
         }
         incumbent_ids_.reserve(max_outstanding);
@@ -150,9 +152,10 @@ public:
                 eligible |= static_cast<std::uint16_t>(1U << i);
             }
         }
+        result.sets.reserve((std::size_t{1} << std::popcount(eligible)) - 1U);
         for (std::uint16_t mask = eligible; mask != 0;
              mask               = static_cast<std::uint16_t>((mask - 1U) & eligible)) {
-            auto& set              = result.sets[result.count++];
+            auto& set              = result.sets.emplace_back();
             set.mask               = mask;
             set.count              = static_cast<std::uint8_t>(std::popcount(mask));
             set.oldest_queue_order = std::numeric_limits<std::uint64_t>::max();
@@ -165,23 +168,22 @@ public:
                 set.oldest_queue_order = std::min(set.oldest_queue_order, r.queue_order);
             }
         }
-        std::sort(result.sets.begin(), result.sets.begin() + result.count,
-                  [](const auto& a, const auto& b) {
-                      if (a.count != b.count) { return a.count < b.count; }
-                      if (a.unblocked_count != b.unblocked_count) {
-                          return a.unblocked_count < b.unblocked_count;
-                      }
-                      if (a.transfer_bytes != b.transfer_bytes) {
-                          return a.transfer_bytes < b.transfer_bytes;
-                      }
-                      if (a.suspension_count != b.suspension_count) {
-                          return a.suspension_count < b.suspension_count;
-                      }
-                      if (a.oldest_queue_order != b.oldest_queue_order) {
-                          return a.oldest_queue_order > b.oldest_queue_order;
-                      }
-                      return a.mask < b.mask;
-                  });
+        std::sort(result.sets.begin(), result.sets.end(), [](const auto& a, const auto& b) {
+            if (a.count != b.count) { return a.count < b.count; }
+            if (a.unblocked_count != b.unblocked_count) {
+                return a.unblocked_count < b.unblocked_count;
+            }
+            if (a.transfer_bytes != b.transfer_bytes) {
+                return a.transfer_bytes < b.transfer_bytes;
+            }
+            if (a.suspension_count != b.suspension_count) {
+                return a.suspension_count < b.suspension_count;
+            }
+            if (a.oldest_queue_order != b.oldest_queue_order) {
+                return a.oldest_queue_order > b.oldest_queue_order;
+            }
+            return a.mask < b.mask;
+        });
         return result;
     }
 

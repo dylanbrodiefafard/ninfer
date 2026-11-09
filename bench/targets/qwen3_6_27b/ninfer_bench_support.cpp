@@ -326,15 +326,15 @@ std::string usage_text(std::string_view program) {
         << "  --sage                    Sage3-style FP4-PV attention; requires --kv-dtype nvfp4\n"
         << "  --keep-frac <f>           Sparge keep fraction (0,1] on exact NVFP4; forbids --sage\n"
         << "  --xattn-tau <f>           XAttention mass threshold (0,1] on exact NVFP4\n"
-        << "  --concurrency <1..8>        concurrent Engine lanes (default: 1);\n"
+        << "  --concurrency <1..12>      concurrent Engine lanes (default: 1);\n"
         << "                              pp+tg at C>1 reports batched decode after a sequential\n"
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
         << "  --spec <dflash>           speculative backend (default: off); dflash requires\n"
         << "                              the artifact to contain dflash/ objects\n"
         << "  --draft-tokens <0..7>     speculative draft window:\n"
         << "                              dflash [1,7] (default: 0)\n"
-        << "  --adaptive-draft            pick live K by E[Y]/T(k,C,L): DFlash {3..N} for N>=5, "
-           "within the captured set\n"
+        << "  --adaptive-draft            pick live K by E[Y]/T(k,C,L): DFlash {3..N} for N>=5,\n"
+        << "                              plus k=2 from batch 9, within the captured set\n"
         << "  --dflash-verify-width <2..16> DFlash packed verify width; 0 = k-dependent\n"
         << "                              default (dflash only)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires "
@@ -424,7 +424,7 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--concurrency") {
             options.concurrency = parse_u32(value("--concurrency"), "concurrency");
             if (options.concurrency > kMaximumConcurrency) {
-                throw std::invalid_argument("--concurrency must be in [1,8]");
+                throw std::invalid_argument("--concurrency must be in [1,12]");
             }
         } else if (arg == "--spec") {
             const std::string selected = value("--spec");

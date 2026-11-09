@@ -127,7 +127,7 @@ void print_help(const char* program) {
         "  --component fold|recurrent|history-record|all\n"
         "                              Measured component (all: fold and recurrent; default all).\n"
         "  --width T                   One physical width in [2,16].\n"
-        "  --batch B                   One active row count in [1,8].\n"
+        "  --batch B                   One active row count in [1,12].\n"
         "  --commits one|dense|mixed|all\n"
         "                              Commit policy (default all).\n"
         "  --valid dense|mixed|all     Recurrent valid-prefix policy (default all).\n"
@@ -154,7 +154,7 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--width") {
             options.exact_width = parse_i32(next("width"), "width", 2, 16);
         } else if (argument == "--batch") {
-            options.exact_batch = parse_i32(next("batch"), "batch", 1, 8);
+            options.exact_batch = parse_i32(next("batch"), "batch", 1, 12);
         } else if (argument == "--commits") {
             options.commits = parse_commits(next("commit policy"));
         } else if (argument == "--valid") {

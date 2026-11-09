@@ -31,10 +31,10 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  *   rotated[j+64] = z[j+64]*cos(phi[j]) + z[j]*sin(phi[j]).
  *
  * k/v are contiguous BF16 [128,8,W,B], gamma is contiguous BF16 [128], positions is
- * contiguous I32 [W,B], and counts/lanes are contiguous I32 [B]. W is positive, B is 1..8,
+ * contiguous I32 [W,B], and counts/lanes are contiguous I32 [B]. W is positive, B is 1..12,
  * and epsilon/theta are positive and finite. The cache is contiguous BF16
  * [128,padded_capacity,8,lane_capacity] with capacity 2048, padded_capacity >= capacity,
- * and B <= lane_capacity <= 8.
+ * and B <= lane_capacity <= 12.
  * All tensor storage is pairwise non-overlapping and at least four-byte aligned.
  *
  * For each t < counts[b], write the final represented BF16 rotated K to cache slot

@@ -16,7 +16,7 @@ inline constexpr std::int32_t kGroupedDynamicConvGroups    = 320;
 inline constexpr std::int32_t kGroupedDynamicConvKernel    = 2;
 inline constexpr std::int32_t kGroupedDynamicConvProjRows =
     2 * kGroupedDynamicConvKernel * kGroupedDynamicConvGroups; // 1280
-inline constexpr std::int32_t kGroupedDynamicConvMaxBatch            = 8;
+inline constexpr std::int32_t kGroupedDynamicConvMaxBatch            = 12;
 inline constexpr std::int32_t kGroupedDynamicConvMaxWidthWhenBatched = 16;
 
 /**
@@ -45,7 +45,7 @@ inline constexpr std::int32_t kGroupedDynamicConvMaxWidthWhenBatched = 16;
  *   hidden/prepared/out are contiguous BF16 [D,T] or [D,T,B]. finish_dynamic is contiguous BF16
  *   [G,2,T] or [G,2,T,B]. base_kernel is contiguous BF16 [D,2,2] stored D-fastest, then kernel
  *   offset, then phase (physical layout of a PyTorch [2,2,D] parameter). kernel_projection is a
- *   logical [1280,D] matrix. T is any positive value at B=1; B=2..8 admits T=1..16.
+ *   logical [1280,D] matrix. T is any positive value at B=1; B=2..12 admits T=1..16.
  *
  * Supported domain:
  *   Activations and base_kernel are BF16. kernel_projection is BF16_CTRL Contiguous [1280,D], or
