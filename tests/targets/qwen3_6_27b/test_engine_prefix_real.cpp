@@ -337,12 +337,13 @@ int exercise_cancel_ladder_heads(const char* artifact) {
     options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(32768);
     options.prefill_chunk         = 4096;
     options.enable_vision         = false;
+    constexpr std::uint32_t kMark = 24576;
+    options.context_checkpoint_marks.assign(1, kMark);
     ninfer::Engine engine(options);
     if (const int rc = verify_loaded_product(engine); rc != 0) { return rc; }
 
-    constexpr std::uint32_t kMark = 24576;
-    auto cancel_first             = [&](ninfer::TokenId pad, std::uint32_t prompt_tokens,
-                                        std::uint64_t extra_tokens, const char* label) {
+    auto cancel_first = [&](ninfer::TokenId pad, std::uint32_t prompt_tokens,
+                            std::uint64_t extra_tokens, const char* label) {
         const auto prompt = padded_ids(pad, prompt_tokens);
         const auto before = engine.runtime_stats().computed_prefill_tokens;
         ninfer::CancellationView cancel([&] {

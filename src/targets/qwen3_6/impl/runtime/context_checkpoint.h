@@ -5,7 +5,6 @@
 #include <ninfer/types.h>
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -63,11 +62,8 @@ context_checkpoint_image_pool_capacity(std::uint32_t max_concurrency,
            best(best, max_concurrency, reachable, kv_capacity);
 }
 
-// Prefill chunk-end thresholds. Advertised restore frontier is the committed chunk end
-// at or past the mark, never the raw named size (24000, 36000, 150000, ...).
-inline constexpr std::array<std::uint32_t, 6> kPrefillContextMarks = {24576u, 36864u,  53248u,
-                                                                      77824u, 102400u, 151552u};
-
+// Prefill chunk-end thresholds come from EngineOptions::context_checkpoint_marks. The advertised
+// restore frontier is the committed chunk end at or past the mark, never the raw mark.
 [[nodiscard]] constexpr std::optional<std::uint32_t>
 next_prefill_context_mark(std::uint32_t frontier, std::span<const std::uint32_t> marks) noexcept {
     for (const std::uint32_t mark : marks) {
@@ -76,26 +72,13 @@ next_prefill_context_mark(std::uint32_t frontier, std::span<const std::uint32_t>
     return std::nullopt;
 }
 
-[[nodiscard]] constexpr std::optional<std::uint32_t>
-next_prefill_context_mark(std::uint32_t frontier) noexcept {
-    return next_prefill_context_mark(frontier, kPrefillContextMarks);
-}
-
 [[nodiscard]] constexpr std::uint32_t
 first_prefill_context_mark(std::span<const std::uint32_t> marks) noexcept {
     return marks.empty() ? 0 : marks.front();
 }
 
-[[nodiscard]] inline std::vector<std::uint32_t>
-resolved_prefill_context_marks(const std::optional<std::vector<std::uint32_t>>& configured) {
-    if (!configured) { return {kPrefillContextMarks.begin(), kPrefillContextMarks.end()}; }
-    return *configured;
-}
-
-inline void validate_configured_context_checkpoint_marks(
-    const std::optional<std::vector<std::uint32_t>>& configured, ninfer::SpeculativeBackend spec) {
-    if (!configured) { return; }
-    const std::vector<std::uint32_t>& marks = *configured;
+inline void validate_configured_context_checkpoint_marks(std::span<const std::uint32_t> marks,
+                                                         ninfer::SpeculativeBackend spec) {
     if (marks.size() > ninfer::kMaxContextCheckpointMarks) {
         throw std::invalid_argument("context-checkpoint mark table accepts at most 16 marks");
     }
@@ -109,7 +92,7 @@ inline void validate_configured_context_checkpoint_marks(
     }
     if (!marks.empty() && spec == SpeculativeBackend::None) {
         throw std::invalid_argument(
-            "custom context-checkpoint marks require speculative backend mtp or dflash");
+            "context-checkpoint marks require speculative backend mtp or dflash");
     }
 }
 

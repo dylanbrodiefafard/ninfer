@@ -1249,9 +1249,12 @@ void ServeMetrics::attach(const ServeOptions& options, const ninfer::LoadSummary
     startup->max_pending_requests = options.max_pending_requests;
     startup->response_max_records = static_cast<double>(options.response_store_max_records);
     startup->response_max_bytes   = static_cast<double>(options.response_store_max_bytes);
-    const char* checkpoints       = "default";
-    if (options.context_checkpoint_marks.has_value()) {
-        checkpoints = options.context_checkpoint_marks->empty() ? "off" : "custom";
+    const char* checkpoints       = "custom";
+    if (options.context_checkpoint_marks.empty()) {
+        checkpoints = "off";
+    } else if (std::ranges::equal(options.context_checkpoint_marks,
+                                  ninfer::kStandardContextCheckpointMarks)) {
+        checkpoints = "on";
     }
     startup->engine_labels = {
         {"adaptive_draft", yn(options.speculative.adaptive_draft)},

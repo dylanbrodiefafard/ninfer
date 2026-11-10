@@ -93,6 +93,10 @@ engine_options(const char* artifact, std::uint32_t max_concurrency = 1,
                                             : ninfer::ProposalHead::Optimized;
     options.enable_vision             = vision;
     options.use_cuda_graph            = true;
+    if (spec != ninfer::SpeculativeBackend::None) {
+        options.context_checkpoint_marks.assign(ninfer::kStandardContextCheckpointMarks.begin(),
+                                                ninfer::kStandardContextCheckpointMarks.end());
+    }
     return options;
 }
 

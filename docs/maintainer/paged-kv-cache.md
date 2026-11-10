@@ -840,8 +840,8 @@ complete continuation state. The current Qwen3.6 retained sequence contains:
 - the current resume frontier;
 - a typed rewrite checkpoint when one is valid, whose kind is `TurnClosure` or `ResponseReplay`;
 - under MTP or DFlash, a prefill context-checkpoint ladder: at the end of each committed prefill
-  chunk, if `valid_frontier` has reached the next mark (default 24576 / 36864 / 53248 / 77824 /
-  102400 / 151552, replaceable with `--context-checkpoints off|a,b,c`) and the Vision items of that
+  chunk, if `valid_frontier` has reached the next mark (none by default; `--context-checkpoints on`
+  selects 24576 / 36864 / 53248 / 77824 / 102400 / 151552 and `a,b,c` sets custom marks) and the Vision items of that
   frontier are complete, the then-current GDN and the last-column hidden of that chunk are frozen.
   DFlash also freezes the lane's cyclic local K/V; restore writes it back into the cyclic buffer and
   sets `dflash_context_frontier=F`. The advertised frontier `F` is the end of that chunk, not the raw

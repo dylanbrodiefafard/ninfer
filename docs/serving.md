@@ -914,7 +914,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks. Custom lists require explicit `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | default ladder |
+| `--context-checkpoints off\|on\|a,b,c` | automatic prefill ladder: `off` captures none, `on` uses the standard marks (24576, 36864, 53248, 77824, 102400, 151552), and a comma list sets custom marks. `on` and custom lists require DFlash, selected automatically or with `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | `off` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--default-thinking-token-budget N\|off` | cap inherited by thinking requests that omit their reasoning budget | `off` |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
@@ -1297,9 +1297,9 @@ provide one page per configured lane, or larger than all configured lanes could 
 
 Compatible resident prefixes are reused for both text and multimodal histories unless the server is
 started with `--no-prefix-reuse`, which also disables prefill context-checkpoint capture and the
-turn-rollback pin. `--context-checkpoints off` disables only the automatic ladder; occupy-append
-rollback and exact-hit `ninfer.capture_context_checkpoint` still pin when DFlash and prefix
-reuse are on. A multimodal hit requires matching token types, three-axis MRoPE
+turn-rollback pin. The automatic ladder is off unless `--context-checkpoints on|a,b,c` enables it.
+Turn (rewrite) checkpoints do not depend on the ladder; occupy-append rollback and exact-hit
+`ninfer.capture_context_checkpoint` still pin when DFlash and prefix reuse are on. A multimodal hit requires matching token types, three-axis MRoPE
 positions, encoded-media digest, grid, and consumer spans; changing an earlier image or video
 therefore resets the prefix instead of reusing placeholder-token KV. Media wholly inside a matched
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
@@ -1315,8 +1315,8 @@ recurrent, hidden, and selected speculative-backend continuation state required 
 rewritten suffix; matching KV tokens alone never authorize a partial hit. Their recurrent and DFlash
 local state live in one lane-owned pinned host image per lane (outside `--kv-ram-capacity`), so they
 do not reduce GPU KV capacity. DFlash prefill may also
-freeze current GDN at committed chunk ends that have reached a context mark (default 24576, 36864,
-53248, 77824, 102400, 151552, or `--context-checkpoints a,b,c`); a later prompt that matches that prefix restores GDN into current and hidden into
+freeze current GDN at committed chunk ends that have reached a context mark when the ladder is enabled
+(`--context-checkpoints on` for 24576, 36864, 53248, 77824, 102400, 151552, or `a,b,c`); a later prompt that matches that prefix restores GDN into current and hidden into
 `tail_hidden` as `restore_context_checkpoint`. DFlash2 also restores that lane's cyclic local K/V
 and `dflash_context_frontier`. GDN staging slot `C` is the Engine-wide GDN image for that
 freeze and for the turn-rollback pin: on `append_frontier` occupy with `E>0` and a

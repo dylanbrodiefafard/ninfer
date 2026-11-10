@@ -24,12 +24,23 @@ using TokenId = std::int32_t;
 inline constexpr std::uint32_t kMaximumConcurrency      = 12;
 inline constexpr std::size_t kMaxContextCheckpointMarks = 16;
 
+// Prefill ladder selected by `--context-checkpoints on`. Each mark is a 4096-token chunk end,
+// so the advertised restore frontier (the committed chunk end at or past the mark) equals the
+// mark at the default prefill chunk rather than a raw named size such as 24000 or 150000.
+inline constexpr std::array<std::uint32_t, 6> kStandardContextCheckpointMarks = {
+    24576u, 36864u, 53248u, 77824u, 102400u, 151552u};
+
+// Parses `off` (no ladder), `on` (the standard ladder), or a strictly increasing comma list.
 [[nodiscard]] inline std::vector<std::uint32_t>
 parse_context_checkpoint_marks_flag(std::string_view raw,
                                     const char* flag = "--context-checkpoints") {
     if (raw == "off") { return {}; }
+    if (raw == "on") {
+        return {kStandardContextCheckpointMarks.begin(), kStandardContextCheckpointMarks.end()};
+    }
     if (raw.empty()) {
-        throw std::invalid_argument(std::string(flag) + " must be off or a comma-separated list");
+        throw std::invalid_argument(std::string(flag) +
+                                    " must be off, on, or a comma-separated list");
     }
     std::vector<std::uint32_t> marks;
     std::size_t begin = 0;
@@ -171,8 +182,9 @@ struct EngineOptions {
     std::string model_id;
     std::string weights_id;
     std::string artifact_tensor_identity;
-    // nullopt = default prefill ladder; empty = disable automatic ladder (`off`).
-    std::optional<std::vector<std::uint32_t>> context_checkpoint_marks;
+    // Automatic prefill-ladder marks; empty (the default) disables the ladder. Turn-rollback
+    // and per-request pinned checkpoints do not depend on it.
+    std::vector<std::uint32_t> context_checkpoint_marks;
     KvCacheStorage kv_cache = KvCacheStorage::Nvfp4;
     // Sage3-style FP4-PV compute recipe (SageAttention3): only issuable with KvCacheStorage::Nvfp4.
     bool sage_attn = false;

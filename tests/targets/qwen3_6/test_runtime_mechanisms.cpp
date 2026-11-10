@@ -646,41 +646,55 @@ void test_prefix_hash_and_dflash_gate() {
 
 void test_prefill_context_marks() {
     using Path = ninfer::PrefixReusePath;
-    expect(q36::detail::kPrefillContextMarks.size() == 6, "product ladder has six marks");
-    expect(q36::detail::kPrefillContextMarks[0] == 24576, "mark 24576");
-    expect(q36::detail::kPrefillContextMarks[1] == 36864, "mark 36864");
-    expect(q36::detail::kPrefillContextMarks[2] == 53248, "mark 53248");
-    expect(q36::detail::kPrefillContextMarks[3] == 77824, "mark 77824");
-    expect(q36::detail::kPrefillContextMarks[4] == 102400, "mark 102400");
-    expect(q36::detail::kPrefillContextMarks[5] == 151552, "mark 151552");
-    for (const std::uint32_t mark : q36::detail::kPrefillContextMarks) {
+    expect(ninfer::kStandardContextCheckpointMarks.size() == 6, "standard ladder has six marks");
+    expect(ninfer::kStandardContextCheckpointMarks[0] == 24576, "mark 24576");
+    expect(ninfer::kStandardContextCheckpointMarks[1] == 36864, "mark 36864");
+    expect(ninfer::kStandardContextCheckpointMarks[2] == 53248, "mark 53248");
+    expect(ninfer::kStandardContextCheckpointMarks[3] == 77824, "mark 77824");
+    expect(ninfer::kStandardContextCheckpointMarks[4] == 102400, "mark 102400");
+    expect(ninfer::kStandardContextCheckpointMarks[5] == 151552, "mark 151552");
+    for (const std::uint32_t mark : ninfer::kStandardContextCheckpointMarks) {
         expect(mark % 4096u == 0, "context marks are 4096-aligned chunk ends");
         expect(mark != 24000 && mark != 36000 && mark != 52000 && mark != 76000 && mark != 100000 &&
                    mark != 10240 && mark != 25000 && mark != 50000 && mark != 80000 &&
                    mark != 120000 && mark != 150000,
                "advertised F is never the raw named size");
     }
-    for (std::size_t i = 0; i < q36::detail::kPrefillContextMarks.size(); ++i) {
-        const std::uint32_t mark = q36::detail::kPrefillContextMarks[i];
-        expect(q36::detail::next_prefill_context_mark(mark - 1) == mark, "next mark just before");
-        if (i + 1 < q36::detail::kPrefillContextMarks.size()) {
-            const std::uint32_t following = q36::detail::kPrefillContextMarks[i + 1];
-            expect(q36::detail::next_prefill_context_mark(mark) == following,
+    for (std::size_t i = 0; i < ninfer::kStandardContextCheckpointMarks.size(); ++i) {
+        const std::uint32_t mark = ninfer::kStandardContextCheckpointMarks[i];
+        expect(q36::detail::next_prefill_context_mark(
+                   mark - 1, ninfer::kStandardContextCheckpointMarks) == mark,
+               "next mark just before");
+        if (i + 1 < ninfer::kStandardContextCheckpointMarks.size()) {
+            const std::uint32_t following = ninfer::kStandardContextCheckpointMarks[i + 1];
+            expect(q36::detail::next_prefill_context_mark(
+                       mark, ninfer::kStandardContextCheckpointMarks) == following,
                    "next mark at freeze");
-            expect(q36::detail::next_prefill_context_mark(mark + 1) == following,
+            expect(q36::detail::next_prefill_context_mark(
+                       mark + 1, ninfer::kStandardContextCheckpointMarks) == following,
                    "next mark just after freeze");
         } else {
-            expect(!q36::detail::next_prefill_context_mark(mark).has_value(), "no mark after last");
-            expect(!q36::detail::next_prefill_context_mark(mark + 1).has_value(),
+            expect(!q36::detail::next_prefill_context_mark(mark,
+                                                           ninfer::kStandardContextCheckpointMarks)
+                        .has_value(),
+                   "no mark after last");
+            expect(!q36::detail::next_prefill_context_mark(mark + 1,
+                                                           ninfer::kStandardContextCheckpointMarks)
+                        .has_value(),
                    "no mark past last");
         }
     }
-    expect(q36::detail::next_prefill_context_mark(0) == 24576, "next mark from 0");
-    expect(q36::detail::next_prefill_context_mark(4096) == 24576,
+    expect(q36::detail::next_prefill_context_mark(0, ninfer::kStandardContextCheckpointMarks) ==
+               24576,
+           "next mark from 0");
+    expect(q36::detail::next_prefill_context_mark(4096, ninfer::kStandardContextCheckpointMarks) ==
+               24576,
            "chunk end 4096 still waits for first mark");
-    expect(q36::detail::next_prefill_context_mark(12288) == 24576,
+    expect(q36::detail::next_prefill_context_mark(12288, ninfer::kStandardContextCheckpointMarks) ==
+               24576,
            "chunk end 12288 still waits for first mark");
-    expect(q36::detail::next_prefill_context_mark(25000) == 36864,
+    expect(q36::detail::next_prefill_context_mark(25000, ninfer::kStandardContextCheckpointMarks) ==
+               36864,
            "off-grid F still uses next mark");
 
     expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 4096, 12288, false,
@@ -750,13 +764,15 @@ void test_prefill_context_marks() {
            "custom table exhausted");
     expect(!q36::detail::next_prefill_context_mark(0, std::span<const std::uint32_t>{}).has_value(),
            "off table has no next mark");
-    expect(q36::detail::next_prefill_context_mark(30000) == 36864u,
+    expect(q36::detail::next_prefill_context_mark(30000, ninfer::kStandardContextCheckpointMarks) ==
+               36864u,
            "rollback-only restore at 30000 does not re-arm 24576");
     expect(!q36::detail::next_prefill_context_mark(30000, std::span<const std::uint32_t>{})
                 .has_value(),
            "off table after restore at 30000 stays inert");
     expect(q36::detail::retain_context_checkpoint_head(24576, 30000) &&
-               q36::detail::next_prefill_context_mark(30000) == 36864u,
+               q36::detail::next_prefill_context_mark(
+                   30000, ninfer::kStandardContextCheckpointMarks) == 36864u,
            "drop_after occupy frontier 30000 keeps a 24576 ladder head but latches 36864");
     expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 32768, 151552, false,
                                                                   true),
@@ -765,12 +781,6 @@ void test_prefill_context_marks() {
                                                               ninfer::SpeculativeBackend::Mtp);
     expect(q36::detail::first_prefill_context_mark({}) == 0, "off table first mark is 0");
     expect(q36::detail::first_prefill_context_mark(custom) == 8192u, "custom first mark");
-    expect(q36::detail::resolved_prefill_context_marks(std::nullopt).size() == 6,
-           "omitted table is the product default");
-    expect(q36::detail::resolved_prefill_context_marks(std::vector<std::uint32_t>{}).empty(),
-           "empty configured table is off");
-    q36::detail::validate_configured_context_checkpoint_marks(std::nullopt,
-                                                              ninfer::SpeculativeBackend::None);
     q36::detail::validate_configured_context_checkpoint_marks(std::vector<std::uint32_t>{},
                                                               ninfer::SpeculativeBackend::None);
     bool custom_without_spec = false;
@@ -887,9 +897,11 @@ void test_prefill_context_marks() {
     expect(!q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnCheckpoint, 24576,
                                                               13000),
            "rewrite occupy drops ladder heads after the new base");
-    expect(q36::detail::next_prefill_context_mark(24576) == 36864,
+    expect(q36::detail::next_prefill_context_mark(24576, ninfer::kStandardContextCheckpointMarks) ==
+               36864,
            "rollback to first mark recaptures the second");
-    expect(q36::detail::next_prefill_context_mark(26000) == 36864,
+    expect(q36::detail::next_prefill_context_mark(26000, ninfer::kStandardContextCheckpointMarks) ==
+               36864,
            "catch-up head between marks still recaptures the second");
 
     expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 24576, 24576, false,
@@ -916,7 +928,8 @@ void test_prefill_context_marks() {
     }
     expect(kept.size() == 2 && kept[0] == 8192 && kept[1] == 24576,
            "occupy drop keeps heads at or before restore F");
-    expect(q36::detail::next_prefill_context_mark(24576) == 36864,
+    expect(q36::detail::next_prefill_context_mark(24576, ninfer::kStandardContextCheckpointMarks) ==
+               36864,
            "occupy restore to 24576 recaptures 36864 next");
     expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreContextCheckpoint, 8192,
                                                              24576) ==

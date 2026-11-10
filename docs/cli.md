@@ -174,7 +174,7 @@ The RTX 5090 tree investigation is in
 | `--lm-head-draft` | optimized proposal head | on with automatic DFlash2; otherwise off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
-| `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks (24576, 36864, 53248, 77824, 102400, 151552). Custom lists require explicit `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark, not the raw named size. | default ladder |
+| `--context-checkpoints off\|on\|a,b,c` | automatic prefill ladder: `off` captures none, `on` uses the standard marks (24576, 36864, 53248, 77824, 102400, 151552), and a comma list sets custom marks. `on` and custom lists require DFlash, selected automatically or with `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark, not the raw named size. Turn-rollback and turn (rewrite) checkpoints do not depend on the ladder. | `off` |
 | `--capture-context-checkpoint` | pin the current resume frontier `E` on an exact-hit / decode-only request (the same one-slot turn-rollback head automatic occupy-append already writes). A fresh one-shot run has `E == 0`, so this is a no-op unless a retained lane already exists in the process. | off |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
@@ -303,14 +303,14 @@ context-checkpoint heads (the same image plus the hidden row) for prefill-ladder
 turn-rollback heads, including heads restored from the RAM or disk tier. The pool holds one
 rollback head per lane plus the most ladder heads all lanes can hold at once: marks above
 `--max-context` are unreachable, and a lane holding k ladder heads keeps at least the k-th mark's
-tokens of the shared KV capacity. With the default marks, C=3 at a 262144-token max context and
+tokens of the shared KV capacity. With `--context-checkpoints on`, C=3 at a 262144-token max context and
 at least 454656 KV tokens gives 21 heads (3.8 GiB plus 0.5 GiB of
 rewrite images); C=6 with every lane able to reach every mark doubles that to 42 heads
 (7.7 GiB), while a 262144-token KV capacity bounds C=6 to 20 heads. Serve prints the slab as
 `ckpt-pin=` and `ckpt-heads=` on the KV capacity line and the CLI as `checkpoint host pinned`.
 Serving never allocates or frees pinned checkpoint memory; while every head is owned, an optional
 capture or restored head is skipped. Startup fails with the required size when the slab would leave
-less than 4096 MiB of the host's available memory; `--context-checkpoints off` shrinks the pool to
+less than 4096 MiB of the host's available memory. With the ladder off (the default) the pool is
 one turn-rollback head per lane, and without DFlash there is no pool. With DFlash, capture copies the state into the Engine-wide device staging slot (a device-to-device copy) and drains
 it to the host image on the copy stream behind later work; a restore while staging still holds that
 image copies it back on the device, otherwise it costs one H2D before the suffix prefill.

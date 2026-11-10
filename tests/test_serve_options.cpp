@@ -1,8 +1,8 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <algorithm>
 #include <iostream>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -207,17 +207,22 @@ int main() {
          "--kv-capacity", "8192", "--log-stats-interval-ms", "0", "--preserve-thinking"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
+    failures += check(configured.context_checkpoint_marks.empty(),
+                      "omitted --context-checkpoints did not leave the ladder off");
+    const ServeOptions on_marks =
+        parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "on"});
+    failures += check(std::ranges::equal(on_marks.context_checkpoint_marks,
+                                         ninfer::kStandardContextCheckpointMarks),
+                      "--context-checkpoints on did not select the standard ladder");
     const ServeOptions off_marks =
         parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "off"});
-    failures += check(off_marks.context_checkpoint_marks.has_value() &&
-                          off_marks.context_checkpoint_marks->empty(),
+    failures += check(off_marks.context_checkpoint_marks.empty(),
                       "--context-checkpoints off did not disable the ladder");
     const ServeOptions custom_marks =
         parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "8192,16384"});
-    failures += check(
-        custom_marks.context_checkpoint_marks ==
-            std::optional<std::vector<std::uint32_t>>(std::vector<std::uint32_t>{8192u, 16384u}),
-        "--context-checkpoints custom list was not parsed");
+    failures +=
+        check(custom_marks.context_checkpoint_marks == std::vector<std::uint32_t>{8192u, 16384u},
+              "--context-checkpoints custom list was not parsed");
     bool bad_marks = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "16384,8192"});

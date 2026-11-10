@@ -1,7 +1,7 @@
 #include "cli/options.h"
 
+#include <algorithm>
 #include <iostream>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -87,21 +87,24 @@ int main() {
         parse({"ninfer", "model.ninfer", "--prompt", "hi", "--capture-context-checkpoint"});
     failures += check(pin.capture_context_checkpoint,
                       "--capture-context-checkpoint did not set the request pin");
-    failures += check(!pin.context_checkpoint_marks.has_value(),
-                      "omitted --context-checkpoints is not the product default table");
+    failures += check(pin.context_checkpoint_marks.empty(),
+                      "omitted --context-checkpoints did not leave the ladder off");
+
+    const ninfer::cli::Options on =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--context-checkpoints", "on"});
+    failures += check(
+        std::ranges::equal(on.context_checkpoint_marks, ninfer::kStandardContextCheckpointMarks),
+        "--context-checkpoints on did not select the standard ladder");
 
     const ninfer::cli::Options off =
         parse({"ninfer", "model.ninfer", "--prompt", "hi", "--context-checkpoints", "off"});
-    failures +=
-        check(off.context_checkpoint_marks.has_value() && off.context_checkpoint_marks->empty(),
-              "--context-checkpoints off did not disable the ladder");
+    failures += check(off.context_checkpoint_marks.empty(),
+                      "--context-checkpoints off did not disable the ladder");
 
     const ninfer::cli::Options custom =
         parse({"ninfer", "model.ninfer", "--prompt", "hi", "--context-checkpoints", "8192,16384"});
-    failures +=
-        check(custom.context_checkpoint_marks == std::optional<std::vector<std::uint32_t>>(
-                                                     std::vector<std::uint32_t>{8192u, 16384u}),
-              "--context-checkpoints custom list was not parsed");
+    failures += check(custom.context_checkpoint_marks == std::vector<std::uint32_t>{8192u, 16384u},
+                      "--context-checkpoints custom list was not parsed");
 
     failures += check(ninfer::cli::usage_text("ninfer").find("--capture-context-checkpoint") !=
                           std::string::npos,

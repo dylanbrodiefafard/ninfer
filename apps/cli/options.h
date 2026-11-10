@@ -43,7 +43,7 @@ struct Options {
     bool use_cuda_graph = true;
 
     bool capture_context_checkpoint = false;
-    std::optional<std::vector<std::uint32_t>> context_checkpoint_marks;
+    std::vector<std::uint32_t> context_checkpoint_marks;
 
     std::optional<std::uint32_t> thinking_token_budget;
     bool raw_output      = false;

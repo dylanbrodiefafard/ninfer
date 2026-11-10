@@ -1136,8 +1136,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .model_id                 = options.model_id,
         .weights_id               = options.weights_id,
         .artifact_tensor_identity = options.artifact_tensor_identity,
-        .context_checkpoint_marks =
-            qwen3_6::detail::resolved_prefill_context_marks(options.context_checkpoint_marks),
+        .context_checkpoint_marks = options.context_checkpoint_marks,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
