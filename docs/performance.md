@@ -21,6 +21,39 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Checkpoint restore uploads on the copy stream rejected (2026-11-09)
+
+The R9700 port's `ccf0a4b14` ("perf: overlap checkpoint restore uploads with decode") was not
+adopted. On a VRAM-resident turn-checkpoint or context-checkpoint restore, NInfer unpacks the
+pinned GDN/hidden/DFlash image on the compute stream at occupy, which stalls every decoding lane
+for the H2D. The R9700 change issues that upload on the copy stream and holds the admission
+(`CopyHold`) while the other lanes keep decoding. Its PCIe x4 link makes each upload about 30 ms,
+so hiding it pays there. The RTX 5090 upload is only about 6.7 ms (restore-request prefill
+33.5 → 26.8 ms), and holding an admission for one DFlash decode round costs the new request more
+than the stall it removes.
+
+A port measured on qwen3.8-27b/nvfp4 + DFlash2 (`--max-context 32768 --max-concurrency 12
+--kv-dtype nvfp4 --greedy`), with 12 staggered `preserve_thinking=false` chats × 6 turns, 96
+output tokens, and 3 reps; 180 of the 216 requests restored a VRAM-resident turn checkpoint. The
+driver is closed-loop (each chat sends its next turn after the previous reply), so wall time is the
+time to finish all 72 turns and mostly sums per-turn latency; it is not a saturated decode-throughput
+measurement, and decode tokens/s was not measured separately.
+
+| Arm | Wall time per rep (s) | TTFT p50 / p90 (ms) |
+|---|---|---|
+| DFlash, compute-stream restore | 9.38 / 9.19 / 9.14 | 58 / 89 |
+| DFlash, copy-stream restore + hold | 9.59 / 9.26 / 9.12 | 82 / 138 |
+| `--spec none`, compute-stream restore | 19.02 / 19.06 / 19.08 | 60 / 94 |
+| `--spec none`, copy-stream restore + hold | 18.91 / 18.93 / 18.93 | 80 / 93 |
+
+Under DFlash, wall time did not improve (+0.9% mean, inside the 9.12–9.59 s rep spread) and TTFT
+regressed by 24 ms at p50 and 49 ms at p90; the R9700 change likewise keeps DFlash mixed-forward on
+the compute-stream path. Without speculation it cut wall time by 0.7% at +20 ms TTFT p50, which
+does not justify the extra lane state for a mode the recommended artifact does not use. Hiding
+the upload completely would require prefetching the image into the GDN staging slot before the
+decode round that precedes admission; its upper bound here is about 4% of this admission-heavy
+workload (180 × 6.7 ms) and under 1% with longer turns, so it was not built.
+
 ## C9–C12 aggregate scaling (2026-11-08)
 
 Same RTX 5090, CUDA 13.1, `sm_120a`, Release build, artifact and README runner settings as the
