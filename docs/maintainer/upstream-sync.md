@@ -8,11 +8,11 @@ so upstream work is ported by hand, not merged.
 
 | Field | Value |
 |---|---|
-| Last upstream commit reviewed | `27df5a344726f68f5b65848fe157e15a44239a0c` (`feat(distributed): prepare qwen4exp model shards`) |
+| Last upstream commit reviewed | `9283505264f1b1a266a8c36e9f615561f4ba89a1` (`feat(glm5next): integrate dflash2 execution`) |
 | Merge-base | `0c94153b` (2026-08-16) |
-| Reviewed on | 2026-10-19 |
+| Reviewed on | 2026-11-09 |
 
-The next review starts from `git log 27df5a34..upstream/dev`; every commit up to and including
+The next review starts from `git log 92835052..upstream/dev`; every commit up to and including
 the watermark has been judged and needs no second pass.
 
 ## AMD fork review
@@ -45,6 +45,40 @@ Unselected optional features include counted-string masks, dependency vendoring,
 composition, choices/regex, provisional tool-argument events, and message-relative media paths.
 HIP kernels, cache formats, dispatch ordering, tuning constants, and AMD measurements require
 native CUDA evaluation. AMD MTP and C12/C16 execution are outside the current product contract.
+
+## Review of 27df5a34..92835052 (2026-11-09)
+
+Reviewed all 237 commits at the fetched `upstream/dev` snapshot (2026-10-19 through
+2026-11-09). Every commit was triaged by subject and changed paths; every commit touching shared
+serving, frontend, media, artifact, core, grammar, or public Engine code, and every candidate
+fix, was judged from its diff. No commit was selected for porting.
+
+### Evaluated candidates
+
+| Upstream | Item | Decision |
+|---|---|---|
+| `a062e016` | Listener uses `SO_REUSEADDR` instead of httplib's default `SO_REUSEPORT` | Not selected. The fork keeps httplib's default socket options, so a second same-user server can bind the same port. Small port if that becomes a problem. |
+| `58733a86`, `1e902680` | libjpeg decoding matched to Pillow; bilinear full-chroma swscale conversion | Not selected. The fork's `SWS_POINT` chroma conversion differs from Pillow. A port adds a libjpeg-turbo dependency and `setjmp` error handling, raises video-frame conversion cost, and changes decoded pixels under existing media cache identities. |
+| `45f74287` | Streams wait for Engine admission before sending SSE headers | Not selected. Most capacity errors already fail at submission with an HTTP status; waiting would withhold headers for the whole queue wait. |
+| `d602894a` | Workspace layout cursor survives an overflow exception | Not selected. Reachable only through u64 overflow, which real shapes cannot produce. |
+| `4ec903a0` | Direct I/O windows planned from per-file `statx` alignment | Not selected. The fork's fixed 4 KiB direct-I/O planning loads correctly from the local ZFS pool; port it if a load ever fails with `EINVAL`. |
+| `1407c62f` | Tool strings compiled as one terminal byte automaton | Not selected. Rewrites upstream's vendored xgrammar; the fork pins xgrammar v0.2.5 with its own patches and has no measured tool-grammar compile-latency need. |
+| `5bad0c16` | Bank-conflict swizzle for staged NVFP4 code rows | Not selected. Lives in upstream's A16 kernel tree, which the fork lacks; any analogous change needs native `tools.kdev` evidence. |
+| `9822c38d` | Whitespace in JSON output | Already ported as `61275549`. |
+| `6dd2b1b4` | Configurable startup memory headroom | Existing equivalent: `--kv-capacity-headroom`. |
+| `419d637d`, `2b13afa5` | Thinking-token counting without a budget; token counts in context errors | Existing equivalents: reasoning tokens count independently of a budget, and context-capacity errors already report prompt and capacity tokens. |
+| `704fa68d`, `41da21f4`, `a754fcf3`, `77c2e5e2`, `76b5370b`, `77241ffb` | Terminal-publication ordering, fragmentation, starvation, preemption, and reclaim fixes | Not applicable: they fix upstream's unified context pool and preemptive scheduler, which the bounded FIFO Engine does not use. |
+
+### Excluded by product contract
+
+The remaining commits are outside the current product: DGX Spark/GB10 shape tuning (MXFP8,
+Block-FP8, BF16, and NVFP4 `dgx_spark` schedules); GLM5Next, including its DFlash2 integration;
+Qwen4-exp; MoE and expert/tensor parallelism; KDA, Kpool/MLA, QSA, and mHC operators;
+FP4-Local checkpoints; NCCL and native distributed collectives; upstream's unified context
+pool, observability snapshot API, and monitoring dashboard; and benchmark, evaluation, and
+documentation changes for those paths. The large mixed refactors among them (`697979a4`,
+`2705a728`, `5551d9b1`, `5b834fc3`, `e0114c70`) replace upstream runtime architecture rather
+than fix behavior shared with this fork.
 
 ## Review of e31bc99b..27df5a34 (2026-10-19)
 
