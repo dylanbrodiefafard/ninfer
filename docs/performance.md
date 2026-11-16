@@ -5471,9 +5471,9 @@ Native K0 is not the base control: it keeps companion weights, draft context/fea
 width-one GDN snapshot/fold publication. Its overhead remains when no proposal is selected.
 `--spec none` disables that execution state, but a stored companion is still materialized;
 the base-artifact control also avoids those stored weights. The full shared head is used, not the
-27B optimized-head route. A true width-one GDN record Op could avoid the private snapshot copies;
-existing record Ops require at least two physical columns. That is separate Op work, not an
-unimplemented serving dependency or a measured speedup.
+27B optimized-head route. These K0 measurements copied every GDN state pool into private
+snapshot scratch each round; the width-one GDN record route that replaced those copies is
+measured in the [Flash-Next plan](maintainer/qwen3.8-flash-next-plan.md#k0-width-one-record-2026-11-16).
 
 The harness command uses `--prefill-tokens '' --decode-repeats 0 --decode-tokens 1024
 --concurrency 1,2,3,4,6,8`. Per-mode reports are `out/sol/native-serve-<mode>.json`; the automatic

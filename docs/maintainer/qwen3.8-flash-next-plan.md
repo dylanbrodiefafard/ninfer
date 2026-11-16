@@ -108,7 +108,7 @@ each step with its FP64 oracle from `qwen4:tools/reference/qwen4/`:
 | 2 | N-gram row hashing: on the host inside the SSD reader (step 7), since the host issues the row reads; constants from the artifact (multipliers, head offsets and sizes), signed-I64 Euclidean remainder, a lag-k predecessor becomes EOS 248044 when any of the last k tokens is EOS | `qwen4:tools/reference/qwen4/ngram.py` | done: `NgramTable` (`src/targets/qwen3_8_flash_next/impl/ngram_table.*`) hashes on the host, reads each distinct missing page once with O_DIRECT on an I/O thread pool through an exact-LRU 8-way row cache; test matches the study's reference row ids (checkpoint constants and wrapping multipliers), the synthetic-table records, and page-read counts from an independent LRU model, and reuses the table after a failed read |
 | 3 | `bf16_projection`: BF16 weights; FP32 output for the GDN a\|b gates [96,2560] (then `gdn_gating_packed`), the MoE control rows [544,2560], PLE key [10240,2560] and value [2560,2560]; BF16 output for the QSA indexer query [512,2560] and key [128,2560] (the converter splits `index_qk_proj`), which feed the BF16 QSA inputs; T=1 GEMV, T>=2 BF16 MMA | HEAD BF16 GEMV/MMA templates | done; oracle test and memcheck pass |
 | 4 | Hyper-connection broadcast, read (with and without write gate), inject: FP32-internal SIMT kernels, token tiles of 8, K split 4 (`ops/hyper_connection`) | `qwen4` `gated_residual` | done; FP64-oracle test passes |
-| 5 | GDN at hidden 2560 composes existing Ops: `gdn_input_proj` [16384,2560], `causal_conv1d_silu_split`, `bf16_projection` [96,2560] + `gdn_gating_packed`, the GDN core (same 16/48-head geometry as the 27B), `gated_rmsnorm` with the new sigmoid gate (`RmsNormGate::Sigmoid`), NVFP4 Linear [2560,6144] | HEAD | Ops done (sigmoid gate and packed gating tested); layer composition open; lane-batched (B<=12): `gdn_input_proj_conv_snapshot` (any W for B=1, W<=16 for B>1, in place at W=1) and `gdn_input_proj_conv_record` (W=2..16, chains and trees) admit the [16384,2560] NVFP4/FP8 parents under A16Only (one projection over all W*B columns, BF16 staging, slot-indexed convolution with split q/k/v), then the existing `gated_delta_net_snapshot` / `gated_delta_net_replay_record`; `gdn_replay_fold` admits the 36-layer pool; FP64-oracle, per-lane, memcheck/racecheck tests pass (`ninfer_lane_batched_state_bench`) |
+| 5 | GDN at hidden 2560 composes existing Ops: `gdn_input_proj` [16384,2560], `causal_conv1d_silu_split`, `bf16_projection` [96,2560] + `gdn_gating_packed`, the GDN core (same 16/48-head geometry as the 27B), `gated_rmsnorm` with the new sigmoid gate (`RmsNormGate::Sigmoid`), NVFP4 Linear [2560,6144] | HEAD | Ops done (sigmoid gate and packed gating tested); layer composition open; lane-batched (B<=12): `gdn_input_proj_conv_snapshot` (any W for B=1, W<=16 for B>1, in place at W=1) and `gdn_input_proj_conv_record` (chains W=1..16, trees W=2..16) admit the [16384,2560] NVFP4/FP8 parents under A16Only (one projection over all W*B columns, BF16 staging, slot-indexed convolution with split q/k/v), then the existing `gated_delta_net_snapshot` / `gated_delta_net_replay_record`; `gdn_replay_fold` admits the 36-layer pool; FP64-oracle, per-lane, memcheck/racecheck tests pass (`ninfer_lane_batched_state_bench`) |
 | 6 | QSA state append, block index/select, selected attention (contiguous single-request state), then the layer composite; check the NVFP4 KV byte layout against HEAD's paged pool | `qwen4` `qsa*` | Ops done (`ops/qsa`: BF16 and NVFP4-G16 state, budgets 512/1024/2048 blocks, causal-prefix visibility, ascending block order; FP64-oracle test with an exact FP32-mean pooling boundary, memcheck, racecheck, clang-tidy; pi Sol review: no math or memory defect). Performance pass done (`ninfer_qsa_bench`, NVFP4 state, cold L2, RTX 5090): the state carries an FP32 sealed key per block (`block_keys` [128,C/4], C a multiple of 4), sealed by `qsa_state_append` (now taking the key norm weight) when a block's last slot is appended, so selection reads 512 B per block instead of rebuilding every key; streaming (W<32) and register-tiled (W>=32) FP32 scoring; radix select on an 8-CTA cluster with distributed-shared-memory histogram reductions for short chunks of rows over 8192 blocks; tensor-core attention (BF16 MMA, 12 heads of a KV group as rows, weights as BF16 hi+lo, each weight formed once), merge forms each split weight once. Decode W=1/W=12 at 256K, budget 2048: select 154/209 -> 49/66 us, attention 43/373 -> 23/64 us; prefill W=4096 at 256K: select 24.9 -> 8.0 ms, attention 78.2 -> 10.0 ms (82 TFLOP/s); no measured case regresses. FP64-oracle test extended (sealing across calls and reseal, new routes), memcheck, racecheck, clang-tidy, pi Sol reviews clean. Open: attention at W=1 stays latency-bound (16-23 us, two tiles per CTA); prefill scoring is FP32 SIMT at about 34 TFLOP/s (a tensor-core split-BF16 score would need a widened tie window); a BF16 sealed key would halve the 256K decode read but changes the score profile; then paged and batched-lane state. Paged lane-batched form done: the Ops take `QsaPagedState` (seven planes of a PageMajor `PagedKVPool` with 64-token pages, plus its block tables) and B rows of W columns with per-row lanes; the contiguous single-request form is removed. FP64-oracle tests over shuffled page tables, page-edge blocks and lanes with different frontiers, bitwise batched-vs-one-row checks, memcheck/racecheck pass. One lane against the contiguous form (NVFP4, budget 2048, cold L2): attention unchanged; select +2 us at 64K decode W=1/12, equal at 256K, +2% at W=4096; B=12 lanes at 256K: select 299/358 us, attention 72/209 us at W=1/4 |
 | 7 | `ple_decode_rows` (int8_row records to BF16) and `ple_inject` (gate, conv-input norm, dilated convolution with carried BF16 history, inject), composed with `bf16_projection` key/value; SSD row reader in step 2 | `qwen4` `ple` reference | done; FP64-oracle test passes (decode rows exact; inject over chunked calls with carried history); `ple_inject` is lane-batched (B<=12 rows of W columns over per-row history slots [9,10240,S], in place) with a per-column `ple_inject_snapshot` (W<=16) for verify rollback; bitwise equal to one call per row |
 | 8 | MoE routing: `bf16_projection` over the packed [544,2560] control matrix (router, shared-expert gate, zero padding) then `moe_route` (top-10, ties to the lower id, renormalized weights, shared scale), output layout as upstream's `ExpertRoutes`; token grouping, shared expert and merge belong to the routed-expert Op (step 10) | `qwen4` reference | routing done, tested |
@@ -381,9 +381,11 @@ independent committed-context projections and full shared FP8 head. Graph A appe
 context, proposes, exports IDs and starts target layer zero; host n-gram reads overlap that layer.
 Graph B finishes verification and acceptance. After Engine output preview, authoritative prefix
 counts fold the 36 GDN layers and commit only published PLE/history/features/head state. This
-avoids copying a full speculative target state before each round. K0 uses logical-width-one
-snapshot arithmetic and Decode-purpose sampling, with deferred publication; its physical replay
-records have width two, with only column zero valid. No extra model column is evaluated.
+avoids copying a full speculative target state before each round. A K0 root is a width-one chain
+record: `gdn_input_proj_conv_record` and `gated_delta_net_replay_record` read the canonical GDN
+pools read-only and write width-one records, with the width-one snapshot's arithmetic, and use
+Decode-purpose sampling with deferred publication. No extra model column is evaluated and no
+GDN state pool is copied (see [K0 width-one record](#k0-width-one-record-2026-11-16)).
 Packed verification passes the same-column numerical-floor gate; cross-width greedy identity is not a
 contract, just as [27B verification differs by K](../performance.md).
 
@@ -449,21 +451,21 @@ separate RAM conversation TTFT. The base artifact is faster in the measured C6/C
 The drafter owns initialized proposal-residual and physical-head transfer panels (1,510,400
 bytes per configured lane), separate from reused context scratch. CUDA 13.1 initcheck can flag
 large captured memcpy sources despite an ordered producer; an exact Cast/crop reproducer
-reports errors only in the large graph route, not eager execution. A separate exact row/head/
-component reproducer shows false uninitialized flags for the second strided-depth gate copy in
-both eager and graph execution. Persistent gate-record initialization keeps those transfer bytes
-defined; live gate writers remain unchanged. No sanitizer check is disabled and no input or
-arithmetic workspace is zeroed to hide a read. Focused native initcheck at C1/C2 passes K3 with
-one-/64-token prefixes and K0 through sixteen outputs. Ordinary/deferred B2 K0 state is compared
-byte-for-byte at two consecutive roots, including record reuse. Full native Program memcheck
-reports zero errors; the longer initcheck panel was not repeated after these scoped fixes.
+reports errors only in the large graph route, not eager execution. No sanitizer check is disabled
+and no input or arithmetic workspace is zeroed to hide a read. Focused native initcheck at C1/C2
+passed K3 with one-/64-token prefixes and K0 through sixteen outputs, before the K0 width-one
+record route; that route removed the strided gate copy whose false initcheck flags had required a
+persistent gate-record initialization, and the initialization with it. Ordinary/deferred B2 K0
+state is compared byte-for-byte at two consecutive roots, including record reuse. Full native
+Program memcheck reported zero errors; the longer initcheck panel was not repeated.
 
 ### Target-side decode performance experiments (2026-11-15)
 
 No target runtime optimization from this panel is retained: the measured candidates did not
-show a speedup in the priority screens. The low-memory K0 fix and pre-fill grouping still need
-Op-owner changes. Native fixed-K verification-route tracing and exact cache-policy replay are
-retained as diagnostic tools; production execution is unchanged by that opt-in instrumentation.
+show a speedup in the priority screens. Pre-fill grouping still needs an Op-owner change; the
+low-memory K0 fix is the [width-one record route](#k0-width-one-record-2026-11-16). Native
+fixed-K verification-route tracing and exact cache-policy replay are retained as diagnostic
+tools; production execution is unchanged by that opt-in instrumentation.
 
 RTX 5090, PCIe Gen5 x16, 600 W, CUDA 13.1, Release `sm_120a`, container
 `ninfer-builder-flashnext`, build `out/sol-lanes`. Public Engine `lanes-bench` uses
@@ -518,10 +520,9 @@ to kernel latency alone. No other owner's changes were reverted.
   admission eligibility, preserving all-column lookups/protection. `--check-policy` cannot silently
   skip a requested counter check; borrowed slots remain protected.
 
-K0 cannot simply use ordinary in-place decode while preserving zero-publication/rejection bytes.
-With the current State layout, a read-only W1 record or split source/destination snapshot Op avoids
-its full-pool copies without spending about 115 MB/lane of expert-cache memory on doubled GDN state.
-Grouping is private to moe_experts and cannot be moved ahead of the fill through its current
+K0 cannot simply use ordinary in-place decode while preserving zero-publication/rejection bytes;
+the read-only width-one record route below removes its full-pool copies without doubling GDN
+state. Grouping is private to moe_experts and cannot be moved ahead of the fill through its current
 completed-fill event interface. The top-k handoff proposes testing 64/128 rather than 32 splits:
 full vocabulary gives 7760 logits/CTA at 32, selecting the expensive sorted-list branch. No kernel
 was authored; exact finite-value/tie-order qualification and sanitizers belong to that Op work.
@@ -535,6 +536,77 @@ verify result matches the independently executed same-width prefill at every rep
 Builds are `-Werror`; focused clang-tidy reports zero diagnostics. Python 3.11 compilation, Ruff,
 formatting and spelling checks pass. Failed runtime candidates were screened at C5/C1 rather than
 expanded into full per-candidate grids; no new sanitizer or universal speedup claim is made.
+
+### K0 width-one record (2026-11-16)
+
+A K0 root used to emulate a read-only width-one record: per GDN layer it copied the whole
+convolution and recurrent pools of every configured lane into private scratch, ran the in-place
+snapshot Ops there and copied the projection, key, value and gates into width-two records. That
+moved about 113 MB of recurrent state per configured lane per round, read and written, and the
+snapshot wrote it once more (about 340 MB of traffic per lane).
+
+The record Ops already share the snapshot's arithmetic: at the [16384,2560] parents the record and
+snapshot run the same A16 projection over the W*B packed columns and the same convolution kernel,
+and `gated_delta_net_replay_record` runs the snapshot's recurrent body without its state store.
+The Op domains therefore admit width-one chains (no kernel changed): `gdn_input_proj_conv_record`
+[16384,2560] T=1..16 for chains (trees T>=2), `gated_delta_net_replay_record` T=1..16 for chains
+(trees and the 27B accepted-history profile keep T>=2), and `gdn_replay_fold` record width 1..16.
+The target sends every verify width, including K0, through the Record branch; records have the
+live width, the fold reads `verify_records(width)`, and the `root_*` scratch (3,268,608 bytes per
+configured lane), its strided gate copy and the gate-record initialization that only served that
+copy are removed. The canonical GDN pools are read-only until the authoritative fold, so
+rejection and zero publication keep every canonical byte. The PLE history copy (184,320 bytes per
+lane) and the sampling-count snapshot (993,280 bytes per lane) remain: the first needs a
+read-only source seam in `ple_inject_snapshot`, the second restores truncated publication.
+
+Verification (RTX 5090 Gen5, CUDA 13.1, Release `sm_120a`, build `out/opus-k0`, matched base
+`out/opus-k0-base` = the same tree with the copy route restored; logs `out/opus-k0-logs`):
+- Op tests: replay record now checks every case against the FP64 recurrence (W=1 dense B=1/12,
+  masked B=5) and bit for bit against the same-shape snapshot; conv record W=1 B=1/5/12 against
+  the FP64 oracle and bit for bit against the same-shape snapshot outputs and newest history tap,
+  FP8 and NVFP4; fold W=1 B=1/5/12 with accepted and rejected roots. The fold test's FP64 oracle
+  condition had never matched a registered geometry; it now runs whenever row 0 commits.
+  memcheck (all three) and racecheck (record, fold) report zero errors.
+- Real artifact: DFlash Program (including the two-row K0 root byte-identity against ordinary
+  decode and rejection preserving the complete continuation), DFlash Engine, retained, RAM and
+  SSD tiers pass; verify floor W=2/3/4 passes; lanes-check graph/eager B2 4096/4096 and B5
+  10240/10240 bit-identical; BF16 parity log-probabilities and split results (32/32, max KL
+  0.0091751) byte-identical to the base. `--dflash-live-tiers`, the default C=4 suite and
+  `--program-parity` fail with the same first difference as before the change.
+- Fixed K0 and fixed K3 lanes-bench tokens are identical to the base at C=1/4/5/6.
+
+Public Engine lanes-bench, DFlash companion, 4096-token prompts, 512 greedy outputs per request,
+`--context 8192`, NVFP4 KV, C=1,4,5,6 in one process; two repetitions in opposite build order.
+ms/round is the decode interval over lane rounds / C.
+
+| Arm | C | Base tok/s (rep 1 / 2) | After tok/s (rep 1 / 2) | ms/round (mean) | Mean change |
+|---|---:|---|---|---|---:|
+| K0 | 1 | 117.3 / 117.1 | 124.3 / 118.3 | 8.53 -> 8.25 | +3.5% |
+| K0 | 4 | 241.2 / 228.2 | 244.0 / 240.1 | 17.06 -> 16.53 | +3.1% |
+| **K0** | **5** | **217.9 / 203.7** | **225.7 / 211.4** | **23.75 -> 22.91** | **+3.7%** |
+| K0 | 6 | 224.6 / 219.6 | 219.6 / 220.7 | 27.02 -> 27.26 | -0.9% |
+| Adaptive | 1 | 165.3 / 158.8 | 170.4 / 160.9 | 11.60 -> 12.18 | +2.2% |
+| Adaptive | 4 | 309.1 / 262.8 | 292.3 / 271.3 | 33.95 -> 36.94 | -1.5% |
+| Adaptive | 5 | 253.9 / 235.4 | 254.2 / 224.9 | 48.57 -> 50.30 | -2.1% |
+| Adaptive | 6 | 269.2 / 179.6 | 236.4 / 247.7 | 63.70 -> 56.86 | +7.9% |
+| K3 | 1 | 182.0 / 179.9 | 172.2 / 179.8 | 14.19 -> 14.60 | -2.7% |
+| K3 | 4 | 275.0 / 206.3 | 289.9 / 278.9 | 50.11 -> 41.55 | +18.2% |
+| K3 | 5 | 223.4 / 198.1 | 238.3 / 223.1 | 68.98 -> 62.85 | +9.5% |
+| K3 | 6 | 226.2 / 192.1 | 239.4 / 228.5 | 87.93 -> 78.14 | +11.8% |
+
+Fixed K3 executes no changed code (identical tokens); its spread, including the disturbed second
+base repetition, is the host's run-to-run noise, so no K3 regression or gain is claimed. K0 moved
+in the same direction in both repetitions at C=1/4/5, in line with the removed traffic (about
+0.95 ms of a 23 ms C=5 round); the C=6 difference is within the noise. Adaptive arm sequences
+follow wall-clock picker timing, so their outputs and arm mixes differ and the adaptive rows are
+not a controlled comparison.
+
+Fully captured commit: not built. nsys of forced-K0 rounds (128 per run) puts the eager commit
+window (commit-ingress upload, fold, selects, scatters) at C=1 / C=5 at 155 / 788 us median span
+with 134 / 765 us GPU busy (fold 108 / 733 us, about 2.1 TB/s of state traffic); the 21 / 23 us
+idle is the most a single captured commit graph could remove, about 0.2% / 0.1% of a round, below
+run-to-run spread. A device-metadata `gdn_replay_fold` form would have no measurable benefit and
+was not added. The fold itself is now the K0 root's main remaining cost over in-place decode.
 
 ## N-gram read budget
 

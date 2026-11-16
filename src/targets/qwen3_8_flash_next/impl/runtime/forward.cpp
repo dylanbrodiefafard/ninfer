@@ -2,7 +2,6 @@
 #include "runtime/dflash.h"
 
 #include "core/device.h"
-#include "core/device_copy.h"
 #include "core/layout.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/argmax.h"

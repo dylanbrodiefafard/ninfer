@@ -709,17 +709,13 @@ int run_tree_paths_match_sequential(std::int32_t value_heads, std::int32_t width
                  node              = parent[static_cast<std::size_t>(node)]) {
                 path.insert(path.begin(), node);
             }
-            // Record requires T>=2; a lone root path is padded with a trailing copy.
-            const auto path_len      = static_cast<std::int32_t>(path.size());
-            const std::int32_t seq_w = std::max(path_len, 2);
+            const auto path_len = static_cast<std::int32_t>(path.size());
             std::vector<std::uint16_t> q_seq, k_seq, v_seq;
             std::vector<float> g_seq, b_seq;
-            for (std::int32_t i = 0; i < seq_w; ++i) {
-                const std::size_t src =
-                    static_cast<std::size_t>(row) * width +
-                    static_cast<std::size_t>(
-                        path[static_cast<std::size_t>(std::min(i, path_len - 1))]);
-                const auto take = [&](auto& dst, const auto& from, std::size_t stride) {
+            for (std::int32_t i = 0; i < path_len; ++i) {
+                const std::size_t src = static_cast<std::size_t>(row) * width +
+                                        static_cast<std::size_t>(path[static_cast<std::size_t>(i)]);
+                const auto take       = [&](auto& dst, const auto& from, std::size_t stride) {
                     dst.insert(dst.end(), from.begin() + static_cast<std::ptrdiff_t>(src * stride),
                                from.begin() + static_cast<std::ptrdiff_t>((src + 1) * stride));
                 };
@@ -730,7 +726,7 @@ int run_tree_paths_match_sequential(std::int32_t value_heads, std::int32_t width
                 take(b_seq, beta, gate_column);
             }
             const auto [seq_out, seq_key, seq_value, seq_gate] =
-                record(q_seq, k_seq, v_seq, g_seq, b_seq, seq_w, 1,
+                record(q_seq, k_seq, v_seq, g_seq, b_seq, path_len, 1,
                        {initial[static_cast<std::size_t>(row)]}, nullptr, {});
             const std::size_t tree_c = static_cast<std::size_t>(row) * width + col;
             const std::size_t seq_c  = static_cast<std::size_t>(path_len - 1);
