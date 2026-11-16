@@ -47,6 +47,7 @@ bool EngineProgram::shrink_window(std::uint32_t lane, const runtime::ExecutionWi
         throw std::logic_error("invalid Flash-Next window shrink");
     }
     const auto extent = static_cast<std::uint32_t>(entry.prompt.size()) + window.output_tokens - 1U;
+    impl_->program.extents().wait_tier_copy(entry.capture_done);
     impl_->program.resize_lane(entry.lane.value(), static_cast<std::int32_t>(entry.tokens.size()),
                                extent);
     entry.reserve_tokens       = extent;
@@ -69,6 +70,7 @@ bool EngineProgram::grant_window(std::uint32_t lane, const runtime::ExecutionWin
     }
     const auto extent =
         static_cast<std::uint32_t>(entry.prompt.size()) + std::max(window.output_tokens, 1U) - 1U;
+    impl_->program.extents().wait_tier_copy(entry.capture_done);
     impl_->program.resize_lane(entry.lane.value(), static_cast<std::int32_t>(entry.tokens.size()),
                                extent);
     entry.reserve_tokens       = extent;
@@ -126,6 +128,7 @@ void EngineProgram::finish_suspend(std::uint32_t lane, std::uint64_t owner) {
         throw std::logic_error("Flash-Next suspension has not settled");
     }
     auto& entry = impl_->record(lane);
+    impl_->program.extents().wait_tier_copy(entry.capture_done);
     impl_->program.close_lane(entry.lane.value());
     entry.lane.reset();
     saved.request = std::move(entry);
@@ -177,6 +180,7 @@ bool EngineProgram::start_resume(std::uint32_t lane, std::uint64_t owner,
                                             std::span(&entry.capture_done, 1));
             }
         }
+        impl_->program.extents().record_tier_copy(entry.capture_done);
         return true;
     } catch (...) {
         impl_->device.synchronize_all();

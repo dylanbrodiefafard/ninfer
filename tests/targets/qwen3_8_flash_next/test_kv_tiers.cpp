@@ -1,10 +1,14 @@
-// Exact complete-state transport at the real Flash-Next GDN/PLE/QSA geometry, without weights.
+// Exact complete-state transport at real Flash-Next GDN/PLE/QSA geometry, without trained weights.
 #include "runtime/state.h"
+#include "runtime/kv_extents.h"
+#include "runtime/cuda_event.h"
+#include "cuda_stream_gate.h"
 #include "core/device.h"
 #include "targets/qwen3_6/impl/runtime/kv_disk_cache.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -12,6 +16,7 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -261,6 +266,209 @@ void run(ninfer::DeviceContext& device, ninfer::KvDiskCompress codec,
               << " disk: current/rewrite/rollback, " << image_bytes
               << " continuation bytes and exact QSA pages pass\n";
 }
+
+// Both gates must be released before either callback is joined: CUDA may serialize callbacks
+// across streams, including the RAM tier's pinned-image copy stream.
+struct TierCopyGates {
+    ninfer::test::StreamCopyGate closing;
+    ninfer::test::StreamCopyGate restoring;
+
+    ~TierCopyGates() {
+        closing.release();
+        restoring.release();
+    }
+};
+
+void require_copy_held(cudaEvent_t done, const char* message) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    do {
+        const auto status = cudaEventQuery(done);
+        if (status != cudaErrorNotReady) { CUDA_CHECK(status); }
+        require(status == cudaErrorNotReady, message);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+}
+
+void return_extent_during_other_restore(ninfer::DeviceContext& device) {
+    constexpr std::uint32_t extent_pages  = 244;
+    constexpr std::uint32_t pool_pages    = 40 + 3 * extent_pages;
+    constexpr std::uint32_t closing_pages = 600;
+    fn::State state(3, closing_pages * 64, std::int64_t{pool_pages} * 64,
+                    ninfer::ops::QsaKvFormat::NVFP4G16);
+    auto& pool = state.pool();
+    fn::KvExpertExtents extents(pool, ninfer::ops::QsaKvFormat::NVFP4G16, device.stream,
+                                device.copy_stream);
+    const std::vector<ninfer::ops::MoeExpertCodec> codecs(fn::kRoutedExperts,
+                                                          ninfer::ops::MoeExpertCodec::F3G32);
+    const fn::ExpertHostStore store(codecs, std::size_t{256} << 20);
+    const fn::ExpertSlotPlan plan;
+    fn::ExpertResidency residency(store, plan, extents.flex_addresses(), {}, device.stream);
+    extents.make_room(pool_pages, residency);
+    for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+        const auto& tensor = pool.plane(plane);
+        CUDA_CHECK(cudaMemsetAsync(tensor.data, static_cast<int>(17U + plane), tensor.bytes(),
+                                   device.stream));
+    }
+    const auto source      = state.open(128, device.stream).value();
+    const auto destination = state.open(128, device.stream).value();
+    const auto closing     = state.open(std::int64_t{closing_pages} * 64, device.stream).value();
+    state.advance(source, 65);
+    state.advance(closing, closing_pages * 64);
+    ninfer::PinnedHostBuffer source_image(state.continuation_bytes()),
+        closing_image(state.continuation_bytes()), restored_image(state.continuation_bytes()),
+        restored_rollback(state.continuation_bytes());
+    state.pack_continuation(source, source_image.data(), device.stream);
+    state.pack_continuation(closing, closing_image.data(), device.stream);
+    const auto page_bytes = ninfer::paged_kv_host_image_bytes(pool, 2);
+    ninfer::PinnedHostBuffer original_pages(page_bytes), restored_pages(page_bytes);
+    ninfer::pack_paged_kv_allocation_to_host(state.pages(source), pool, original_pages.data(), 2,
+                                             device.stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    tier::KVRamCache ram(std::size_t{2048} << 20);
+    fn::CudaEvent closing_done(cudaEventDisableTiming), restore_done(cudaEventDisableTiming),
+        returned(cudaEventDisableTiming);
+    TierCopyGates gates;
+    const auto capture = [&](std::int32_t lane, std::uint32_t frontier,
+                             ninfer::PinnedHostBuffer& image, cudaEvent_t done) {
+        ninfer::targets::qwen3_6::PreparedPromptData proof;
+        const auto count = static_cast<std::size_t>(frontier) + 1;
+        proof.token_ids.assign(count, 1000 + lane);
+        proof.token_types.resize(count, 0);
+        proof.positions.resize(3 * count);
+        proof.identity.reusable = true;
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            for (std::size_t position = 0; position < count; ++position) {
+                proof.positions[axis * count + position] = static_cast<std::int32_t>(position);
+            }
+        }
+        tier::ResidentPrefixIdentity identity;
+        identity.assign(proof);
+        tier::RamCaptureSource from;
+        from.execution_frontier        = frontier;
+        from.ledger_frontier           = frontier + 1;
+        from.text_kv_valid             = frontier;
+        from.tail_hidden_valid         = true;
+        from.ledger                    = proof.token_ids;
+        from.identity                  = &identity;
+        from.hash_f                    = tier::prefix_hash_at(from.ledger, identity, frontier);
+        from.text                      = &state.pages(lane);
+        from.text_pool                 = &pool;
+        from.flash_next_state          = bytes(image);
+        from.current_state.copies_done = done;
+        from.stream                    = device.copy_stream;
+        if (lane == source) {
+            tier::RamLadderHead head;
+            head.frontier         = frontier;
+            head.hash             = from.hash_f;
+            head.kind             = tier::ContextCheckpointKind::TurnRollback;
+            head.flash_next_state = bytes(image);
+            head.copies_done      = done;
+            from.ladder_heads.push_back(head);
+        }
+        device.order_copy_after_compute();
+        const auto result = ram.capture(from);
+        require(result.status == tier::RamCaptureStatus::Captured, "fence fixture RAM capture");
+        extents.record_tier_copy(done);
+        return result.entry_id;
+    };
+    const auto source_id = capture(source, 65, source_image, restore_done.get());
+    ram.wait_entry_copies(source_id);
+    ram.claim(source_id);
+    {
+        tier::RamRestoreTarget initial;
+        initial.text                = &state.pages(destination);
+        initial.text_pool           = &pool;
+        initial.text_dst_pages      = 2;
+        initial.flash_next_state    = bytes(restored_image);
+        initial.flash_next_writable = restore_done.get();
+        initial.reuse               = ninfer::PrefixReusePath::AppendAtFrontier;
+        initial.reuse_base          = 65;
+        initial.stream              = device.copy_stream;
+        device.order_copy_after_compute();
+        const auto host = ram.unpack_device(source_id, initial);
+        ram.wait_entry_copies(source_id);
+        extents.record_tier_copy(restore_done.get());
+        CUDA_CHECK(cudaEventSynchronize(restore_done.get()));
+        require(host.ladder_images.size() == 1 &&
+                    host.ladder_images.front().flash_next_state.size() == restored_rollback.size(),
+                "detached rollback fixture geometry");
+        std::memset(restored_rollback.data(), 203, restored_rollback.size());
+        const fn::CudaEvent detached_done(cudaEventDisableTiming);
+        ninfer::test::StreamCopyGate detached;
+        detached.launch(device.stream);
+        CUDA_CHECK(cudaEventRecord(detached_done.get(), device.stream));
+        const ninfer::HostCopy copy{restored_rollback.data(),
+                                    host.ladder_images.front().flash_next_state.data(),
+                                    restored_rollback.size()};
+        const auto fence = detached_done.get();
+        ram.copy_from_entry(source_id, std::span(&copy, 1), std::span(&fence, 1));
+        extents.record_tier_copy(detached_done.get());
+        require_copy_held(detached_done.get(), "copy-stream fence lost a detached rollback writer");
+        detached.release();
+        CUDA_CHECK(cudaEventSynchronize(detached_done.get()));
+        require(std::memcmp(restored_rollback.data(), source_image.data(), source_image.size()) ==
+                    0,
+                "lane fence completed before its detached rollback image landed");
+    }
+    for (const auto page : state.pages(destination).page_ids()) {
+        for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+            const auto& tensor = pool.plane(plane);
+            const auto stride  = static_cast<std::size_t>(tensor.nb[3]);
+            auto* address =
+                static_cast<std::byte*>(tensor.data) + static_cast<std::size_t>(page) * stride;
+            CUDA_CHECK(cudaMemsetAsync(address, 91, stride, device.stream));
+        }
+    }
+    gates.closing.arm(ram);
+    (void)capture(closing, closing_pages * 64, closing_image, closing_done.get());
+    gates.restoring.arm(ram);
+    tier::RamRestoreTarget target;
+    target.text                = &state.pages(destination);
+    target.text_pool           = &pool;
+    target.text_dst_pages      = 2;
+    target.flash_next_state    = bytes(restored_image);
+    target.flash_next_writable = restore_done.get();
+    target.reuse               = ninfer::PrefixReusePath::AppendAtFrontier;
+    target.reuse_base          = 65;
+    target.stream              = device.copy_stream;
+    device.order_copy_after_compute();
+    (void)ram.unpack_device(source_id, target);
+    extents.record_tier_copy(restore_done.get());
+
+    extents.wait_tier_copy(closing_done.get());
+    state.close(closing, device.stream);
+    extents.give_back(residency);
+    CUDA_CHECK(cudaEventRecord(returned.get(), device.stream));
+    require_copy_held(returned.get(), "extent returned before its own tier capture completed");
+    gates.closing.release();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        const auto status = cudaEventQuery(returned.get());
+        if (status == cudaSuccess) { break; }
+        if (status != cudaErrorNotReady) { CUDA_CHECK(status); }
+        require(std::chrono::steady_clock::now() < deadline,
+                "extent return waited for another lane's tier restore");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    require(!extents.lent(2) && !extents.lent(1) && extents.lent(0),
+            "closing lane did not return its extents and preserve the spare");
+    const auto pending = cudaEventQuery(restore_done.get());
+    if (pending != cudaErrorNotReady) { CUDA_CHECK(pending); }
+    require(pending == cudaErrorNotReady, "other-lane restore was not held in flight");
+    gates.restoring.release();
+    ram.wait_entry_copies(source_id);
+    extents.wait_tier_copy(restore_done.get());
+    ninfer::pack_paged_kv_allocation_to_host(state.pages(destination), pool, restored_pages.data(),
+                                             2, device.stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    require(std::memcmp(restored_image.data(), source_image.data(), source_image.size()) == 0 &&
+                std::memcmp(restored_pages.data(), original_pages.data(), page_bytes) == 0,
+            "extent return damaged the other lane's restored continuation or QSA pages");
+    ram.release(source_id);
+    state.close(destination, device.stream);
+    state.close(source, device.stream);
+    std::cout << "KV-flex return joins its own tier capture, not another lane's RAM restore\n";
+}
 } // namespace
 
 int main() {
@@ -270,6 +478,7 @@ int main() {
             run(device, ninfer::KvDiskCompress::Off, execution);
             run(device, ninfer::KvDiskCompress::Zstd, execution);
         }
+        return_extent_during_other_restore(device);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

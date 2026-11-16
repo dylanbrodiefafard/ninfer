@@ -1357,10 +1357,16 @@ report zero errors.
   first, and always leaves one extent of free pages outside them. Without that spare, a lane that
   grows and shrinks across an extent boundary would take back and lend the same extent on every
   request, evicting its 84 records each time.
-- `give_back` makes the compute stream wait for the copy stream before the first return. Host-tier
-  transfers of QSA pages run there, and a shrink (retain, rollback) does not wait for them the way
-  the adapter's `close` waits for `capture_done`. The borrow needs no join: every restore orders its
-  copy stream after the compute stream (`order_copy_after_compute`) once the lane is open.
+- Host-tier producers publish a per-lane composite transfer fence: each joins the lane's previous
+  fence (including detached rollback-image copies) and records after that lane's submitted
+  copy-stream work; RAM restore and live resume record it after their checkpoint-head copies.
+  Close, retain, retained consumption, window resizing and suspension release join only their own
+  lane's fence before releasing pages, so `give_back` never waits behind another lane's large tier
+  restore. Closing the destination lane of a pending disk ticket cancels and drains that ticket's
+  workers, state transfers and scatter events before unmapping; closing any other lane neither
+  cancels that restore nor depends on its later copy-stream work. The borrow needs no join: every
+  restore orders its copy stream after the compute stream (`order_copy_after_compute`) once the
+  lane is open.
 - Pages stay mapped eagerly: `State::open` and `State::resize` map the whole reservation, as before,
   and only unreserved pages are lent. Lazy materialization ahead of the frontier was considered and
   not adopted. A lane's unwritten reservation is its output budget: at most the request's

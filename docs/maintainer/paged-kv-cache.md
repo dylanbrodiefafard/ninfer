@@ -555,7 +555,9 @@ cache, which lends whole extents of unreserved QSA pages to its F3 slot pool
 (`KvExpertExtents`, [Flash-Next plan](qwen3.8-flash-next-plan.md#kv-pages-as-expert-cache-slots-2026-11-15)).
 Its ordering contract: a run is restored, and the cache's slots over it borrowed, on the compute stream
 before any lane maps its pages; a run is withheld only when every page is free, after the compute
-stream has waited for the copy stream and after the block-table unmap of its last owner.
+stream has waited for the transfer fence of each lane that last owned those pages and after the
+block-table unmap of its last owner. A lane's fence covers every host-tier transfer submitted for it
+(including detached rollback-image copies); returning a run never waits on other lanes' transfers.
 
 ---
 

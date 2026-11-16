@@ -248,8 +248,10 @@ public:
         bool tier_restored = false;
         tier::ResidentPrefixIdentity identity;
         std::optional<std::uint32_t> system_capture;
-        std::uint64_t disk_entry_id           = 0;
-        void* tier_image                      = nullptr;
+        std::uint64_t disk_entry_id = 0;
+        void* tier_image            = nullptr;
+        // Covers copy-stream tier transfers and pinned-image callbacks in either direction.
+        // A pending disk ticket separately owns scatter on the disk cache's streams.
         cudaEvent_t capture_done              = nullptr;
         std::uint32_t window_output_tokens    = 0;
         std::uint32_t effective_output_tokens = 0;
@@ -397,11 +399,18 @@ public:
         }
     }
 
-    // Returns the record to Idle, then releases its Program lane; the host-side reset completes
-    // even when the release throws.
+    // Joins only this lane's tier uses before releasing pages. A pending disk destination is
+    // cancelled here, so page safety does not depend on the executor draining scatter first.
+    // The host-side reset precedes Program release and completes even if that release throws.
     void close(LaneRecord& entry) {
         const std::optional<Lane> lane = entry.lane;
-        CUDA_CHECK(cudaStreamWaitEvent(device.stream, entry.capture_done, 0));
+        if (pending_disk_owner == &entry) {
+            disk->cancel_restore();
+            disk->release_restore_ticket(pending_disk_ticket);
+            pending_disk_ticket = 0;
+            pending_disk_owner  = nullptr;
+        }
+        program.extents().wait_tier_copy(entry.capture_done);
         entry.lane.reset();
         entry.phase  = Phase::Idle;
         entry.output = nullptr;
@@ -435,6 +444,7 @@ public:
             close(entry);
             return false;
         }
+        program.extents().wait_tier_copy(entry.capture_done);
         const std::array lanes{*entry.lane};
         program.flush_context(lanes);
         program.resize_lane(*entry.lane, static_cast<std::int32_t>(entry.tokens.size()),
@@ -523,7 +533,7 @@ public:
                             counts, program.state().token_counts(*entry.lane), kSamplingCountsBytes,
                             cudaMemcpyDeviceToHost, device.copy_stream));
                     }
-                    CUDA_CHECK(cudaEventRecord(entry.capture_done, device.copy_stream));
+                    program.extents().record_tier_copy(entry.capture_done);
                     if (id != nullptr) { *id = result.entry_id; }
                     if (disk && !system && live_owner == 0) {
                         disk->note_ram_resident(result.entry_id, source.disk_entry_id);
@@ -679,7 +689,9 @@ public:
     std::unique_ptr<tier::KVDiskCache> disk;
     std::uint32_t system_prompt_limit = 0;
     std::uint64_t pending_disk_ticket = 0;
-    bool tiers_shutdown               = false;
+    // Points into records while the restore ticket owns a destination's pages.
+    LaneRecord* pending_disk_owner = nullptr;
+    bool tiers_shutdown            = false;
     CudaEvent copy_cancel{cudaEventDisableTiming};
     std::uint64_t use_tick = 0;
     std::array<LaneFence, kMaximumConcurrency> lane_fences{};
@@ -1027,6 +1039,7 @@ EngineProgram::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt, R
         .prefix_reuse_source  = owned.summary().reuse_source,
     };
     if (reuse != 0) {
+        impl_->program.extents().wait_tier_copy(entry.capture_done);
         if (tier_restored) {
             impl_->program.restore_lane(entry.lane.value(), std::span(entry.prompt).first(reuse),
                                         sampling, image);

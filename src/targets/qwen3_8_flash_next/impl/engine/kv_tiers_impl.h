@@ -69,6 +69,7 @@ void EngineProgram::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id
                 entry.rollback_frontier = head.frontier;
             }
         }
+        impl_->program.extents().record_tier_copy(entry.capture_done);
         entry.tier_restored  = true;
         entry.phase          = Impl::Phase::Retained;
         entry.reserve_tokens = plan.base_.reserve_tokens_;
@@ -93,7 +94,10 @@ void EngineProgram::restore_disk_entry(std::uint32_t lane, std::uint64_t entry_i
         throw std::logic_error("Flash-Next disk restore requires a winning complete-state plan");
     }
     auto& entry = impl_->record(lane);
-    if (entry.lane) { throw std::logic_error("Flash-Next disk restore needs an empty lane"); }
+    if (entry.lane || impl_->pending_disk_ticket != 0) {
+        throw std::logic_error(
+            "Flash-Next disk restore needs an empty lane and no pending restore");
+    }
     const auto frontier = plan.summary().reusable_prompt_tokens;
     try {
         auto host = impl_->disk->load_host(entry_id, plan.summary().disk_committed_generation);
@@ -136,6 +140,7 @@ void EngineProgram::restore_disk_entry(std::uint32_t lane, std::uint64_t entry_i
         }
         impl_->device.order_copy_after_compute();
         impl_->pending_disk_ticket = impl_->disk->restore_device(entry_id, target);
+        impl_->pending_disk_owner  = &entry;
         entry.tier_restored        = true;
         entry.phase                = Impl::Phase::Retained;
         entry.reserve_tokens       = plan.base_.reserve_tokens_;
@@ -229,6 +234,7 @@ void EngineProgram::cancel_disk_restore() {
         impl_->disk->release_restore_ticket(impl_->pending_disk_ticket);
     }
     impl_->pending_disk_ticket = 0;
+    impl_->pending_disk_owner  = nullptr;
 }
 
 void EngineProgram::begin_copy_hold_cancel() {
@@ -302,6 +308,7 @@ void EngineProgram::wait_kv_ram_copies_on_compute() {
             impl_->disk->release_restore_ticket(impl_->pending_disk_ticket);
         }
         impl_->pending_disk_ticket = 0;
+        impl_->pending_disk_owner  = nullptr;
     }
 }
 

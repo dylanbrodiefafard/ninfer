@@ -6,7 +6,6 @@
 // their pages. A record is a copy of an immutable host record, so taking an extent back only
 // evicts.
 
-#include "runtime/cuda_event.h"
 #include "runtime/expert_residency.h"
 
 #include "core/paged_kv_cache.h"
@@ -54,14 +53,13 @@ namespace ninfer::targets::qwen3_8_flash_next {
  * an extent's borrow before the caller maps its pages, so the borrow follows every enqueued reader
  * of the evicted records and precedes every write of the pages as KV, on this stream and on the
  * copy stream after DeviceContext::order_copy_after_compute. No fill may be pending: the caller
- * runs between Forward calls, whose fills the compute stream has joined. give_back enqueues an
- * extent's return after the stream has waited for the copy stream's work so far, so host-tier
- * transfers that read or wrote its pages as KV, and the block-table unmap of State::close or
- * State::resize, precede every fill of its slots. Disk-tier restores scatter pages on the disk
- * cache's own stream; they target a lane that stays open until the Engine has drained or cancelled
- * them, so a lane's pages are never free while such a copy is in flight. The join makes the
- * compute stream wait for every queued copy, including another lane's restore; it happens only
- * when an extent is actually returned.
+ * runs between Forward calls, whose fills the compute stream has joined. Tier producers record
+ * each lane's last submitted copy with record_tier_copy. Before closing or shrinking that lane,
+ * the adapter calls wait_tier_copy for its fence, not the copy stream's later work. The adapter
+ * also cancels and drains any disk restore owned by that lane, including scatter on the disk
+ * cache's separate stream. give_back then enqueues the extent's return after those joins and the
+ * block-table unmap of State::close or State::resize. Every later fill follows the return on the
+ * compute stream; an unrelated lane's later tier restore does not delay it.
  * Not thread-safe; the pool and the residency must outlive this object.
  */
 class KvExpertExtents {
@@ -105,6 +103,15 @@ public:
     // only extent again.
     void give_back(ExpertResidency& cache);
 
+    // Joins the event's previous record, including detached host-image copies, into the copy
+    // stream, then records its final use of a lane's pages and images. The caller owns the
+    // nonnull event and preserves it through the corresponding wait. These
+    // calls change external stream/event state, not the extent map, and propagate CUDA errors.
+    void record_tier_copy(cudaEvent_t done) const;
+    // Enqueues only the recorded use before subsequent compute, including unmap and give_back.
+    // A disk restore must also be cancelled/joined by its adapter before releasing its pages.
+    void wait_tier_copy(cudaEvent_t done) const;
+
 private:
     [[nodiscard]] std::uint32_t extent_first_page(std::size_t extent) const noexcept;
 
@@ -117,8 +124,6 @@ private:
     std::vector<std::uint64_t> flex_addresses_;
     // lent_[x]: extent x is KvLent.
     std::vector<bool> lent_;
-    // Recorded on the copy stream by give_back; the compute stream waits for it before a return.
-    CudaEvent copies_done_;
 };
 
 } // namespace ninfer::targets::qwen3_8_flash_next

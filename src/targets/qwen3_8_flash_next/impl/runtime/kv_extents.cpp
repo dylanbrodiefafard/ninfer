@@ -33,7 +33,7 @@ std::uint32_t kv_extent_pages(ops::QsaKvFormat format) {
 KvExpertExtents::KvExpertExtents(PagedKVPool& pool, ops::QsaKvFormat format, cudaStream_t stream,
                                  cudaStream_t copy_stream)
     : pool_(pool), stream_(stream), copy_stream_(copy_stream),
-      extent_pages_(kv_extent_pages(format)), copies_done_(cudaEventDisableTiming) {
+      extent_pages_(kv_extent_pages(format)) {
     if (pool.plane_order() != PagedKVPlaneOrder::PageMajor) {
         throw std::invalid_argument("KvExpertExtents: the pool must be PageMajor");
     }
@@ -101,16 +101,19 @@ void KvExpertExtents::make_room(std::uint32_t pages, ExpertResidency& cache) {
     }
 }
 
+void KvExpertExtents::record_tier_copy(cudaEvent_t done) const {
+    CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, done, 0));
+    CUDA_CHECK(cudaEventRecord(done, copy_stream_));
+}
+
+void KvExpertExtents::wait_tier_copy(cudaEvent_t done) const {
+    CUDA_CHECK(cudaStreamWaitEvent(stream_, done, 0));
+}
+
 void KvExpertExtents::give_back(ExpertResidency& cache) {
-    bool joined = false;
     // Lending x withholds E free pages, so at least E stay free while 2 E are free before it.
     for (std::size_t x = lent_.size(); x-- > 0 && pool_.free_pages() >= 2 * extent_pages_;) {
         if (!lent_[x] || !pool_.pages_free(extent_first_page(x), extent_pages_)) { continue; }
-        if (!joined && copy_stream_ != nullptr) {
-            CUDA_CHECK(cudaEventRecord(copies_done_.get(), copy_stream_));
-            CUDA_CHECK(cudaStreamWaitEvent(stream_, copies_done_.get(), 0));
-            joined = true;
-        }
         ops::moe_expert_cache_return(cache.cache(), kFlexCodec, ops::MoeCacheSlotRegion::Flex,
                                      static_cast<std::int32_t>(x) * slots_per_extent_,
                                      slots_per_extent_, stream_);

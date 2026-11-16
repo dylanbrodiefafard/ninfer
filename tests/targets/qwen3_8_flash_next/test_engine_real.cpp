@@ -1,20 +1,17 @@
 // qwen3.8-flash-next through the public Engine on the real artifact and n-gram table.
 //
-//   --program-parity  greedy Engine output equals the target Program's own prefill and decode on
-//                     the same prompt and capacity (a two-super-chunk prompt);
-//   (default)         one Engine with four lanes: four concurrent requests agree with their solo
-//                     runs;
-//                     requests whose reservations exceed the shared QSA pool wait and still equal
-//                     their solo runs; a short prompt interrupts a long prefill between
-//                     super-chunks; decode and mid-prefill cancellation release their lanes and
-//                     leave later requests unchanged.
+//   --program-parity  raw greedy Engine output equals the target Program's own prefill and decode
+//                     on the same prompt and capacity (a two-super-chunk prompt);
+//   (default)         four concurrent requests preserve their first tokens and share decode
+//                     rounds; capacity-limited requests wait and equal their solo runs; a short
+//                     prompt interrupts a long prefill between super-chunks; cancellation releases
+//                     lanes and leaves later requests unchanged.
 //
-// Greedy decoding is deterministic at a fixed QSA capacity, so every request that decodes alone
-// (B = 1) is compared exactly. Batched decode rounds are not bitwise equal to B = 1 (routing and
-// reduction order differ by batch size; the Program's lane check measures per-lane KL 0.012-0.017
-// and 97.5-98% top-1 agreement), so the C=4 case compares each stream with its solo run by
-// logprobs: equal first token (prefill is per lane), close token logprobs over the common prefix,
-// and a near-tie at the first divergence.
+// B1 requests with identical execution geometry are compared exactly. B1/B4 arithmetic profiles
+// can differ in routing and reduction order. Their numerical comparison therefore uses identical
+// per-position histories, not free-running answers: full next-token distributions on B1 teacher
+// trajectories, and selected-token logprobs/top-1 on each public Engine request's published
+// history. The latter also checks post-prefill request/state routing.
 
 #include "ninfer/engine.h"
 
@@ -887,6 +884,69 @@ void retained_suite(const Inputs& inputs) {
     // against the cold-route floor. This mode checks the Engine's ownership and reuse behavior.
 }
 
+void disk_close_before_drain(const Inputs& inputs, const ninfer::EngineOptions& options,
+                             const Tokens& source, const Tokens& expected) {
+    ninfer::DeviceContext device(0);
+    const ninfer::artifact::Reader reader(inputs.artifact);
+    const fn::LoadedModel model(reader, device);
+    auto frontend = fn::Package::make_frontend(model);
+    fn::EngineProgram program(model, options, device);
+
+    struct DiskClaim {
+        fn::EngineProgram& owner;
+        const std::uint64_t id;
+
+        DiskClaim(fn::EngineProgram& program, const ninfer::runtime::RequestPlanSummary& summary)
+            : owner(program), id(summary.disk_entry_id) {
+            require(owner.claim_disk_entry(id, summary.disk_execution_frontier,
+                                           summary.disk_hash_f_lo, summary.disk_hash_f_hi,
+                                           summary.reusable_prompt_tokens, summary.disk_reuse_path,
+                                           summary.disk_committed_generation),
+                    "disk-close fixture claim");
+        }
+
+        ~DiskClaim() { owner.release_disk_entry(id); }
+
+        DiskClaim(const DiskClaim&)            = delete;
+        DiskClaim& operator=(const DiskClaim&) = delete;
+    };
+
+    for (const bool close_pending : {true, false}) {
+        auto prompt = frontend.prepare_tokens(source, true);
+        ninfer::runtime::ResolvedExecutionOptions execution;
+        execution.requested_output_tokens   = 1;
+        execution.reservation_window_tokens = 1;
+        execution.allow_prefix_reuse        = true;
+        const auto base                     = program.plan_request_base(prompt, execution);
+        auto plan                           = program.plan_disk_reuse(prompt, base);
+        const auto summary                  = plan.summary();
+        require(summary.reuse_source == ninfer::PrefixReuseSource::HostDisk &&
+                    summary.reusable_prompt_tokens == source.size(),
+                "disk-close fixture has no complete durable source");
+        const DiskClaim claim(program, summary);
+        program.restore_disk_entry(0, summary.disk_entry_id, plan);
+        require(program.pending_disk_restore_ticket() != 0, "disk restore did not own a ticket");
+        if (close_pending) {
+            // No executor wait or cancellation precedes this close. The adapter owns draining
+            // the destination's scatter and state transfers before its pages can be reused.
+            program.evict_retained_lane(0);
+            require(program.pending_disk_restore_ticket() == 0 && !program.has_retained_lane(0),
+                    "closing an SSD destination left a live restore or lane");
+        } else {
+            program.wait_kv_disk_copies();
+            program.wait_kv_ram_copies_on_compute();
+            const auto first = program.start_prefill_lane(0, std::move(prompt), std::move(plan), {},
+                                                          ninfer::runtime::PrefillPace::Exclusive);
+            require(first.complete && !first.round.tokens.empty() && expected.size() == 1 &&
+                        first.round.tokens.front() == expected.front(),
+                    "SSD close/reopen changed the complete-state continuation");
+            program.resolve_prefill_lane(0, true);
+            program.evict_retained_lane(0);
+        }
+    }
+    std::cout << "SSD destination close cancels its own pending restore; source restores exactly\n";
+}
+
 void tier_suite(const Inputs& inputs, bool disk) {
     const auto directory =
         std::filesystem::temp_directory_path() /
@@ -898,6 +958,8 @@ void tier_suite(const Inputs& inputs, bool disk) {
         auto options                  = engine_options(inputs, 1, 4096, 4096);
         options.kv_ram_capacity_bytes = std::size_t{512} << 20;
         options.kv_ram_system_prompts = 2;
+        const Tokens close_prompt     = prompt_tokens(600, 1950);
+        Tokens close_expected;
         if (disk) {
             options.kv_disk_capacity_bytes = std::size_t{2048} << 20;
             options.kv_disk_location       = directory;
@@ -974,7 +1036,14 @@ void tier_suite(const Inputs& inputs, bool disk) {
                       << " Engine: rollback, exact hit, suffix/decode and disposable preservation "
                          "pass; captures="
                       << stats.kv_ram_captures << " RAM restores=" << stats.kv_ram_restores << '\n';
+            if (disk) {
+                auto request       = reuse_options(1);
+                request.output.raw = true;
+                close_expected = engine.generate(engine.prepare_tokens(close_prompt, true), request)
+                                     .generated_token_ids;
+            }
         }
+        if (disk) { disk_close_before_drain(inputs, options, close_prompt, close_expected); }
     } catch (...) {
         if (disk) { std::filesystem::remove_all(directory); }
         throw;
