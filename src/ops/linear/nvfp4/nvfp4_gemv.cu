@@ -70,6 +70,30 @@ void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cud
     case Nvfp4Problem::MtpFc:
         launch_exact<Nvfp4MtpFcGeometry>(x, weight, out, stream);
         return;
+    case Nvfp4Problem::FlashNextMixerOut:
+        launch_exact<Nvfp4FlashNextMixerOutGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::FlashNextDflashFeature:
+        launch_exact<Nvfp4FlashNextDflashFeatureGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::FlashNextDflashQkv:
+        launch_exact<Nvfp4FlashNextDflashQkvGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+        launch_exact<Nvfp4FlashNextDflashAttnOutGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::FlashNextDflashGateUp:
+        launch_exact<Nvfp4FlashNextDflashGateUpGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::FlashNextDflashDown:
+        launch_exact<Nvfp4FlashNextDflashDownGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::FlashNextDflashConvProj:
+        launch_exact<Nvfp4FlashNextDflashConvProjGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::FlashNextDflashSelector:
+        launch_exact<Nvfp4FlashNextDflashSelectorGeometry>(x, weight, out, stream);
+        return;
     }
 }
 

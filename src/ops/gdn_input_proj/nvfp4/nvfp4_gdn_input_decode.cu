@@ -5,12 +5,17 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 
-namespace ninfer::ops::detail {
+#include <stdexcept>
 
-void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                   cudaStream_t stream) {
-    using Geometry = Nvfp4GdnInputGeometry;
+namespace ninfer::ops::detail {
+namespace {
+
+template <class Geometry>
+void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                  cudaStream_t stream) {
     using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
+    static_assert(Geometry::kOutputRows ==
+                  Nvfp4GdnInputOutput::kQkvRows + Nvfp4GdnInputOutput::kZRows);
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
@@ -22,6 +27,22 @@ void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor
             Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
                                 static_cast<__nv_bfloat16*>(z.data)});
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                   cudaStream_t stream) {
+    switch (weight.k) {
+    case Nvfp4GdnInputGeometry::kInputRows:
+        launch_exact<Nvfp4GdnInputGeometry>(x, weight, qkv, z, stream);
+        return;
+    case Nvfp4FlashNextGdnInputGeometry::kInputRows:
+        launch_exact<Nvfp4FlashNextGdnInputGeometry>(x, weight, qkv, z, stream);
+        return;
+    default:
+        throw std::invalid_argument("nvfp4 gdn_input_proj decode: unsupported input rows");
+    }
 }
 
 } // namespace ninfer::ops::detail

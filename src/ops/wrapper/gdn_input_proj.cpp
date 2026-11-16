@@ -4,6 +4,7 @@
 #include "ops/common/a8_activation_check.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
+#include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
@@ -70,13 +71,13 @@ ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
     return {width, batch, width * batch};
 }
 
-ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden) {
+// min_width is 1 for the [16384,2560] chain record and 2 for every other registered record.
+ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden, std::int32_t min_width) {
     constexpr std::int32_t kMaximumBatch = 12;
-    constexpr std::int32_t kMinimumWidth = 2;
     constexpr std::int32_t kMaximumWidth = 16;
     const std::int32_t width             = x.ne[1];
     const std::int32_t batch             = x.ne[2];
-    if (width < kMinimumWidth || width > kMaximumWidth || batch <= 0 || batch > kMaximumBatch) {
+    if (width < min_width || width > kMaximumWidth || batch <= 0 || batch > kMaximumBatch) {
         throw std::invalid_argument("gdn_input_proj_conv_record: unsupported B/T domain");
     }
     require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_record", "x");
@@ -290,11 +291,10 @@ void require_snapshot_capacity_domain(std::int32_t batch_size, std::int32_t min_
 }
 
 void require_record_capacity_domain(std::int32_t batch_size, std::int32_t min_width,
-                                    std::int32_t max_width) {
+                                    std::int32_t max_width, std::int32_t registered_min_width) {
     constexpr std::int32_t kMaximumBatch = 12;
-    constexpr std::int32_t kMinimumWidth = 2;
     constexpr std::int32_t kMaximumWidth = 16;
-    if (batch_size <= 0 || batch_size > kMaximumBatch || min_width < kMinimumWidth ||
+    if (batch_size <= 0 || batch_size > kMaximumBatch || min_width < registered_min_width ||
         max_width < min_width || max_width > kMaximumWidth) {
         throw std::invalid_argument("gdn_input_proj_conv_record workspace: invalid B/T domain");
     }
@@ -317,46 +317,182 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
 
     if (weight.qtype == QType::NVFP4) {
-        constexpr std::int32_t kHidden  = 5120;
+        // Registered parents: [16384,5120] (A16Only or AllowA4) and [16384,2560] (A16Only).
         constexpr std::int32_t kQkvRows = 10240;
         constexpr std::int32_t kZRows   = 6144;
         constexpr std::int32_t kRows    = kQkvRows + kZRows;
-        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
-            throw std::invalid_argument("NVFP4 gdn_input_proj admits only A16 or A4");
+        detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj");
+        const std::int32_t hidden = weight.k;
+        if (weight.n != kRows || (hidden != detail::Nvfp4GdnInputGeometry::kInputRows &&
+                                  hidden != detail::Nvfp4FlashNextGdnInputGeometry::kInputRows)) {
+            throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported weight shape");
         }
-        require_matrix(x, kHidden, cols, "x");
+        const bool policy_registered = policy == LinearPolicy::A16Only ||
+                                       (hidden == detail::Nvfp4GdnInputGeometry::kInputRows &&
+                                        policy == LinearPolicy::AllowA4);
+        if (!policy_registered) {
+            throw std::invalid_argument("NVFP4 gdn_input_proj: policy is not registered for K");
+        }
+        require_matrix(x, hidden, cols, "x");
         require_matrix(qkv, kQkvRows, cols, "qkv");
         require_matrix(z, kZRows, cols, "z");
         require_single_parent_nonoverlap(x, qkv, z);
-        detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj");
-        if (weight.n != kRows || weight.k != kHidden) {
-            throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported weight shape");
-        }
         detail::nvfp4_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
     }
 
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        constexpr std::int32_t kHidden  = 5120;
+        // Registered parents: [16384,5120] (A16Only or AllowA8) and [16384,2560] (A16Only).
         constexpr std::int32_t kQkvRows = 10240;
         constexpr std::int32_t kZRows   = 6144;
         constexpr std::int32_t kRows    = kQkvRows + kZRows;
-        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
-            throw std::invalid_argument("FP8 gdn_input_proj admits only A16 or A8");
+        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj");
+        const std::int32_t hidden = weight.k;
+        if (weight.n != kRows || (hidden != detail::Fp8GdnInputGeometry::kInputRows &&
+                                  hidden != detail::Fp8FlashNextGdnInputGeometry::kInputRows)) {
+            throw std::invalid_argument("fp8 gdn_input_proj: unsupported weight shape");
         }
-        require_matrix(x, kHidden, cols, "x");
+        const bool policy_registered =
+            policy == LinearPolicy::A16Only ||
+            (hidden == detail::Fp8GdnInputGeometry::kInputRows && policy == LinearPolicy::AllowA8);
+        if (!policy_registered) {
+            throw std::invalid_argument("FP8 gdn_input_proj: policy is not registered for K");
+        }
+        require_matrix(x, hidden, cols, "x");
         require_matrix(qkv, kQkvRows, cols, "qkv");
         require_matrix(z, kZRows, cols, "z");
         require_single_parent_nonoverlap(x, qkv, z);
-        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj");
-        if (weight.n != kRows || weight.k != kHidden) {
-            throw std::invalid_argument("fp8 gdn_input_proj: unsupported weight shape");
-        }
         detail::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
     }
 
     throw std::invalid_argument("gdn_input_proj: unsupported parent qtype");
+}
+
+// The [16384,2560] parent of either qtype. Its snapshot and record forms compose one A16
+// projection over all W*B packed columns, which reads the parent once for the whole batch, with a
+// slot-indexed convolution over the BF16 projection; the BF16 projection is private staging
+// covered by the A16 criterion (the snapshot's persistent history is BF16 in every route).
+bool flash_next_parent(const Weight& weight) {
+    constexpr std::int32_t kFlashNextHidden = 2560;
+    return weight.k == kFlashNextHidden;
+}
+
+struct SplitConvOutputs {
+    Tensor& query;
+    Tensor& key;
+    Tensor& value;
+    Tensor& z;
+};
+
+void require_split_conv_outputs(const SplitConvOutputs& outputs, ConvGeometry geometry,
+                                const char* op) {
+    constexpr std::int32_t kQueryRows = 2048;
+    constexpr std::int32_t kKeyRows   = 2048;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    require_conv_tensor(outputs.query, kQueryRows, geometry.width, geometry.batch, op, "query");
+    require_conv_tensor(outputs.key, kKeyRows, geometry.width, geometry.batch, op, "key");
+    require_conv_tensor(outputs.value, kValueRows, geometry.width, geometry.batch, op, "value");
+    require_conv_tensor(outputs.z, kZRows, geometry.width, geometry.batch, op, "z");
+}
+
+// A16 projection of the packed [2560, W*B] input into a contiguous [10240, W*B] q|k|v plane and
+// z [6144, W*B]; the registered K=2560 projection admits every positive column count.
+void flash_next_project(const Tensor& x, const Weight& weight, const Tensor& qkv_plane, Tensor& z,
+                        ConvGeometry geometry, cudaStream_t stream) {
+    constexpr std::int32_t kChannels = 10240;
+    constexpr std::int32_t kZRows    = 6144;
+    const Tensor x_flat(x.data, DType::BF16, {weight.k, geometry.aggregate_columns});
+    Tensor qkv_flat(qkv_plane.data, DType::BF16, {kChannels, geometry.aggregate_columns});
+    Tensor z_flat(z.data, DType::BF16, {kZRows, geometry.aggregate_columns});
+    if (weight.qtype == QType::NVFP4) {
+        detail::nvfp4_gdn_input_dispatch(x_flat, weight, qkv_flat, z_flat, LinearPolicy::A16Only,
+                                         nullptr, stream);
+    } else {
+        detail::fp8_gdn_input_a16_dispatch(x_flat, weight, qkv_flat, z_flat, stream);
+    }
+}
+
+std::size_t flash_next_snapshot_plane_bytes(std::int32_t batch, std::int32_t width) {
+    constexpr std::size_t kChannels = 10240;
+    return kChannels * sizeof(std::uint16_t) * static_cast<std::size_t>(width) *
+           static_cast<std::size_t>(batch);
+}
+
+void dispatch_flash_next_snapshot(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearPolicy policy,
+                                  WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr const char* kOp        = "gdn_input_proj_conv_snapshot";
+    constexpr std::int32_t kChannels = 10240;
+    if (policy != LinearPolicy::A16Only) {
+        throw std::invalid_argument(
+            "gdn_input_proj_conv_snapshot: the [16384,2560] parent admits only A16Only");
+    }
+    const ConvGeometry geometry = require_snapshot_input(x, weight.k);
+    require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                              snapshot_base_slots, kChannels, geometry);
+    require_split_conv_outputs({query, key, value, z}, geometry, kOp);
+    require_snapshot_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                                snapshot_base_slots, query, key, value, z, workspace);
+    const std::array<const Tensor*, 10> tensors{&x,
+                                                &conv_weight,
+                                                &conv_states,
+                                                &valid_columns,
+                                                &initial_state_slots,
+                                                &snapshot_base_slots,
+                                                &query,
+                                                &key,
+                                                &value,
+                                                &z};
+    require_parent_nonoverlap(weight, tensors, workspace, kOp);
+
+    auto scope = workspace.scope();
+    const DeviceSpan plane_storage =
+        workspace.alloc_bytes(flash_next_snapshot_plane_bytes(geometry.batch, geometry.width));
+    const Tensor plane(plane_storage.data, DType::BF16,
+                       {kChannels, geometry.width, geometry.batch});
+    flash_next_project(x, weight, plane, z, geometry, stream);
+    detail::gdn_projected_conv_snapshot_launch(plane, conv_weight, conv_states, valid_columns,
+                                               initial_state_slots, snapshot_base_slots, query, key,
+                                               value, stream);
+}
+
+void dispatch_flash_next_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                                const Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, Tensor& conv_record,
+                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
+                                const Tensor* parent_index) {
+    constexpr const char* kOp        = "gdn_input_proj_conv_record";
+    constexpr std::int32_t kChannels = 10240;
+    if (policy != LinearPolicy::A16Only) {
+        throw std::invalid_argument(
+            "gdn_input_proj_conv_record: the [16384,2560] parent admits only A16Only");
+    }
+    // A width-one chain is the read-only counterpart of the width-one snapshot; a tree needs T>=2.
+    const ConvGeometry geometry =
+        require_record_input(x, weight.k, parent_index_active(parent_index) ? 2 : 1);
+    require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,
+                            geometry);
+    require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch, kOp, "conv record");
+    require_split_conv_outputs({query, key, value, z}, geometry, kOp);
+    require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                              conv_record, query, key, value, z, workspace, parent_index);
+    require_record_parent_index(parent_index, geometry);
+    const std::array<const Tensor*, 10> tensors{
+        &x,           &conv_weight, &conv_states, &valid_columns, &initial_state_slots,
+        &conv_record, &query,       &key,         &value,         &z};
+    require_parent_nonoverlap(weight, tensors, workspace, kOp);
+
+    // The projection lands in the observable record, which the convolution then reads.
+    flash_next_project(x, weight, conv_record, z, geometry, stream);
+    detail::gdn_projected_conv_record_launch(
+        conv_record, conv_weight, conv_states, valid_columns, initial_state_slots, query, key,
+        value, stream, parent_index_active(parent_index) ? parent_index : nullptr);
 }
 
 void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
@@ -366,6 +502,29 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      Tensor& value, Tensor& z, LinearPolicy policy,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
     validate_policy(policy);
+
+    if (weight.qtype == QType::NVFP4 && flash_next_parent(weight)) {
+        detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_snapshot");
+        if (weight.n != detail::Nvfp4FlashNextGdnInputGeometry::kOutputRows) {
+            throw std::invalid_argument(
+                "nvfp4 gdn_input_proj_conv_snapshot: unsupported weight shape");
+        }
+        dispatch_flash_next_snapshot(x, weight, conv_weight, conv_states, valid_columns,
+                                     initial_state_slots, snapshot_base_slots, query, key, value, z,
+                                     policy, workspace, stream);
+        return;
+    }
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S && flash_next_parent(weight)) {
+        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_snapshot");
+        if (weight.n != detail::Fp8FlashNextGdnInputGeometry::kOutputRows) {
+            throw std::invalid_argument(
+                "fp8 gdn_input_proj_conv_snapshot: unsupported weight shape");
+        }
+        dispatch_flash_next_snapshot(x, weight, conv_weight, conv_states, valid_columns,
+                                     initial_state_slots, snapshot_base_slots, query, key, value, z,
+                                     policy, workspace, stream);
+        return;
+    }
 
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden     = 5120;
@@ -455,6 +614,28 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    cudaStream_t stream, const Tensor* parent_index) {
     validate_policy(policy);
 
+    if (weight.qtype == QType::NVFP4 && flash_next_parent(weight)) {
+        detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_record");
+        if (weight.n != detail::Nvfp4FlashNextGdnInputGeometry::kOutputRows) {
+            throw std::invalid_argument(
+                "nvfp4 gdn_input_proj_conv_record: unsupported weight shape");
+        }
+        dispatch_flash_next_record(x, weight, conv_weight, conv_states, valid_columns,
+                                   initial_state_slots, conv_record, query, key, value, z, policy,
+                                   workspace, stream, parent_index);
+        return;
+    }
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S && flash_next_parent(weight)) {
+        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_record");
+        if (weight.n != detail::Fp8FlashNextGdnInputGeometry::kOutputRows) {
+            throw std::invalid_argument("fp8 gdn_input_proj_conv_record: unsupported weight shape");
+        }
+        dispatch_flash_next_record(x, weight, conv_weight, conv_states, valid_columns,
+                                   initial_state_slots, conv_record, query, key, value, z, policy,
+                                   workspace, stream, parent_index);
+        return;
+    }
+
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden     = 5120;
         constexpr std::int32_t kQueryRows  = 2048;
@@ -463,7 +644,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         constexpr std::int32_t kZRows      = 6144;
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
-        const ConvGeometry geometry        = require_record_input(x, kHidden);
+        const ConvGeometry geometry        = require_record_input(x, kHidden, 2);
         if (policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("NVFP4 gdn_input_proj_conv_record is registered for A8");
         }
@@ -506,7 +687,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         constexpr std::int32_t kZRows      = 6144;
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
-        const ConvGeometry geometry        = require_record_input(x, kHidden);
+        const ConvGeometry geometry        = require_record_input(x, kHidden, 2);
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("FP8 gdn_input_proj_conv_record admits only A16 or A8");
         }
@@ -553,20 +734,30 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        if (parent_rows != detail::Fp8GdnInputGeometry::kOutputRows ||
-            input_rows != detail::Fp8GdnInputGeometry::kInputRows ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
+        const bool registered =
+            parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&
+            ((input_rows == detail::Fp8GdnInputGeometry::kInputRows &&
+              (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8)) ||
+             (input_rows == detail::Fp8FlashNextGdnInputGeometry::kInputRows &&
+              policy == LinearPolicy::A16Only));
+        if (!registered) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported FP8 profile");
         }
-        return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::fp8_gdn_input_workspace_capacity_bytes(input_rows, policy, min_tokens,
+                                                              max_tokens);
     }
     if (parent_qtype == QType::NVFP4) {
-        if (parent_rows != detail::Nvfp4GdnInputGeometry::kOutputRows ||
-            input_rows != detail::Nvfp4GdnInputGeometry::kInputRows ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
+        const bool registered =
+            parent_rows == detail::Nvfp4GdnInputGeometry::kOutputRows &&
+            ((input_rows == detail::Nvfp4GdnInputGeometry::kInputRows &&
+              (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA4)) ||
+             (input_rows == detail::Nvfp4FlashNextGdnInputGeometry::kInputRows &&
+              policy == LinearPolicy::A16Only));
+        if (!registered) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(input_rows, policy, min_tokens,
+                                                                max_tokens);
     }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");
 }
@@ -619,6 +810,13 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
+    if ((parent_qtype == QType::FP8_E4M3FN_ROW_BF16S || parent_qtype == QType::NVFP4) &&
+        parent_rows == detail::Fp8FlashNextGdnInputGeometry::kOutputRows &&
+        input_rows == detail::Fp8FlashNextGdnInputGeometry::kInputRows &&
+        policy == LinearPolicy::A16Only) {
+        require_snapshot_capacity_domain(batch_size, min_width, max_width);
+        return flash_next_snapshot_plane_bytes(batch_size, max_width);
+    }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
         parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&
         input_rows == detail::Fp8GdnInputGeometry::kInputRows &&
@@ -642,11 +840,19 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
+    if ((parent_qtype == QType::FP8_E4M3FN_ROW_BF16S || parent_qtype == QType::NVFP4) &&
+        parent_rows == detail::Fp8FlashNextGdnInputGeometry::kOutputRows &&
+        input_rows == detail::Fp8FlashNextGdnInputGeometry::kInputRows &&
+        policy == LinearPolicy::A16Only) {
+        // The projection writes the caller-owned record directly.
+        require_record_capacity_domain(batch_size, min_width, max_width, 1);
+        return 0;
+    }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
         parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&
         input_rows == detail::Fp8GdnInputGeometry::kInputRows &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8)) {
-        require_record_capacity_domain(batch_size, min_width, max_width);
+        require_record_capacity_domain(batch_size, min_width, max_width, 2);
         return detail::fp8_gdn_record_workspace_capacity_bytes(policy, batch_size, min_width,
                                                                max_width);
     }
@@ -656,7 +862,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
         throw std::invalid_argument(
             "gdn_input_proj_conv_record workspace: unsupported single-parent profile");
     }
-    require_record_capacity_domain(batch_size, min_width, max_width);
+    require_record_capacity_domain(batch_size, min_width, max_width, 2);
     return detail::nvfp4_gdn_record_workspace_capacity_bytes(policy, batch_size, min_width,
                                                              max_width);
 }

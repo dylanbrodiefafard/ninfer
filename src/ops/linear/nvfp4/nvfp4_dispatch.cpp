@@ -19,15 +19,41 @@ enum class Nvfp4LinearRoute : std::uint8_t {
     W4A4,
 };
 
-// DFlash qkv, attention-output and feature projections run BF16 activations on tensor cores for
-// T>=2; T=1 keeps the GEMV decode kernel.
+// The DFlash qkv, attention-output and feature projections, the Flash-Next drafter's feature,
+// qkv, attention-output, MLP and conv projections, and the Flash-Next mixer output run BF16
+// activations on tensor cores for T>=2; T=1 keeps the GEMV decode kernel. The [640,2560] conv
+// projection takes the MMA because it ties SmallT at T<=4 and is 2x faster from T=16 on the RTX
+// 5090 (cold L2: T=16 8.2 us against 18.4 us).
 bool a16_uses_mma(Nvfp4Problem problem, std::int32_t tokens) {
-    return tokens >= 2 &&
-           (problem == Nvfp4Problem::DflashQkv || problem == Nvfp4Problem::DflashAttnOut ||
-            problem == Nvfp4Problem::DflashFeature);
+    if (tokens < 2) { return false; }
+    switch (problem) {
+    case Nvfp4Problem::DflashFeature:
+    case Nvfp4Problem::DflashQkv:
+    case Nvfp4Problem::DflashAttnOut:
+    case Nvfp4Problem::FlashNextMixerOut:
+    case Nvfp4Problem::FlashNextDflashFeature:
+    case Nvfp4Problem::FlashNextDflashQkv:
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+    case Nvfp4Problem::FlashNextDflashGateUp:
+    case Nvfp4Problem::FlashNextDflashDown:
+    case Nvfp4Problem::FlashNextDflashConvProj:
+        return true;
+    case Nvfp4Problem::AttnInput:
+    case Nvfp4Problem::GdnInput:
+    case Nvfp4Problem::MlpGateUp:
+    case Nvfp4Problem::Residual6144:
+    case Nvfp4Problem::Residual17408:
+    case Nvfp4Problem::DflashConvProj:
+    case Nvfp4Problem::DflashSelector:
+    case Nvfp4Problem::MtpFc:
+    case Nvfp4Problem::FlashNextDflashSelector:
+        return false;
+    }
+    return false;
 }
 
-// Width from which AllowA4 selects W4A4 for problem; the DFlash2-only problems never do.
+// Width from which AllowA4 selects W4A4 for problem; the DFlash2-only problems and the Flash-Next
+// problems never do.
 std::int32_t first_w4a4_tokens(Nvfp4Problem problem) {
     switch (problem) {
     case Nvfp4Problem::AttnInput:
@@ -47,13 +73,21 @@ std::int32_t first_w4a4_tokens(Nvfp4Problem problem) {
     case Nvfp4Problem::DflashAttnOut:
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
+    case Nvfp4Problem::FlashNextMixerOut:
+    case Nvfp4Problem::FlashNextDflashFeature:
+    case Nvfp4Problem::FlashNextDflashQkv:
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+    case Nvfp4Problem::FlashNextDflashGateUp:
+    case Nvfp4Problem::FlashNextDflashDown:
+    case Nvfp4Problem::FlashNextDflashConvProj:
+    case Nvfp4Problem::FlashNextDflashSelector:
         return std::numeric_limits<std::int32_t>::max();
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }
 
 // Whether the A16 route has a kernel for every launch it splits tokens into: the T=1 GEMV, the
-// DFlash A16 MMA, or kNvfp4LastSmallT-column SmallT chunks plus one remainder.
+// A16 MMA, or kNvfp4LastSmallT-column SmallT chunks plus one remainder.
 bool a16_tokens_registered(Nvfp4Problem problem, std::int32_t tokens) {
     if (tokens == 1 || a16_uses_mma(problem, tokens)) { return true; }
     const std::int32_t full_chunks = tokens / kNvfp4LastSmallT;
@@ -107,8 +141,8 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 
 } // namespace
 
-bool is_nvfp4_dflash_mma_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
-                                           LinearPolicy policy) {
+bool is_nvfp4_a16_mma_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
+                                        LinearPolicy policy) {
     if (!is_nvfp4_linear_problem(output_rows, input_rows) ||
         (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
         return false;

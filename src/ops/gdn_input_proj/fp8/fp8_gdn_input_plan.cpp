@@ -13,8 +13,19 @@ enum class Fp8GdnInputRoute : std::uint8_t {
     A8,
 };
 
-Fp8GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
+// The [16384,5120] parent runs A16 under A16Only and from T=8 runs A8 under AllowA8. The
+// [16384,2560] parent admits only A16Only and runs A16 at every T.
+Fp8GdnInputRoute resolve_route(std::int32_t input_rows, LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 gdn_input_proj: T must be positive"); }
+    if (input_rows == Fp8FlashNextGdnInputGeometry::kInputRows) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("fp8 gdn_input_proj: K=2560 admits only A16Only");
+        }
+        return Fp8GdnInputRoute::A16;
+    }
+    if (input_rows != Fp8GdnInputGeometry::kInputRows) {
+        throw std::invalid_argument("fp8 gdn_input_proj: unsupported input rows");
+    }
     if (policy == LinearPolicy::A16Only) { return Fp8GdnInputRoute::A16; }
     if (policy != LinearPolicy::AllowA8) {
         throw std::invalid_argument("fp8 gdn_input_proj: unsupported policy");
@@ -24,13 +35,14 @@ Fp8GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 
 } // namespace
 
-std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
+std::size_t fp8_gdn_input_workspace_capacity_bytes(std::int32_t input_rows, LinearPolicy policy,
+                                                   std::int32_t min_tokens,
                                                    std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("fp8 gdn_input_proj workspace: invalid token interval");
     }
-    (void)resolve_route(policy, min_tokens);
-    return resolve_route(policy, max_tokens) == Fp8GdnInputRoute::A8
+    (void)resolve_route(input_rows, policy, min_tokens);
+    return resolve_route(input_rows, policy, max_tokens) == Fp8GdnInputRoute::A8
                ? fp8_a8_workspace_capacity_bytes(max_tokens, Fp8GdnInputGeometry::kInputRows)
                : 0;
 }
@@ -53,7 +65,7 @@ void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qk
 
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-    if (resolve_route(policy, x.ne[1]) == Fp8GdnInputRoute::A16) {
+    if (resolve_route(weight.k, policy, x.ne[1]) == Fp8GdnInputRoute::A16) {
         fp8_gdn_input_a16_dispatch(x, weight, qkv, z, stream);
         return;
     }

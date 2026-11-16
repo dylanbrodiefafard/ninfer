@@ -61,18 +61,15 @@ struct MediaInputPermit {
     std::shared_ptr<MediaInputCapacity> capacity;
 };
 
-void reject_unavailable_context_checkpoint_capture(bool capture_requested, bool allow_prefix_reuse,
-                                                   ninfer::SpeculativeBackend spec) {
-    if (!capture_requested ||
-        ninfer::context_checkpoint_capture_available(allow_prefix_reuse, spec)) {
-        return;
-    }
+void reject_unavailable_context_checkpoint_capture(bool capture_requested, bool available) {
+    if (!capture_requested || available) { return; }
     ApiError error;
-    error.status  = 400;
-    error.type    = "invalid_request_error";
-    error.code    = "context_checkpoint_unavailable";
-    error.param   = "ninfer.capture_context_checkpoint";
-    error.message = "capture_context_checkpoint requires prefix reuse and --spec dflash";
+    error.status = 400;
+    error.type   = "invalid_request_error";
+    error.code   = "context_checkpoint_unavailable";
+    error.param  = "ninfer.capture_context_checkpoint";
+    error.message =
+        "capture_context_checkpoint requires a supported target, prefix reuse and --spec dflash";
     throw ApiException(std::move(error));
 }
 
@@ -340,6 +337,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
+    engine_options.ngram_table_path         = options_.ngram_table_path;
+    engine_options.qsa_select_budget        = options_.qsa_select_budget;
     engine_options.load_progress            = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
@@ -419,9 +418,9 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                  "capture_context_checkpoint=true requires cache_write=true "
                                  "because it creates a retained context checkpoint."));
     }
-    reject_unavailable_context_checkpoint_capture(request.capture_context_checkpoint,
-                                                  options_.allow_prefix_reuse,
-                                                  options_.speculative.backend);
+    reject_unavailable_context_checkpoint_capture(
+        request.capture_context_checkpoint,
+        engine_->context_checkpoint_capture_available(options_.allow_prefix_reuse));
     const ResolvedRequestSemantics semantics =
         resolve_request_semantics(request, options_, prompt_capabilities_);
     PreparedRequest prepared;

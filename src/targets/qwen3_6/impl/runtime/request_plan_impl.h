@@ -152,8 +152,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->force_cold_prefill         = options.force_cold_prefill;
     base->capture_context_checkpoint = options.capture_context_checkpoint;
     if (options.capture_context_checkpoint &&
-        !ninfer::context_checkpoint_capture_available(options.allow_prefix_reuse,
-                                                      speculative_backend)) {
+        !ninfer::context_checkpoint_mode_available(options.allow_prefix_reuse,
+                                                   speculative_backend)) {
         throw std::invalid_argument(
             "capture_context_checkpoint requires prefix reuse and a speculative backend");
     }

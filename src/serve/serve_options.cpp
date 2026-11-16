@@ -123,6 +123,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--context-checkpoints off|on|a,b,c] "
+           "[--ngram-table PATH] [--qsa-select-budget 512|1024|2048] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--system-prepend TEXT] "
            "[--default-thinking-token-budget N|off] "
            "[--cors] "
@@ -165,6 +166,15 @@ std::string serve_usage_text(const char* argv0) {
            "(both require DFlash). Marks at or above --max-context stay unused. "
            "Advertised freeze F is the committed chunk end at or past the mark. Turn-rollback "
            "checkpoints do not depend on the ladder.\n"
+           "       qwen3.8-flash-next requires --ngram-table (its 8-bit n-gram table file) and "
+           "accepts --qsa-select-budget (QSA blocks per query, default 512). Its DFlash2 companion "
+           "enables adaptive K0-3 with the full shared head; --spec none disables it. RAM/disk KV "
+           "tiers are supported. It rejects --lm-head-draft, --dflash-verify-width, context "
+           "checkpoints, "
+           "--vision, --kv-dtype int8, "
+           "--sage, --keep-frac, --xattn-tau and --no-cuda-graph. --kv-capacity N shares N "
+           "tokens of QSA state among the --max-concurrency lanes (auto reserves "
+           "--max-concurrency x --max-context); the expert cache takes the remaining GPU memory.\n"
            "       --default-thinking-token-budget defaults omitted request caps to N (default "
            "off); "
            "explicit null remains unlimited\n"
@@ -333,6 +343,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--ngram-table") {
+            options.ngram_table_path = require_value("--ngram-table");
+            if (options.ngram_table_path.empty()) {
+                throw std::invalid_argument("--ngram-table must not be empty");
+            }
+        } else if (arg == "--qsa-select-budget") {
+            options.qsa_select_budget =
+                parse_qsa_select_budget_flag(require_value("--qsa-select-budget"));
         } else if (arg == "--context-checkpoints") {
             options.context_checkpoint_marks =
                 parse_context_checkpoint_marks_flag(require_value("--context-checkpoints"));

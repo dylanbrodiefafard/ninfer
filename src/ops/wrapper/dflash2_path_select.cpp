@@ -17,8 +17,10 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
-bool is_quantized_projection(QType qtype) {
-    return qtype == QType::Q4G64_F16S || qtype == QType::W8G32_F16S || qtype == QType::NVFP4;
+// Q4/W8 projections are registered Linear problems only at D=5120; NVFP4 at both widths.
+bool is_quantized_projection(QType qtype, std::int32_t hidden) {
+    return qtype == QType::NVFP4 ||
+           (hidden == 5120 && (qtype == QType::Q4G64_F16S || qtype == QType::W8G32_F16S));
 }
 
 void require_sequence_extent(std::int32_t tokens, std::int32_t batch, const char* op) {
@@ -34,10 +36,10 @@ void require_hidden(const Tensor& hidden, std::int32_t tokens, std::int32_t batc
     if (hidden.dtype != DType::BF16 || !hidden.is_contiguous() || hidden.data == nullptr) {
         throw std::invalid_argument("dflash2_path_select: hidden must be contiguous BF16");
     }
-    if (hidden.ne[0] != kDflash2PathSelectHidden || hidden.ne[1] != tokens ||
+    if (!dflash2_path_select_hidden_registered(hidden.ne[0]) || hidden.ne[1] != tokens ||
         hidden.ne[2] != batch || hidden.ne[3] != 1) {
         throw std::invalid_argument(
-            "dflash2_path_select: hidden must be BF16 [5120,T] or [5120,T,B]");
+            "dflash2_path_select: hidden must be BF16 [D,T] or [D,T,B] with D in {5120,2560}");
     }
 }
 
@@ -132,10 +134,10 @@ void require_selector(const Tensor& ids, const Tensor& q, std::int32_t tokens, s
     }
 }
 
-void require_projection_weight(const Weight& weight) {
-    if (weight.n != kDflash2PathSelectRank || weight.k != kDflash2PathSelectHidden) {
+void require_projection_weight(const Tensor& hidden, const Weight& weight) {
+    if (weight.n != kDflash2PathSelectRank || weight.k != hidden.ne[0]) {
         throw std::invalid_argument(
-            "dflash2_path_select: hidden_projection must be logical [256,5120]");
+            "dflash2_path_select: hidden_projection must be logical [256,D]");
     }
     if (weight.qtype == QType::BF16_CTRL) {
         if (weight.layout != QuantLayout::Contiguous ||
@@ -145,11 +147,12 @@ void require_projection_weight(const Weight& weight) {
         }
         return;
     }
-    if (!is_quantized_projection(weight.qtype) ||
+    if (!is_quantized_projection(weight.qtype, hidden.ne[0]) ||
         (weight.qtype != QType::NVFP4 && weight.layout != QuantLayout::RowSplit) ||
         (weight.qtype == QType::NVFP4 && weight.layout != QuantLayout::BlockScaleK16M128x4)) {
         throw std::invalid_argument(
-            "dflash2_path_select: hidden_projection must be BF16_CTRL, Q4/W8 row-split, or NVFP4");
+            "dflash2_path_select: hidden_projection must be BF16_CTRL, NVFP4, or (D=5120) Q4/W8 "
+            "row-split");
     }
 }
 
@@ -160,7 +163,7 @@ std::size_t hidden_proj_bytes(std::int32_t tokens, std::int32_t batch) {
 
 void project_hidden(const Tensor& hidden, const Weight& hidden_projection, Tensor& hidden_proj,
                     std::int32_t tokens, std::int32_t batch, cudaStream_t stream) {
-    Tensor hidden_flat = hidden.view({kDflash2PathSelectHidden, tokens * batch});
+    Tensor hidden_flat = hidden.view({hidden.ne[0], tokens * batch});
     if (hidden_projection.qtype == QType::BF16_CTRL) {
         if (!aligned_to(hidden_flat.data, 16) || !aligned_to(hidden_proj.data, 16)) {
             throw std::invalid_argument(
@@ -215,7 +218,8 @@ TopkScratch alloc_topk_scratch(WorkspaceArena& workspace, std::int32_t tokens, s
 
 } // namespace
 
-std::size_t dflash2_path_select_workspace_capacity_bytes(QType qtype, std::int32_t min_tokens,
+std::size_t dflash2_path_select_workspace_capacity_bytes(QType qtype, std::int32_t hidden,
+                                                         std::int32_t min_tokens,
                                                          std::int32_t max_tokens,
                                                          std::int32_t batch) {
     if (min_tokens <= 0 || max_tokens < min_tokens || batch <= 0 ||
@@ -223,15 +227,17 @@ std::size_t dflash2_path_select_workspace_capacity_bytes(QType qtype, std::int32
         (batch > 1 && max_tokens > kDflash2PathSelectMaxWidthWhenBatched)) {
         throw std::invalid_argument("dflash2_path_select workspace: invalid token/batch interval");
     }
+    if (!dflash2_path_select_hidden_registered(hidden)) {
+        throw std::invalid_argument("dflash2_path_select workspace: unregistered hidden width");
+    }
     std::size_t bytes = align_workspace(hidden_proj_bytes(max_tokens, batch)) +
                         align_workspace(topk_scratch_bytes(max_tokens, batch));
     if (qtype == QType::BF16_CTRL) { return bytes; }
-    if (!is_quantized_projection(qtype)) {
+    if (!is_quantized_projection(qtype, hidden)) {
         throw std::invalid_argument("dflash2_path_select workspace: unsupported projection qtype");
     }
-    bytes +=
-        linear_workspace_capacity_bytes(qtype, kDflash2PathSelectRank, kDflash2PathSelectHidden,
-                                        LinearPolicy::A16Only, min_tokens, max_tokens);
+    bytes += linear_workspace_capacity_bytes(qtype, kDflash2PathSelectRank, hidden,
+                                             LinearPolicy::A16Only, min_tokens, max_tokens);
     return bytes;
 }
 
@@ -271,7 +277,7 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
     require_anchors(anchors, batch);
     require_anchors(logical_positions, batch);
     require_path(path, tokens, batch);
-    require_projection_weight(hidden_projection);
+    require_projection_weight(hidden, hidden_projection);
     if ((selector_ids == nullptr) != (selector_q == nullptr)) {
         throw std::invalid_argument(
             "dflash2_path_select: selector_ids and selector_q must both be null or both set");
@@ -332,7 +338,7 @@ void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,
     if (logit_token_ids != nullptr) { require_logit_token_ids(*logit_token_ids, vocab); }
     require_anchors(anchors, batch);
     require_anchors(frontiers, batch);
-    require_projection_weight(hidden_projection);
+    require_projection_weight(hidden, hidden_projection);
     const std::int32_t width = verify_ids.ne[0];
     if (width < 2 || width > kDflash2TreeMaxWidth) {
         throw std::invalid_argument("dflash2_tree_select: W must be in [2,16]");

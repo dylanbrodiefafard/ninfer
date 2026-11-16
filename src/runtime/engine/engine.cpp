@@ -9,11 +9,14 @@
 
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
 namespace ninfer {
 namespace {
@@ -142,21 +145,25 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using Executor = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
+    // One registered target's executor Instance and the executor that drives it.
+    template <class Instance>
+    struct TargetRuntime {
+        std::unique_ptr<Instance> instance;
+        std::unique_ptr<runtime::ConcurrentExecutor<Instance>> executor;
+    };
+
+    using ActiveRuntime = std::variant<TargetRuntime<targets::Qwen3_6_27BInstance>,
+                                       TargetRuntime<targets::Qwen3_8FlashNextInstance>>;
+    static_assert(std::variant_size_v<ActiveRuntime> == 2);
 
     explicit Impl(EngineOptions engine_options)
-        : options(std::move(engine_options)), device(options.device) {
-        auto constructed  = targets::construct_target(options, device);
-        active            = std::move(constructed.active);
-        load              = std::move(constructed.load);
-        sampling_defaults = constructed.sampling_defaults;
-        executor          = std::make_unique<Executor>(*active, options);
-    }
+        : options(std::move(engine_options)), device(options.device),
+          active(start(targets::construct_target(options, device))) {}
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
         // Destroying the executor joins its worker, so no CUDA work is issued after this point.
-        executor.reset();
+        for_each_runtime([](auto& target) noexcept { target.executor.reset(); });
         // The final drain only orders teardown of device resources owned by later members; a
         // destructor has no caller to report a sticky device error to, and every allocation is
         // released by its own RAII owner regardless.
@@ -166,26 +173,85 @@ public:
         } catch (const std::exception&) {}
     }
 
-    [[nodiscard]] const targets::Qwen3_6_27BInstance& target() const {
-        if (active == nullptr) { throw std::logic_error("Engine target is not active"); }
-        return *active;
+    Impl(const Impl&)            = delete;
+    Impl& operator=(const Impl&) = delete;
+    Impl(Impl&&)                 = delete;
+    Impl& operator=(Impl&&)      = delete;
+
+    // Calls fn(instance, executor) for the active target. Both targets share the Qwen3.6
+    // frontend types, so callers see one prompt and output vocabulary.
+    template <class Fn>
+    decltype(auto) visit(Fn&& fn) const {
+        return std::visit(
+            [&](const auto& target) -> decltype(auto) {
+                if (target.instance == nullptr || target.executor == nullptr) {
+                    throw std::logic_error("concurrent Engine executor is unavailable");
+                }
+                return fn(*target.instance, *target.executor);
+            },
+            active);
     }
 
-    [[nodiscard]] Executor& loaded_executor() const {
-        if (executor == nullptr) {
-            throw std::logic_error("concurrent Engine executor is unavailable");
-        }
-        return *executor;
+    [[nodiscard]] const targets::qwen3_6::Frontend& frontend() const {
+        return visit([](const auto& instance, auto&) -> const targets::qwen3_6::Frontend& {
+            return instance.loaded->frontend;
+        });
+    }
+
+    [[nodiscard]] std::uint32_t capacity() const {
+        return visit([](const auto& instance, auto&) { return instance.capacity; });
+    }
+
+    // Applies fn to the active runtime without std::visit's bad_variant_access path: the
+    // variant is never valueless, because start() constructs it once and nothing assigns it.
+    template <class Fn>
+    void for_each_runtime(Fn&& fn) noexcept {
+        if (auto* target = std::get_if<0>(&active)) { fn(*target); }
+        if (auto* target = std::get_if<1>(&active)) { fn(*target); }
+    }
+
+    [[nodiscard]] bool available() const {
+        return std::visit(
+            [](const auto& target) {
+                return target.executor != nullptr && target.executor->available();
+            },
+            active);
     }
 
     EngineOptions options;
     DeviceContext device;
-    targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
-    std::unique_ptr<Executor> executor;
+    ActiveRuntime active;
     mutable targets::qwen3_6::frontend_internal::EncodedHistoryCache host_encode_cache;
+
+private:
+    ActiveRuntime start(targets::ConstructedTarget constructed) {
+        load              = std::move(constructed.load);
+        sampling_defaults = constructed.sampling_defaults;
+        return std::visit(
+            [&](auto& instance) -> ActiveRuntime {
+                using Instance = typename std::decay_t<decltype(instance)>::element_type;
+                TargetRuntime<Instance> target{.instance = std::move(instance), .executor = {}};
+                target.executor = std::make_unique<runtime::ConcurrentExecutor<Instance>>(
+                    *target.instance, options);
+                return target;
+            },
+            constructed.active);
+    }
 };
+
+bool Engine::context_checkpoint_capture_available(bool allow_prefix_reuse) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (!context_checkpoint_mode_available(allow_prefix_reuse,
+                                           impl_->options.speculative.backend)) {
+        return false;
+    }
+    return impl_->visit([](const auto& instance, auto&) {
+        using Package = typename std::remove_cvref_t<decltype(instance)>::Package;
+        return Package::supports_context_checkpoints;
+    });
+}
 
 Engine::Engine(EngineOptions options) {
     validate_speculative_backend(options.speculative.backend);
@@ -200,14 +266,14 @@ PreparedPrompt Engine::prepare(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     const SamplingMode sampling_mode =
         input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    const auto& target = impl_->target();
-    auto prepared      = targets::qwen3_6::EncodedHistoryPrepare::prepare(
-        target.loaded->frontend, std::move(input), impl_->host_encode_cache,
+    auto prepared = targets::qwen3_6::EncodedHistoryPrepare::prepare(
+        impl_->frontend(), std::move(input), impl_->host_encode_cache,
         impl_->options.kv_ram_system_prompts != 0);
-    PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > target.capacity) {
+    PromptSummary info           = prepared.summary();
+    const std::uint32_t capacity = impl_->capacity();
+    if (info.prompt_tokens > capacity) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           context_capacity_error(info.prompt_tokens, target.capacity));
+                           context_capacity_error(info.prompt_tokens, capacity));
     }
     const double seconds = prepared.prepare_seconds();
     return PreparedPrompt(
@@ -217,13 +283,12 @@ PreparedPrompt Engine::prepare(PromptInput input) const {
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                       bool allow_prefix_identity) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const auto& target = impl_->target();
-    auto prepared =
-        target.loaded->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
-    PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > target.capacity) {
+    auto prepared = impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity);
+    PromptSummary info           = prepared.summary();
+    const std::uint32_t capacity = impl_->capacity();
+    if (info.prompt_tokens > capacity) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           context_capacity_error(info.prompt_tokens, target.capacity));
+                           context_capacity_error(info.prompt_tokens, capacity));
     }
     const double seconds = prepared.prepare_seconds();
     return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
@@ -232,21 +297,18 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
 
 std::uint32_t Engine::count_tokens(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const auto& target = impl_->target();
     return targets::qwen3_6::EncodedHistoryPrepare::count_tokens(
-        target.loaded->frontend, std::move(input), impl_->host_encode_cache);
+        impl_->frontend(), std::move(input), impl_->host_encode_cache);
 }
 
 PromptCapabilities Engine::prompt_capabilities() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const auto& target = impl_->target();
-    return target.loaded->frontend.prompt_capabilities();
+    return impl_->frontend().prompt_capabilities();
 }
 
 std::string Engine::token_bytes(TokenId token) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const auto& target = impl_->target();
-    return std::string(target.loaded->frontend.token_bytes(token));
+    return std::string(impl_->frontend().token_bytes(token));
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -291,10 +353,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                            "creates a retained context checkpoint.");
     }
     if (resolved_options.execution.capture_context_checkpoint &&
-        !context_checkpoint_capture_available(resolved_options.execution.allow_prefix_reuse,
-                                              impl_->options.speculative.backend)) {
+        !context_checkpoint_capture_available(resolved_options.execution.allow_prefix_reuse)) {
         throw std::invalid_argument(
-            "capture_context_checkpoint requires prefix reuse and a speculative backend");
+            "capture_context_checkpoint requires a supported target, prefix reuse and DFlash");
     }
     if (resolved_options.execution.requested_output_tokens == 0) {
         struct ImmediateSubmission {
@@ -316,12 +377,13 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             impl_, std::move(immediate), resolved_sampling));
     }
 
-    auto& executor  = impl_->loaded_executor();
-    auto submission = executor.submit(std::move(prompt.impl_->value), prompt_summary,
-                                      prepare_seconds, std::move(resolved_options), delivery,
-                                      pending_deadline, std::move(host_input));
-    return GenerationHandle(
-        std::make_unique<GenerationHandle::Impl>(impl_, std::move(submission), resolved_sampling));
+    return impl_->visit([&](const auto&, auto& executor) {
+        auto submission = executor.submit(std::move(prompt.impl_->value), prompt_summary,
+                                          prepare_seconds, std::move(resolved_options), delivery,
+                                          pending_deadline, std::move(host_input));
+        return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+            impl_, std::move(submission), resolved_sampling));
+    });
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
@@ -346,8 +408,9 @@ ScoreResult Engine::score(PreparedPrompt prompt, ScoreOptions options) {
     if (options.schedule == ScoreSchedule::Decode && prompt_summary.prompt_tokens < 3) {
         throw std::invalid_argument("decode score requires at least three prompt tokens");
     }
-    auto& executor = impl_->loaded_executor();
-    return executor.score(std::move(prompt.impl_->value), options);
+    return impl_->visit([&](const auto&, auto& executor) {
+        return executor.score(std::move(prompt.impl_->value), options);
+    });
 }
 
 const EngineOptions& Engine::options() const {
@@ -362,23 +425,21 @@ LoadSummary Engine::load_summary() const {
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    auto& executor = impl_->loaded_executor();
-    return executor.memory_summary();
+    return impl_->visit([](const auto&, auto& executor) { return executor.memory_summary(); });
 }
 
-bool Engine::available() const {
-    return impl_ != nullptr && impl_->executor != nullptr && impl_->executor->available();
-}
+bool Engine::available() const { return impl_ != nullptr && impl_->available(); }
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    auto& executor = impl_->loaded_executor();
-    return executor.runtime_stats();
+    return impl_->visit([](const auto&, auto& executor) { return executor.runtime_stats(); });
 }
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
-    if (impl_->executor != nullptr) { impl_->executor->reset_memory_peaks(); }
+    impl_->for_each_runtime([](auto& target) noexcept {
+        if (target.executor != nullptr) { target.executor->reset_memory_peaks(); }
+    });
 }
 
 } // namespace ninfer

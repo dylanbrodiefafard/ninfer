@@ -4,9 +4,10 @@
 
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
-#include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
+#include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh"
 
 #include <stdexcept>
@@ -50,7 +51,7 @@ void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace work
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
     auto* output      = static_cast<__nv_bfloat16*>(residual.data);
-    const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    const float alpha = nvfp4_w4a4_alpha(weight, "nvfp4 linear_add");
     const Nvfp4AddResidualEpilogue epilogue{output, Geometry::kOutputRows};
     const Nvfp4ContiguousOutput out{output, Geometry::kOutputRows};
     launch_nvfp4_w4a4_mma<Geometry, Schedule, Nvfp4AddResidualEpilogue, Nvfp4ContiguousOutput>(
@@ -106,7 +107,7 @@ void nvfp4_linear_add_w4a4_project(const Weight& weight, std::int32_t tokens,
     const Nvfp4Problem problem = resolve_nvfp4_problem(weight.n, weight.k);
     const Nvfp4W4a4Route route = nvfp4_w4a4_route(problem, tokens);
     if (route == Nvfp4W4a4Route::Tma) {
-        const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+        const float alpha = nvfp4_w4a4_alpha(weight, "nvfp4 linear_add");
         launch_nvfp4_w4a4_tma_linear_add(problem, activation.codes, activation.scales,
                                          static_cast<const std::uint8_t*>(weight.qdata),
                                          static_cast<const std::uint8_t*>(weight.scales),
@@ -132,6 +133,14 @@ void nvfp4_linear_add_w4a4_project(const Weight& weight, std::int32_t tokens,
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
     case Nvfp4Problem::MtpFc:
+    case Nvfp4Problem::FlashNextMixerOut:
+    case Nvfp4Problem::FlashNextDflashFeature:
+    case Nvfp4Problem::FlashNextDflashQkv:
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+    case Nvfp4Problem::FlashNextDflashGateUp:
+    case Nvfp4Problem::FlashNextDflashDown:
+    case Nvfp4Problem::FlashNextDflashConvProj:
+    case Nvfp4Problem::FlashNextDflashSelector:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

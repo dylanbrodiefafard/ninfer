@@ -135,6 +135,7 @@ std::string usage_text(const char* argv0) {
            "       [--reasoning-effort low|medium|xhigh]\n"
            "       [--vision] [--no-cuda-graph] [--capture-context-checkpoint]\n"
            "       [--context-checkpoints off|on|a,b,c]\n"
+           "       [--ngram-table PATH] [--qsa-select-budget 512|1024|2048]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -161,7 +162,15 @@ std::string usage_text(const char* argv0) {
            "(no-op on a fresh one-shot run).\n"
            "P-less sampling is enabled by default and uses temperature (default 1.5) and seed "
            "only; top-p, top-k, min-p, and penalties are ignored.\n"
-           "--no-p-less-sampling opts into the registered production sampler.\n";
+           "--no-p-less-sampling opts into the registered production sampler.\n"
+           "qwen3.8-flash-next requires --ngram-table (its 8-bit n-gram table file) and accepts\n"
+           "--qsa-select-budget (QSA blocks per query, default 512). A DFlash2 companion enables\n"
+           "adaptive K0-3 with the full shared head; --spec none disables it. RAM/disk KV tiers\n"
+           "are supported. It rejects --lm-head-draft, --dflash-verify-width, context "
+           "checkpoints,\n"
+           "--vision, --kv-dtype int8, --sage,\n"
+           "--keep-frac, --xattn-tau and --no-cuda-graph. --kv-capacity auto reserves\n"
+           "--max-context tokens of QSA state; the expert cache takes the remaining GPU memory.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -253,6 +262,13 @@ Options parse_options(int argc, char** argv) {
             options.capture_context_checkpoint = true;
         } else if (arg == "--context-checkpoints") {
             options.context_checkpoint_marks = parse_context_checkpoint_marks_flag(value(arg));
+        } else if (arg == "--ngram-table") {
+            options.ngram_table_path = value(arg);
+            if (options.ngram_table_path.empty()) {
+                throw std::invalid_argument("--ngram-table must not be empty");
+            }
+        } else if (arg == "--qsa-select-budget") {
+            options.qsa_select_budget = parse_qsa_select_budget_flag(value(arg));
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

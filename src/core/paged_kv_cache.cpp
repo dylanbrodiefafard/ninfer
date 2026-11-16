@@ -93,7 +93,8 @@ std::size_t PagedKVPoolLayout::metadata_bytes() const noexcept { return block_ta
 
 PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
     : spec_(layout.spec), block_tables_(layout.block_tables.bind(backing)),
-      row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false) {
+      row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false),
+      page_withheld_(layout.spec.page_group_count, false) {
     if (layout.planes.size() != spec_.planes.size() || layout.planes.empty()) {
         throw std::invalid_argument("Paged KV layout plane inventory is inconsistent");
     }
@@ -151,6 +152,60 @@ std::uint32_t PagedKVPool::mapped_pages() const noexcept { return mapped_pages_;
 
 std::uint32_t PagedKVPool::free_pages() const noexcept {
     return static_cast<std::uint32_t>(free_page_ids_.size());
+}
+
+std::uint32_t PagedKVPool::withheld_pages() const noexcept { return withheld_pages_; }
+
+bool PagedKVPool::pages_free(std::uint32_t first, std::uint32_t count) const noexcept {
+    if (count == 0 || first >= page_group_count() || count > page_group_count() - first) {
+        return false;
+    }
+    // The free set is sorted and duplicate-free, so the run is free exactly when its first page
+    // is present and the following count - 1 entries continue it.
+    const auto it        = std::lower_bound(free_page_ids_.begin(), free_page_ids_.end(),
+                                            static_cast<std::int32_t>(first));
+    const auto available = static_cast<std::size_t>(free_page_ids_.end() - it);
+    return available >= count && *it == static_cast<std::int32_t>(first) &&
+           *(it + static_cast<std::ptrdiff_t>(count - 1)) ==
+               static_cast<std::int32_t>(first + count - 1);
+}
+
+void PagedKVPool::withhold_pages(std::uint32_t first, std::uint32_t count) {
+    if (!pages_free(first, count)) {
+        throw std::invalid_argument("Paged KV withheld run must consist of free pages");
+    }
+    const auto begin = std::lower_bound(free_page_ids_.begin(), free_page_ids_.end(),
+                                        static_cast<std::int32_t>(first));
+    free_page_ids_.erase(begin, begin + static_cast<std::ptrdiff_t>(count));
+    for (std::uint32_t page = first; page < first + count; ++page) { page_withheld_[page] = true; }
+    withheld_pages_ += count;
+}
+
+void PagedKVPool::restore_pages(std::uint32_t first, std::uint32_t count) {
+    if (count == 0 || first >= page_group_count() || count > page_group_count() - first ||
+        !std::all_of(page_withheld_.begin() + static_cast<std::ptrdiff_t>(first),
+                     page_withheld_.begin() + static_cast<std::ptrdiff_t>(first) +
+                         static_cast<std::ptrdiff_t>(count),
+                     [](bool withheld) { return withheld; })) {
+        throw std::invalid_argument("Paged KV restored run must consist of withheld pages");
+    }
+    // A withheld run holds no free id, so it inserts as one block at its sorted position. The free
+    // set reserved every page at construction, so the insertion allocates nothing and cannot throw:
+    // a borrower may enqueue device work for the run before restoring it.
+    const auto position =
+        static_cast<std::size_t>(std::lower_bound(free_page_ids_.begin(), free_page_ids_.end(),
+                                                  static_cast<std::int32_t>(first)) -
+                                 free_page_ids_.begin());
+    const std::size_t old_size = free_page_ids_.size();
+    free_page_ids_.resize(old_size + count);
+    std::move_backward(free_page_ids_.begin() + static_cast<std::ptrdiff_t>(position),
+                       free_page_ids_.begin() + static_cast<std::ptrdiff_t>(old_size),
+                       free_page_ids_.end());
+    for (std::uint32_t offset = 0; offset < count; ++offset) {
+        free_page_ids_[position + offset] = static_cast<std::int32_t>(first + offset);
+    }
+    for (std::uint32_t page = first; page < first + count; ++page) { page_withheld_[page] = false; }
+    withheld_pages_ -= count;
 }
 
 bool PagedKVPool::can_reserve(std::uint32_t page_entitlement) const noexcept {

@@ -5,13 +5,15 @@
 #include "core/tensor.h"
 #include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
+#include "ninfer/ops/gated_rmsnorm.h"
 
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {
 
+// z is null for an ungated norm; gate selects the activation of a non-null z.
 void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
-                    const Tensor* z, Tensor& out, cudaStream_t stream);
+                    const Tensor* z, RmsNormGate gate, Tensor& out, cudaStream_t stream);
 
 // D=5120 unit-offset RMSNorm publishing the A8 activation of its BF16 output, and that BF16
 // output too when `out` is non-null. Inputs already validated by the wrapper.

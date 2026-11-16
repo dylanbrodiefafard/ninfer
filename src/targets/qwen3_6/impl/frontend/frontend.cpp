@@ -198,13 +198,15 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json does not use the official <|endoftext|> pad token");
     }
-    if (!tokenizer_config.contains("chat_template") ||
-        !tokenizer_config.at("chat_template").is_string()) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template must contain the loaded chat template");
+    // frontend/chat_template.jinja is the template authority. Checkpoints that also embed the
+    // template in tokenizer_config.json (Qwen3.8-27B) must embed the same source;
+    // Qwen3.8-Flash-Next omits the field.
+    const auto chat_template = tokenizer_config.find("chat_template");
+    if (chat_template == tokenizer_config.end()) { return; }
+    if (!chat_template->is_string()) {
+        throw std::invalid_argument("tokenizer_config.json.chat_template must be a string");
     }
-    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-        resources.chat_template_jinja) {
+    if (chat_template->get_ref<const std::string&>() != resources.chat_template_jinja) {
         throw std::invalid_argument(
             "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
     }

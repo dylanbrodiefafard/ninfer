@@ -28,6 +28,18 @@ RIDGE_FLOP_PER_BYTE = (DENSE_FP4_TFLOP_S * 1e12) / (SUSTAINED_READ_GB_S * 1e9)
 NVFP4_MMA = (16, 8, 64)  # m16n8k64, 16384 FLOP
 BF16_MMA = (16, 8, 16)  # m16n8k16, 4096 FLOP
 S8_MMA = (16, 8, 32)  # m16n8k32, 8192 FLOP
+# Candidate atoms for `profiled_new_family`, keyed like profiles/kdev/mma_issue.json.
+CANDIDATE_ATOMS = {
+    "nvfp4": NVFP4_MMA,
+    "bf16": BF16_MMA,
+    "s8": S8_MMA,
+    "fp8": (16, 8, 32),
+    "fp8_k16": (16, 8, 16),
+}
+# `profiled_new_family` admits a point only while every achieved-bandwidth
+# source (model bytes over the measured time, same-kernel DRAM) stays below
+# this fraction of the sustained read.
+NEW_FAMILY_MAX_READ_FRACTION = 0.6
 
 QTYPES = {
     "q4": {"group": 64, "bytes_per_group": 34, "pad_k": 128},
@@ -66,6 +78,7 @@ IDEAS = (
     "quality_tradeoff",
     "grid_underfill",
     "profiled_overhead",
+    "profiled_new_family",
     "tcgen05",
     "tmem",
     "sm100",
@@ -164,6 +177,12 @@ IDEA_CATALOG = {
         "tc": "measure",
         "note": "Requires a measured public-Op baseline, same-kernel profiler evidence, and a bounded hypothesis inside the current legal family. Preserve semantics and weight passes; instruction or stall shares are not latency savings.",
     },
+    "profiled_new_family": {
+        "lever": "replace a kernel well below the byte roof with a different legal SM120 family",
+        "dram": "measure",
+        "tc": "measure",
+        "note": "DRAM points only. Requires a measured public-Op baseline achieving <60% of sustained read (model bytes, and same-kernel DRAM if profiled) and a hypothesis whose max(t_mem, candidate t_issue) beats it. Oracle criteria unchanged.",
+    },
     "tcgen05": {
         "lever": "SM100 tcgen05 MMA",
         "dram": "refuse",
@@ -235,6 +254,20 @@ def add_problem_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--hypothesis", help="bounded change and predicted effect on the identified bottleneck"
     )
+    parser.add_argument(
+        "--candidate-atom",
+        choices=sorted(CANDIDATE_ATOMS),
+        help="profiled_new_family candidate MMA atom (calibrated by `kdev mma`)",
+    )
+    parser.add_argument(
+        "--operand-terms",
+        type=int,
+        default=1,
+        help="MMAs per candidate tile product (2 for a BF16 hi+lo operand split)",
+    )
+    parser.add_argument(
+        "--candidate-mma-per-s", type=float, help="override the candidate atom MMA/s"
+    )
     parser.add_argument("--mma-json", help="profiles/kdev/mma_issue.json from `kdev mma`")
     parser.add_argument(
         "--mma-per-s",
@@ -288,6 +321,13 @@ def analyze_from_args(args) -> dict:
         else "nvfp4"
     )
     mma_rate = args.mma_per_s if args.mma_per_s is not None else _load_mma_rate(args.mma_json, atom)
+    candidate_rate = None
+    if args.candidate_atom is not None:
+        candidate_rate = (
+            args.candidate_mma_per_s
+            if args.candidate_mma_per_s is not None
+            else _load_mma_rate(args.mma_json, args.candidate_atom)
+        )
     card = analyze(
         n,
         k,
@@ -308,6 +348,9 @@ def analyze_from_args(args) -> dict:
         bottleneck=args.bottleneck,
         profile_evidence=args.profile_evidence,
         hypothesis=args.hypothesis,
+        candidate_atom=args.candidate_atom,
+        operand_terms=args.operand_terms,
+        candidate_mma_per_s=candidate_rate,
     )
     if args.preset:
         card["preset"] = args.preset
@@ -402,6 +445,66 @@ def classify_sm120(
     return {"legal": not reasons, "reasons": reasons}
 
 
+def _positive_finite(value: float | None) -> bool:
+    return value is not None and 0 < value < float("inf")
+
+
+def _classify_profiled_new_family(
+    bound: str,
+    *,
+    measured_us: float | None,
+    measured_read_gbs: float | None,
+    profiled_dram_gbs: float | None,
+    hypothesis: str | None,
+    candidate_predicted_us: float | None,
+) -> dict:
+    """Admit a different legal family at a DRAM point on measured evidence.
+
+    The byte roof says the point is DRAM-bound, so a compute-side family is
+    only worth building while the current kernel stays well below that roof
+    (model bytes over the measured time and, when profiled, same-kernel DRAM
+    throughput) and the candidate's own floor beats the measured time.
+    """
+    if bound != "DRAM":
+        return {
+            "name": "profiled_new_family",
+            "verdict": "measure",
+            "reason": "Not a DRAM point; use new_family against the measured current-kernel gap.",
+        }
+    read_limit_gbs = NEW_FAMILY_MAX_READ_FRACTION * SUSTAINED_READ_GB_S
+    missing = []
+    if not _positive_finite(measured_us):
+        missing.append("positive finite --measured-us")
+    elif not measured_read_gbs < read_limit_gbs:
+        missing.append(
+            f"model-byte rate {measured_read_gbs:.0f} GB/s below {read_limit_gbs:.0f} GB/s"
+        )
+    if profiled_dram_gbs is not None and not (0 < profiled_dram_gbs < read_limit_gbs):
+        missing.append(f"--profiled-dram-gbs below {read_limit_gbs:.0f}")
+    if not (hypothesis and hypothesis.strip()):
+        missing.append("concrete --hypothesis")
+    if not _positive_finite(candidate_predicted_us):
+        missing.append("--candidate-atom with calibrated MMA/s")
+    elif _positive_finite(measured_us) and candidate_predicted_us >= measured_us:
+        missing.append(f"candidate floor {candidate_predicted_us:.2f}us below the measured time")
+    if missing:
+        return {
+            "name": "profiled_new_family",
+            "verdict": "measure",
+            "reason": "Do not write CUDA: require " + "; ".join(missing) + ".",
+        }
+    return {
+        "name": "profiled_new_family",
+        "verdict": "allow",
+        "reason": (
+            f"DRAM point at {measured_read_gbs:.0f} GB/s achieved; candidate floor "
+            f"{candidate_predicted_us:.2f}us < measured {measured_us:.2f}us. Build the stated "
+            "legal SM120 family only; meet the unchanged oracle criteria and keep the current "
+            "route wherever it measures faster."
+        ),
+    }
+
+
 def classify_idea(
     idea: str,
     bound: str,
@@ -414,8 +517,19 @@ def classify_idea(
     bottleneck: str | None = None,
     profile_evidence: str | None = None,
     hypothesis: str | None = None,
+    measured_read_gbs: float | None = None,
+    candidate_predicted_us: float | None = None,
 ) -> dict:
     idea = idea.strip()
+    if idea == "profiled_new_family":
+        return _classify_profiled_new_family(
+            bound,
+            measured_us=measured_us,
+            measured_read_gbs=measured_read_gbs,
+            profiled_dram_gbs=profiled_dram_gbs,
+            hypothesis=hypothesis,
+            candidate_predicted_us=candidate_predicted_us,
+        )
     if idea == "profiled_overhead":
         admitted = (
             measured_us is not None
@@ -570,6 +684,9 @@ def analyze(
     bottleneck: str | None = None,
     profile_evidence: str | None = None,
     hypothesis: str | None = None,
+    candidate_atom: str | None = None,
+    operand_terms: int = 1,
+    candidate_mma_per_s: float | None = None,
 ) -> dict:
     qtype = qtype.lower()
     if qtype not in QTYPES:
@@ -622,28 +739,44 @@ def analyze(
     compute_us = t_comp_us if t_issue_us is None else max(t_comp_us, t_issue_us)
     bound = "DRAM" if t_mem_us >= compute_us else "tensor-core"
     phase = phase or infer_phase(t)
+    candidate = None
+    if candidate_atom is not None:
+        if candidate_atom not in CANDIDATE_ATOMS:
+            raise ValueError(
+                f"unknown candidate atom '{candidate_atom}'; expected {', '.join(CANDIDATE_ATOMS)}"
+            )
+        if operand_terms < 1:
+            raise ValueError("operand_terms must be at least 1")
+        if not _positive_finite(candidate_mma_per_s):
+            raise ValueError("candidate atom requires matching kdev mma calibration")
+        # Output rows on MMA-M and tokens on MMA-N, padded to the atom extents.
+        candidate_count = mma_count(n, k, t, CANDIDATE_ATOMS[candidate_atom]) * operand_terms
+        candidate_issue_us = candidate_count / candidate_mma_per_s * 1e6
+        candidate = {
+            "atom": candidate_atom,
+            "operand_terms": operand_terms,
+            "mma_per_s": candidate_mma_per_s,
+            "mma_count": candidate_count,
+            "t_issue_us": candidate_issue_us,
+            "predicted_us": max(t_mem_us, candidate_issue_us),
+        }
+    evidence = dict(
+        profiled_ctas=profiled_ctas,
+        profiled_dram_gbs=profiled_dram_gbs,
+        measured_us=measured_us,
+        bottleneck=bottleneck,
+        profile_evidence=profile_evidence,
+        hypothesis=hypothesis,
+        measured_read_gbs=bytes_ / (measured_us * 1e3) if measured_us is not None else None,
+        candidate_predicted_us=candidate["predicted_us"] if candidate else None,
+    )
     sm120 = classify_sm120(
         needs_tmem=needs_tmem,
         needs_tcgen05=needs_tcgen05,
         cluster=cluster,
         smem_bytes=smem_bytes,
     )
-    idea_card = (
-        classify_idea(
-            idea,
-            bound,
-            t,
-            phase,
-            profiled_ctas=profiled_ctas,
-            profiled_dram_gbs=profiled_dram_gbs,
-            measured_us=measured_us,
-            bottleneck=bottleneck,
-            profile_evidence=profile_evidence,
-            hypothesis=hypothesis,
-        )
-        if idea
-        else None
-    )
+    idea_card = classify_idea(idea, bound, t, phase, **evidence) if idea else None
     if idea_card and not sm120["legal"]:
         idea_card = {
             "name": idea,
@@ -653,18 +786,7 @@ def analyze(
 
     allowed, refused, measured = [], [], []
     for name in IDEAS:
-        card = classify_idea(
-            name,
-            bound,
-            t,
-            phase,
-            profiled_ctas=profiled_ctas,
-            profiled_dram_gbs=profiled_dram_gbs,
-            measured_us=measured_us,
-            bottleneck=bottleneck,
-            profile_evidence=profile_evidence,
-            hypothesis=hypothesis,
-        )
+        card = classify_idea(name, bound, t, phase, **evidence)
         if card["verdict"] == "allow":
             allowed.append(name)
         elif card["verdict"] == "refuse":
@@ -683,9 +805,13 @@ def analyze(
         next_step = "Allowed. Implement only as a parameter inside the current family, then Layer 2 microbench."
         if idea_card["name"] == "quality_tradeoff":
             next_step = "Requested quality candidate admitted. Verify candidate ISA and oracle, then measure public-Op latency before paired model quality. Existing roof is baseline-only."
-        elif idea_card["name"] == "profiled_overhead":
+        elif idea_card["name"] in {"profiled_overhead", "profiled_new_family"}:
             next_step = idea_card["reason"]
-    elif idea_card and idea_card["name"] in {"grid_underfill", "profiled_overhead"}:
+    elif idea_card and idea_card["name"] in {
+        "grid_underfill",
+        "profiled_overhead",
+        "profiled_new_family",
+    }:
         next_step = idea_card["reason"]
 
     measured_pct = None
@@ -702,6 +828,7 @@ def analyze(
         "bottleneck": bottleneck,
         "profile_evidence": profile_evidence,
         "hypothesis": hypothesis,
+        "candidate": candidate,
         "label": label,
         "problem": {"n": n, "k": k, "t": t, "qtype": qtype, "policy": policy, "phase": phase},
         "weight_bytes": w_bytes,
@@ -734,6 +861,16 @@ def analyze(
     }
 
 
+# Card evidence fields shown by `render` and replayed by `recipe`.
+EVIDENCE_FIELDS = (
+    "profiled_ctas",
+    "profiled_dram_gbs",
+    "bottleneck",
+    "profile_evidence",
+    "hypothesis",
+)
+
+
 def render(card: dict) -> str:
     p = card["problem"]
     idea = card.get("idea")
@@ -764,9 +901,16 @@ def render(card: dict) -> str:
         lines.append("       sm120=ILLEGAL  " + "; ".join(card["sm120"]["reasons"]))
     if idea:
         lines.append(f"       idea={idea['name']}  verdict={verdict.upper()}  {idea['reason']}")
-    for field in ("bottleneck", "profile_evidence", "hypothesis"):
-        if card.get(field):
+    for field in EVIDENCE_FIELDS:
+        if card.get(field) is not None:
             lines.append(f"       {field}={card[field]}")
+    candidate = card.get("candidate")
+    if candidate:
+        lines.append(
+            f"       candidate={candidate['atom']} x{candidate['operand_terms']}  "
+            f"mma={candidate['mma_count']}  t_issue={candidate['t_issue_us']:.2f}us  "
+            f"predicted={candidate['predicted_us']:.2f}us"
+        )
     lines.append(f"       allow: {', '.join(card['allowed'])}")
     lines.append(f"       refuse: {', '.join(card['refused'])}")
     lines.append(f"       next: {card['next']}")
@@ -865,6 +1009,60 @@ def _self_test() -> int:
         14336, 5120, 8, "nvfp4", idea="profiled_overhead", needs_tcgen05=True, **evidence
     )
     check("profiled-overhead-illegal", illegal_profile["idea"]["verdict"] == "refuse")
+    # Hyper-connection down [324,10240] FP8 at T=8: SIMT kernel, BF16 hi+lo candidate.
+    family = dict(
+        measured_us=9.5,
+        hypothesis="m16n8k16 BF16 hi+lo, tokens padded to n8; replaces per-token FMA chains",
+    )
+    candidate = dict(candidate_atom="bf16", operand_terms=2, candidate_mma_per_s=61.95e9)
+
+    def gate_family(t=8, **overrides):
+        inputs = family | candidate | overrides
+        return analyze(
+            324, 10240, t, "fp8", mma_per_s=61.95e9, idea="profiled_new_family", **inputs
+        )
+
+    admitted = gate_family()
+    check("new-family-allow", admitted["idea"]["verdict"] == "allow", admitted["idea"])
+    check("new-family-count", admitted["candidate"]["mma_count"] == 21 * 640 * 2)
+    check(
+        "new-family-floor",
+        admitted["candidate"]["predicted_us"]
+        == max(admitted["t_mem_us"], admitted["candidate"]["t_issue_us"]),
+    )
+    check(
+        "new-family-profiled-allow",
+        gate_family(profiled_dram_gbs=350.0)["idea"]["verdict"] == "allow",
+    )
+    # Slightly faster than the 60% rate, so the achieved read sits just above the limit.
+    near_roof_us = 0.99 * admitted["model_bytes"] / (0.6 * SUSTAINED_READ_GB_S * 1e3)
+    for name, overrides in (
+        ("no-baseline", {"measured_us": None}),
+        ("no-hypothesis", {"hypothesis": None}),
+        ("blank-hypothesis", {"hypothesis": "  "}),
+        ("near-roof-measured", {"measured_us": near_roof_us}),
+        ("near-roof-profiled", {"profiled_dram_gbs": 0.6 * SUSTAINED_READ_GB_S}),
+        ("zero-profiled", {"profiled_dram_gbs": 0.0}),
+        ("slow-candidate", {"operand_terms": 200}),
+    ):
+        gate = gate_family(**overrides)
+        check(f"new-family-{name}", gate["idea"]["verdict"] == "measure", gate["idea"])
+    no_candidate = analyze(
+        324, 10240, 8, "fp8", mma_per_s=61.95e9, idea="profiled_new_family", **family
+    )
+    check("new-family-no-candidate", no_candidate["idea"]["verdict"] == "measure")
+    tc_point = gate_family(t=4096, measured_us=500.0)
+    check("new-family-tc-point", tc_point["idea"]["verdict"] == "measure", tc_point["bound"])
+    illegal_family = gate_family(needs_tcgen05=True)
+    check("new-family-illegal", illegal_family["idea"]["verdict"] == "refuse")
+    for name in ("new_family", "force_mma_small_t", "tile_shape", "occupancy"):
+        gate = analyze(324, 10240, 8, "fp8", mma_per_s=61.95e9, idea=name, **family, **candidate)
+        check(f"new-family-no-bypass-{name}", gate["idea"]["verdict"] == "refuse")
+    try:
+        analyze(324, 10240, 8, "fp8", mma_per_s=61.95e9, candidate_atom="bf16")
+        check("new-family-calibration-required", False)
+    except ValueError:
+        check("new-family-calibration-required", True)
     d1 = analyze(14336, 5120, 1, "nvfp4")
     check("t1-dram", d1["bound"] == "DRAM", d1["bound"])
     d1024 = analyze(14336, 5120, 1024, "nvfp4")

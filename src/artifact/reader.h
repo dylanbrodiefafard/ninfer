@@ -29,6 +29,8 @@ enum class NumericFormat {
     W8G32_F16S,
     NVFP4,
     FP8_E4M3FN_ROW_BF16S,
+    F3G32_E4M3FN,
+    E2M1G16_E4M3FN,
 };
 
 enum class StorageLayout {
@@ -36,6 +38,7 @@ enum class StorageLayout {
     RowSplitK128V1,
     BlockScaleK16M128x4V1,
     RowScaleV1,
+    MoeExpertTilesV1,
 };
 
 enum class ResourceEncoding {
@@ -93,6 +96,22 @@ struct RowScaleGeometry {
 };
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
+
+// moe-expert-tiles-v1 over [experts, hidden, intermediate]: per expert, gate|up chunks of 16 gate
+// and 16 up rows by 128 K, then down chunks of 32 rows by 128 K, padded to 256 bytes.
+struct ExpertTilesGeometry {
+    std::uint64_t experts        = 0;
+    std::uint64_t hidden         = 0;
+    std::uint64_t intermediate   = 0;
+    std::uint64_t chunk_bytes    = 0;
+    std::uint64_t gate_up_chunks = 0;
+    std::uint64_t down_chunks    = 0;
+    std::uint64_t record_bytes   = 0;
+    std::uint64_t encoded_bytes  = 0;
+};
+
+ExpertTilesGeometry expert_tiles_geometry(NumericFormat format,
+                                          std::span<const std::uint64_t> shape);
 
 struct TensorDescriptor {
     std::string name;

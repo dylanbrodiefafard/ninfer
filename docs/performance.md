@@ -5389,3 +5389,142 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.
+
+## Flash-Next native DFlash2, Gen5 (2026-11-15)
+
+Target `qwen3.8-flash-next/f3-fp8-nvfp4`, RTX 5090, PCIe Gen5 x16, 600 W power limit,
+CUDA 13.1, Release `sm_120a`, NVFP4 KV. The base artifact is
+`qwen3.8-flash-next-f3-fp8-nvfp4.ninfer`; native arms use its append-only
+`qwen3.8-flash-next-f3-fp8-nvfp4-dflash.ninfer` companion. The external table is
+`/ai/qwen3.8-flash-next-ngram/ngram_table.int8.bin`. No CUDA kernels were changed.
+These are single measured runs per configuration, not confidence intervals or a universal
+speculation-speed claim.
+
+### Public Engine lane workload
+
+The parity tool's `lanes-bench` uses only public Engine inference. Each startup concurrency C
+receives C distinct 4096-token prefixes from `out/flashnext/long_tokens.i32` and generates 512
+raw greedy tokens per request. KV capacity is automatic, with a 4610-token logical context per
+lane (4672 page-rounded tokens). The timed interval begins after all initial prefills and uses
+monotonic committed-decode counters through natural request drain. It measures 511×C tokens;
+it is not a fixed-width synthetic round loop. Startup/model load and initial prefill are excluded.
+
+| C | Base, no speculation | Native K0 | K1 | K2 | K3 | Adaptive K0..3 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 137.57 | 122.51 | 125.69 | 139.24 | 143.87 | 134.60 |
+| 2 | 154.44 | 143.16 | 191.22 | 210.57 | 214.74 | 210.96 |
+| 3 | 197.82 | 183.70 | 230.63 | 245.76 | 268.49 | 251.47 |
+| 4 | 225.03 | 207.11 | 249.02 | 295.58 | 315.76 | 280.54 |
+| 6 | 223.43 | 191.96 | 254.33 | 238.04 | 225.51 | 219.17 |
+| 8 | 238.39 | 210.00 | 267.34 | 219.10 | 233.74 | 222.90 |
+
+All rates are aggregate tokens/s. The adaptive policy compares separate time/token EWMAs
+(E[T]/E[Y], not EWMA(T/Y)), warms each arm with four interleaved observations, discards its
+first cold observation and periodically probes the least recently observed arm. A short changing
+trace need not equal the best fixed arm; its generated trajectory and cache history also differ.
+The table reports the ratio-based policy, not the superseded reciprocal-average experiment.
+
+Example, in the builder container under the GPU queue lock:
+
+```bash
+out/sol-lanes/src/targets/qwen3_8_flash_next/ninfer_qwen3_8_flash_next_parity \
+  --artifact models/qwen3.8-flash-next-f3-fp8-nvfp4-dflash.ninfer \
+  --ngram-table /ai/qwen3.8-flash-next-ngram/ngram_table.int8.bin \
+  --tokens out/flashnext/long_tokens.i32 --mode lanes-bench \
+  --prompt-lengths 4096 --decode 512 --chunk 4096 --super-chunk 16384 \
+  --lanes 1,2,3,4,6,8 --spec dflash --draft-tokens 3 --adaptive-draft \
+  --out out/sol/native-lanes-adaptive-ratio
+```
+
+Fixed arms omit `--adaptive-draft`; the no-speculation control uses the base artifact and
+`--spec none`. Reports are `lanes_bench.json`; token dumps are request-major I32. Private cache,
+window and profiler knobs are not accepted by this production benchmark.
+
+### HTTP workload and Strata reference
+
+The existing `/home/battlefront/ai/bench/serve_bench.py` harness drives one resident server with
+startup concurrency **8**, automatic 8×65,536-token KV capacity, and client concurrency
+C=1,2,3,4,6,8. It generates 1024 tokens per request using the harness's technical/story tasks,
+unique nonces, T=1, top-p .95 and top-k 20. NInfer retains its default **p-less** sampler, so the
+latter two controls do not affect its target distribution. Each mode has one untimed warmup.
+These aggregate rates include prefill, queueing and natural drain; no long-prefill sweep is
+included in this decode comparison.
+
+| Client C | Base, no speculation | Native K0 | K1 | K2 | K3 | Automatic adaptive | Strata IQ3S Gen5 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 134.16 | 112.18 | 135.66 | 157.12 | 160.21 | 147.02 | 211.83 |
+| 2 | 152.53 | 134.17 | 182.46 | 196.20 | 195.69 | 189.90 | 210.95 |
+| 3 | 171.26 | 158.81 | 193.58 | 185.34 | 178.96 | 187.49 | 182.76 |
+| 4 | 191.17 | 177.97 | 195.09 | 190.34 | 182.52 | 193.93 | 198.88 |
+| 6 | 199.39 | 182.50 | 184.71 | 184.00 | 181.30 | 194.17 | — |
+| 8 | 227.65 | 191.61 | 193.23 | 184.07 | 178.80 | 189.22 | — |
+
+Strata values come from `/home/battlefront/ai/bench/results/strata-iq3s-gen5.json`. That file has
+no C6/C8 results. This is a deployment-level reference, **not** numerical identity or a controlled
+same-sampler/quantization A/B: Strata uses its recorded ordinary sampler and IQ3S representation,
+and its resident-lane configuration is not specified by that JSON. Native model weights, KV and
+sampling profiles differ. On this measured HTTP workload, the fastest native arm improves over
+its base control by about 19% at C1 and 29% at C2; the base control wins at C6/C8. C3 is measured
+explicitly. Small differences between adjacent arms are not statistical claims.
+
+Native K0 is not the base control: it keeps companion weights, draft context/features and deferred
+width-one GDN snapshot/fold publication. Its overhead remains when no proposal is selected.
+`--spec none` disables that execution state, but a stored companion is still materialized;
+the base-artifact control also avoids those stored weights. The full shared head is used, not the
+27B optimized-head route. A true width-one GDN record Op could avoid the private snapshot copies;
+existing record Ops require at least two physical columns. That is separate Op work, not an
+unimplemented serving dependency or a measured speedup.
+
+The harness command uses `--prefill-tokens '' --decode-repeats 0 --decode-tokens 1024
+--concurrency 1,2,3,4,6,8`. Per-mode reports are `out/sol/native-serve-<mode>.json`; the automatic
+case omits `--spec`, exercising companion discovery. OpenAI/Responses reject unsupported context
+capture before streaming; an Anthropic streaming request completes through native DFlash2.
+
+### Expert cache over idle KV pages (2026-11-16)
+
+The shared QSA pool lends whole extents of unreserved pages to the F3 expert-cache pool and takes
+them back before a request maps them ([design](maintainer/qwen3.8-flash-next-plan.md#kv-pages-as-expert-cache-slots-2026-11-15)).
+Same HTTP harness and server flags as above, client C = 4, 5, 6, mean of two waves per C, before and
+after the change on the same tree. The 8 x 65,536-token automatic pool lends up to 5.15 GiB beside the
+17.50 GiB fixed cache:
+
+| Client C | K3 before | K3 after | Adaptive before | Adaptive after |
+|---:|---:|---:|---:|---:|
+| 4 | 189.0 | 290.3 | 206.1 | 309.0 |
+| 5 | 191.1 | 291.4 | 209.7 | 318.4 |
+| 6 | 181.3 | 271.4 | 207.5 | 298.6 |
+
+Expert-cache miss bytes per K3 round fall 28-33% at 500K-600K-token pools (C=5 at 524,288 tokens:
+3,664 to 2,635 MB). Two waves per C on a shared host, not confidence intervals; the plan records the per-row traces and the
+lanes-bench rows.
+
+### Sampled acceptance and complete-state tiers
+
+All 27 study HOLDOUT sequences at all 31 predeclared frontiers (64..1984), K3, T=1, top-k20,
+top-p .95, ordinary target sampling and verifier-selected anchors yield 837 native realized walks:
+conditional acceptance **70.49% / 68.31% / 70.22%**, mean L **2.52449**. Study case-c integrates
+over accept uniforms and reports **70.7% / 67.5% / 71.9%**, mean L **2.527**. These descriptive
+values use different arithmetic/KV profiles (native NVFP4 KV; study BF16), not identical draws.
+The [native numerical qualification](maintainer/qwen3.8-flash-next-plan.md#native-dflash2-qualification-status)
+separately checks same-column numerical floors and exact rejection/accepted-prefix contracts.
+
+Base continuations are 116,139,008 bytes; DFlash2 continuations are 158,184,704 bytes, including
+cyclic KV, pending features and explicit calibration. Both pass exact current/rewrite/rollback
+transport through RAM and reopened raw/Zstd SSD with independent QSA page mappings. Real native
+Engine RAM and SSD tests also pass exact-hit/suffix decode, rollback and source-preserving
+branches. Live RAM resumes preserve sampled IDs, counts, calibration and cumulative statistics
+through slot changes and parked-credit growth/relocation.
+
+The separate base-artifact conversation test uses six transcript identities, C4, 8192 MiB RAM,
+a 220,000-token NVFP4 pool, and includes queueing/restoration in mean TTFT:
+
+| Transcript length | Cold TTFT, s | Reuse TTFT, s | RAM hits |
+|---:|---:|---:|---:|
+| 8192 | 6.09943 | 5.83806 | 0/6 |
+| 16384 | 8.89488 | 5.96833 | 6/6 |
+| 32768 | 17.5465 | 9.06513 | 6/6 |
+| 50000 | 30.2631 | 12.8225 | 6/6 |
+
+The 50K requests restore 32,768 tokens, about 2.36× lower TTFT. This is **RAM**, not an SSD TTFT
+benchmark and not a DFlash2 TTFT claim. SSD evidence establishes exact transport and observable
+reuse behavior, not an SSD latency number.

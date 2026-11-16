@@ -312,7 +312,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         Tensor prepared_batch =
                             roots.prepared.view({Config::hidden, width, batch_size});
                         Tensor finish_dynamic = roots.finish_dynamic.view(
-                            {ops::kGroupedDynamicConvGroups, 2, width, batch_size});
+                            {ops::grouped_dynamic_conv_groups(Config::hidden), 2, width,
+                             batch_size});
                         ops::grouped_dynamic_conv_prepare(
                             hidden_batch, weight.attention_conv.base_kernel,
                             weight.attention_conv.kernel_projection, prepared_batch, finish_dynamic,
@@ -412,7 +413,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         Tensor prepared_batch =
                             roots.delta.view({Config::hidden, width, batch_size});
                         Tensor finish_dynamic = roots.finish_dynamic.view(
-                            {ops::kGroupedDynamicConvGroups, 2, width, batch_size});
+                            {ops::grouped_dynamic_conv_groups(Config::hidden), 2, width,
+                             batch_size});
                         ops::grouped_dynamic_conv_prepare(
                             hidden_batch, weight.mlp_conv.base_kernel,
                             weight.mlp_conv.kernel_projection, prepared_batch, finish_dynamic,

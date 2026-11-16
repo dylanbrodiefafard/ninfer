@@ -46,7 +46,7 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, Tensor& con
  * `conv_states` is contiguous BF16 [C,3,Slots], and `initial_state_slots` and
  * `snapshot_base_slots` are contiguous I32 [B]. `valid_columns` is either contiguous I32 [B],
  * with every value in [1,W], or an empty Tensor meaning every row has W valid columns. B=1
- * accepts every positive W; B=2..8 accepts W=1..16.
+ * accepts every positive W; B=2..12 accepts W=1..16.
  *
  * Row b starts from the window selected by initial_state_slots[b]. After valid column j, the new
  * window is written to snapshot_base_slots[b]+j. Invalid-tail output columns are exact BF16 zero

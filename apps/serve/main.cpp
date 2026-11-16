@@ -97,8 +97,12 @@ int main(int argc, char** argv) {
                  << " headroom=" << format_bytes(memory.kv_capacity_headroom_bytes)
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
                  << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
-                 << format_bytes(memory.cuda_graph_allowance_bytes)
-                 << " ckpt-pin=" << format_bytes(memory.checkpoint_image_host_bytes)
+                 << format_bytes(memory.cuda_graph_allowance_bytes);
+        if (memory.expert_cache_bytes != 0 || memory.expert_cache_flex_bytes != 0) {
+            capacity << " expert-cache=" << format_bytes(memory.expert_cache_bytes)
+                     << "+kv-lendable=" << format_bytes(memory.expert_cache_flex_bytes);
+        }
+        capacity << " ckpt-pin=" << format_bytes(memory.checkpoint_image_host_bytes)
                  << " ckpt-heads=" << memory.checkpoint_image_pool_heads
                  << " kv-ram=" << ninfer::serve::format_kv_ram_occupancy(memory)
                  << " kv-disk=" << ninfer::serve::format_kv_disk_occupancy(memory);

@@ -18,14 +18,17 @@ inline constexpr std::int32_t kEmbedGatherW8TextD     = 5120;
 inline constexpr std::int32_t kEmbedGatherW8RowVector = 16;
 inline constexpr std::int32_t kEmbedGatherW8TextThreads =
     kEmbedGatherW8TextD / kEmbedGatherW8RowVector;
-inline constexpr std::int32_t kEmbedGatherFp8D = 5120;
 
-template <int BlocksPerToken, int Threads>
+// FP8 row-scaled gather of D-wide rows: grid T * BlocksPerToken, block Threads. Block b serves
+// token b / BlocksPerToken and decodes one contiguous D / BlocksPerToken slice of its row, four
+// codes per 32-bit load; thread 0 publishes the row id and BF16 scale through shared memory.
+// Requires 4-byte-aligned code rows and output columns (D % 4 == 0 and aligned bases).
+template <int D, int BlocksPerToken, int Threads>
 __launch_bounds__(Threads) __global__
     void embed_gather_fp8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                  const __nv_bfloat16* scales, __nv_bfloat16* out) {
-    static_assert(kEmbedGatherFp8D % BlocksPerToken == 0);
-    constexpr int kValuesPerBlock = kEmbedGatherFp8D / BlocksPerToken;
+    static_assert(D % BlocksPerToken == 0);
+    constexpr int kValuesPerBlock = D / BlocksPerToken;
     static_assert(kValuesPerBlock % 4 == 0);
     constexpr int kWordsPerBlock = kValuesPerBlock / 4;
 
@@ -40,8 +43,8 @@ __launch_bounds__(Threads) __global__
     __syncthreads();
 
     const int split_offset = split * kValuesPerBlock;
-    const auto* code_row   = codes + static_cast<std::int64_t>(row) * kEmbedGatherFp8D;
-    auto* output_column    = out + static_cast<std::int64_t>(token) * kEmbedGatherFp8D;
+    const auto* code_row   = codes + static_cast<std::int64_t>(row) * D;
+    auto* output_column    = out + static_cast<std::int64_t>(token) * D;
     for (int word_index = static_cast<int>(threadIdx.x); word_index < kWordsPerBlock;
          word_index += Threads) {
         const int offset    = split_offset + word_index * 4;

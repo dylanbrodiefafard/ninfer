@@ -58,20 +58,20 @@ int verify_output_range_sampled(std::string_view label, const GuardedBf16Tensor&
 }
 
 int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy) {
-    constexpr std::int32_t kHidden      = 5120;
+    const std::int32_t hidden           = parent.host.weight.k;
     constexpr std::int32_t kQkvRows     = 10240;
     constexpr std::int32_t kZRows       = 6144;
     constexpr std::int32_t kRows        = kQkvRows + kZRows;
-    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 601U + tokens);
+    const std::vector<float> activation = make_bf16_activation(hidden, tokens, 601U + tokens);
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
     GuardedBf16Tensor qkv(kQkvRows, tokens);
     GuardedBf16Tensor z(kZRows, tokens);
-    Tensor x                   = Tensor(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor x                   = Tensor(device_activation.p, DType::BF16, {hidden, tokens});
     Tensor qkv_output          = qkv.tensor();
     Tensor z_output            = z.tensor();
     const std::size_t capacity = ops::gdn_input_proj_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, policy, tokens, tokens);
+        QType::NVFP4, kRows, hidden, policy, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
     ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, policy, workspace, nullptr);
     cuda_synchronize();
@@ -79,24 +79,24 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     const bool a4                       = policy == ops::LinearPolicy::AllowA4 && tokens >= 3;
     const ReductionCriterion& criterion = a4 ? kGdnInputProjA4Tolerance : kGdnInputProjA16Tolerance;
     const std::int32_t sample_count     = a4 ? kGdnInputProjA4SampleRows : 7;
-    const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
-    int failures = qkv.verify_guards("gdn qkv" + suffix);
+    const std::string suffix            = std::string(" NVFP4 K=") + std::to_string(hidden) +
+                                          (a4 ? " A4" : " A16") + " T=" + std::to_string(tokens);
+    int failures                        = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
     failures += z.verify_fully_written("gdn z" + suffix);
     failures +=
         verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, 2048, parent.host, 0,
-                                    activation, kHidden, tokens, criterion, sample_count);
+                                    activation, hidden, tokens, criterion, sample_count);
     failures +=
         verify_output_range_sampled("gdn key" + suffix, qkv, kQkvRows, 2048, 2048, parent.host,
-                                    2048, activation, kHidden, tokens, criterion, sample_count);
+                                    2048, activation, hidden, tokens, criterion, sample_count);
     failures +=
         verify_output_range_sampled("gdn value" + suffix, qkv, kQkvRows, 4096, 6144, parent.host,
-                                    4096, activation, kHidden, tokens, criterion, sample_count);
+                                    4096, activation, hidden, tokens, criterion, sample_count);
     failures +=
         verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host, kQkvRows,
-                                    activation, kHidden, tokens, criterion, sample_count);
+                                    activation, hidden, tokens, criterion, sample_count);
     if (workspace.peak_used() != capacity) {
         std::cerr << "gdn workspace" << suffix << ": query/execution high-water mismatch\n";
         ++failures;
@@ -165,27 +165,56 @@ int run_nvfp4() {
     return failures;
 }
 
+// The [16384,2560] parent admits only A16Only: the T=1 GEMV and the BF16-activation MMA at every
+// T>=2, whose wide tiles change at each eight-token panel count 1..8 (T=64) and repeat beyond.
+// Distinct parent rows make a misrouted q/k/v/z range visible to the oracle.
+int run_nvfp4_2560() {
+    constexpr std::int32_t kHidden = 2560;
+    constexpr std::int32_t kRows   = 16384;
+    DevicePackedWeight parent(
+        with_distinct_nvfp4_rows(make_nvfp4_a16_weight(kRows, kHidden, 609U)));
+    int failures = 0;
+    for (const std::int32_t tokens :
+         {1, 2, 3, 8, 9, 16, 17, 24, 25, 32, 33, 40, 41, 48, 49, 56, 57, 64, 65, 300, 1000}) {
+        failures += run_nvfp4_case(parent, tokens, ops::LinearPolicy::A16Only);
+    }
+    if (ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, kRows, kHidden,
+                                                     ops::LinearPolicy::A16Only, 1, 4096) != 0) {
+        std::cerr << "NVFP4 K=2560 gdn input A16 workspace interval is not zero-capacity\n";
+        ++failures;
+    }
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, kRows, kHidden,
+                                                                ops::LinearPolicy::AllowA4, 1, 1);
+        },
+        "NVFP4 K=2560 gdn input accepted AllowA4");
+    return failures;
+}
+
 constexpr ReductionCriterion kFp8GdnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 constexpr int kA8SampleRows = 31;
 
+// a16_sample_count bounds the rows an A16 case compares per q/k/v/z range; a count of at least
+// 6144, the widest range, compares every row.
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
-                 bool convenience = false) {
-    constexpr std::int32_t kHidden  = 5120;
+                 bool convenience = false, std::int32_t a16_sample_count = 7) {
+    const std::int32_t hidden       = parent.host.weight.k;
     constexpr std::int32_t kQkvRows = 10240;
     constexpr std::int32_t kZRows   = 6144;
     constexpr std::int32_t kRows    = kQkvRows + kZRows;
     const std::vector<float> activation =
-        make_bf16_activation(kHidden, tokens, 617U + static_cast<std::uint32_t>(tokens));
+        make_bf16_activation(hidden, tokens, 617U + static_cast<std::uint32_t>(tokens));
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
     GuardedBf16Tensor qkv(kQkvRows, tokens);
     GuardedBf16Tensor z(kZRows, tokens);
-    Tensor x                   = Tensor(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor x                   = Tensor(device_activation.p, DType::BF16, {hidden, tokens});
     Tensor qkv_output          = qkv.tensor();
     Tensor z_output            = z.tensor();
     const std::size_t capacity = ops::gdn_input_proj_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, tokens, tokens);
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, hidden, policy, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
     if (convenience) {
         ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, nullptr);
@@ -197,25 +226,25 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     const bool a8 = policy == ops::LinearPolicy::AllowA8 && tokens >= 8;
     const ReductionCriterion& criterion =
         a8 ? kFp8GdnInputProjA8Tolerance : kFp8GdnInputProjA16Tolerance;
-    const std::int32_t sample_count = a8 ? kA8SampleRows : 7;
-    const std::string suffix =
-        std::string(" FP8 ") + (a8 ? "A8" : "A16") + " T=" + std::to_string(tokens);
-    int failures = qkv.verify_guards("gdn qkv" + suffix);
+    const std::int32_t sample_count = a8 ? kA8SampleRows : a16_sample_count;
+    const std::string suffix        = std::string(" FP8 K=") + std::to_string(hidden) +
+                                      (a8 ? " A8" : " A16") + " T=" + std::to_string(tokens);
+    int failures                    = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
     failures += z.verify_fully_written("gdn z" + suffix);
     failures +=
         verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, 2048, parent.host, 0,
-                                    activation, kHidden, tokens, criterion, sample_count);
+                                    activation, hidden, tokens, criterion, sample_count);
     failures +=
         verify_output_range_sampled("gdn key" + suffix, qkv, kQkvRows, 2048, 2048, parent.host,
-                                    2048, activation, kHidden, tokens, criterion, sample_count);
+                                    2048, activation, hidden, tokens, criterion, sample_count);
     failures +=
         verify_output_range_sampled("gdn value" + suffix, qkv, kQkvRows, 4096, 6144, parent.host,
-                                    4096, activation, kHidden, tokens, criterion, sample_count);
+                                    4096, activation, hidden, tokens, criterion, sample_count);
     failures +=
         verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host, kQkvRows,
-                                    activation, kHidden, tokens, criterion, sample_count);
+                                    activation, hidden, tokens, criterion, sample_count);
     if (workspace.peak_used() != capacity) {
         std::cerr << "gdn workspace" << suffix << ": query/execution high-water mismatch\n";
         ++failures;
@@ -263,6 +292,57 @@ int run_fp8() {
     return failures;
 }
 
+// The [16384,2560] parent admits only A16Only: the T=1 GEMV, every SIMT width T=2..8, the 16-,
+// 24-, and 32-column small-T MMA tiles, and the 64- and 128-column GEMM tiers, each on both sides
+// of its boundary. Every parent row is compared, and distinct parent rows make any misrouted row
+// range visible to the oracle.
+int run_fp8_2560() {
+    constexpr std::int32_t kHidden   = 2560;
+    constexpr std::int32_t kRows     = 16384;
+    constexpr std::int32_t kEveryRow = 6144;
+    DevicePackedWeight parent(with_distinct_fp8_rows(quantized_weight::make_patterned_weight(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 619U)));
+    int failures = 0;
+    for (const std::int32_t tokens :
+         {1, 2, 3, 5, 6, 7, 8, 9, 16, 17, 24, 25, 32, 33, 64, 65, 127, 128, 129, 300, 1000}) {
+        failures += run_fp8_case(parent, tokens, ops::LinearPolicy::A16Only, false, kEveryRow);
+    }
+    failures += run_fp8_case(parent, 4, ops::LinearPolicy::A16Only, true, kEveryRow);
+    if (ops::gdn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden,
+                                                     ops::LinearPolicy::A16Only, 1, 4096) != 0) {
+        std::cerr << "FP8 K=2560 gdn input A16 workspace interval is not zero-capacity\n";
+        ++failures;
+    }
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::gdn_input_proj_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1, 1);
+        },
+        "FP8 K=2560 gdn input workspace accepted AllowA8");
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::gdn_input_proj_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA4, 1, 1);
+        },
+        "FP8 K=2560 gdn input workspace accepted AllowA4");
+    failures += expect_invalid_argument(
+        [&] {
+            const std::vector<std::uint16_t> zeros(static_cast<std::size_t>(kHidden), 0);
+            DeviceBuffer device_x = to_device(zeros);
+            GuardedBf16Tensor qkv(10240, 1);
+            GuardedBf16Tensor z(6144, 1);
+            Tensor x(device_x.p, DType::BF16, {kHidden, 1});
+            Tensor qkv_output = qkv.tensor();
+            Tensor z_output   = z.tensor();
+            WorkspaceArena workspace(256);
+            ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, ops::LinearPolicy::AllowA8,
+                                workspace, nullptr);
+            return 0;
+        },
+        "FP8 K=2560 gdn input accepted AllowA8");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -273,7 +353,9 @@ int main() {
 
     int failures = 0;
     failures += run_fp8();
+    failures += run_fp8_2560();
     failures += run_nvfp4();
+    failures += run_nvfp4_2560();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

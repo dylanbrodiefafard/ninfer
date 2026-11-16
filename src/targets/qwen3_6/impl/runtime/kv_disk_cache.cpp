@@ -463,7 +463,7 @@ encode_pack_map_frame(const PackedMapEntry& entry,
 
 [[nodiscard]] bool valid_state_kind(std::uint8_t kind) {
     return kind >= static_cast<std::uint8_t>(DiskStateKind::CurrentGdn) &&
-           kind <= static_cast<std::uint8_t>(DiskStateKind::DflashLadder);
+           kind <= static_cast<std::uint8_t>(DiskStateKind::FlashNextLadder);
 }
 
 [[nodiscard]] bool payload_fits(std::uint64_t file_bytes, std::uint64_t header,
@@ -586,6 +586,9 @@ void encode_plane_schema(OutBuf& w, const DiskPlaneSchema& plane) {
     w.i32(fp.cyclic_kv_heads);
     w.i32(fp.cyclic_head_dim);
     w.u32(fp.snapshot_version);
+    w.u64(fp.flash_next_state_bytes);
+    w.str(fp.flash_next_ngram_identity);
+    w.u32(fp.flash_next_select_budget);
     for (const DiskPlaneSchema& plane : fp.text_planes) { encode_plane_schema(w, plane); }
     for (const DiskPlaneSchema& plane : fp.backend_planes) { encode_plane_schema(w, plane); }
     return std::move(w.bytes);
@@ -621,6 +624,9 @@ void encode_plane_schema(OutBuf& w, const DiskPlaneSchema& plane) {
     fp.cyclic_kv_heads                      = r.i32();
     fp.cyclic_head_dim                      = r.i32();
     fp.snapshot_version                     = r.u32();
+    fp.flash_next_state_bytes               = r.u64();
+    fp.flash_next_ngram_identity            = r.str();
+    fp.flash_next_select_budget             = r.u32();
     const std::uint64_t plane_count =
         static_cast<std::uint64_t>(text_plane_count) + backend_plane_count;
     if (plane_count > (1U << 20) || plane_count > r.remain() / kDiskFingerprintPlaneBytes) {
@@ -646,17 +652,19 @@ void encode_slot(OutBuf& w, const DiskCheckpointSlot& slot) {
     w.u64(slot.gdn_id);
     w.u64(slot.hidden_id);
     w.u64(slot.dflash_id);
+    w.u64(slot.flash_next_id);
 }
 
 DiskCheckpointSlot decode_slot(InBuf& r) {
     DiskCheckpointSlot slot;
-    slot.frontier  = r.u32();
-    slot.kind      = static_cast<ContextCheckpointKind>(r.u32());
-    slot.hash.lo   = r.u64();
-    slot.hash.hi   = r.u64();
-    slot.gdn_id    = r.u64();
-    slot.hidden_id = r.u64();
-    slot.dflash_id = r.u64();
+    slot.frontier      = r.u32();
+    slot.kind          = static_cast<ContextCheckpointKind>(r.u32());
+    slot.hash.lo       = r.u64();
+    slot.hash.hi       = r.u64();
+    slot.gdn_id        = r.u64();
+    slot.hidden_id     = r.u64();
+    slot.dflash_id     = r.u64();
+    slot.flash_next_id = r.u64();
     return slot;
 }
 
@@ -688,6 +696,8 @@ DiskCheckpointSlot decode_slot(InBuf& r) {
     w.u64(meta.rewrite_gdn_id);
     w.u64(meta.rewrite_hidden_id);
     w.u64(meta.rewrite_cyclic_id);
+    w.u64(meta.current_flash_next_id);
+    w.u64(meta.rewrite_flash_next_id);
     encode_slot(w, meta.rollback);
     encode_slot(w, meta.ladders[0]);
     encode_slot(w, meta.ladders[1]);
@@ -730,6 +740,8 @@ DiskCheckpointSlot decode_slot(InBuf& r) {
         meta.rewrite_gdn_id          = r.u64();
         meta.rewrite_hidden_id       = r.u64();
         meta.rewrite_cyclic_id       = r.u64();
+        meta.current_flash_next_id   = r.u64();
+        meta.rewrite_flash_next_id   = r.u64();
         meta.rollback                = decode_slot(r);
         meta.ladders[0]              = decode_slot(r);
         meta.ladders[1]              = decode_slot(r);
@@ -892,6 +904,12 @@ void check_fingerprint(const DiskFingerprint& have, const DiskFingerprint& want)
     compare_fingerprint_field(have.cyclic_kv_heads == want.cyclic_kv_heads, "cyclic_kv_heads");
     compare_fingerprint_field(have.cyclic_head_dim == want.cyclic_head_dim, "cyclic_head_dim");
     compare_fingerprint_field(have.snapshot_version == want.snapshot_version, "snapshot_version");
+    compare_fingerprint_field(have.flash_next_state_bytes == want.flash_next_state_bytes,
+                              "flash_next_state_bytes");
+    compare_fingerprint_field(have.flash_next_ngram_identity == want.flash_next_ngram_identity,
+                              "flash_next_ngram_identity");
+    compare_fingerprint_field(have.flash_next_select_budget == want.flash_next_select_budget,
+                              "flash_next_select_budget");
     compare_fingerprint_field(have.text_planes == want.text_planes, "text_plane_schema");
     compare_fingerprint_field(have.backend_planes == want.backend_planes, "backend_plane_schema");
 }
@@ -920,6 +938,11 @@ void check_fingerprint(const DiskFingerprint& have, const DiskFingerprint& want)
     case DiskStateKind::DflashRollback:
     case DiskStateKind::DflashLadder:
         return fp.cyclic_lane_bytes;
+    case DiskStateKind::FlashNextCurrent:
+    case DiskStateKind::FlashNextRewrite:
+    case DiskStateKind::FlashNextRollback:
+    case DiskStateKind::FlashNextLadder:
+        return fp.flash_next_state_bytes;
     case DiskStateKind::TailHidden:
     case DiskStateKind::RewriteHidden:
     case DiskStateKind::RollbackHidden:
@@ -987,13 +1010,17 @@ void for_each_meta_object(const DiskMeta& meta, Visit&& visit) {
     add(DiskObjectKind::State, meta.rewrite_gdn_id);
     add(DiskObjectKind::State, meta.rewrite_hidden_id);
     add(DiskObjectKind::State, meta.rewrite_cyclic_id);
+    add(DiskObjectKind::State, meta.current_flash_next_id);
+    add(DiskObjectKind::State, meta.rewrite_flash_next_id);
     add(DiskObjectKind::State, meta.rollback.gdn_id);
     add(DiskObjectKind::State, meta.rollback.hidden_id);
     add(DiskObjectKind::State, meta.rollback.dflash_id);
+    add(DiskObjectKind::State, meta.rollback.flash_next_id);
     for (const auto& slot : meta.ladders) {
         add(DiskObjectKind::State, slot.gdn_id);
         add(DiskObjectKind::State, slot.hidden_id);
         add(DiskObjectKind::State, slot.dflash_id);
+        add(DiskObjectKind::State, slot.flash_next_id);
     }
     for (std::uint64_t id : meta.main_page_ids) { add(DiskObjectKind::Main, id); }
     for (std::uint64_t id : meta.backend_page_ids) { add(DiskObjectKind::Backend, id); }
@@ -2459,9 +2486,15 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
             if (slot.frontier == 0) { return false; }
             if (need_gdn && slot.gdn_id == 0) { return true; }
             if (need_cyclic && slot.dflash_id == 0) { return true; }
+            if (config_.fingerprint.flash_next_state_bytes != 0 && slot.flash_next_id == 0) {
+                return true;
+            }
             return false;
         };
-        if ((need_gdn && meta.current_gdn_id == 0) ||
+        if ((config_.fingerprint.flash_next_state_bytes != 0 &&
+             (meta.current_flash_next_id == 0 ||
+              (meta.rewrite_valid && meta.rewrite_flash_next_id == 0))) ||
+            (need_gdn && meta.current_gdn_id == 0) ||
             (need_cyclic && meta.current_cyclic_id == 0) ||
             (need_gdn && meta.rewrite_valid && meta.rewrite_gdn_id == 0) ||
             (need_cyclic && meta.rewrite_valid && meta.rewrite_cyclic_id == 0) ||
@@ -2499,7 +2532,13 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
                           header_ok(DiskObjectKind::State, meta.rollback.hidden_id, false,
                                     DiskStateKind::RollbackHidden) &&
                           header_ok(DiskObjectKind::State, meta.rollback.dflash_id, false,
-                                    DiskStateKind::DflashRollback);
+                                    DiskStateKind::DflashRollback) &&
+                          header_ok(DiskObjectKind::State, meta.current_flash_next_id, false,
+                                    DiskStateKind::FlashNextCurrent) &&
+                          header_ok(DiskObjectKind::State, meta.rewrite_flash_next_id, false,
+                                    DiskStateKind::FlashNextRewrite) &&
+                          header_ok(DiskObjectKind::State, meta.rollback.flash_next_id, false,
+                                    DiskStateKind::FlashNextRollback);
         for (const auto& slot : meta.ladders) {
             objects_ok =
                 objects_ok &&
@@ -2507,7 +2546,9 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
                 header_ok(DiskObjectKind::State, slot.hidden_id, false,
                           DiskStateKind::LadderHidden) &&
                 header_ok(DiskObjectKind::State, slot.dflash_id, false,
-                          DiskStateKind::DflashLadder);
+                          DiskStateKind::DflashLadder) &&
+                header_ok(DiskObjectKind::State, slot.flash_next_id, false,
+                          DiskStateKind::FlashNextLadder);
         }
         auto pages_ok = [&](DiskObjectKind kind, const std::vector<std::uint64_t>& ids) {
             if (ids.empty()) { return true; }
@@ -4593,6 +4634,16 @@ bool KVDiskCache::collect_checkpoint_decode_jobs(const DiskMeta& meta,
                 return false;
             }
         }
+        if (!image.flash_next_state.empty()) {
+            if (image.flash_next_state.size() != config_.fingerprint.flash_next_state_bytes ||
+                slot->flash_next_id == 0 ||
+                !enqueue_unique_decode(
+                    plan, slot->flash_next_id,
+                    rollback ? DiskStateKind::FlashNextRollback : DiskStateKind::FlashNextLadder,
+                    image.flash_next_state.data(), image.flash_next_state.size())) {
+                return false;
+            }
+        }
         if (image.writable != nullptr) { plan.writable.push_back(image.writable); }
     }
     return true;
@@ -5618,9 +5669,13 @@ void KVDiskCache::persist_checkpoints(SpillSession& session, std::unique_lock<st
         pack_buf(session.image.tail_hidden, session.image.hidden_bytes, DiskStateKind::TailHidden);
     session.draft.current_cyclic_id = pack_buf(
         session.image.dflash_local, session.image.cyclic_bytes, DiskStateKind::DflashLocal);
-    session.draft.rewrite_gdn_id    = 0;
-    session.draft.rewrite_hidden_id = 0;
-    session.draft.rewrite_cyclic_id = 0;
+    session.draft.current_flash_next_id =
+        pack_buf(reinterpret_cast<const std::uint8_t*>(session.image.flash_next_state.data()),
+                 session.image.flash_next_state.size(), DiskStateKind::FlashNextCurrent);
+    session.draft.rewrite_flash_next_id = 0;
+    session.draft.rewrite_gdn_id        = 0;
+    session.draft.rewrite_hidden_id     = 0;
+    session.draft.rewrite_cyclic_id     = 0;
     if (session.host.rewrite_valid) {
         session.draft.rewrite_gdn_id =
             pack_gdn(session.image.gdn_conv_checkpoint, session.image.gdn_recurrent_checkpoint,
@@ -5630,6 +5685,9 @@ void KVDiskCache::persist_checkpoints(SpillSession& session, std::unique_lock<st
                      DiskStateKind::RewriteHidden);
         session.draft.rewrite_cyclic_id = pack_buf(
             session.image.dflash_rewrite, session.image.cyclic_bytes, DiskStateKind::DflashRewrite);
+        session.draft.rewrite_flash_next_id =
+            pack_buf(reinterpret_cast<const std::uint8_t*>(session.image.flash_next_rewrite.data()),
+                     session.image.flash_next_rewrite.size(), DiskStateKind::FlashNextRewrite);
     }
     std::vector<RamLadderImage> ladders;
     std::vector<RamLadderImage> rollbacks;
@@ -5649,15 +5707,20 @@ void KVDiskCache::persist_checkpoints(SpillSession& session, std::unique_lock<st
     auto store_slot = [&](const RamLadderImage& image, DiskStateKind gdn_kind,
                           DiskStateKind hidden_kind, DiskStateKind cyclic_kind) {
         DiskCheckpointSlot slot;
-        slot.frontier  = image.frontier;
-        slot.hash      = image.hash;
-        slot.kind      = image.kind;
-        slot.gdn_id    = pack_gdn(static_cast<const std::uint8_t*>(image.conv),
-                                  static_cast<const std::uint8_t*>(image.recurrent), gdn_kind);
-        slot.hidden_id = pack_buf(static_cast<const std::uint8_t*>(image.hidden),
-                                  image.hidden_bytes, hidden_kind);
-        slot.dflash_id = pack_buf(static_cast<const std::uint8_t*>(image.dflash),
-                                  image.dflash_bytes, cyclic_kind);
+        slot.frontier      = image.frontier;
+        slot.hash          = image.hash;
+        slot.kind          = image.kind;
+        slot.gdn_id        = pack_gdn(static_cast<const std::uint8_t*>(image.conv),
+                                      static_cast<const std::uint8_t*>(image.recurrent), gdn_kind);
+        slot.hidden_id     = pack_buf(static_cast<const std::uint8_t*>(image.hidden),
+                                      image.hidden_bytes, hidden_kind);
+        slot.dflash_id     = pack_buf(static_cast<const std::uint8_t*>(image.dflash),
+                                      image.dflash_bytes, cyclic_kind);
+        slot.flash_next_id = pack_buf(
+            reinterpret_cast<const std::uint8_t*>(image.flash_next_state.data()),
+            image.flash_next_state.size(),
+            image.kind == ContextCheckpointKind::TurnRollback ? DiskStateKind::FlashNextRollback
+                                                              : DiskStateKind::FlashNextLadder);
         return slot;
     };
     session.draft.rollback = {};
@@ -5902,6 +5965,11 @@ bool KVDiskCache::draft_ready(const SpillSession& session) const {
     const bool need_cyclic = config_.fingerprint.cyclic_lane_bytes != 0;
     if (need_gdn && session.draft.current_gdn_id == 0) { return false; }
     if (need_cyclic && session.draft.current_cyclic_id == 0) { return false; }
+    if (config_.fingerprint.flash_next_state_bytes != 0 &&
+        (session.draft.current_flash_next_id == 0 ||
+         (session.host.rewrite_valid && session.draft.rewrite_flash_next_id == 0))) {
+        return false;
+    }
     if (session.host.rewrite_valid) {
         if (need_gdn && session.draft.rewrite_gdn_id == 0) { return false; }
         if (need_cyclic && session.draft.rewrite_cyclic_id == 0) { return false; }
@@ -6328,6 +6396,16 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
             std::size_t second_bytes;
         };
 
+        const auto flash_next_bytes = config_.fingerprint.flash_next_state_bytes;
+        if (session.image.flash_next_state.size() != flash_next_bytes ||
+            (session.host.rewrite_valid &&
+             session.image.flash_next_rewrite.size() != flash_next_bytes) ||
+            std::any_of(session.image.ladder_images.begin(), session.image.ladder_images.end(),
+                        [flash_next_bytes](const auto& head) {
+                            return head.flash_next_state.size() != flash_next_bytes;
+                        })) {
+            throw std::logic_error("KV disk Flash-Next spill image geometry mismatch");
+        }
         std::vector<StateSource> state_sources;
         auto prepare_state = [&](DiskStateKind kind, const void* first, std::size_t first_bytes,
                                  const void* second = nullptr, std::size_t second_bytes = 0) {
@@ -6342,6 +6420,8 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
                       session.image.hidden_bytes);
         prepare_state(DiskStateKind::DflashLocal, session.image.dflash_local,
                       session.image.cyclic_bytes);
+        prepare_state(DiskStateKind::FlashNextCurrent, session.image.flash_next_state.data(),
+                      session.image.flash_next_state.size());
         if (session.host.rewrite_valid) {
             prepare_state(DiskStateKind::RewriteGdn, session.image.gdn_conv_checkpoint, conv_n,
                           session.image.gdn_recurrent_checkpoint, rec_n);
@@ -6349,6 +6429,8 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
                           session.image.rewrite_hidden_bytes);
             prepare_state(DiskStateKind::DflashRewrite, session.image.dflash_rewrite,
                           session.image.cyclic_bytes);
+            prepare_state(DiskStateKind::FlashNextRewrite, session.image.flash_next_rewrite.data(),
+                          session.image.flash_next_rewrite.size());
         }
         std::vector<RamLadderImage> rollbacks;
         std::vector<RamLadderImage> ladders;
@@ -6372,6 +6454,10 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
             prepare_state(gdn_kind, image.conv, conv_n, image.recurrent, rec_n);
             prepare_state(hidden_kind, image.hidden, image.hidden_bytes);
             prepare_state(cyclic_kind, image.dflash, image.dflash_bytes);
+            prepare_state(image.kind == ContextCheckpointKind::TurnRollback
+                              ? DiskStateKind::FlashNextRollback
+                              : DiskStateKind::FlashNextLadder,
+                          image.flash_next_state.data(), image.flash_next_state.size());
         };
         if (!rollbacks.empty()) {
             prepare_slot(rollbacks.front(), DiskStateKind::RollbackGdn,
@@ -8543,8 +8629,19 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
             return;
         }
 
+        const auto flash_next_state    = target.flash_next_state;
+        const auto flash_next_rewrite  = target.flash_next_rewrite;
+        const auto flash_next_writable = target.flash_next_writable;
+        if (flash_next_state.size() != config_.fingerprint.flash_next_state_bytes ||
+            (unpack_rewrite && meta.rewrite_valid &&
+             flash_next_rewrite.size() != config_.fingerprint.flash_next_state_bytes)) {
+            throw std::logic_error("KV disk Flash-Next restore image geometry mismatch");
+        }
         lock.unlock();
         maybe_restore_state_barrier();
+        if (flash_next_writable != nullptr) {
+            CUDA_CHECK(cudaEventSynchronize(flash_next_writable));
+        }
         restore_io_started = std::chrono::steady_clock::now();
 
         auto abort_stale = [&] {
@@ -8648,6 +8745,33 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
                     enqueue(meta.rewrite_cyclic_id, DiskStateKind::DflashRewrite,
                             restore_state_capacity_.rewrite_cyclic, state_slices.rewrite_cyclic,
                             cyclic_n);
+                }
+            }
+            // These target-owned pinned images are stable through cancel_restore(), just like
+            // checkpoint_images. The target performs their H2D only after restore readiness.
+            if (!flash_next_state.empty()) {
+                const auto id = use_head                               ? slot.flash_next_id
+                                : is_rewrite_checkpoint_restore(reuse) ? meta.rewrite_flash_next_id
+                                                                       : meta.current_flash_next_id;
+                const auto kind = use_head ? (slot.kind == ContextCheckpointKind::TurnRollback
+                                                  ? DiskStateKind::FlashNextRollback
+                                                  : DiskStateKind::FlashNextLadder)
+                                  : is_rewrite_checkpoint_restore(reuse)
+                                      ? DiskStateKind::FlashNextRewrite
+                                      : DiskStateKind::FlashNextCurrent;
+                if (id == 0) {
+                    failed = true;
+                } else {
+                    jobs.push_back(
+                        {id, kind, flash_next_state.data(), flash_next_state.size(), true});
+                }
+            }
+            if (unpack_rewrite && meta.rewrite_valid && !flash_next_rewrite.empty()) {
+                if (meta.rewrite_flash_next_id == 0) {
+                    failed = true;
+                } else {
+                    jobs.push_back({meta.rewrite_flash_next_id, DiskStateKind::FlashNextRewrite,
+                                    flash_next_rewrite.data(), flash_next_rewrite.size(), true});
                 }
             }
             if (!failed && !decode_state_parallel(jobs)) { failed = true; }

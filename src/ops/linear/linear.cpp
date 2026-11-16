@@ -94,14 +94,15 @@ std::int32_t packed_sequence_group_width(const Tensor& x, const Weight& w,
         return group;
     }
     if (w.qtype == QType::NVFP4 && sequence_width >= 2 &&
-        detail::is_nvfp4_dflash_mma_aggregate_problem(w.n, w.k, policy)) {
+        detail::is_nvfp4_a16_mma_aggregate_problem(w.n, w.k, policy)) {
         return x.ne[1];
     }
     if (w.qtype == QType::NVFP4 &&
         detail::is_nvfp4_dflash_w4a4_aggregate_problem(w.n, w.k, policy, sequence_width)) {
         return x.ne[1];
     }
-    // The DFlash conv projection SmallT keeps one lane reduction for every pass width.
+    // The 27B DFlash conv projection [1280,5120] SmallT keeps one lane reduction for every pass
+    // width.
     if (w.qtype == QType::NVFP4 && sequence_width >= 2 && sequence_width <= kDflash2MaxChainWidth &&
         x.ne[1] > sequence_width &&
         detail::is_nvfp4_dflash_conv_aggregate_problem(w.n, w.k, policy)) {

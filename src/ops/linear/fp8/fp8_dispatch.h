@@ -16,8 +16,9 @@ namespace ninfer::ops::detail {
                                                               std::int32_t min_tokens,
                                                               std::int32_t max_tokens);
 
-// The FP8 vocabulary projection [248320,5120]; every other FP8 problem throws
-// std::invalid_argument. It requires no workspace.
+// The FP8 vocabulary projections [248320,5120] and [248320,2560] and the Flash-Next GDN/attention
+// output [2560,6144]; every other FP8 problem throws std::invalid_argument. They require no
+// workspace.
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                   cudaStream_t stream);
 

@@ -43,7 +43,22 @@ class Fp8RowFormat:
     name: str
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat
+@dataclass(frozen=True, slots=True)
+class ExpertCodeFormat:
+    """FP4 routed-expert codes with one E4M3FN scale per K group and an external multiplier.
+
+    ``code_bits`` is 4 for native E2M1 nibbles and 3 for indices into an external eight-entry
+    E2M1 book. The per-matrix FP32 multiplier and the book are separate model-role tensors.
+    """
+
+    name: str
+    code_bits: int
+    group_size: int
+
+
+NumericFormat: TypeAlias = (
+    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | ExpertCodeFormat
+)
 
 
 BF16 = DirectFormat("BF16", 2)
@@ -56,6 +71,8 @@ Q6G64_F16S = QuantFormat("Q6G64_F16S", 6, 64, -32, 31)
 W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("NVFP4", 16)
 FP8_E4M3FN_ROW_BF16S = Fp8RowFormat("FP8_E4M3FN_ROW_BF16S")
+F3G32_E4M3FN = ExpertCodeFormat("F3G32_E4M3FN", 3, 32)
+E2M1G16_E4M3FN = ExpertCodeFormat("E2M1G16_E4M3FN", 4, 16)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, I32)})
@@ -64,8 +81,15 @@ QUANT_FORMATS = MappingProxyType(
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S})
+EXPERT_CODE_FORMATS = MappingProxyType({item.name: item for item in (F3G32_E4M3FN, E2M1G16_E4M3FN)})
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS}
+    {
+        **DIRECT_FORMATS,
+        **QUANT_FORMATS,
+        **NVFP4_FORMATS,
+        **FP8_ROW_FORMATS,
+        **EXPERT_CODE_FORMATS,
+    }
 )
 
 
@@ -140,6 +164,9 @@ def get_format(name: str) -> NumericFormat:
 __all__ = [
     "BF16",
     "DIRECT_FORMATS",
+    "E2M1G16_E4M3FN",
+    "EXPERT_CODE_FORMATS",
+    "F3G32_E4M3FN",
     "FP8_E4M3FN_ROW_BF16S",
     "FP8_ROW_FORMATS",
     "FP32",
@@ -153,6 +180,7 @@ __all__ = [
     "QUANT_FORMATS",
     "W8G32_F16S",
     "DirectFormat",
+    "ExpertCodeFormat",
     "Fp8RowFormat",
     "NumericFormat",
     "Nvfp4Format",

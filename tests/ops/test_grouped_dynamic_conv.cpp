@@ -17,10 +17,7 @@ using namespace ninfer::test::direct_bf16_weight;
 
 namespace {
 
-constexpr std::int32_t kD     = ops::kGroupedDynamicConvHidden;
-constexpr std::int32_t kG     = ops::kGroupedDynamicConvGroups;
 constexpr std::int32_t kGroup = ops::kGroupedDynamicConvGroupSize;
-constexpr std::int32_t kProj  = ops::kGroupedDynamicConvProjRows;
 
 constexpr ReductionCriterion prepare_criterion() {
     return {/*relative_l2*/ 1.0 / 256.0, /*gross_absolute*/ 1.0 / 256.0,
@@ -37,248 +34,268 @@ std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
     return bits;
 }
 
-std::size_t hid_index(std::int32_t d, std::int32_t t, std::int32_t b, std::int32_t tokens) {
-    return (static_cast<std::size_t>(b) * tokens + t) * kD + d;
-}
+// One suite per registered hidden width D: G = D/16 groups and P = D/4 projection rows.
+template <std::int32_t kD>
+struct Suite {
+    static constexpr std::int32_t kG    = ops::grouped_dynamic_conv_groups(kD);
+    static constexpr std::int32_t kProj = ops::grouped_dynamic_conv_projection_rows(kD);
 
-std::size_t dyn_index(std::int32_t g, std::int32_t offset, std::int32_t t, std::int32_t b,
-                      std::int32_t tokens) {
-    return ((static_cast<std::size_t>(b) * tokens + t) * 2 + offset) * kG + g;
-}
-
-std::size_t base_index(std::int32_t d, std::int32_t offset, std::int32_t phase) {
-    return static_cast<std::size_t>(phase) * kD * 2 + static_cast<std::size_t>(offset) * kD + d;
-}
-
-void convolve_oracle(const std::vector<float>& hidden, const std::vector<float>& base,
-                     const std::vector<double>& dynamic, std::int32_t tokens, std::int32_t batch,
-                     std::int32_t phase, std::vector<double>& out) {
-    out.assign(static_cast<std::size_t>(kD) * tokens * batch, 0.0);
-    for (std::int32_t b = 0; b < batch; ++b) {
-        for (std::int32_t t = 0; t < tokens; ++t) {
-            for (std::int32_t d = 0; d < kD; ++d) {
-                const std::int32_t g = d / kGroup;
-                const double x0      = static_cast<double>(hidden[hid_index(d, t, b, tokens)]);
-                const double x1 =
-                    t == 0 ? 0.0 : static_cast<double>(hidden[hid_index(d, t - 1, b, tokens)]);
-                const double b0 = static_cast<double>(base[base_index(d, 0, phase)]);
-                const double b1 = static_cast<double>(base[base_index(d, 1, phase)]);
-                const double d0 = dynamic[dyn_index(g, 0, t, b, tokens)];
-                const double d1 = dynamic[dyn_index(g, 1, t, b, tokens)];
-                out[hid_index(d, t, b, tokens)] = (b0 + d0) * x0 + (b1 + d1) * x1;
-            }
-        }
+    static std::size_t hid_index(std::int32_t d, std::int32_t t, std::int32_t b,
+                                 std::int32_t tokens) {
+        return (static_cast<std::size_t>(b) * tokens + t) * kD + d;
     }
-}
 
-void projection_oracle(const HostWeight& weight, const std::vector<float>& hidden,
-                       std::int32_t tokens, std::int32_t batch, std::vector<double>& proj) {
-    proj.assign(static_cast<std::size_t>(kProj) * tokens * batch, 0.0);
-    for (std::int32_t b = 0; b < batch; ++b) {
-        for (std::int32_t t = 0; t < tokens; ++t) {
-            std::vector<float> column(static_cast<std::size_t>(kD));
-            for (std::int32_t d = 0; d < kD; ++d) {
-                column[static_cast<std::size_t>(d)] = hidden[hid_index(d, t, b, tokens)];
-            }
-            const std::size_t col = static_cast<std::size_t>(b) * tokens + t;
-            for (std::int32_t n = 0; n < kProj; ++n) {
-                proj[col * kProj + n] = dot_fp64(weight, n, column);
-            }
-        }
+    static std::size_t dyn_index(std::int32_t g, std::int32_t offset, std::int32_t t,
+                                 std::int32_t b, std::int32_t tokens) {
+        return ((static_cast<std::size_t>(b) * tokens + t) * 2 + offset) * kG + g;
     }
-}
 
-void split_projection(const std::vector<double>& proj, std::int32_t tokens, std::int32_t batch,
-                      std::int32_t phase, std::vector<double>& dynamic) {
-    dynamic.assign(static_cast<std::size_t>(kG) * 2 * tokens * batch, 0.0);
-    for (std::int32_t b = 0; b < batch; ++b) {
-        for (std::int32_t t = 0; t < tokens; ++t) {
-            const std::size_t col = static_cast<std::size_t>(b) * tokens + t;
-            for (std::int32_t offset = 0; offset < 2; ++offset) {
-                for (std::int32_t g = 0; g < kG; ++g) {
-                    dynamic[dyn_index(g, offset, t, b, tokens)] =
-                        proj[col * kProj + static_cast<std::size_t>(phase) * 640 +
-                             static_cast<std::size_t>(offset) * kG + g];
+    static std::size_t base_index(std::int32_t d, std::int32_t offset, std::int32_t phase) {
+        return static_cast<std::size_t>(phase) * kD * 2 + static_cast<std::size_t>(offset) * kD + d;
+    }
+
+    static void convolve_oracle(const std::vector<float>& hidden, const std::vector<float>& base,
+                                const std::vector<double>& dynamic, std::int32_t tokens,
+                                std::int32_t batch, std::int32_t phase, std::vector<double>& out) {
+        out.assign(static_cast<std::size_t>(kD) * tokens * batch, 0.0);
+        for (std::int32_t b = 0; b < batch; ++b) {
+            for (std::int32_t t = 0; t < tokens; ++t) {
+                for (std::int32_t d = 0; d < kD; ++d) {
+                    const std::int32_t g = d / kGroup;
+                    const double x0      = static_cast<double>(hidden[hid_index(d, t, b, tokens)]);
+                    const double x1 =
+                        t == 0 ? 0.0 : static_cast<double>(hidden[hid_index(d, t - 1, b, tokens)]);
+                    const double b0 = static_cast<double>(base[base_index(d, 0, phase)]);
+                    const double b1 = static_cast<double>(base[base_index(d, 1, phase)]);
+                    const double d0 = dynamic[dyn_index(g, 0, t, b, tokens)];
+                    const double d1 = dynamic[dyn_index(g, 1, t, b, tokens)];
+                    out[hid_index(d, t, b, tokens)] = (b0 + d0) * x0 + (b1 + d1) * x1;
                 }
             }
         }
     }
-}
 
-int run_prepare_case(const char* label, std::int32_t tokens, std::int32_t batch,
-                     std::uint32_t seed) {
-    HostWeight host_weight = make_patterned(kProj, kD, seed);
-    DeviceWeight device_weight(std::move(host_weight));
-
-    std::vector<float> hidden(static_cast<std::size_t>(kD) * tokens * batch);
-    std::vector<float> base(static_cast<std::size_t>(kD) * 4);
-    fill_uniform(hidden, seed + 11, -1.0f, 1.0f);
-    fill_uniform(base, seed + 23, -0.5f, 0.5f);
-    round_to_bf16(hidden);
-    round_to_bf16(base);
-
-    std::vector<double> proj;
-    projection_oracle(device_weight.host, hidden, tokens, batch, proj);
-    std::vector<double> prepare_dyn;
-    std::vector<double> finish_dyn;
-    split_projection(proj, tokens, batch, 0, prepare_dyn);
-    split_projection(proj, tokens, batch, 1, finish_dyn);
-    std::vector<double> expected_prepared;
-    convolve_oracle(hidden, base, prepare_dyn, tokens, batch, 0, expected_prepared);
-
-    const auto hidden_bits = encode_bf16(hidden);
-    const auto base_bits   = encode_bf16(base);
-    GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_base(base_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_prepared(hidden_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_finish(finish_dyn.size() * sizeof(std::uint16_t));
-    device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
-    device_base.copy_from_host(base_bits.data(), device_base.bytes());
-    device_prepared.fill(0xcd);
-    device_finish.fill(0xcd);
-
-    Tensor hidden_t = batch == 1 ? Tensor(device_hidden.data(), DType::BF16, {kD, tokens})
-                                 : Tensor(device_hidden.data(), DType::BF16, {kD, tokens, batch});
-    Tensor base_t(device_base.data(), DType::BF16, {kD, 2, 2});
-    Tensor prepared_t = batch == 1
-                            ? Tensor(device_prepared.data(), DType::BF16, {kD, tokens})
-                            : Tensor(device_prepared.data(), DType::BF16, {kD, tokens, batch});
-    Tensor finish_t   = batch == 1
-                            ? Tensor(device_finish.data(), DType::BF16, {kG, 2, tokens})
-                            : Tensor(device_finish.data(), DType::BF16, {kG, 2, tokens, batch});
-
-    const std::size_t workspace_bytes = ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-        QType::BF16_CTRL, tokens, tokens, batch);
-    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
-    ops::grouped_dynamic_conv_prepare(hidden_t, base_t, device_weight.view(), prepared_t, finish_t,
-                                      workspace, nullptr);
-    cuda_synchronize();
-
-    int failures = verify_reduction(label, from_device_bf16(device_prepared.data(), hidden.size()),
-                                    expected_prepared, prepare_criterion());
-    const std::string finish_label = std::string(label) + " finish_dynamic";
-    failures += verify_reduction(finish_label.c_str(),
-                                 from_device_bf16(device_finish.data(), finish_dyn.size()),
-                                 finish_dyn, prepare_criterion());
-    failures += device_hidden.verify_guards("grouped_dynamic_conv hidden");
-    failures += device_prepared.verify_guards("grouped_dynamic_conv prepared");
-    failures += device_finish.verify_guards("grouped_dynamic_conv finish_dynamic");
-    failures += device_weight.verify_preserved("grouped_dynamic_conv weight");
-    return failures;
-}
-
-int run_finish_case(const char* label, std::int32_t tokens, std::int32_t batch,
-                    std::uint32_t seed) {
-    std::vector<float> hidden(static_cast<std::size_t>(kD) * tokens * batch);
-    std::vector<float> base(static_cast<std::size_t>(kD) * 4);
-    std::vector<float> dynamic(static_cast<std::size_t>(kG) * 2 * tokens * batch);
-    fill_uniform(hidden, seed + 31, -1.0f, 1.0f);
-    fill_uniform(base, seed + 41, -0.5f, 0.5f);
-    fill_uniform(dynamic, seed + 51, -0.25f, 0.25f);
-    round_to_bf16(hidden);
-    round_to_bf16(base);
-    round_to_bf16(dynamic);
-
-    std::vector<double> dynamic64(dynamic.size());
-    for (std::size_t i = 0; i < dynamic.size(); ++i) {
-        dynamic64[i] = static_cast<double>(dynamic[i]);
-    }
-    std::vector<double> expected;
-    convolve_oracle(hidden, base, dynamic64, tokens, batch, 1, expected);
-
-    const auto hidden_bits  = encode_bf16(hidden);
-    const auto base_bits    = encode_bf16(base);
-    const auto dynamic_bits = encode_bf16(dynamic);
-    GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_base(base_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_dynamic(dynamic_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_out(hidden_bits.size() * sizeof(std::uint16_t));
-    device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
-    device_base.copy_from_host(base_bits.data(), device_base.bytes());
-    device_dynamic.copy_from_host(dynamic_bits.data(), device_dynamic.bytes());
-    device_out.fill(0xcd);
-
-    Tensor hidden_t = batch == 1 ? Tensor(device_hidden.data(), DType::BF16, {kD, tokens})
-                                 : Tensor(device_hidden.data(), DType::BF16, {kD, tokens, batch});
-    Tensor base_t(device_base.data(), DType::BF16, {kD, 2, 2});
-    Tensor dyn_t = batch == 1 ? Tensor(device_dynamic.data(), DType::BF16, {kG, 2, tokens})
-                              : Tensor(device_dynamic.data(), DType::BF16, {kG, 2, tokens, batch});
-    Tensor out_t = batch == 1 ? Tensor(device_out.data(), DType::BF16, {kD, tokens})
-                              : Tensor(device_out.data(), DType::BF16, {kD, tokens, batch});
-    ops::grouped_dynamic_conv_finish(hidden_t, base_t, dyn_t, out_t, nullptr);
-    cuda_synchronize();
-
-    int failures = verify_pointwise(label, from_device_bf16(device_out.data(), hidden.size()),
-                                    expected, finish_criterion());
-    failures += device_out.verify_guards("grouped_dynamic_conv finish out");
-    return failures;
-}
-
-int run_nvfp4_prepare_case(const char* label, std::int32_t tokens) {
-    quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
-    options.input_scale_divisor  = 1.0F;
-    input_projection::DevicePackedWeight device_weight(
-        quantized_weight::make_patterned_weight(QType::NVFP4, kProj, kD, 77u, options));
-
-    std::vector<float> hidden(static_cast<std::size_t>(kD) * tokens);
-    std::vector<float> base(static_cast<std::size_t>(kD) * 4);
-    fill_uniform(hidden, 81u, -1.0f, 1.0f);
-    fill_uniform(base, 83u, -0.5f, 0.5f);
-    round_to_bf16(hidden);
-    round_to_bf16(base);
-
-    std::vector<double> proj(static_cast<std::size_t>(kProj) * tokens, 0.0);
-    for (std::int32_t t = 0; t < tokens; ++t) {
-        std::vector<float> column(static_cast<std::size_t>(kD));
-        for (std::int32_t d = 0; d < kD; ++d) {
-            column[static_cast<std::size_t>(d)] = hidden[hid_index(d, t, 0, tokens)];
-        }
-        for (std::int32_t n = 0; n < kProj; ++n) {
-            proj[static_cast<std::size_t>(t) * kProj + n] =
-                quantized_weight::dot_fp64(device_weight.host, n, column.data(), kD);
+    static void projection_oracle(const HostWeight& weight, const std::vector<float>& hidden,
+                                  std::int32_t tokens, std::int32_t batch,
+                                  std::vector<double>& proj) {
+        proj.assign(static_cast<std::size_t>(kProj) * tokens * batch, 0.0);
+        for (std::int32_t b = 0; b < batch; ++b) {
+            for (std::int32_t t = 0; t < tokens; ++t) {
+                std::vector<float> column(static_cast<std::size_t>(kD));
+                for (std::int32_t d = 0; d < kD; ++d) {
+                    column[static_cast<std::size_t>(d)] = hidden[hid_index(d, t, b, tokens)];
+                }
+                const std::size_t col = static_cast<std::size_t>(b) * tokens + t;
+                for (std::int32_t n = 0; n < kProj; ++n) {
+                    proj[col * kProj + n] = dot_fp64(weight, n, column);
+                }
+            }
         }
     }
-    std::vector<double> prepare_dyn;
-    std::vector<double> finish_dyn;
-    split_projection(proj, tokens, 1, 0, prepare_dyn);
-    split_projection(proj, tokens, 1, 1, finish_dyn);
-    std::vector<double> expected_prepared;
-    convolve_oracle(hidden, base, prepare_dyn, tokens, 1, 0, expected_prepared);
 
-    const auto hidden_bits = encode_bf16(hidden);
-    const auto base_bits   = encode_bf16(base);
-    GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_base(base_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_prepared(hidden_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_finish(finish_dyn.size() * sizeof(std::uint16_t));
-    device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
-    device_base.copy_from_host(base_bits.data(), device_base.bytes());
-    device_prepared.fill(0xcd);
-    device_finish.fill(0xcd);
+    static void split_projection(const std::vector<double>& proj, std::int32_t tokens,
+                                 std::int32_t batch, std::int32_t phase,
+                                 std::vector<double>& dynamic) {
+        dynamic.assign(static_cast<std::size_t>(kG) * 2 * tokens * batch, 0.0);
+        for (std::int32_t b = 0; b < batch; ++b) {
+            for (std::int32_t t = 0; t < tokens; ++t) {
+                const std::size_t col = static_cast<std::size_t>(b) * tokens + t;
+                for (std::int32_t offset = 0; offset < 2; ++offset) {
+                    for (std::int32_t g = 0; g < kG; ++g) {
+                        dynamic[dyn_index(g, offset, t, b, tokens)] =
+                            proj[col * kProj + static_cast<std::size_t>(phase) * 2 * kG +
+                                 static_cast<std::size_t>(offset) * kG + g];
+                    }
+                }
+            }
+        }
+    }
 
-    Tensor hidden_t(device_hidden.data(), DType::BF16, {kD, tokens});
-    Tensor base_t(device_base.data(), DType::BF16, {kD, 2, 2});
-    Tensor prepared_t(device_prepared.data(), DType::BF16, {kD, tokens});
-    Tensor finish_t(device_finish.data(), DType::BF16, {kG, 2, tokens});
-    const std::size_t workspace_bytes =
-        ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(QType::NVFP4, tokens, tokens, 1);
-    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
-    ops::grouped_dynamic_conv_prepare(hidden_t, base_t, device_weight.view(), prepared_t, finish_t,
-                                      workspace, nullptr);
-    cuda_synchronize();
+    static int run_prepare_case(const char* label, std::int32_t tokens, std::int32_t batch,
+                                std::uint32_t seed) {
+        HostWeight host_weight = make_patterned(kProj, kD, seed);
+        DeviceWeight device_weight(std::move(host_weight));
 
-    int failures = verify_reduction(label, from_device_bf16(device_prepared.data(), hidden.size()),
-                                    expected_prepared, prepare_criterion());
-    const std::string finish_label = std::string(label) + " finish_dynamic";
-    failures += verify_reduction(finish_label.c_str(),
-                                 from_device_bf16(device_finish.data(), finish_dyn.size()),
-                                 finish_dyn, prepare_criterion());
-    failures += device_hidden.verify_guards("grouped_dynamic_conv NVFP4 hidden");
-    failures += device_prepared.verify_guards("grouped_dynamic_conv NVFP4 prepared");
-    failures += device_weight.verify_preserved("grouped_dynamic_conv NVFP4 projection");
-    return failures;
-}
+        std::vector<float> hidden(static_cast<std::size_t>(kD) * tokens * batch);
+        std::vector<float> base(static_cast<std::size_t>(kD) * 4);
+        fill_uniform(hidden, seed + 11, -1.0f, 1.0f);
+        fill_uniform(base, seed + 23, -0.5f, 0.5f);
+        round_to_bf16(hidden);
+        round_to_bf16(base);
+
+        std::vector<double> proj;
+        projection_oracle(device_weight.host, hidden, tokens, batch, proj);
+        std::vector<double> prepare_dyn;
+        std::vector<double> finish_dyn;
+        split_projection(proj, tokens, batch, 0, prepare_dyn);
+        split_projection(proj, tokens, batch, 1, finish_dyn);
+        std::vector<double> expected_prepared;
+        convolve_oracle(hidden, base, prepare_dyn, tokens, batch, 0, expected_prepared);
+
+        const auto hidden_bits = encode_bf16(hidden);
+        const auto base_bits   = encode_bf16(base);
+        GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer device_base(base_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer device_prepared(hidden_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer device_finish(finish_dyn.size() * sizeof(std::uint16_t));
+        device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
+        device_base.copy_from_host(base_bits.data(), device_base.bytes());
+        device_prepared.fill(0xcd);
+        device_finish.fill(0xcd);
+
+        Tensor hidden_t = batch == 1
+                              ? Tensor(device_hidden.data(), DType::BF16, {kD, tokens})
+                              : Tensor(device_hidden.data(), DType::BF16, {kD, tokens, batch});
+        Tensor base_t(device_base.data(), DType::BF16, {kD, 2, 2});
+        Tensor prepared_t = batch == 1
+                                ? Tensor(device_prepared.data(), DType::BF16, {kD, tokens})
+                                : Tensor(device_prepared.data(), DType::BF16, {kD, tokens, batch});
+        Tensor finish_t   = batch == 1
+                                ? Tensor(device_finish.data(), DType::BF16, {kG, 2, tokens})
+                                : Tensor(device_finish.data(), DType::BF16, {kG, 2, tokens, batch});
+
+        const std::size_t workspace_bytes =
+            ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(QType::BF16_CTRL, kD, tokens,
+                                                                       tokens, batch);
+        WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+        ops::grouped_dynamic_conv_prepare(hidden_t, base_t, device_weight.view(), prepared_t,
+                                          finish_t, workspace, nullptr);
+        cuda_synchronize();
+
+        int failures =
+            verify_reduction(label, from_device_bf16(device_prepared.data(), hidden.size()),
+                             expected_prepared, prepare_criterion());
+        const std::string finish_label = std::string(label) + " finish_dynamic";
+        failures += verify_reduction(finish_label.c_str(),
+                                     from_device_bf16(device_finish.data(), finish_dyn.size()),
+                                     finish_dyn, prepare_criterion());
+        failures += device_hidden.verify_guards("grouped_dynamic_conv hidden");
+        failures += device_prepared.verify_guards("grouped_dynamic_conv prepared");
+        failures += device_finish.verify_guards("grouped_dynamic_conv finish_dynamic");
+        failures += device_weight.verify_preserved("grouped_dynamic_conv weight");
+        return failures;
+    }
+
+    static int run_finish_case(const char* label, std::int32_t tokens, std::int32_t batch,
+                               std::uint32_t seed) {
+        std::vector<float> hidden(static_cast<std::size_t>(kD) * tokens * batch);
+        std::vector<float> base(static_cast<std::size_t>(kD) * 4);
+        std::vector<float> dynamic(static_cast<std::size_t>(kG) * 2 * tokens * batch);
+        fill_uniform(hidden, seed + 31, -1.0f, 1.0f);
+        fill_uniform(base, seed + 41, -0.5f, 0.5f);
+        fill_uniform(dynamic, seed + 51, -0.25f, 0.25f);
+        round_to_bf16(hidden);
+        round_to_bf16(base);
+        round_to_bf16(dynamic);
+
+        std::vector<double> dynamic64(dynamic.size());
+        for (std::size_t i = 0; i < dynamic.size(); ++i) {
+            dynamic64[i] = static_cast<double>(dynamic[i]);
+        }
+        std::vector<double> expected;
+        convolve_oracle(hidden, base, dynamic64, tokens, batch, 1, expected);
+
+        const auto hidden_bits  = encode_bf16(hidden);
+        const auto base_bits    = encode_bf16(base);
+        const auto dynamic_bits = encode_bf16(dynamic);
+        GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer device_base(base_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer device_dynamic(dynamic_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer device_out(hidden_bits.size() * sizeof(std::uint16_t));
+        device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
+        device_base.copy_from_host(base_bits.data(), device_base.bytes());
+        device_dynamic.copy_from_host(dynamic_bits.data(), device_dynamic.bytes());
+        device_out.fill(0xcd);
+
+        Tensor hidden_t = batch == 1
+                              ? Tensor(device_hidden.data(), DType::BF16, {kD, tokens})
+                              : Tensor(device_hidden.data(), DType::BF16, {kD, tokens, batch});
+        Tensor base_t(device_base.data(), DType::BF16, {kD, 2, 2});
+        Tensor dyn_t = batch == 1
+                           ? Tensor(device_dynamic.data(), DType::BF16, {kG, 2, tokens})
+                           : Tensor(device_dynamic.data(), DType::BF16, {kG, 2, tokens, batch});
+        Tensor out_t = batch == 1 ? Tensor(device_out.data(), DType::BF16, {kD, tokens})
+                                  : Tensor(device_out.data(), DType::BF16, {kD, tokens, batch});
+        ops::grouped_dynamic_conv_finish(hidden_t, base_t, dyn_t, out_t, nullptr);
+        cuda_synchronize();
+
+        int failures = verify_pointwise(label, from_device_bf16(device_out.data(), hidden.size()),
+                                        expected, finish_criterion());
+        failures += device_out.verify_guards("grouped_dynamic_conv finish out");
+        return failures;
+    }
+
+    static int run_nvfp4_prepare_case(const char* label, std::int32_t tokens, std::int32_t batch) {
+        quantized_weight::PatternedWeightOptions options;
+        options.weight_scale_divisor = 0.125F;
+        options.input_scale_divisor  = 1.0F;
+        input_projection::DevicePackedWeight device_weight(
+            quantized_weight::make_patterned_weight(QType::NVFP4, kProj, kD, 77u, options));
+
+        std::vector<float> hidden(static_cast<std::size_t>(kD) * tokens * batch);
+        std::vector<float> base(static_cast<std::size_t>(kD) * 4);
+        fill_uniform(hidden, 81u, -1.0f, 1.0f);
+        fill_uniform(base, 83u, -0.5f, 0.5f);
+        round_to_bf16(hidden);
+        round_to_bf16(base);
+
+        std::vector<double> proj(static_cast<std::size_t>(kProj) * tokens * batch, 0.0);
+        for (std::int32_t b = 0; b < batch; ++b) {
+            for (std::int32_t t = 0; t < tokens; ++t) {
+                std::vector<float> column(static_cast<std::size_t>(kD));
+                for (std::int32_t d = 0; d < kD; ++d) {
+                    column[static_cast<std::size_t>(d)] = hidden[hid_index(d, t, b, tokens)];
+                }
+                const std::size_t col = static_cast<std::size_t>(b) * tokens + t;
+                for (std::int32_t n = 0; n < kProj; ++n) {
+                    proj[col * kProj + n] =
+                        quantized_weight::dot_fp64(device_weight.host, n, column.data(), kD);
+                }
+            }
+        }
+        std::vector<double> prepare_dyn;
+        std::vector<double> finish_dyn;
+        split_projection(proj, tokens, batch, 0, prepare_dyn);
+        split_projection(proj, tokens, batch, 1, finish_dyn);
+        std::vector<double> expected_prepared;
+        convolve_oracle(hidden, base, prepare_dyn, tokens, batch, 0, expected_prepared);
+
+        const auto hidden_bits = encode_bf16(hidden);
+        const auto base_bits   = encode_bf16(base);
+        GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer device_base(base_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer device_prepared(hidden_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer device_finish(finish_dyn.size() * sizeof(std::uint16_t));
+        device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
+        device_base.copy_from_host(base_bits.data(), device_base.bytes());
+        device_prepared.fill(0xcd);
+        device_finish.fill(0xcd);
+
+        Tensor hidden_t(device_hidden.data(), DType::BF16, {kD, tokens, batch});
+        Tensor base_t(device_base.data(), DType::BF16, {kD, 2, 2});
+        Tensor prepared_t(device_prepared.data(), DType::BF16, {kD, tokens, batch});
+        Tensor finish_t(device_finish.data(), DType::BF16, {kG, 2, tokens, batch});
+        const std::size_t workspace_bytes =
+            ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(QType::NVFP4, kD, tokens,
+                                                                       tokens, batch);
+        WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+        ops::grouped_dynamic_conv_prepare(hidden_t, base_t, device_weight.view(), prepared_t,
+                                          finish_t, workspace, nullptr);
+        cuda_synchronize();
+
+        int failures =
+            verify_reduction(label, from_device_bf16(device_prepared.data(), hidden.size()),
+                             expected_prepared, prepare_criterion());
+        const std::string finish_label = std::string(label) + " finish_dynamic";
+        failures += verify_reduction(finish_label.c_str(),
+                                     from_device_bf16(device_finish.data(), finish_dyn.size()),
+                                     finish_dyn, prepare_criterion());
+        failures += device_hidden.verify_guards("grouped_dynamic_conv NVFP4 hidden");
+        failures += device_prepared.verify_guards("grouped_dynamic_conv NVFP4 prepared");
+        failures += device_weight.verify_preserved("grouped_dynamic_conv NVFP4 projection");
+        return failures;
+    }
+};
 
 } // namespace
 
@@ -289,14 +306,29 @@ int main() {
     }
 
     int failures = 0;
-    failures += run_finish_case("grouped_dynamic_conv_finish T=8", 8, 1, 101u);
-    failures += run_finish_case("grouped_dynamic_conv_finish T=1", 1, 1, 102u);
-    failures += run_finish_case("grouped_dynamic_conv_finish T=4 B=2", 4, 2, 103u);
-    failures += run_prepare_case("grouped_dynamic_conv_prepare T=8", 8, 1, 201u);
-    failures += run_prepare_case("grouped_dynamic_conv_prepare T=1", 1, 1, 202u);
-    failures += run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 prepare T=1", 1);
-    failures += run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 prepare T=5", 5);
-    failures += run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 prepare T=8", 8);
+    using Wide   = Suite<5120>;
+    using Narrow = Suite<2560>;
+    failures += Wide::run_finish_case("grouped_dynamic_conv_finish D=5120 T=8", 8, 1, 101u);
+    failures += Wide::run_finish_case("grouped_dynamic_conv_finish D=5120 T=1", 1, 1, 102u);
+    failures += Wide::run_finish_case("grouped_dynamic_conv_finish D=5120 T=4 B=2", 4, 2, 103u);
+    failures += Wide::run_prepare_case("grouped_dynamic_conv_prepare D=5120 T=8", 8, 1, 201u);
+    failures += Wide::run_prepare_case("grouped_dynamic_conv_prepare D=5120 T=1", 1, 1, 202u);
+    failures += Wide::run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 D=5120 T=1", 1, 1);
+    failures += Wide::run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 D=5120 T=5", 5, 1);
+    failures += Wide::run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 D=5120 T=8", 8, 1);
+    // Flash-Next drafter: proposal widths W=k+1 in [2,8] at one to twelve packed requests; packed
+    // NVFP4 projections cross the 32-column conv pass (W=3 B=12, W=8 B=6).
+    failures += Narrow::run_finish_case("grouped_dynamic_conv_finish D=2560 T=8", 8, 1, 111u);
+    failures += Narrow::run_finish_case("grouped_dynamic_conv_finish D=2560 T=1", 1, 1, 112u);
+    failures += Narrow::run_finish_case("grouped_dynamic_conv_finish D=2560 T=3 B=12", 3, 12, 113u);
+    failures += Narrow::run_prepare_case("grouped_dynamic_conv_prepare D=2560 T=8", 8, 1, 211u);
+    failures += Narrow::run_prepare_case("grouped_dynamic_conv_prepare D=2560 T=2 B=5", 2, 5, 212u);
+    failures += Narrow::run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 D=2560 T=1", 1, 1);
+    failures += Narrow::run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 D=2560 T=2", 2, 1);
+    failures += Narrow::run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 D=2560 T=8", 8, 1);
+    failures += Narrow::run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 D=2560 T=3 B=12", 3, 12);
+    failures += Narrow::run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 D=2560 T=8 B=6", 8, 6);
+    failures += Narrow::run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 D=2560 T=5 B=4", 5, 4);
     std::cout << (failures ? "FAIL" : "OK") << " grouped_dynamic_conv\n";
     return failures ? 1 : 0;
 }

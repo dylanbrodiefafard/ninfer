@@ -81,6 +81,51 @@ function(ninfer_add_fused_linear_test name source common)
 endfunction()
 
 # Artifact framing and model-independent runtime contracts.
+# Experimental Qwen3.8-Flash-Next runtime pieces (CPU and direct I/O; no GPU).
+ninfer_add_test(ninfer_flash_next_ngram_table_test
+  SOURCES targets/qwen3_8_flash_next/test_ngram_table.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next)
+ninfer_add_test(ninfer_flash_next_ple_feeder_test
+  SOURCES targets/qwen3_8_flash_next/test_ple_feeder.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next)
+ninfer_add_test(ninfer_flash_next_state_test
+  SOURCES targets/qwen3_8_flash_next/test_state.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next)
+ninfer_add_test(ninfer_flash_next_kv_tiers_test
+  SOURCES targets/qwen3_8_flash_next/test_kv_tiers.cpp
+  LIBRARIES ninfer_engine ninfer_qwen3_8_flash_next)
+target_include_directories(ninfer_flash_next_kv_tiers_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+# Pins about 1 GB of host memory and reads it from the GPU.
+ninfer_add_test(ninfer_flash_next_expert_residency_test
+  SOURCES targets/qwen3_8_flash_next/test_expert_residency.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next ninfer_ops)
+ninfer_add_test(ninfer_flash_next_kv_extents_test
+  SOURCES targets/qwen3_8_flash_next/test_kv_extents.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next ninfer_ops)
+# Engine integration on the real artifact and n-gram table: each mode loads about 50 GB of routed
+# experts into pinned host memory.
+ninfer_add_test(ninfer_qwen3_8_flash_next_engine_real_test
+  SOURCES targets/qwen3_8_flash_next/test_engine_real.cpp
+  LIBRARIES ninfer_engine ninfer_qwen3_8_flash_next)
+target_include_directories(ninfer_qwen3_8_flash_next_engine_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_flash_next/export)
+set_tests_properties(ninfer_qwen3_8_flash_next_engine_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+add_test(NAME ninfer_qwen3_8_flash_next_program_parity_real_test
+  COMMAND ${NINFER_TEST_LAUNCHER}
+    $<TARGET_FILE:ninfer_qwen3_8_flash_next_engine_real_test> --program-parity)
+set_tests_properties(ninfer_qwen3_8_flash_next_program_parity_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+foreach(mode IN ITEMS retained reuse-parity ram-tiers disk-tiers live-tiers)
+  string(REPLACE "-" "_" test_mode "${mode}")
+  add_test(NAME ninfer_qwen3_8_flash_next_${test_mode}_real_test
+    COMMAND ${NINFER_TEST_LAUNCHER}
+      $<TARGET_FILE:ninfer_qwen3_8_flash_next_engine_real_test> --${mode})
+  set_tests_properties(ninfer_qwen3_8_flash_next_${test_mode}_real_test PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 1800)
+endforeach()
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES test_ninfer_artifact_reader.cpp
   LIBRARIES ninfer_artifact)
@@ -442,7 +487,17 @@ set(ninfer_op_tests
   scalar
   cast
   scatter
-  position)
+  position
+  hyper_connection
+  stream_mean
+  qsa
+  bf16_projection
+  moe_route
+  moe_expert_cache
+  moe_expert_cache_fill
+  moe_expert_cache_window
+  moe_experts
+  ple)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test
     SOURCES ops/test_${op}.cpp
@@ -455,6 +510,8 @@ ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_sanitizer_cases(ninfer_a4_activation_test)
+ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_fill_test)
+ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_window_test)
 ninfer_add_op_test(ninfer_gqa_xattn_sort_test
   SOURCES ops/test_gqa_xattn_sort.cu
   LIBRARIES ninfer_ops)

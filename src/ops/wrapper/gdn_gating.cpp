@@ -98,4 +98,31 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     detail::gdn_gating_launch(a, b, A_log, dt_bias, g, beta, stream);
 }
 
+void gdn_gating_packed(const Tensor& ab, const Tensor& A_log, const Tensor& dt_bias, Tensor& g,
+                       Tensor& beta, cudaStream_t stream) {
+    const std::int32_t tokens = ab.ne[1];
+    if (ab.dtype != DType::FP32 || ab.ne[0] != 96 || tokens < 1 || ab.ne[2] != 1 || ab.ne[3] != 1 ||
+        !ab.is_contiguous() || ab.data == nullptr) {
+        throw std::invalid_argument("gdn_gating_packed: ab must be contiguous FP32 [96,T], T>0");
+    }
+    if (A_log.dtype != DType::FP32 || dt_bias.dtype != DType::FP32 || g.dtype != DType::FP32 ||
+        beta.dtype != DType::FP32) {
+        throw std::invalid_argument("gdn_gating_packed: A_log/dt_bias/g/beta must be FP32");
+    }
+    require_vector48_shape(A_log, "A_log");
+    require_vector48_shape(dt_bias, "dt_bias");
+    require_gate_shape(g, "g");
+    require_gate_shape(beta, "beta");
+    if (g.ne[1] != tokens || beta.ne[1] != tokens) {
+        throw std::invalid_argument("gdn_gating_packed: g/beta must be [48,T] for ab [96,T]");
+    }
+    if (!A_log.is_contiguous() || !dt_bias.is_contiguous() || !g.is_contiguous() ||
+        !beta.is_contiguous() || A_log.data == nullptr || dt_bias.data == nullptr ||
+        g.data == nullptr || beta.data == nullptr) {
+        throw std::invalid_argument(
+            "gdn_gating_packed: all tensors must be contiguous with non-null data");
+    }
+    detail::gdn_gating_packed_launch(ab, A_log, dt_bias, g, beta, stream);
+}
+
 } // namespace ninfer::ops

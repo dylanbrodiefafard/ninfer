@@ -7,6 +7,9 @@
 #include "core/device.h"
 #include "runtime/engine/kv_capacity.h"
 
+#include "load/binder.h"
+#include "ninfer/ops/qsa.h"
+
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -102,10 +105,20 @@ decltype(auto) with_automatic_headroom_hint(const KvCapacityPolicy& policy, Fn&&
     }
 }
 
+// Engine options only qwen3.8-flash-next implements.
+void reject_flash_next_options(const EngineOptions& options, std::string_view target_key) {
+    if (!options.ngram_table_path.empty() || options.qsa_select_budget.has_value()) {
+        throw std::invalid_argument("--ngram-table and --qsa-select-budget apply only to "
+                                    "qwen3.8-flash-next, not to target '" +
+                                    std::string(target_key) + "'");
+    }
+}
+
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
                                        std::string_view target_key) {
+    reject_flash_next_options(options, target_key);
     const auto& identity = reader.identity();
     artifact::Binder binder(reader);
     const auto weights_profile                    = Target::resolve_weights(identity, binder);
@@ -183,7 +196,76 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                              .sampling_defaults = sampling_defaults};
 }
 
+// qwen3.8-flash-next loads its dense weights and routed experts, then builds its Program over
+// the device memory left: QSA state for the requested capacity, then the expert cache. The KV
+// capacity is not traded against device memory by a sizing curve; Automatic reserves
+// max_concurrency * max_context tokens.
+ConstructedTarget construct_flash_next(const EngineOptions& options, DeviceContext& device,
+                                       const artifact::Reader& reader,
+                                       Clock::time_point load_start) {
+    Qwen3_8FlashNext::validate_options(options);
+    const auto& identity = reader.identity();
+    if (identity.weights_id != Qwen3_8FlashNext::weights_id) {
+        throw std::runtime_error("artifact identity '" + identity.model_id + "/" +
+                                 identity.weights_id + "' is not supported by target '" +
+                                 std::string(Qwen3_8FlashNext::target_key) + "'");
+    }
+    const ModelSamplingDefaults sampling_defaults =
+        Qwen3_8FlashNext::sampling_defaults(identity.model_id);
+    auto progress = artifact_progress(options.load_progress);
+    auto model    = Qwen3_8FlashNext::load(reader, device, progress.callback ? &progress : nullptr);
+    device.synchronize();
+    const std::size_t available_after_weights  = current_free_device_bytes();
+    const artifact::MaterializationStats stats = model->materialization_stats();
+    auto loaded   = std::make_unique<LoadedQwen3_8FlashNext>(std::move(model));
+    auto instance = std::make_unique<Qwen3_8FlashNextInstance>(std::move(loaded), options, device);
+    device.synchronize();
+
+    const MemorySummary memory = instance->program->memory_summary();
+    const std::uint32_t pages =
+        memory.kv_capacity / static_cast<std::uint32_t>(ops::kQsaPageTokens);
+    runtime::KvCapacityResolution& resolved    = instance->kv_capacity_resolution;
+    resolved.mode                              = options.kv_capacity.mode;
+    resolved.main_page_groups                  = pages;
+    resolved.maximum_main_page_groups          = pages;
+    resolved.resolved_tokens                   = memory.kv_capacity;
+    resolved.minimum_runtime_reservation_bytes = memory.sequence.capacity_bytes;
+    resolved.runtime_reservation_bytes         = memory.sequence.capacity_bytes;
+    resolved.available_after_weights_bytes     = available_after_weights;
+    resolved.available_after_startup_bytes     = current_free_device_bytes();
+
+    LoadSummary summary;
+    summary.target               = std::string(Qwen3_8FlashNext::target_key);
+    summary.model_id             = identity.model_id;
+    summary.weights_id           = identity.weights_id;
+    summary.load_seconds         = std::chrono::duration<double>(Clock::now() - load_start).count();
+    summary.upload_seconds       = stats.upload_seconds;
+    summary.artifact_bytes_read  = stats.file_bytes;
+    summary.host_to_device_bytes = stats.h2d_bytes;
+    summary.mapped_host_bytes    = stats.mapped_host_bytes;
+    summary.peak_staging_bytes   = stats.peak_staging_bytes;
+    summary.tensor_count         = stats.tensor_count;
+    summary.resource_count       = stats.resource_count;
+    return ConstructedTarget{.active            = std::move(instance),
+                             .load              = std::move(summary),
+                             .sampling_defaults = sampling_defaults};
+}
+
 } // namespace
+
+LoadedQwen3_8FlashNext::LoadedQwen3_8FlashNext(
+    std::unique_ptr<Qwen3_8FlashNext::LoadedModel> stable_model)
+    : model(std::move(stable_model)), frontend(Qwen3_8FlashNext::make_frontend(*model)) {}
+
+LoadedQwen3_8FlashNext::~LoadedQwen3_8FlashNext() = default;
+
+Qwen3_8FlashNextInstance::Qwen3_8FlashNextInstance(
+    std::unique_ptr<LoadedQwen3_8FlashNext> stable_loaded, const EngineOptions& options,
+    DeviceContext& device)
+    : loaded(std::move(stable_loaded)), request_memory(device, 0), capacity(options.max_context),
+      program(Qwen3_8FlashNext::create_program(*loaded->model, options, device)) {}
+
+Qwen3_8FlashNextInstance::~Qwen3_8FlashNextInstance() = default;
 
 LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model)
     : model(std::move(stable_model)), frontend(Qwen3_6_27B::make_frontend(*model)) {}
@@ -212,6 +294,9 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start, Qwen3_6_27B::target_key);
+    }
+    if (identity.model_id == Qwen3_8FlashNext::model_id) {
+        return construct_flash_next(options, device, reader, load_start);
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");

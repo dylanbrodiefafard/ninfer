@@ -26,7 +26,7 @@ runtime, operator, and qualification documents.
 - Single GPU, single resident model instance;
 - `max_concurrency=C` is fixed at startup, and `C=1..12` is supported;
 - `0..C` admitted requests at run time;
-- Text and image/video prompts;
+- Text and image/video prompts (text only for qwen3.8-flash-next, §1.4);
 - ordinary decoding and engine-wide speculative decoding;
 - streaming and non-streaming output;
 - prefix reuse, plus an optional completed-bundle pinned-host RAM second tier;
@@ -82,6 +82,46 @@ state. It does not define the substrate's page geometry, physical slab layout, a
 block-table representation, or page-aware operator implementation. The active contract of the
 growing KV substrate is defined by [Paged KV Context Store](paged-kv-cache.md); this document
 consumes only its allocation, reservation, and execution-view semantics.
+
+### 1.4 qwen3.8-flash-next behind the same executor
+
+The second registered target, `qwen3.8-flash-next/f3-fp8-nvfp4`, is not a Qwen3.6-family
+variant: its 48 hyper-connected MoE layers run through a target-owned lane Program
+(`src/targets/qwen3_8_flash_next/impl/runtime/program.h`). The Engine selects it in the closed
+registry (`ActiveTarget` is a two-alternative `std::variant`; `Engine::Impl` holds one
+`ConcurrentExecutor<Instance>` per alternative and dispatches with `std::visit`), and the same
+executor drives it through `EngineProgram`
+(`src/targets/qwen3_8_flash_next/export/ninfer/targets/qwen3_8_flash_next/package.h`), whose header
+lists the call-by-call mapping. The invariants of §2 hold unchanged; the target fixes these
+answers:
+
+- **State substrate.** QSA state is the growing context: a `PagedKVPool` of 64-token pages shared
+  by all lanes (`--kv-capacity`, NVFP4-G16 or BF16 planes). GDN, PLE convolution history and the
+  n-gram history are fixed per-lane state. Admission reserves the pages of
+  `prompt + effective output - 1` tokens at `open_lane` (RAM-off completion reservation, §6.2);
+  a request that does not fit waits in the FIFO under the protected-head rules of §5.
+- **Lanes.** Executor lanes map to the Program lanes `open_lane` returns; a terminal, cancelled or
+  aborted request closes its Program lane, which unmaps its pages. No lane is retained, so every
+  turn is a cold prefill; the mapping keeps a retained Program lane bound to its executor lane once
+  lane retention is added.
+- **Prefill.** One prefill step appends one super-chunk (16,384 tokens, layer-major over
+  `--prefill-chunk` sub-chunks); it is the target's only interruption unit. Shared pace (§7.3)
+  interleaves `--mixed-forward-rounds` decode rounds between super-chunks, and a short prompt may
+  start on a spare lane between two super-chunks of a suspended owner, whose per-lane state needs
+  no restaging. There is no mixed forward (`prefill_mixable` is false).
+- **Decode.** One round is one graph replay over all decode-ready lanes (`B = 1..12`). Before the
+  round the adapter re-arms each lane's one-shot token mask (`OutputSession::fill_token_masks` at
+  the committed root), its cycle-exit exclusion and its suppressed tokens, as the family Program
+  does for ordinary rounds; logprobs and the 20 ranked alternatives come from the unmodified
+  distribution. Ordinary rounds are never rejected. A row whose output constraint, after its
+  suppressed tokens, admits no token closes before the round and is reported in
+  `BatchedGeneratedRound::row_errors`; the executor fails that request alone
+  (`invalid_output_constraint`) and commits the other rows. A prefill step that fails with a
+  request-local error likewise ends only its request.
+- **Absent features.** Speculation, RAM/disk tiers, context checkpoints, live suspension and
+  Vision are rejected at startup; their executor queries return the empty answers (no retained
+  lane, copies always ready, index version 0, suspension credit refused) and their mutators are
+  unreachable and throw `std::logic_error`.
 
 ---
 

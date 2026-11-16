@@ -11,9 +11,14 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::int32_t kDflash2PathSelectTopK                = 16;
+inline constexpr std::int32_t kDflash2PathSelectTopK = 16;
+
+// Registered hidden widths D: 5120 (Qwen3.8-27B DFlash2) and 2560 (Qwen3.8-Flash-Next DFlash2).
+[[nodiscard]] constexpr bool dflash2_path_select_hidden_registered(std::int32_t hidden) noexcept {
+    return hidden == 5120 || hidden == 2560;
+}
+
 inline constexpr std::int32_t kDflash2PathSelectRank                = 256;
-inline constexpr std::int32_t kDflash2PathSelectHidden              = 5120;
 inline constexpr std::int32_t kDflash2PathSelectCodebookRows        = 248320;
 inline constexpr std::int32_t kDflash2PathSelectShortlistRows       = 131072;
 inline constexpr std::int32_t kDflash2PathSelectMaxBatch            = 12;
@@ -41,7 +46,7 @@ static_assert(kDflash2MaxChainWidth < kDflash2TreeMaxWidth);
  *   candidates[c] = logit_token_ids[rows[c]] when logit_token_ids is non-null, else rows[c].
  *   unary[c] = logits[rows[c], t, b]. Project the hidden state
  *
- *     h[r,t,b] = sum_{k=0}^{5119} W_h[r,k] * hidden[k,t,b],   r in [0,256).
+ *     h[r,t,b] = sum_{k=0}^{D-1} W_h[r,k] * hidden[k,t,b],   r in [0,256).
  *
  *   prev[-1,b] = anchors[b]. Anchors are vocabulary ids (not shortlist rows). For t = 0..T-1
  *   and each candidate c,
@@ -74,22 +79,22 @@ static_assert(kDflash2MaxChainWidth < kDflash2TreeMaxWidth);
  *   Null selectors leave q implicit one-hot at path[t,b].
  *
  * Logical shapes:
- *   logits is contiguous BF16 [V,T] or [V,T,B] with V>=16. hidden is contiguous BF16 [5120,T] or
- *   [5120,T,B]. pred_code and succ_code are contiguous BF16 [256, codebook_rows] (rank fastest)
- *   when the NVFP4 codebook weights are null.
+ *   logits is contiguous BF16 [V,T] or [V,T,B] with V>=16. hidden is contiguous BF16 [D,T] or
+ *   [D,T,B] with D in {5120,2560}. pred_code and succ_code are contiguous BF16
+ *   [256, codebook_rows] (rank fastest) when the NVFP4 codebook weights are null.
  *   When logit_token_ids is null, codebook_rows >= V (identity: logit row is the token id).
  *   When logit_token_ids is non-null it is contiguous I32 [V] mapping each logit row to a token
  *   id; codebook_rows >= 248320 and is not required to be >= V. Product uses codebook_rows=248320
  *   and V in {131072, 248320}. anchors and logical_positions are contiguous I32 [B], or scalars
  *   for B=1. logical_positions[b] is the current anchor position. path is contiguous I32 [T] or
- *   [T,B]. selector_ids is contiguous I32 [16,T] or [16,T,B] and
- *   selector_q is contiguous FP32 of the same shape; both null or both non-null. Every anchor
- *   and every selected token id is in [0, codebook_rows).
- *   T is any positive value at B=1; B=2..12 admits T=1..16.
+ *   [T,B]. selector_ids is contiguous I32 [16,T] or [16,T,B] and selector_q is contiguous FP32 of
+ *   the same shape; both null or both non-null. Every anchor and every selected token id is in
+ *   [0, codebook_rows). T is any positive value at B=1; B=2..12 admits T=1..16.
  *
  * Supported domain:
- *   hidden_projection is BF16_CTRL Contiguous [256,5120], or a Linear-registered Q4G64_F16S /
- *   W8G32_F16S RowSplit / NVFP4 BlockScale problem of that logical shape. The Q4/W8/NVFP4 route
+ *   hidden_projection is BF16_CTRL Contiguous [256,D], or a Linear-registered problem of that
+ *   logical shape: Q4G64_F16S / W8G32_F16S RowSplit or NVFP4 BlockScale at D=5120, NVFP4
+ *   BlockScale at D=2560. The Q4/W8/NVFP4 route
  *   calls Linear at per-sequence T (not T*B) so C>1 does not select a different T-specialized
  *   kernel than C=1.
  *
@@ -109,9 +114,11 @@ static_assert(kDflash2MaxChainWidth < kDflash2TreeMaxWidth);
  *
  * Workspace:
  *   Caller-owned transient storage sized by dflash2_path_select_workspace_capacity_bytes() holds
- *   the [256,T*B] hidden projection, per-column top-16 scratch, and any Linear child scratch.
+ *   the [256,T*B] hidden projection, per-column top-16 scratch, and any Linear child scratch. The
+ *   query takes the projection qtype and D and throws for an unregistered pair.
  */
 [[nodiscard]] std::size_t dflash2_path_select_workspace_capacity_bytes(QType qtype,
+                                                                       std::int32_t hidden,
                                                                        std::int32_t min_tokens,
                                                                        std::int32_t max_tokens,
                                                                        std::int32_t batch = 1);

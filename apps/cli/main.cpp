@@ -279,6 +279,11 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
+    if (memory.expert_cache_bytes != 0 || memory.expert_cache_flex_bytes != 0) {
+        print_metric("gpu expert cache", format_bytes(memory.expert_cache_bytes) + " + up to " +
+                                             format_bytes(memory.expert_cache_flex_bytes) +
+                                             " of idle KV pages");
+    }
     print_metric("checkpoint host pinned", format_bytes(memory.checkpoint_image_host_bytes) + " (" +
                                                std::to_string(memory.checkpoint_image_pool_heads) +
                                                " pooled heads)");
@@ -428,9 +433,11 @@ int main(int argc, char** argv) {
         engine_options.xattn_tau                = cli.xattn_tau;
         engine_options.speculative              = ninfer::product::resolve_speculative_startup(
             cli.artifact_path, cli.speculative_selection, cli.speculative);
-        engine_options.enable_vision  = cli.enable_vision;
-        engine_options.use_cuda_graph = cli.use_cuda_graph;
-        engine_options.load_progress  = load_progress.callback();
+        engine_options.enable_vision     = cli.enable_vision;
+        engine_options.use_cuda_graph    = cli.use_cuda_graph;
+        engine_options.ngram_table_path  = cli.ngram_table_path;
+        engine_options.qsa_select_budget = cli.qsa_select_budget;
+        engine_options.load_progress     = load_progress.callback();
 
         const auto load_started = Clock::now();
         ninfer::Engine engine(std::move(engine_options));

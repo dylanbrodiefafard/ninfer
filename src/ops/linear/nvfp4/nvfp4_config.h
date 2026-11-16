@@ -134,6 +134,22 @@ using Nvfp4DflashAttnOutGeometry  = Nvfp4GemvGeometry<5120, 4096>;
 using Nvfp4DflashConvProjGeometry = Nvfp4GemvGeometry<1280, 5120>;
 using Nvfp4DflashSelectorGeometry = Nvfp4GemvGeometry<256, 5120>;
 using Nvfp4MtpFcGeometry          = Nvfp4GemvGeometry<5120, 10240>;
+// Qwen3.8-Flash-Next (hidden 2560) Text projections. The GDN q|k|v|z input [10240+6144] and the
+// attention query|key|gate|value input [6144+512+6144+512] are split-output Ops (gdn_input_proj,
+// attn_input_proj); the GDN/attention output [2560,6144] is a generic Linear problem.
+using Nvfp4FlashNextGdnInputGeometry  = Nvfp4GemvGeometry<16384, 2560>;
+using Nvfp4FlashNextAttnInputGeometry = Nvfp4GemvGeometry<13312, 2560>;
+using Nvfp4FlashNextMixerOutGeometry  = Nvfp4GemvGeometry<2560, 6144>;
+// Qwen3.8-Flash-Next DFlash2 drafter (hidden 2560, intermediate 7680, five target feature layers):
+// the feature projection, fused QKV, attention output, fused MLP gate/up and down, the grouped
+// dynamic conv projection, and the path-select hidden projection.
+using Nvfp4FlashNextDflashFeatureGeometry  = Nvfp4GemvGeometry<2560, 12800>;
+using Nvfp4FlashNextDflashQkvGeometry      = Nvfp4GemvGeometry<6144, 2560>;
+using Nvfp4FlashNextDflashAttnOutGeometry  = Nvfp4GemvGeometry<2560, 4096>;
+using Nvfp4FlashNextDflashGateUpGeometry   = Nvfp4GemvGeometry<15360, 2560>;
+using Nvfp4FlashNextDflashDownGeometry     = Nvfp4GemvGeometry<2560, 7680>;
+using Nvfp4FlashNextDflashConvProjGeometry = Nvfp4GemvGeometry<640, 2560>;
+using Nvfp4FlashNextDflashSelectorGeometry = Nvfp4GemvGeometry<256, 2560>;
 
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
@@ -152,6 +168,14 @@ enum class Nvfp4Problem : std::uint8_t {
     DflashConvProj,
     DflashSelector,
     MtpFc,
+    FlashNextMixerOut,
+    FlashNextDflashFeature,
+    FlashNextDflashQkv,
+    FlashNextDflashAttnOut,
+    FlashNextDflashGateUp,
+    FlashNextDflashDown,
+    FlashNextDflashConvProj,
+    FlashNextDflashSelector,
 };
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -176,7 +200,23 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
            (output_rows == Nvfp4DflashSelectorGeometry::kOutputRows &&
             input_rows == Nvfp4DflashSelectorGeometry::kInputRows) ||
            (output_rows == Nvfp4MtpFcGeometry::kOutputRows &&
-            input_rows == Nvfp4MtpFcGeometry::kInputRows);
+            input_rows == Nvfp4MtpFcGeometry::kInputRows) ||
+           (output_rows == Nvfp4FlashNextMixerOutGeometry::kOutputRows &&
+            input_rows == Nvfp4FlashNextMixerOutGeometry::kInputRows) ||
+           (output_rows == Nvfp4FlashNextDflashFeatureGeometry::kOutputRows &&
+            input_rows == Nvfp4FlashNextDflashFeatureGeometry::kInputRows) ||
+           (output_rows == Nvfp4FlashNextDflashQkvGeometry::kOutputRows &&
+            input_rows == Nvfp4FlashNextDflashQkvGeometry::kInputRows) ||
+           (output_rows == Nvfp4FlashNextDflashAttnOutGeometry::kOutputRows &&
+            input_rows == Nvfp4FlashNextDflashAttnOutGeometry::kInputRows) ||
+           (output_rows == Nvfp4FlashNextDflashGateUpGeometry::kOutputRows &&
+            input_rows == Nvfp4FlashNextDflashGateUpGeometry::kInputRows) ||
+           (output_rows == Nvfp4FlashNextDflashDownGeometry::kOutputRows &&
+            input_rows == Nvfp4FlashNextDflashDownGeometry::kInputRows) ||
+           (output_rows == Nvfp4FlashNextDflashConvProjGeometry::kOutputRows &&
+            input_rows == Nvfp4FlashNextDflashConvProjGeometry::kInputRows) ||
+           (output_rows == Nvfp4FlashNextDflashSelectorGeometry::kOutputRows &&
+            input_rows == Nvfp4FlashNextDflashSelectorGeometry::kInputRows);
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -223,6 +263,38 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
     if (output_rows == Nvfp4MtpFcGeometry::kOutputRows &&
         input_rows == Nvfp4MtpFcGeometry::kInputRows) {
         return Nvfp4Problem::MtpFc;
+    }
+    if (output_rows == Nvfp4FlashNextMixerOutGeometry::kOutputRows &&
+        input_rows == Nvfp4FlashNextMixerOutGeometry::kInputRows) {
+        return Nvfp4Problem::FlashNextMixerOut;
+    }
+    if (output_rows == Nvfp4FlashNextDflashFeatureGeometry::kOutputRows &&
+        input_rows == Nvfp4FlashNextDflashFeatureGeometry::kInputRows) {
+        return Nvfp4Problem::FlashNextDflashFeature;
+    }
+    if (output_rows == Nvfp4FlashNextDflashQkvGeometry::kOutputRows &&
+        input_rows == Nvfp4FlashNextDflashQkvGeometry::kInputRows) {
+        return Nvfp4Problem::FlashNextDflashQkv;
+    }
+    if (output_rows == Nvfp4FlashNextDflashAttnOutGeometry::kOutputRows &&
+        input_rows == Nvfp4FlashNextDflashAttnOutGeometry::kInputRows) {
+        return Nvfp4Problem::FlashNextDflashAttnOut;
+    }
+    if (output_rows == Nvfp4FlashNextDflashGateUpGeometry::kOutputRows &&
+        input_rows == Nvfp4FlashNextDflashGateUpGeometry::kInputRows) {
+        return Nvfp4Problem::FlashNextDflashGateUp;
+    }
+    if (output_rows == Nvfp4FlashNextDflashDownGeometry::kOutputRows &&
+        input_rows == Nvfp4FlashNextDflashDownGeometry::kInputRows) {
+        return Nvfp4Problem::FlashNextDflashDown;
+    }
+    if (output_rows == Nvfp4FlashNextDflashConvProjGeometry::kOutputRows &&
+        input_rows == Nvfp4FlashNextDflashConvProjGeometry::kInputRows) {
+        return Nvfp4Problem::FlashNextDflashConvProj;
+    }
+    if (output_rows == Nvfp4FlashNextDflashSelectorGeometry::kOutputRows &&
+        input_rows == Nvfp4FlashNextDflashSelectorGeometry::kInputRows) {
+        return Nvfp4Problem::FlashNextDflashSelector;
     }
     throw std::invalid_argument("unsupported NVFP4 problem");
 }
@@ -294,9 +366,17 @@ enum class Nvfp4W4a4Route : std::uint8_t {
     case Nvfp4Problem::DflashAttnOut:
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
+    case Nvfp4Problem::FlashNextMixerOut:
+    case Nvfp4Problem::FlashNextDflashFeature:
+    case Nvfp4Problem::FlashNextDflashQkv:
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+    case Nvfp4Problem::FlashNextDflashGateUp:
+    case Nvfp4Problem::FlashNextDflashDown:
+    case Nvfp4Problem::FlashNextDflashConvProj:
+    case Nvfp4Problem::FlashNextDflashSelector:
         break;
     }
-    throw std::invalid_argument("nvfp4 W4A4: DFlash2 problems are A16-only");
+    throw std::invalid_argument("nvfp4 W4A4: DFlash2 and Flash-Next problems are A16-only");
 }
 
 // Every W4A4 table routes all widths above this one to the TMA kernel.
@@ -415,9 +495,9 @@ inline constexpr std::int32_t kNvfp4FirstW4a4MtpFc         = 8;
 inline constexpr std::int32_t kNvfp4FirstA8 = 2;
 
 // Generic NVFP4 Linear serves the DFlash2 drafter (whose packed proposal launches span at most
-// kNvfp4DflashMaxProposalTokens columns) and MTP fc; Text projections run through their fused
-// Ops. The predicates below are the token counts those callers launch, and dispatchers
-// instantiate only kernels for them.
+// kNvfp4DflashMaxProposalTokens columns), MTP fc, and the Flash-Next GDN/attention output
+// projection; the Text input projections run through their split-output Ops. The predicates below
+// are the token counts those callers launch, and dispatchers instantiate only kernels for them.
 inline constexpr std::int32_t kNvfp4DflashMaxProposalTokens =
     kDflash2MaxChainWidth * kDflash2MaxBatch;
 // The DFlash conv projection packs proposal blocks into passes of at most this many columns, the
@@ -438,8 +518,9 @@ inline constexpr std::int32_t kNvfp4DflashConvProjPassTokens = kNvfp4LastSmallT;
 
 // Token counts in [kNvfp4FirstSmallT, kNvfp4LastSmallT] at which generic Linear launches the A16
 // SmallT kernel: the DFlash MLP down at the k=1 proposal width (wider blocks take W4A4), the conv
-// projection passes, the selector projection at T=k, and MTP fc. The DFlash feature, QKV and
-// attention-output projections run the A16 MMA at T>=2 instead.
+// projection passes, the selector projection at T=k of both drafters, and MTP fc. The DFlash
+// feature, QKV and attention-output projections, the other Flash-Next drafter projections, and the
+// Flash-Next mixer output run the A16 MMA at T>=2 instead.
 [[nodiscard]] constexpr bool nvfp4_linear_small_t_admitted(Nvfp4Problem problem,
                                                            std::int32_t tokens) {
     if (tokens < kNvfp4FirstSmallT || tokens > kNvfp4LastSmallT) { return false; }
@@ -449,6 +530,7 @@ inline constexpr std::int32_t kNvfp4DflashConvProjPassTokens = kNvfp4LastSmallT;
     case Nvfp4Problem::DflashConvProj:
         return nvfp4_dflash_conv_proj_pass_tokens(tokens);
     case Nvfp4Problem::DflashSelector:
+    case Nvfp4Problem::FlashNextDflashSelector:
         return tokens <= kDflash2MaxDraftTokens;
     case Nvfp4Problem::MtpFc:
         return true;
@@ -459,6 +541,13 @@ inline constexpr std::int32_t kNvfp4DflashConvProjPassTokens = kNvfp4LastSmallT;
     case Nvfp4Problem::DflashFeature:
     case Nvfp4Problem::DflashQkv:
     case Nvfp4Problem::DflashAttnOut:
+    case Nvfp4Problem::FlashNextMixerOut:
+    case Nvfp4Problem::FlashNextDflashFeature:
+    case Nvfp4Problem::FlashNextDflashQkv:
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+    case Nvfp4Problem::FlashNextDflashGateUp:
+    case Nvfp4Problem::FlashNextDflashDown:
+    case Nvfp4Problem::FlashNextDflashConvProj:
         return false;
     }
     return false;
@@ -482,6 +571,14 @@ inline constexpr std::int32_t kNvfp4DflashConvProjPassTokens = kNvfp4LastSmallT;
     case Nvfp4Problem::DflashAttnOut:
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
+    case Nvfp4Problem::FlashNextMixerOut:
+    case Nvfp4Problem::FlashNextDflashFeature:
+    case Nvfp4Problem::FlashNextDflashQkv:
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+    case Nvfp4Problem::FlashNextDflashGateUp:
+    case Nvfp4Problem::FlashNextDflashDown:
+    case Nvfp4Problem::FlashNextDflashConvProj:
+    case Nvfp4Problem::FlashNextDflashSelector:
         return false;
     }
     return false;

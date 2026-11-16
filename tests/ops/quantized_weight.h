@@ -397,10 +397,11 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             throw std::invalid_argument(
                 "quantized-weight fixture: row-split patterns do not apply to NVFP4");
         }
+        // The input divisor is 0 for an A16-only weight (no activation divisor), else positive.
         if (!std::isfinite(options.weight_scale_divisor) || options.weight_scale_divisor <= 0.0F ||
-            !std::isfinite(options.input_scale_divisor) || options.input_scale_divisor <= 0.0F) {
-            throw std::invalid_argument(
-                "quantized-weight fixture: NVFP4 divisors must be finite and positive");
+            !std::isfinite(options.input_scale_divisor) || options.input_scale_divisor < 0.0F) {
+            throw std::invalid_argument("quantized-weight fixture: NVFP4 weight divisor must be "
+                                        "positive and input divisor zero or positive");
         }
 
         PackedWeight packed;

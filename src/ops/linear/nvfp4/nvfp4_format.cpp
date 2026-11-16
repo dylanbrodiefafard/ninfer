@@ -58,7 +58,7 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
         weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
         weight.payload_bytes < geometry.required_payload_bytes ||
         !std::isfinite(weight.weight_scale_divisor) || weight.weight_scale_divisor <= 0.0F ||
-        !std::isfinite(weight.input_scale_divisor) || weight.input_scale_divisor <= 0.0F ||
+        !std::isfinite(weight.input_scale_divisor) || weight.input_scale_divisor < 0.0F ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument(std::string(operation) + ": invalid NVFP4 weight");
     }
@@ -68,6 +68,18 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
         throw std::invalid_argument(std::string(operation) + ": invalid NVFP4 plane geometry");
     }
     return geometry;
+}
+
+float nvfp4_input_scale_divisor(const Weight& weight, const char* operation) {
+    if (!(weight.input_scale_divisor > 0.0F)) {
+        throw std::invalid_argument(std::string(operation) +
+                                    ": an A4 route needs an NVFP4 weight with an input divisor");
+    }
+    return weight.input_scale_divisor;
+}
+
+float nvfp4_w4a4_alpha(const Weight& weight, const char* operation) {
+    return 1.0F / (nvfp4_input_scale_divisor(weight, operation) * weight.weight_scale_divisor);
 }
 
 } // namespace ninfer::ops::detail

@@ -97,9 +97,8 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 
 // HTTP 400 owner for capture_context_checkpoint on a server that cannot pin.
 // Throws before Engine submit. No-op when capture is not requested, or when
-// prefix reuse and a speculative backend are both available.
-void reject_unavailable_context_checkpoint_capture(bool capture_requested, bool allow_prefix_reuse,
-                                                   ninfer::SpeculativeBackend spec);
+// the Engine reports target, prefix-reuse and DFlash support.
+void reject_unavailable_context_checkpoint_capture(bool capture_requested, bool available);
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and

@@ -63,8 +63,13 @@ Artifact and model references:
 - [Persistent storage layouts](maintainer/storage-layouts.md)
 - [Qwen3.6-family 27B model semantics and family/Variant structure](maintainer/qwen3.6-27b-model.md)
 - [Qwen3.8-27B artifact contract: inventory, formats, conversion, and binding](maintainer/qwen3.8-27b-artifact.md)
+- [Qwen3.8-Flash-Next artifact: inventory, formats, routed-expert records, and conversion](maintainer/qwen3.8-flash-next-artifact.md)
 
 Pending plans:
+
+- [Qwen3.8-Flash-Next target](maintainer/qwen3.8-flash-next-plan.md) records the measured
+  baseline to beat, the memory budgets, the Program and Engine-integration design, measurements,
+  and the open phases.
 
 - [DFlash A8 verification follow-ups](maintainer/dflash-a8-followups.md) lists measured
   attribution and candidate speedups after the A8/A8 default, with per-candidate outcomes.

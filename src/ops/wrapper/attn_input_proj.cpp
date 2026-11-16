@@ -79,25 +79,31 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::NVFP4) {
-        constexpr std::int32_t kHidden = 5120;
-        constexpr std::int32_t kQRows  = 6144;
-        constexpr std::int32_t kKvRows = 1024;
-        constexpr std::int32_t kRows   = 14336;
-        const std::int32_t cols        = x.ne[1];
+        // Registered parents: [14336,5120] with 1024 key/value rows (A16Only, AllowA4, AllowA8)
+        // and [13312,2560] with 512 key/value rows (A16Only); both have 6144 query/gate rows.
+        constexpr std::int32_t kQRows = 6144;
+        const std::int32_t cols       = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
-            policy != LinearPolicy::AllowA8) {
-            throw std::invalid_argument("NVFP4 attn_input_proj admits only A16 or A4");
-        }
-        require_matrix(x, kHidden, cols, "x");
-        require_matrix(q, kQRows, cols, "q");
-        require_matrix(gate, kQRows, cols, "gate");
-        require_matrix(k, kKvRows, cols, "k");
-        require_matrix(v, kKvRows, cols, "v");
         detail::validate_nvfp4_weight(weight, "nvfp4 attn_input_proj");
-        if (weight.n != kRows || weight.k != kHidden) {
+        const bool hidden_5120 = weight.n == detail::Nvfp4AttnInputGeometry::kOutputRows &&
+                                 weight.k == detail::Nvfp4AttnInputGeometry::kInputRows;
+        const bool hidden_2560 = weight.n == detail::Nvfp4FlashNextAttnInputGeometry::kOutputRows &&
+                                 weight.k == detail::Nvfp4FlashNextAttnInputGeometry::kInputRows;
+        if (!hidden_5120 && !hidden_2560) {
             throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
         }
+        const bool policy_registered =
+            policy == LinearPolicy::A16Only ||
+            (hidden_5120 && (policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8));
+        if (!policy_registered) {
+            throw std::invalid_argument("NVFP4 attn_input_proj: policy is not registered for K");
+        }
+        const std::int32_t kv_rows = hidden_5120 ? 1024 : 512;
+        require_matrix(x, weight.k, cols, "x");
+        require_matrix(q, kQRows, cols, "q");
+        require_matrix(gate, kQRows, cols, "gate");
+        require_matrix(k, kv_rows, cols, "k");
+        require_matrix(v, kv_rows, cols, "v");
         detail::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
         return;
     }
@@ -144,14 +150,21 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");
         }
         return 0;
-    case QType::NVFP4:
-        if (parent_rows != detail::Nvfp4AttnInputGeometry::kOutputRows ||
-            input_rows != detail::Nvfp4AttnInputGeometry::kInputRows ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
-             policy != LinearPolicy::AllowA8)) {
+    case QType::NVFP4: {
+        const bool registered =
+            (parent_rows == detail::Nvfp4AttnInputGeometry::kOutputRows &&
+             input_rows == detail::Nvfp4AttnInputGeometry::kInputRows &&
+             (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA4 ||
+              policy == LinearPolicy::AllowA8)) ||
+            (parent_rows == detail::Nvfp4FlashNextAttnInputGeometry::kOutputRows &&
+             input_rows == detail::Nvfp4FlashNextAttnInputGeometry::kInputRows &&
+             policy == LinearPolicy::A16Only);
+        if (!registered) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::nvfp4_attn_input_workspace_capacity_bytes(input_rows, policy, min_tokens,
+                                                                 max_tokens);
+    }
     case QType::FP8_E4M3FN_ROW_BF16S:
         if (parent_rows != detail::Fp8AttnInputGeometry::kOutputRows ||
             input_rows != detail::Fp8AttnInputGeometry::kInputRows) {

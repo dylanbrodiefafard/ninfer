@@ -3380,6 +3380,118 @@ int run_full_batch_compaction(Frontend& frontend) {
     return failures;
 }
 
+// A row the target reports as constraint-exhausted (BatchedGeneratedRound::row_errors) fails
+// alone with InvalidOutputConstraint: the peer in the same rounds reaches its output limit, the
+// failed lane is never resolved, and the executor keeps admitting. A request-local failure of a
+// later prefill step likewise ends only its request.
+class ConstraintExhaustionProgram final : public PrefillScheduleProgram {
+public:
+    bool fail_prefill_step         = false;
+    bool row_failed                = false;
+    std::uint32_t failed_lane      = 99;
+    bool resolved_failed_lane      = false;
+    std::uint32_t resolves_after   = 0;
+    std::uint32_t prefill_failures = 0;
+
+    [[nodiscard]] BatchedGeneratedRound
+    decode_batch(std::span<const std::uint32_t> members,
+                 std::span<const RoundBudget> budgets) override {
+        BatchedGeneratedRound round = PrefillScheduleProgram::decode_batch(members, budgets);
+        if (members.size() == 2 && !row_failed) {
+            row_failed          = true;
+            failed_lane         = members[1];
+            round.row_errors[1] = std::make_exception_ptr(
+                ninfer::RequestError(ninfer::RequestErrorKind::InvalidOutputConstraint,
+                                     "scripted exhausted constraint"));
+        }
+        return round;
+    }
+
+    void resolve_pending_batch(std::span<const std::uint32_t> resolved,
+                               std::span<const std::uint32_t>, std::span<const std::uint8_t>,
+                               std::span<const std::uint8_t>,
+                               std::span<const std::uint8_t>) override {
+        if (!row_failed) { return; }
+        ++resolves_after;
+        resolved_failed_lane = resolved_failed_lane || std::find(resolved.begin(), resolved.end(),
+                                                                 failed_lane) != resolved.end();
+    }
+
+    [[nodiscard]] PrefillStepResult advance_prefill_lane(std::uint32_t lane,
+                                                         PrefillPace pace) override {
+        if (fail_prefill_step && lengths[lane] >= 4096 && remaining[lane] < lengths[lane]) {
+            ++prefill_failures;
+            throw ninfer::RequestError(ninfer::RequestErrorKind::InvalidOutputConstraint,
+                                       "scripted exhausted first-token constraint");
+        }
+        return PrefillScheduleProgram::advance_prefill_lane(lane, pace);
+    }
+};
+
+int run_constraint_exhaustion(Frontend& frontend) {
+    ConstraintExhaustionProgram program;
+    program.gate_decode = true;
+    program.release_first_chunk.store(true);
+    ProbeLoaded loaded{frontend};
+    PrefillScheduleProbe instance{&program, &loaded, {}};
+    auto options                = engine_options();
+    options.max_concurrency     = 2;
+    options.max_context         = 32768;
+    options.generation_recovery = false;
+    ninfer::runtime::ConcurrentExecutor<PrefillScheduleProbe> executor(instance, options);
+    auto submit = [&](std::uint32_t tokens, std::uint32_t outputs) {
+        auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(tokens, 1000 + 'a'));
+        const auto summary = prompt.summary();
+        ninfer::runtime::ResolvedRequestOptions request;
+        request.execution.allow_prefix_reuse      = false;
+        request.execution.requested_output_tokens = outputs;
+        return executor.submit(std::move(prompt), summary, 0.0, std::move(request),
+                               ninfer::OutputDelivery::TerminalOnly);
+    };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto peer           = submit(16, 128);
+    while (!program.decode_entered.load()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("constraint exhaustion peer never decoded");
+        }
+        std::this_thread::yield();
+    }
+    auto exhausted = submit(16, 128);
+    program.release_decode.store(true);
+
+    int failures = 0;
+    const ninfer::CancellationView cancel;
+    bool rejected = false;
+    try {
+        (void)exhausted.wait(nullptr, cancel);
+    } catch (const ninfer::RequestError& error) {
+        rejected = error.kind() == ninfer::RequestErrorKind::InvalidOutputConstraint;
+    }
+    failures += check(rejected, "constraint-exhausted row did not fail its own request");
+    const auto peer_result = peer.wait(nullptr, cancel);
+    failures += check(peer_result.finish_reason == FinishReason::OutputLimit &&
+                          peer_result.generated_token_ids.size() == 128,
+                      "peer of a constraint-exhausted row did not reach its output limit");
+    failures +=
+        check(program.row_failed && program.resolves_after != 0 && !program.resolved_failed_lane,
+              "constraint-exhausted lane was resolved after its row failed");
+    failures += check(executor.available(), "constraint exhaustion failed the executor");
+
+    program.fail_prefill_step = true;
+    bool prefill_rejected     = false;
+    try {
+        (void)submit(8192, 4).wait(nullptr, cancel);
+    } catch (const ninfer::RequestError& error) {
+        prefill_rejected = error.kind() == ninfer::RequestErrorKind::InvalidOutputConstraint;
+    }
+    failures += check(prefill_rejected && program.prefill_failures == 1,
+                      "request-local prefill-step failure did not fail its own request");
+    const auto after = submit(16, 4).wait(nullptr, cancel);
+    failures += check(after.finish_reason == FinishReason::OutputLimit && executor.available(),
+                      "executor stopped serving after request-local constraint failures");
+    return failures;
+}
+
 int run_prefill_interruptions(Frontend& frontend) {
     int failures = 0;
     for (const unsigned scenario : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U}) {
@@ -4948,6 +5060,7 @@ int main(int argc, char** argv) {
         failures += run_prefill_interruptions(frontend);
         failures += run_prefill_thresholds(frontend);
         failures += run_full_batch_compaction(frontend);
+        failures += run_constraint_exhaustion(frontend);
         for (const CacheCase script : recovery_cases) {
             failures += run_recovery(frontend, script);
         }

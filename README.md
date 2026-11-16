@@ -280,6 +280,43 @@ Keep system prefixes stable for persistent reuse. In harnesses such as OpenCode,
 unnecessary daily date from the initial prefix, or place it after stable history: a changed date
 invalidates reuse after that point. NInfer does not remove dates itself.
 
+## Qwen3.8-Flash-Next
+
+NInfer also serves **Qwen3.8-Flash-Next** (`qwen3.8-flash-next/f3-fp8-nvfp4`), a 180B
+mixture-of-experts model whose 24,576 routed experts live in pinned host RAM behind a VRAM expert
+cache, with its 8-bit n-gram table read from an SSD. Qwen3.8-27B remains the recommended model.
+The [artifact guide](docs/maintainer/qwen3.8-flash-next-artifact.md) covers the conversion; the
+52 GB n-gram table (`ngram_table.int8.bin`) stays outside the artifact. Loading takes about a
+minute and needs at least 70 GB of free host RAM, of which the experts pin about 50 GB.
+
+```bash
+build/apps/ninfer-serve models/qwen3.8-flash-next-f3-fp8-nvfp4.ninfer \
+  --ngram-table /path/to/qwen3.8-flash-next-ngram/ngram_table.int8.bin \
+  --host 127.0.0.1 --port 8080 \
+  --max-context 262144 --max-concurrency 4 --kv-capacity 500000
+```
+
+`--kv-capacity N` is the QSA attention state all requests share (NVFP4, about 11.4 KiB per
+token): 500,000 tokens for four agents or 600,000 for six are the intended settings. The expert
+cache takes the GPU memory left after it, so a smaller pool raises the expert hit rate.
+`--kv-capacity auto` reserves `--max-concurrency × --max-context` tokens. Up to twelve requests
+run in one decode batch; a prompt is processed in 16,384-token steps, between which other
+requests decode and a short prompt may start. `--qsa-select-budget 512|1024|2048` sets the QSA
+blocks each query attends to (default 512).
+
+Exact-prefix reuse retains complete QSA/GDN/PLE state and prefills only a new suffix. The shared
+RAM and inclusive SSD cache tiers preserve evicted continuations; RAM-on requests use funded
+output windows and may suspend under KV pressure. The optional DFlash2 artifact
+`qwen3.8-flash-next-f3-fp8-nvfp4-dflash.ninfer` enables adaptive chain drafting over K=0..3
+with the full shared head; base artifacts stay non-speculative. Use `--spec none` to disable it,
+or `--spec dflash --draft-tokens 3` for fixed K3. Retention and host tiers preserve complete
+speculative continuation. Context checkpoints, the optimized proposal-head flag, explicit verify
+widths, Vision and INT8 KV are unsupported.
+Tools, constraints, reasoning budgets, logprobs and p-less sampling work as for the 27B.
+[Native Gen5 measurements](docs/performance.md#flash-next-native-dflash2-gen5-2026-11-15)
+compare fixed/adaptive arms, Strata, and RAM conversation TTFT. Speculation is workload-dependent;
+the base artifact wins the measured high-concurrency HTTP cases.
+
 ## Docker
 
 Requires Docker and the NVIDIA Container Toolkit on a Linux host with the supported GPU and

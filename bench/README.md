@@ -165,15 +165,172 @@ utilization still require NCU.
 
 `ninfer_grouped_dynamic_conv_bench` measures the complete public convolution
 finish/residual/plain-RMS edge, comparing its three-Op composition with
-`grouped_dynamic_conv_finish_residual_rmsnorm`. Both use D=5120, represented BF16
-inputs, warm-L2 captured graphs and untimed residual resets. Timing includes graph
+`grouped_dynamic_conv_finish_residual_rmsnorm`. Both use D=5120 (`--hidden 2560` selects the
+Flash-Next drafter width), represented BF16 inputs, warm-L2 captured graphs and untimed residual resets. Timing includes graph
 dispatch/event overhead; it is an operator-edge comparison, not Engine throughput.
 The retained benchmark selects production dispatch and has no private route controls.
 
 ```bash
 cmake --build build --parallel 4 --target ninfer_grouped_dynamic_conv_bench
 ./build/bench/ninfer_grouped_dynamic_conv_bench --batch 6 --width 8 --repeat 300
+./build/bench/ninfer_grouped_dynamic_conv_bench --hidden 2560 --batch 4 --width 4 --repeat 300
 ```
+
+## Stream-mean Op benchmark
+
+`ninfer_stream_mean_bench` measures `stream_mean` writing one 2560-row slot of a
+`[12800,T]` DFlash2 feature matrix from a `[2560,4,T]` hyper-connection residual. It reports
+warm-L2 and flushed-L2 graph timings and the model-byte roof (four stream reads and one write
+per channel and token at 1674.5 GB/s).
+
+```bash
+cmake --build build --parallel 4 --target ninfer_stream_mean_bench
+./build/bench/ninfer_stream_mean_bench --tokens 8 --repeat 300
+```
+
+## QSA sparse-attention Op benchmark
+
+`ninfer_qsa_bench` measures `qsa_index_select` and `qsa_selected_attention` at the
+Qwen3.8-Flash-Next QSA geometry. A paged state of B lanes (`--lanes`, default 1) of capacity
+equal to the context, its 64-token pages in a shuffled physical order, is filled through
+lane-batched `qsa_state_append` calls, and every lane's W queries occupy its last W slots, so
+decode (W=1, 12) and prefill chunks (W=512, 4096) see their real prefixes; attention consumes
+the selection the select Op produced. Each call is a captured graph replayed cold (an L2 flush precedes
+every replay). Bandwidth is the contract's compulsory bytes against the `1674.5 GB/s` read
+roof; prefill attention counts every query's selected K/V without dedupe, so read its
+TFLOP/s instead.
+
+```bash
+cmake --build build --parallel 4 --target ninfer_qsa_bench
+./build/bench/ninfer_qsa_bench --context 8192,65536,262144 --width 1,12,512,4096 \
+  --budget 512,2048 --kv nvfp4 --op all
+```
+
+## Lane-batched stateful Op benchmark
+
+`ninfer_lane_batched_state_bench` times the Qwen3.8-Flash-Next lane-batched stateful forms at
+B = 1, 4, 12 lanes of W = 1 and 4 columns, each a captured graph replayed cold:
+`gdn_input_proj_conv_snapshot` and `gdn_input_proj_conv_record` with FP8 and NVFP4 [16384,2560]
+parents (plus, for comparison, the same snapshot as B one-row calls and the unfused
+`gdn_input_proj` + `causal_conv1d_silu_snapshot`), `gated_delta_net_snapshot`, `ple_inject`, and
+`ple_inject_snapshot`.
+
+```bash
+cmake --build build --parallel 4 --target ninfer_lane_batched_state_bench
+./build/bench/ninfer_lane_batched_state_bench
+```
+
+## Routed-expert MoE Op benchmark
+
+`ninfer_moe_experts_bench` measures `moe_experts` at the Qwen3.8-Flash-Next geometry (2560 hidden,
+512 routed experts top-10, intermediate 640, NVFP4 shared-expert record) with 32 NVFP4 and 480 F3
+expert records. Configurations: 0 all records in VRAM with uniform routing, 1 all records in mapped
+pinned host memory (PCIe), 2 odd experts on the host with skewed routing. Each call is a captured graph replayed cold; it reports microseconds, DRAM or PCIe
+GB/s against `1674.5` and `26.8 GB/s`, and TFLOP/s.
+
+```bash
+cmake --build build --parallel 4 --target ninfer_moe_experts_bench
+./build/bench/ninfer_moe_experts_bench --tokens 1 --config 0
+./build/bench/ninfer_moe_experts_bench --tokens 4096 --config 2
+```
+
+## Hyper-connection read Op benchmark
+
+`ninfer_hyper_connection_bench` measures `hyper_connection_read` at the Qwen3.8-Flash-Next
+geometry: residual BF16 `[2560,4,T]`, BF16 norm and write projection, and FP8_E4M3FN_ROW_BF16S
+down `[320,10240]` and up `[10240,320]`; `--final` drops the write projection, as the model's
+final read does. One captured graph chains `--layers` reads (default 16), each over its own weight
+set, and is replayed cold (an L2 flush precedes every replay); the reported time is the replay
+median over the chain length. The chain resolves decode times below the event timer's granularity,
+but adjacent reads may overlap at their launch boundary, so `--layers 1` gives the isolated-call
+figure. Bandwidth counts the compulsory bytes once per read (every weight plane, the residual read,
+x and the write scales written) against the `1674.5 GB/s` read roof; the private FP32 workspace is
+not counted. `--inject` follows every read with an in-place inject of a fixed independent BF16
+block output. Its latency is microseconds per read/inject pair, including the next-read dependency
+inside the chain; bandwidth additionally counts the inject's logical residual read/write, block
+read and scale read. It requires the write projection and cannot be combined with `--final`.
+
+```bash
+cmake --build build --parallel 4 --target ninfer_hyper_connection_bench
+./build/bench/ninfer_hyper_connection_bench --tokens 1,12,512,4096
+./build/bench/ninfer_hyper_connection_bench --tokens 1,12 --final
+./build/bench/ninfer_hyper_connection_bench --tokens 1,12,512,4096 --layers 1
+./build/bench/ninfer_hyper_connection_bench --tokens 1,2,4,8,12,16,20,24,32 --inject
+```
+
+## BF16 projection Op benchmark
+
+`ninfer_bf16_projection_bench` measures `bf16_projection` at its admitted Qwen3.8-Flash-Next
+shapes: BF16 weights `[N,2560]` for N in 96, 128, 512, 544, 2560 and 10240, BF16 x `[2560,T]`,
+and the projection's fixed output dtype (BF16 for 128 and 512 rows, FP32 otherwise). One captured
+graph chains `--layers` calls (default 16), each over its own weight and output and all over one
+x, and is replayed cold (an L2 flush precedes every replay), so every weight is read from DRAM
+while x is L2-resident after the first call, as in a decode round. The reported time is the
+replay median over the chain length and includes the inter-kernel gap of a graph. Bandwidth counts
+the weight, x and y once per call against the `1674.5 GB/s` read roof.
+
+```bash
+cmake --build build --parallel 4 --target ninfer_bf16_projection_bench
+./build/bench/ninfer_bf16_projection_bench --tokens 1,2,3,4,8,12,16,17,20,24,32,33,40,48,49,64
+./build/bench/ninfer_bf16_projection_bench --rows 96,544 --tokens 4,20
+```
+
+RTX 5090, CUDA 13.1, median µs per call. The small-T MMA serves T <= 48 (including T = 1 below
+2560 rows); the GEMV serves T = 1 at 2560 and 10240 rows; the tensor-core GEMM serves T > 48 and
+every T >= 2 at 10240 rows, where it already reads the weight at 74% of the roof. Before is the
+GEMV at T = 1 and the GEMM at every T >= 2.
+
+| N | route | T=1 | T=2 | T=4 | T=8 | T=16 | T=17 | T=20 | T=32 | T=33 | T=48 | T=49 (GEMM) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 96 | before | 3.58 | 26.6 | 25.9 | 25.9 | 25.7 | 25.9 | 25.9 | 25.9 | 25.9 | 25.9 | 25.9 |
+| 96 | after | 2.43 | 2.43 | 2.43 | 2.43 | 2.56 | 2.56 | 2.56 | 2.69 | 2.56 | 2.69 | 25.9 |
+| 128 | before | 3.58 | 38.7 | 38.7 | 38.7 | 38.7 | 38.7 | 38.8 | 38.8 | 38.8 | 38.8 | 38.8 |
+| 128 | after | 2.43 | 2.43 | 2.53 | 2.54 | 2.56 | 2.69 | 2.69 | 2.69 | 2.69 | 2.81 | 38.8 |
+| 512 | before | 4.48 | 38.7 | 38.7 | 38.7 | 38.8 | 38.8 | 38.8 | 38.9 | 38.9 | 38.9 | 38.9 |
+| 512 | after | 3.58 | 3.58 | 3.58 | 3.58 | 3.58 | 3.71 | 3.71 | 3.97 | 4.10 | 4.22 | 38.9 |
+| 544 | before | 4.48 | 25.9 | 25.9 | 25.9 | 25.9 | 25.9 | 25.9 | 25.9 | 25.9 | 25.9 | 26.0 |
+| 544 | after | 3.58 | 3.58 | 3.58 | 3.71 | 3.71 | 3.84 | 3.84 | 4.09 | 4.22 | 4.22 | 26.0 |
+| 2560 | before | 10.75 | 39.2 | 39.2 | 39.2 | 39.2 | 39.2 | 39.2 | 39.2 | 39.2 | 39.3 | 39.4 |
+| 2560 | after | 10.88 | 10.24 | 10.24 | 10.24 | 10.24 | 10.37 | 10.46 | 10.49 | 11.14 | 11.39 | 39.4 |
+| 10240 | unchanged | 35.1 | 42.6 | 42.8 | 42.9 | 43.0 | 43.0 | 43.1 | 43.3 | 43.4 | 43.8 | 43.8 |
+
+The small-T rows are close to flat in T. Their floor is the launch and DRAM latency of a
+sub-3 MB weight (the byte roof is 0.3-1.9 µs at N <= 544) and 7.9-8.3 µs of weight stream at
+N = 2560.
+
+On RTX 5090 / `sm_120a`, CUDA 13.1, Release (`-O3`), the default cold-L2, 16-distinct-weight
+chain (5 warmups, 41 replays) measured the following medians. Each column adds one improvement;
+these are Op-chain measurements, not Engine throughput. The separate finish is selected only
+from T=9: it lost at T=8 (10.496 versus 10.240 µs/read), but won at T=9 (11.520 versus
+12.032 µs/read). The fused two-kernel read remains selected at T≤8.
+
+Read-only latency (µs/read; inject changes do not affect this workload):
+
+| T | Baseline | Token-tiled MMA | Separate finish |
+|---:|---:|---:|---:|
+| 1 | 8.192 | 8.192 | 8.192 |
+| 2 | 8.832 | 8.832 | 8.832 |
+| 4 | 9.728 | 9.344 | 9.344 |
+| 8 | 10.496 | 10.240 | 10.240 |
+| 12 | 13.568 | 13.056 | 11.904 |
+| 16 | 15.616 | 14.464 | 12.928 |
+| 20 | 24.832 | 19.328 | 17.280 |
+| 24 | 29.312 | 19.712 | 17.664 |
+| 32 | 35.072 | 22.656 | 19.072 |
+
+With `--inject` (µs/read-inject pair, including internal inject→read edges):
+
+| T | Baseline | Word-tiled inject + PDL | Token-tiled MMA | Separate finish |
+|---:|---:|---:|---:|---:|
+| 1 | 10.352 | 9.344 | 9.344 | 9.344 |
+| 2 | 10.880 | 9.984 | 9.984 | 9.984 |
+| 4 | 11.648 | 10.624 | 10.240 | 10.240 |
+| 8 | 12.416 | 11.264 | 11.136 | 11.136 |
+| 12 | 15.616 | 14.464 | 13.824 | 12.800 |
+| 16 | 17.536 | 16.384 | 15.328 | 13.696 |
+| 20 | 26.752 | 25.728 | 20.224 | 18.048 |
+| 24 | 31.360 | 30.208 | 20.608 | 18.560 |
+| 32 | 37.120 | 35.968 | 23.664 | 20.096 |
 
 ## Selected K/V projection and normalization Op benchmarks
 
@@ -290,8 +447,10 @@ cmake --build build --parallel --target ninfer_gated_delta_net_bench
 
 ## GDN input-projection Op benchmark
 
-`ninfer_gdn_input_proj_bench` measures the public 27B NVFP4 single-parent `gdn_input_proj` form
-under either admitted policy. Every timed and profiled point is exactly one public Op call.
+`ninfer_gdn_input_proj_bench` measures the public single-parent `gdn_input_proj` form for the NVFP4
+or FP8 parent (`--format nvfp4|fp8`) at hidden 5120 (Qwen3.8-27B) or 2560 (Qwen3.8-Flash-Next,
+`--hidden 2560`) under the policy given by `--nvfp4-policy` or `--fp8-policy`; the Op rejects
+an unregistered parent or policy. Every timed and profiled point is exactly one public Op call.
 Workspace is queried and allocated through the public capacity entry before timing; the benchmark has no private launchers, route controls, or candidate mode.
 
 Cold cache is the primary model-layer condition. Reported logical traffic counts encoded weights
@@ -306,6 +465,8 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
   --csv-out profiles/bench/gdn_input_proj.csv
 ./build/bench/ninfer_gdn_input_proj_bench \
   --nvfp4-policy a4 --tokens 1024 --cache cold --profile
+./build/bench/ninfer_gdn_input_proj_bench \
+  --format fp8 --hidden 2560 --fp8-policy a16 --tokens 1,12,512,4096 --cache cold
 ```
 
 ## GDN input projection/convolution/snapshot Op benchmark

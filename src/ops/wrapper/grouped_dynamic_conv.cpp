@@ -23,13 +23,13 @@ void require_hidden_layout(const Tensor& hidden, const char* label) {
         throw std::invalid_argument(std::string("grouped_dynamic_conv: ") + label +
                                     " must be BF16");
     }
-    if (hidden.ne[0] != kGroupedDynamicConvHidden || hidden.ne[1] <= 0 || hidden.ne[2] <= 0 ||
-        hidden.ne[2] > kGroupedDynamicConvMaxBatch || hidden.ne[3] != 1) {
+    if (!grouped_dynamic_conv_hidden_registered(hidden.ne[0]) || hidden.ne[1] <= 0 ||
+        hidden.ne[2] <= 0 || hidden.ne[2] > kGroupedDynamicConvMaxBatch || hidden.ne[3] != 1) {
         throw std::invalid_argument(std::string("grouped_dynamic_conv: ") + label +
-                                    " must be BF16 [5120,T] or [5120,T,B]");
+                                    " must be BF16 [D,T] or [D,T,B] with D in {5120,2560}");
     }
     if (hidden.ne[2] > 1 && hidden.ne[1] > kGroupedDynamicConvMaxWidthWhenBatched) {
-        throw std::invalid_argument("grouped_dynamic_conv: B=2..8 admits T=1..16");
+        throw std::invalid_argument("grouped_dynamic_conv: B=2..12 admits T=1..16");
     }
     if (!hidden.is_contiguous() || hidden.data == nullptr) {
         throw std::invalid_argument(std::string("grouped_dynamic_conv: ") + label +
@@ -47,14 +47,14 @@ void require_matching_activation(const Tensor& hidden, const Tensor& other, cons
     }
 }
 
-void require_base_kernel(const Tensor& base_kernel) {
+void require_base_kernel(const Tensor& hidden, const Tensor& base_kernel) {
     if (base_kernel.dtype != DType::BF16 || !base_kernel.is_contiguous() ||
         base_kernel.data == nullptr) {
         throw std::invalid_argument("grouped_dynamic_conv: base_kernel must be contiguous BF16");
     }
-    if (base_kernel.ne[0] != kGroupedDynamicConvHidden || base_kernel.ne[1] != 2 ||
-        base_kernel.ne[2] != 2 || base_kernel.ne[3] != 1) {
-        throw std::invalid_argument("grouped_dynamic_conv: base_kernel must be BF16 [5120,2,2]");
+    if (base_kernel.ne[0] != hidden.ne[0] || base_kernel.ne[1] != 2 || base_kernel.ne[2] != 2 ||
+        base_kernel.ne[3] != 1) {
+        throw std::invalid_argument("grouped_dynamic_conv: base_kernel must be BF16 [D,2,2]");
     }
 }
 
@@ -64,10 +64,11 @@ void require_finish_dynamic(const Tensor& hidden, const Tensor& finish_dynamic, 
         throw std::invalid_argument(std::string("grouped_dynamic_conv: ") + label +
                                     " must be contiguous BF16");
     }
-    if (finish_dynamic.ne[0] != kGroupedDynamicConvGroups || finish_dynamic.ne[1] != 2 ||
-        finish_dynamic.ne[2] != hidden.ne[1] || finish_dynamic.ne[3] != hidden.ne[2]) {
+    if (finish_dynamic.ne[0] != grouped_dynamic_conv_groups(hidden.ne[0]) ||
+        finish_dynamic.ne[1] != 2 || finish_dynamic.ne[2] != hidden.ne[1] ||
+        finish_dynamic.ne[3] != hidden.ne[2]) {
         throw std::invalid_argument(std::string("grouped_dynamic_conv: ") + label +
-                                    " must be BF16 [320,2,T] or [320,2,T,B]");
+                                    " must be BF16 [D/16,2,T] or [D/16,2,T,B]");
     }
 }
 
@@ -75,14 +76,17 @@ void require_disjoint(const Tensor& a, const Tensor& b, const char* message) {
     if (a.data == b.data) { throw std::invalid_argument(message); }
 }
 
-bool is_quantized_projection(QType qtype) {
-    return qtype == QType::Q4G64_F16S || qtype == QType::W8G32_F16S || qtype == QType::NVFP4;
+// Q4/W8 projections are registered Linear problems only at D=5120; NVFP4 at both widths.
+bool is_quantized_projection(QType qtype, std::int32_t hidden) {
+    return qtype == QType::NVFP4 ||
+           (hidden == 5120 && (qtype == QType::Q4G64_F16S || qtype == QType::W8G32_F16S));
 }
 
-void require_projection_weight(const Weight& weight) {
-    if (weight.n != kGroupedDynamicConvProjRows || weight.k != kGroupedDynamicConvHidden) {
+void require_projection_weight(const Tensor& hidden, const Weight& weight) {
+    const std::int32_t width = hidden.ne[0];
+    if (weight.n != grouped_dynamic_conv_projection_rows(width) || weight.k != width) {
         throw std::invalid_argument(
-            "grouped_dynamic_conv: kernel_projection must be logical [1280,5120]");
+            "grouped_dynamic_conv: kernel_projection must be logical [D/4,D]");
     }
     if (weight.qtype == QType::BF16_CTRL) {
         if (weight.layout != QuantLayout::Contiguous ||
@@ -92,39 +96,42 @@ void require_projection_weight(const Weight& weight) {
         }
         return;
     }
-    if (!is_quantized_projection(weight.qtype) ||
+    if (!is_quantized_projection(weight.qtype, width) ||
         (weight.qtype != QType::NVFP4 && weight.layout != QuantLayout::RowSplit) ||
         (weight.qtype == QType::NVFP4 && weight.layout != QuantLayout::BlockScaleK16M128x4)) {
         throw std::invalid_argument(
-            "grouped_dynamic_conv: kernel_projection must be BF16_CTRL, Q4/W8 row-split, or NVFP4");
+            "grouped_dynamic_conv: kernel_projection must be BF16_CTRL, NVFP4, or (D=5120) Q4/W8 "
+            "row-split");
     }
 }
 
-std::size_t projection_bytes(std::int32_t tokens, std::int32_t batch) {
-    return static_cast<std::size_t>(kGroupedDynamicConvProjRows) *
+std::size_t projection_bytes(std::int32_t hidden, std::int32_t tokens, std::int32_t batch) {
+    return static_cast<std::size_t>(grouped_dynamic_conv_projection_rows(hidden)) *
            static_cast<std::size_t>(tokens) * static_cast<std::size_t>(batch) *
            sizeof(std::uint16_t);
 }
 
 } // namespace
 
-std::size_t grouped_dynamic_conv_prepare_workspace_capacity_bytes(QType qtype,
+std::size_t grouped_dynamic_conv_prepare_workspace_capacity_bytes(QType qtype, std::int32_t hidden,
                                                                   std::int32_t min_tokens,
                                                                   std::int32_t max_tokens,
                                                                   std::int32_t batch) {
+    if (!grouped_dynamic_conv_hidden_registered(hidden)) {
+        throw std::invalid_argument("grouped_dynamic_conv workspace: unregistered hidden width");
+    }
     if (min_tokens <= 0 || max_tokens < min_tokens || batch <= 0 ||
         batch > kGroupedDynamicConvMaxBatch ||
         (batch > 1 && max_tokens > kGroupedDynamicConvMaxWidthWhenBatched)) {
         throw std::invalid_argument("grouped_dynamic_conv workspace: invalid token/batch interval");
     }
-    std::size_t bytes = projection_bytes(max_tokens, batch);
+    std::size_t bytes = projection_bytes(hidden, max_tokens, batch);
     if (qtype == QType::BF16_CTRL) { return bytes; }
-    if (!is_quantized_projection(qtype)) {
+    if (!is_quantized_projection(qtype, hidden)) {
         throw std::invalid_argument("grouped_dynamic_conv workspace: unsupported projection qtype");
     }
-    bytes += linear_workspace_capacity_bytes(qtype, kGroupedDynamicConvProjRows,
-                                             kGroupedDynamicConvHidden, LinearPolicy::A16Only,
-                                             min_tokens, max_tokens);
+    bytes += linear_workspace_capacity_bytes(qtype, grouped_dynamic_conv_projection_rows(hidden),
+                                             hidden, LinearPolicy::A16Only, min_tokens, max_tokens);
     return bytes;
 }
 
@@ -134,9 +141,9 @@ void grouped_dynamic_conv_prepare(const Tensor& hidden, const Tensor& base_kerne
                                   cudaStream_t stream) {
     require_hidden_layout(hidden, "hidden");
     require_matching_activation(hidden, prepared, "prepared");
-    require_base_kernel(base_kernel);
+    require_base_kernel(hidden, base_kernel);
     require_finish_dynamic(hidden, finish_dynamic, "finish_dynamic");
-    require_projection_weight(kernel_projection);
+    require_projection_weight(hidden, kernel_projection);
     require_disjoint(hidden, prepared, "grouped_dynamic_conv: prepared must not alias hidden");
     require_disjoint(hidden, finish_dynamic,
                      "grouped_dynamic_conv: finish_dynamic must not alias hidden");
@@ -145,14 +152,16 @@ void grouped_dynamic_conv_prepare(const Tensor& hidden, const Tensor& base_kerne
     require_disjoint(prepared, base_kernel,
                      "grouped_dynamic_conv: prepared must not alias base_kernel");
 
+    const std::int32_t width     = hidden.ne[0];
     const std::int32_t tokens    = hidden.ne[1];
     const std::int32_t batch     = hidden.ne[2];
     auto scratch_scope           = workspace.scope();
-    const std::size_t proj_bytes = projection_bytes(tokens, batch);
+    const std::size_t proj_bytes = projection_bytes(width, tokens, batch);
     const DeviceSpan proj_span   = workspace.alloc_bytes(proj_bytes);
-    Tensor projection(proj_span.data, DType::BF16, {kGroupedDynamicConvProjRows, tokens * batch});
+    Tensor projection(proj_span.data, DType::BF16,
+                      {grouped_dynamic_conv_projection_rows(width), tokens * batch});
 
-    Tensor hidden_flat = hidden.view({kGroupedDynamicConvHidden, tokens * batch});
+    Tensor hidden_flat = hidden.view({width, tokens * batch});
     if (kernel_projection.qtype == QType::BF16_CTRL) {
         if (!aligned_to(hidden_flat.data, 16) || !aligned_to(projection.data, 16)) {
             throw std::invalid_argument(
@@ -171,7 +180,7 @@ void grouped_dynamic_conv_finish(const Tensor& hidden, const Tensor& base_kernel
                                  const Tensor& finish_dynamic, Tensor& out, cudaStream_t stream) {
     require_hidden_layout(hidden, "hidden");
     require_matching_activation(hidden, out, "out");
-    require_base_kernel(base_kernel);
+    require_base_kernel(hidden, base_kernel);
     require_finish_dynamic(hidden, finish_dynamic, "finish_dynamic");
     require_disjoint(hidden, out, "grouped_dynamic_conv: out must not alias hidden");
     require_disjoint(out, finish_dynamic,
@@ -187,10 +196,10 @@ void grouped_dynamic_conv_finish_residual_rmsnorm(const Tensor& hidden, const Te
     require_hidden_layout(hidden, "hidden");
     require_matching_activation(hidden, residual, "residual");
     require_matching_activation(hidden, out, "out");
-    require_base_kernel(base_kernel);
+    require_base_kernel(hidden, base_kernel);
     require_finish_dynamic(hidden, finish_dynamic, "finish_dynamic");
     if (weight.dtype != DType::BF16 || !weight.is_contiguous() || weight.data == nullptr ||
-        weight.ne[0] != kGroupedDynamicConvHidden || weight.ne[1] != 1 || weight.ne[2] != 1 ||
+        weight.ne[0] != hidden.ne[0] || weight.ne[1] != 1 || weight.ne[2] != 1 ||
         weight.ne[3] != 1 || !std::isfinite(epsilon) || epsilon <= 0.0F) {
         throw std::invalid_argument(
             "grouped_dynamic_conv_finish_residual_rmsnorm: invalid weight or epsilon");

@@ -1,5 +1,5 @@
-// Public-Op benchmark for the NVFP4 GDN input-projection contract.
-// Production dispatch is owned exclusively by gdn_input_proj().
+// Public-Op benchmark for the single-parent GDN input-projection contract: the NVFP4 or FP8 parent
+// [16384,5120] or [16384,2560]. Production dispatch is owned exclusively by gdn_input_proj().
 
 #include "ninfer/ops/gdn_input_proj.h"
 
@@ -29,14 +29,18 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
-constexpr double kRtx5090DramGBs  = 1792.0;
+constexpr std::size_t kFlushBytes         = std::size_t{256} << 20;
+constexpr double kRtx5090DramGBs          = 1792.0;
+constexpr double kRtx5090SustainedReadGBs = 1674.5;
 
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
 struct Options {
+    QType format                   = QType::NVFP4;
+    std::int32_t hidden            = 5120;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
+    ops::LinearPolicy fp8_policy   = ops::LinearPolicy::A16Only;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
     bool tokens_explicit = false;
@@ -48,6 +52,7 @@ struct Options {
 
 struct Result {
     const char* format;
+    std::int32_t hidden;
     const char* policy;
     std::int32_t tokens;
     CacheState cache;
@@ -61,7 +66,8 @@ struct Result {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_gdn_input_proj_bench "
-                 "[--nvfp4-policy a16|a4] "
+                 "[--format nvfp4|fp8] [--hidden 5120|2560] [--nvfp4-policy a16|a4] "
+                 "[--fp8-policy a16|a8] "
                  "[--tokens T,...] [--cache cold|warm|both] [--warmup N] [--repeat N] "
                  "[--profile] [--csv-out PATH]\n",
                  message);
@@ -104,7 +110,28 @@ Options parse_options(int argc, char** argv) {
             if (++index == argc) { usage(flag); }
             return argv[index];
         };
-        if (argument == "--nvfp4-policy") {
+        if (argument == "--format") {
+            const std::string_view value(next("--format requires a value"));
+            if (value == "nvfp4")
+                options.format = QType::NVFP4;
+            else if (value == "fp8")
+                options.format = QType::FP8_E4M3FN_ROW_BF16S;
+            else
+                usage("--format expects nvfp4 or fp8");
+        } else if (argument == "--hidden") {
+            options.hidden = parse_i32(next("--hidden requires a value"), 2560, 5120, "--hidden");
+            if (options.hidden != 2560 && options.hidden != 5120) {
+                usage("--hidden expects 5120 or 2560");
+            }
+        } else if (argument == "--fp8-policy") {
+            const std::string_view value(next("--fp8-policy requires a value"));
+            if (value == "a16")
+                options.fp8_policy = ops::LinearPolicy::A16Only;
+            else if (value == "a8")
+                options.fp8_policy = ops::LinearPolicy::AllowA8;
+            else
+                usage("--fp8-policy expects a16 or a8");
+        } else if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
             if (value == "a16")
                 options.nvfp4_policy = ops::LinearPolicy::A16Only;
@@ -139,9 +166,10 @@ Options parse_options(int argc, char** argv) {
             usage("unknown argument");
         }
     }
-    // NVFP4 A16 is registered only below the W4A4 cutover: the default sweep keeps those widths
-    // and an explicit wider T is a usage error.
-    if (options.nvfp4_policy == ops::LinearPolicy::A16Only) {
+    // NVFP4 [16384,5120] A16 is registered only below the W4A4 cutover: the default sweep keeps
+    // those widths and an explicit wider T is a usage error.
+    if (options.format == QType::NVFP4 && options.hidden == 5120 &&
+        options.nvfp4_policy == ops::LinearPolicy::A16Only) {
         const auto too_wide = [](std::int32_t tokens) {
             return tokens >= ops::kA4GdnInputMinTokens;
         };
@@ -163,7 +191,15 @@ Options parse_options(int argc, char** argv) {
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
 const char* policy_name(ops::LinearPolicy policy) {
-    return policy == ops::LinearPolicy::AllowA4 ? "a4" : "a16";
+    switch (policy) {
+    case ops::LinearPolicy::A16Only:
+        return "a16";
+    case ops::LinearPolicy::AllowA8:
+        return "a8";
+    case ops::LinearPolicy::AllowA4:
+        return "a4";
+    }
+    return "unknown";
 }
 
 template <class Launch>
@@ -201,19 +237,22 @@ void report(const Result& result) {
     const double seconds = result.timing.median_us * 1.0e-6;
     const double gbps    = static_cast<double>(result.logical_bytes) / seconds / 1.0e9;
     const double tflops  = result.useful_flops / seconds / 1.0e12;
-    std::printf("entry=gdn_input_proj format=%-6s policy=%-3s cache=%-4s T=%4d "
+    std::printf("entry=gdn_input_proj format=%-6s K=%4d policy=%-3s cache=%-4s T=%4d "
                 "workspace=%9zu median=%9.3f us min=%9.3f us p95=%9.3f us "
-                "logical=%8.1f GB/s (%5.1f%% of %.0f) math=%8.2f TFLOP/s\n",
-                result.format, result.policy, cache_name(result.cache), result.tokens,
-                result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs,
+                "logical=%8.1f GB/s (%5.1f%% of %.0f, %5.1f%% of %.1f sustained) "
+                "math=%8.2f TFLOP/s\n",
+                result.format, result.hidden, result.policy, cache_name(result.cache),
+                result.tokens, result.workspace_bytes, result.timing.median_us,
+                result.timing.min_us, result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0,
+                kRtx5090DramGBs, gbps / kRtx5090SustainedReadGBs * 100.0, kRtx5090SustainedReadGBs,
                 tflops);
 }
 
-void append_result(std::vector<Result>& results, const char* format, const char* policy,
-                   std::int32_t tokens, CacheState cache, std::size_t workspace_bytes,
-                   std::uint64_t logical_bytes, double useful_flops, bench::ColdTiming timing) {
-    Result result{format,          policy,        tokens,       cache,
+void append_result(std::vector<Result>& results, const char* format, std::int32_t hidden,
+                   const char* policy, std::int32_t tokens, CacheState cache,
+                   std::size_t workspace_bytes, std::uint64_t logical_bytes, double useful_flops,
+                   bench::ColdTiming timing) {
+    Result result{format,          hidden,        policy,       tokens, cache,
                   workspace_bytes, logical_bytes, useful_flops, timing};
     report(result);
     results.push_back(result);
@@ -242,40 +281,42 @@ void measure_points(const Options& options, const char* format, const char* poli
                 continue;
             }
             append_result(
-                results, format, policy, tokens, cache, workspace_bytes, logical, flops,
+                results, format, hidden, policy, tokens, cache, workspace_bytes, logical, flops,
                 measure_public(launch, cache, flush, stream, options.warmup, options.repeat));
         }
     }
 }
 
-void run_nvfp4(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
-               std::vector<Result>& results) {
-    constexpr std::int32_t kHidden     = 5120;
+void run_parent(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
+                std::vector<Result>& results) {
     constexpr std::int32_t kQkvRows    = 10240;
     constexpr std::int32_t kZRows      = 6144;
     constexpr std::int32_t kOutputRows = kQkvRows + kZRows;
+    const std::int32_t hidden          = options.hidden;
+    const bool fp8                     = options.format == QType::FP8_E4M3FN_ROW_BF16S;
+    const ops::LinearPolicy policy     = fp8 ? options.fp8_policy : options.nvfp4_policy;
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
-    bench::PackedQuantizedWeight parent = bench::make_nvfp4_weight(kOutputRows, kHidden);
+    bench::PackedQuantizedWeight parent = fp8 ? bench::make_fp8_weight(kOutputRows, hidden)
+                                              : bench::make_nvfp4_weight(kOutputRows, hidden);
     const std::size_t maximum_workspace = ops::gdn_input_proj_workspace_capacity_bytes(
-        QType::NVFP4, kOutputRows, kHidden, options.nvfp4_policy, max_tokens, max_tokens);
+        options.format, kOutputRows, hidden, policy, max_tokens, max_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(maximum_workspace, 256));
-    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens);
+    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer qkv(static_cast<std::size_t>(kQkvRows) * max_tokens * 2);
     DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
     const auto make_launch = [&](std::int32_t tokens) {
         return [&, tokens](cudaStream_t launch_stream) {
-            Tensor x(input.p, DType::BF16, {kHidden, tokens});
+            Tensor x(input.p, DType::BF16, {hidden, tokens});
             Tensor tqkv(qkv.p, DType::BF16, {kQkvRows, tokens});
             Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, parent.weight, tqkv, tz, options.nvfp4_policy, workspace,
-                                launch_stream);
+            ops::gdn_input_proj(x, parent.weight, tqkv, tz, policy, workspace, launch_stream);
         };
     };
     const auto workspace_capacity = [&](std::int32_t tokens) {
-        return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, kOutputRows, kHidden,
-                                                            options.nvfp4_policy, tokens, tokens);
+        return ops::gdn_input_proj_workspace_capacity_bytes(options.format, kOutputRows, hidden,
+                                                            policy, tokens, tokens);
     };
-    measure_points(options, "nvfp4", policy_name(options.nvfp4_policy), kHidden, kOutputRows,
+    measure_points(options, fp8 ? "fp8" : "nvfp4", policy_name(policy), hidden, kOutputRows,
                    parent.model_weight_bytes(), workspace_capacity, make_launch, flush, stream,
                    results);
 }
@@ -286,14 +327,14 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
-    output << "entry,format,policy,cache,T,workspace_bytes,logical_bytes,useful_flops,"
+    output << "entry,format,K,policy,cache,T,workspace_bytes,logical_bytes,useful_flops,"
               "median_us,min_us,p95_us\n";
     for (const Result& result : results) {
-        output << "gdn_input_proj," << result.format << ',' << result.policy << ','
-               << cache_name(result.cache) << ',' << result.tokens << ',' << result.workspace_bytes
-               << ',' << result.logical_bytes << ',' << result.useful_flops << ','
-               << result.timing.median_us << ',' << result.timing.min_us << ','
-               << result.timing.p95_us << '\n';
+        output << "gdn_input_proj," << result.format << ',' << result.hidden << ',' << result.policy
+               << ',' << cache_name(result.cache) << ',' << result.tokens << ','
+               << result.workspace_bytes << ',' << result.logical_bytes << ','
+               << result.useful_flops << ',' << result.timing.median_us << ','
+               << result.timing.min_us << ',' << result.timing.p95_us << '\n';
     }
 }
 
@@ -312,7 +353,7 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(kFlushBytes);
         std::vector<Result> results;
 
-        run_nvfp4(options, flush, stream, results);
+        run_parent(options, flush, stream, results);
 
         write_csv(options, results);
         CUDA_CHECK(cudaStreamDestroy(stream));

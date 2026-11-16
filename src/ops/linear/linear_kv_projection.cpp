@@ -82,10 +82,10 @@ Weight row_split_view(const Weight& parent, RowSplitGeometry geometry, std::int3
 
 void linear_kv_projection(const Tensor& x, const Weight& w, Tensor& key, Tensor& value,
                           cudaStream_t stream, std::int32_t sequence_width) {
-    constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kKvRows = 1024;
+    const std::int32_t hidden      = w.k;
     const auto tokens              = x.ne[1];
-    if (w.n != 6144 || w.k != kHidden || tokens <= 0 || sequence_width <= 0 ||
+    if (w.n != 6144 || (hidden != 5120 && hidden != 2560) || tokens <= 0 || sequence_width <= 0 ||
         tokens % sequence_width != 0 || tokens / sequence_width > 12) {
         throw std::invalid_argument("linear_kv_projection: unsupported original or packed shape");
     }
@@ -96,21 +96,26 @@ void linear_kv_projection(const Tensor& x, const Weight& w, Tensor& key, Tensor&
         break;
     case QType::W8G32_F16S:
     case QType::Q4G64_F16S:
+        if (hidden != 5120) {
+            throw std::invalid_argument(
+                "linear_kv_projection: RowSplit weights are registered only at K=5120");
+        }
         row_split = require_row_split_weight(w);
         break;
     default:
         throw std::invalid_argument("linear_kv_projection: unsupported original weight format");
     }
-    require_matrix(x, kHidden, tokens, "input");
+    require_matrix(x, hidden, tokens, "input");
     require_matrix(key, kKvRows, tokens, "key output");
     require_matrix(value, kKvRows, tokens, "value output");
 
-    const auto input   = address_range(x.data, static_cast<std::uint64_t>(kHidden) * tokens * 2);
-    const auto payload = address_range(w.payload, w.payload_bytes);
-    const auto key_range =
-        address_range(key.data, static_cast<std::uint64_t>(kKvRows) * tokens * 2);
-    const auto value_range =
-        address_range(value.data, static_cast<std::uint64_t>(kKvRows) * tokens * 2);
+    const auto input       = address_range(x.data, static_cast<std::uint64_t>(hidden) *
+                                                       static_cast<std::uint64_t>(tokens) * 2);
+    const auto payload     = address_range(w.payload, w.payload_bytes);
+    const auto key_range   = address_range(key.data, static_cast<std::uint64_t>(kKvRows) *
+                                                         static_cast<std::uint64_t>(tokens) * 2);
+    const auto value_range = address_range(value.data, static_cast<std::uint64_t>(kKvRows) *
+                                                           static_cast<std::uint64_t>(tokens) * 2);
     if (overlaps(key_range, value_range) || overlaps(key_range, input) ||
         overlaps(value_range, input) || overlaps(key_range, payload) ||
         overlaps(value_range, payload)) {

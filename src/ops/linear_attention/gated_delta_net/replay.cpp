@@ -107,7 +107,10 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
     const bool registered_heads    = qk_heads == 16 && value_heads == 48;
-    if (!registered_heads || width < 2 || width > 16 || rows <= 0 || rows > kMaximumRows) {
+    const bool tree                = tree_schedule != nullptr && tree_schedule->data != nullptr;
+    // A chain record admits one column; a tree needs a root and at least one child.
+    const std::int32_t min_width = tree ? 2 : 1;
+    if (!registered_heads || width < min_width || width > 16 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
     if (states.ne[3] <= 0) {
@@ -133,7 +136,6 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out");
     require_scale(scale, kOp);
 
-    const bool tree = tree_schedule != nullptr && tree_schedule->data != nullptr;
     if (tree) {
         require_tensor(*tree_schedule, DType::I32, {kGdnTreeScheduleWords, rows}, 4, kOp,
                        "tree schedule");
@@ -163,15 +165,16 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
 }
 
 bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
-    return spec.layers == 48 && spec.qk_heads == 16 && spec.value_heads == 48 &&
-           spec.conv_channels == 10240;
+    return (spec.layers == 48 || spec.layers == 36) && spec.qk_heads == 16 &&
+           spec.value_heads == 48 && spec.conv_channels == 10240;
 }
 
-void validate_fold_records(const GdnReplayRecords& records) {
+// gdn_replay_fold admits width-one chain records; the accepted-history profile keeps T=2..16.
+void validate_fold_records(const GdnReplayRecords& records, std::int32_t min_width) {
     constexpr const char* kOp       = "gdn_replay_fold";
     const GdnReplayRecordSpec& spec = records.spec;
     if (!is_registered_fold_geometry(spec) || spec.record_capacity <= 0 ||
-        spec.record_capacity > kMaximumRows || spec.width < 2 || spec.width > 16 ||
+        spec.record_capacity > kMaximumRows || spec.width < min_width || spec.width > 16 ||
         spec.key_dim != kStateDim || spec.value_dim != kStateDim) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported record geometry");
     }
@@ -425,7 +428,7 @@ void gated_delta_net_tree_schedule(const Tensor& parent_index, const Tensor& val
 
 void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                      std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) {
-    validate_fold_records(records);
+    validate_fold_records(records, 1);
     validate_fold_states(records, states);
     require_records_disjoint_from_states(records, states);
     const detail::gated_delta_net::GdnReplayFoldKernelRows packed =
@@ -443,7 +446,7 @@ void gated_delta_net_history_record(const Tensor& q, const Tensor& k, const Tens
                                     const Tensor* tree_schedule) {
     validate_replay_record(q, k, v, g, beta, scale, states, valid_columns, initial_slots,
                            key_record, value_record, gate_record, out, tree_schedule);
-    if (q.ne[1] != 16 || v.ne[1] != 48 || states.ne[3] < history.counts.ne[0]) {
+    if (q.ne[1] != 16 || v.ne[1] != 48 || q.ne[2] < 2 || states.ne[3] < history.counts.ne[0]) {
         throw std::invalid_argument("GDN history record requires the D128/Hq16/Hv48 profile");
     }
     validate_history_layer(history, q.ne[3], q.ne[2]);
@@ -490,7 +493,7 @@ void gated_delta_net_history_record(const Tensor& q, const Tensor& k, const Tens
 void gdn_history_commit(const GdnReplayRecords& records, const GdnHistory& history,
                         LinearAttentionStateAllLayersView states,
                         std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) {
-    validate_fold_records(records);
+    validate_fold_records(records, 2);
     validate_fold_states(records, states);
     require_records_disjoint_from_states(records, states);
     validate_history(history, records, states);
@@ -510,7 +513,7 @@ void gdn_history_materialize(const GdnReplayRecords& records, const GdnHistory& 
     if (slots.empty() || slots.size() > static_cast<std::size_t>(history.spec.slots)) {
         throw std::invalid_argument("GDN history materialization slot count is invalid");
     }
-    validate_fold_records(records);
+    validate_fold_records(records, 2);
     validate_fold_states(records, states);
     require_records_disjoint_from_states(records, states);
     validate_history(history, records, states);

@@ -148,6 +148,69 @@ void test_fp8_row_layout() {
         "FP8 cannot use grouped integer layout");
 }
 
+void test_expert_tiles_layout() {
+    // Qwen3.8-Flash-Next records: 800 gate|up and 400 down chunks of 1664 (F3) or 2304 bytes.
+    const std::array<std::uint64_t, 3> flash_next{3, 2560, 640};
+    const auto f3 =
+        ninfer::artifact::expert_tiles_geometry(NumericFormat::F3G32_E4M3FN, flash_next);
+    const auto e2m1 =
+        ninfer::artifact::expert_tiles_geometry(NumericFormat::E2M1G16_E4M3FN, flash_next);
+    if (f3.chunk_bytes != 1664 || f3.gate_up_chunks != 800 || f3.down_chunks != 400 ||
+        f3.record_bytes != 1996800 || f3.encoded_bytes != 3 * 1996800 || e2m1.chunk_bytes != 2304 ||
+        e2m1.record_bytes != 2764800) {
+        throw std::runtime_error("expert-tile geometry differs from the record layout");
+    }
+
+    // [1,128,128] F3: 12 chunks, 19968 bytes; [2,128,128] E2M1: 2 x 27648 bytes.
+    auto directory = normative_directory();
+    directory["objects"].push_back({{"name", "f3_records"},
+                                    {"kind", "tensor"},
+                                    {"shape", {1, 128, 128}},
+                                    {"format", "F3G32_E4M3FN"},
+                                    {"layout", "moe-expert-tiles-v1"},
+                                    {"offset", 3584},
+                                    {"bytes", 19968}});
+    directory["objects"].push_back({{"name", "e2m1_records"},
+                                    {"kind", "tensor"},
+                                    {"shape", {2, 128, 128}},
+                                    {"format", "E2M1G16_E4M3FN"},
+                                    {"layout", "moe-expert-tiles-v1"},
+                                    {"offset", 23552},
+                                    {"bytes", 55296}});
+    auto fixture = write_fixture(directory, "expert-tiles");
+    Reader reader(fixture.path);
+    const auto* f3_tensor   = std::get_if<TensorDescriptor>(reader.find("f3_records"));
+    const auto* e2m1_tensor = std::get_if<TensorDescriptor>(reader.find("e2m1_records"));
+    if (f3_tensor == nullptr || f3_tensor->format != NumericFormat::F3G32_E4M3FN ||
+        f3_tensor->layout != StorageLayout::MoeExpertTilesV1 ||
+        reader.payload(*f3_tensor).data.size() != 19968 || e2m1_tensor == nullptr ||
+        e2m1_tensor->format != NumericFormat::E2M1G16_E4M3FN ||
+        reader.payload(*e2m1_tensor).data.size() != 55296) {
+        throw std::runtime_error("expert-tile directory/payload did not round trip");
+    }
+
+    const std::array<std::uint64_t, 2> matrix{128, 128};
+    const std::array<std::uint64_t, 3> ragged{1, 128, 160};
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::tensor_encoded_size(StorageLayout::RowSplitK128V1,
+                                                        NumericFormat::F3G32_E4M3FN, matrix);
+        },
+        "F3 cannot use grouped integer layout");
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::tensor_encoded_size(StorageLayout::MoeExpertTilesV1,
+                                                        NumericFormat::NVFP4, flash_next);
+        },
+        "NVFP4 cannot use expert tiles");
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::tensor_encoded_size(StorageLayout::MoeExpertTilesV1,
+                                                        NumericFormat::E2M1G16_E4M3FN, ragged);
+        },
+        "expert tiles require 128-multiple widths");
+}
+
 void test_normative_fixture() {
     auto fixture = write_fixture(normative_directory(), "valid");
     Reader reader(fixture.path);
@@ -373,6 +436,7 @@ int main() {
     try {
         test_registered_sizes();
         test_fp8_row_layout();
+        test_expert_tiles_layout();
         test_normative_fixture();
         test_common_validation();
         test_selected_row_identity();

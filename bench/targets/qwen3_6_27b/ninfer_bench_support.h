@@ -93,8 +93,11 @@ struct BenchOptions {
     ProposalHead proposal_head        = ProposalHead::Full;
     int device                        = 0;
     bool use_cuda_graph               = true;
-    bool profile_measured             = false;
-    OutputFormat output               = OutputFormat::Table;
+    // qwen3.8-flash-next only.
+    std::string ngram_table_path;
+    std::optional<QsaSelectBudget> qsa_select_budget;
+    bool profile_measured = false;
+    OutputFormat output   = OutputFormat::Table;
     std::string output_file;
     bool help_requested = false;
 };

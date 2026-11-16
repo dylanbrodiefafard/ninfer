@@ -712,6 +712,231 @@ int run_fp8() {
     return failures;
 }
 
+// [16384,2560] parents (Qwen3.8-Flash-Next GDN), A16Only: one projection over all W*B packed
+// columns, BF16 staging in the workspace, and the slot-indexed convolution.
+DevicePackedWeight make_flash_next_parent(QType qtype) {
+    constexpr std::int32_t kHidden = 2560;
+    constexpr std::int32_t kRows   = 16384;
+    if (qtype == QType::NVFP4) {
+        return DevicePackedWeight(
+            with_distinct_nvfp4_rows(make_nvfp4_a16_weight(kRows, kHidden, 1301U)));
+    }
+    return DevicePackedWeight(with_distinct_fp8_rows(quantized_weight::make_patterned_weight(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 1303U)));
+}
+
+const ReductionCriterion& flash_next_criterion(QType qtype) {
+    return qtype == QType::NVFP4 ? kGdnInputProjConvSnapshotA16Tolerance
+                                 : kFp8GdnInputProjConvSnapshotA16Tolerance;
+}
+
+// Each lane of one batched call against a B=1 call on that lane's input and history. The B=1
+// call uses its own packed column count, so its projection reduction route may differ; both are
+// compared under the Op's A16 criterion, and untouched slots must stay bit-identical. With
+// in_place (W=1), every row publishes into its own initial slot, the decode configuration.
+int run_flash_next_lane_equivalence(QType qtype, DevicePackedWeight& parent, std::int32_t width,
+                                    std::int32_t batch, bool in_place) {
+    constexpr std::int32_t kHidden    = 2560;
+    constexpr std::int32_t kChannels  = 10240;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    constexpr std::int32_t kRows      = 16384;
+    const std::int32_t aggregate      = width * batch;
+    const std::int32_t slots          = aggregate + batch;
+    const std::size_t slot_stride     = static_cast<std::size_t>(kChannels) * 3;
+    const std::vector<float> activation =
+        make_bf16_activation(kHidden, aggregate, 1307U + static_cast<std::uint32_t>(aggregate));
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    const std::vector<std::uint16_t> conv_weight_bits =
+        bf16_bits(make_conv_weight(kChannels, 1311U));
+    std::vector<std::uint16_t> state_before(slot_stride * static_cast<std::size_t>(slots));
+    {
+        std::vector<float> values(state_before.size());
+        fill_uniform(values, 1313U, -0.05F, 0.05F);
+        round_to_bf16(values);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            state_before[index] = f32_to_bf16(values[index]);
+        }
+    }
+    std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
+    std::vector<std::int32_t> snapshot_bases(static_cast<std::size_t>(batch));
+    std::vector<std::int32_t> valid_columns(static_cast<std::size_t>(batch));
+    for (std::int32_t row = 0; row < batch; ++row) {
+        // Lanes are not in slot order: row b reads slot aggregate + (batch - 1 - b).
+        initial_slots[static_cast<std::size_t>(row)] =
+            in_place ? (batch - 1 - row) * width : aggregate + batch - 1 - row;
+        snapshot_bases[static_cast<std::size_t>(row)] = (batch - 1 - row) * width;
+        valid_columns[static_cast<std::size_t>(row)]  = 1 + (row * 3) % width;
+    }
+
+    DeviceBuffer device_x      = to_device(activation_bits);
+    DeviceBuffer device_conv   = to_device(conv_weight_bits);
+    DeviceBuffer device_init   = to_device(initial_slots);
+    DeviceBuffer device_base   = to_device(snapshot_bases);
+    DeviceBuffer device_valid  = to_device(valid_columns);
+    DeviceBuffer batched_state = to_device(state_before);
+    DeviceBuffer lane_state    = to_device(state_before);
+    GuardedBf16Tensor bq(kQueryRows, aggregate), bk(kKeyRows, aggregate), bv(kValueRows, aggregate),
+        bz(kZRows, aggregate);
+    GuardedBf16Tensor lq(kQueryRows, aggregate), lk(kKeyRows, aggregate), lv(kValueRows, aggregate),
+        lz(kZRows, aggregate);
+
+    const Tensor x(device_x.p, DType::BF16, {kHidden, width, batch});
+    const Tensor conv(device_conv.p, DType::BF16, {kChannels, 4});
+    Tensor batched_view(batched_state.p, DType::BF16, {kChannels, 3, slots});
+    Tensor lane_view(lane_state.p, DType::BF16, {kChannels, 3, slots});
+    const Tensor initial(device_init.p, DType::I32, {batch});
+    const Tensor base(device_base.p, DType::I32, {batch});
+    const Tensor valid(device_valid.p, DType::I32, {batch});
+    const auto view = [&](GuardedBf16Tensor& tensor, std::int32_t rows) {
+        return Tensor(tensor.data(), DType::BF16, {rows, width, batch});
+    };
+    Tensor q = view(bq, kQueryRows), k = view(bk, kKeyRows), v = view(bv, kValueRows),
+           z      = view(bz, kZRows);
+    Tensor q_lane = view(lq, kQueryRows), k_lane = view(lk, kKeyRows),
+           v_lane = view(lv, kValueRows), z_lane = view(lz, kZRows);
+
+    const std::size_t batched_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        qtype, kRows, kHidden, ops::LinearPolicy::A16Only, batch, width, width);
+    WorkspaceArena batched_workspace(batched_bytes);
+    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, batched_view, valid, initial, base, q,
+                                      k, v, z, batched_workspace, nullptr);
+    const std::size_t lane_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        qtype, kRows, kHidden, ops::LinearPolicy::A16Only, 1, width, width);
+    WorkspaceArena lane_workspace(lane_bytes);
+    for (std::int32_t row = 0; row < batch; ++row) {
+        Tensor q_row = q_lane.slice(2, row, 1), k_row = k_lane.slice(2, row, 1),
+               v_row = v_lane.slice(2, row, 1), z_row = z_lane.slice(2, row, 1);
+        ops::gdn_input_proj_conv_snapshot(x.slice(2, row, 1), parent.view(), conv, lane_view,
+                                          valid.slice(0, row, 1), initial.slice(0, row, 1),
+                                          base.slice(0, row, 1), q_row, k_row, v_row, z_row,
+                                          ops::LinearPolicy::A16Only, lane_workspace, nullptr);
+    }
+    cuda_synchronize();
+
+    const std::string label = std::string(qtype == QType::NVFP4 ? "NVFP4" : "FP8") +
+                              " K=2560 lane equivalence B=" + std::to_string(batch) +
+                              " W=" + std::to_string(width) + (in_place ? " in-place" : "");
+    const ReductionCriterion& criterion = flash_next_criterion(qtype);
+    int failures                        = 0;
+    failures += compare(label + " query", bq.values(), lq.values(), criterion);
+    failures += compare(label + " key", bk.values(), lk.values(), criterion);
+    failures += compare(label + " value", bv.values(), lv.values(), criterion);
+    failures += compare(label + " z", bz.values(), lz.values(), criterion);
+    const std::vector<std::uint16_t> batched_after =
+        from_device<std::uint16_t>(batched_state.p, state_before.size());
+    const std::vector<std::uint16_t> lane_after =
+        from_device<std::uint16_t>(lane_state.p, state_before.size());
+    std::vector<double> batched_written;
+    std::vector<double> lane_written;
+    std::vector<bool> written(static_cast<std::size_t>(slots), false);
+    for (std::int32_t row = 0; row < batch; ++row) {
+        for (std::int32_t column = 0; column < valid_columns[static_cast<std::size_t>(row)];
+             ++column) {
+            written[static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(row)]) +
+                    static_cast<std::size_t>(column)] = true;
+        }
+    }
+    for (std::int32_t slot = 0; slot < slots; ++slot) {
+        const auto begin =
+            static_cast<std::ptrdiff_t>(slot_stride * static_cast<std::size_t>(slot));
+        const auto end = begin + static_cast<std::ptrdiff_t>(slot_stride);
+        if (!written[static_cast<std::size_t>(slot)]) {
+            // An unwritten slot keeps its bits; an in-place row's unwritten initial slot is one.
+            if (!std::equal(state_before.begin() + begin, state_before.begin() + end,
+                            batched_after.begin() + begin) ||
+                !std::equal(state_before.begin() + begin, state_before.begin() + end,
+                            lane_after.begin() + begin)) {
+                std::cerr << label << ": unwritten state slot " << slot << " was modified\n";
+                ++failures;
+            }
+            continue;
+        }
+        for (auto index = begin; index < end; ++index) {
+            batched_written.push_back(bf16_to_f32(batched_after[static_cast<std::size_t>(index)]));
+            lane_written.push_back(bf16_to_f32(lane_after[static_cast<std::size_t>(index)]));
+        }
+    }
+    failures += compare(label + " state", batched_written, lane_written, criterion);
+    failures += verify_zero_tail(label + " query", bq, kQueryRows, width, batch, valid_columns);
+    failures += verify_zero_tail(label + " value", bv, kValueRows, width, batch, valid_columns);
+    return failures;
+}
+
+int run_flash_next(QType qtype) {
+    constexpr std::int32_t kHidden    = 2560;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    constexpr std::int32_t kChannels  = 10240;
+    constexpr std::int32_t kRows      = 16384;
+    DevicePackedWeight parent         = make_flash_next_parent(qtype);
+    const std::string name            = qtype == QType::NVFP4 ? "NVFP4" : "FP8";
+    int failures                      = 0;
+
+    const auto run_batched = [&](std::int32_t width, std::int32_t batch,
+                                 std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
+        const std::vector<float> conv_weight = make_conv_weight(kChannels, seed);
+        const std::size_t workspace_bytes =
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                qtype, kRows, kHidden, ops::LinearPolicy::A16Only, batch, width, width);
+        if (workspace_bytes != static_cast<std::size_t>(20480) * width * batch) {
+            std::cerr << name << " K=2560 snapshot workspace is not the BF16 projection plane\n";
+            ++failures;
+        }
+        return run_batched_case(
+            name + " K=2560 A16 B=" + std::to_string(batch) + " W=" + std::to_string(width),
+            kHidden, kValueRows, kZRows, width, batch, std::move(valid_columns), conv_weight,
+            workspace_bytes, flash_next_criterion(qtype),
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, kChannels + row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+                Tensor& z, WorkspaceArena& workspace) {
+                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
+                                                  snapshot_base, q, k, v, z, workspace, nullptr);
+            });
+    };
+    // W=1 decode (the GEMV route at B=1, the packed routes from B=2), multi-column snapshots
+    // with mixed valid prefixes, and a long single-row snapshot.
+    failures += run_batched(1, 1, {}, 1321U);
+    failures += run_batched(1, 4, {}, 1323U);
+    failures += run_batched(1, 12, {}, 1327U);
+    failures += run_batched(4, 4, {4, 3, 1, 2}, 1329U);
+    failures += run_batched(4, 12, {4, 1, 2, 3, 4, 4, 1, 2, 3, 4, 2, 1}, 1331U);
+    failures += run_batched(16, 2, {16, 9}, 1333U);
+    failures += run_batched(37, 1, {}, 1337U);
+
+    failures += run_flash_next_lane_equivalence(qtype, parent, 1, 8, true);
+    failures += run_flash_next_lane_equivalence(qtype, parent, 1, 12, true);
+    failures += run_flash_next_lane_equivalence(qtype, parent, 4, 4, false);
+
+    for (const ops::LinearPolicy policy :
+         {ops::LinearPolicy::AllowA8, ops::LinearPolicy::AllowA4}) {
+        failures += expect_invalid_argument(
+            [&] {
+                return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                    qtype, kRows, kHidden, policy, 1, 1, 1);
+            },
+            name + " K=2560 snapshot workspace accepted a quantized-activation policy");
+    }
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                qtype, kRows, kHidden, ops::LinearPolicy::A16Only, 2, 1, 17);
+        },
+        name + " K=2560 snapshot workspace accepted B=2 W=17");
+    failures += parent.verify_preserved(name + " K=2560 snapshot parent weight");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -731,6 +956,8 @@ int main() {
     }
     failures += run_fp8();
     failures += run_nvfp4();
+    failures += run_flash_next(QType::FP8_E4M3FN_ROW_BF16S);
+    failures += run_flash_next(QType::NVFP4);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

@@ -134,6 +134,7 @@ def parse_openai_stream(response: Response) -> tuple[str, str, str, dict[str, An
     usage: dict[str, Any] | None = None
     saw_role = False
     saw_done = False
+    finish_usage: dict[str, Any] | None = None
     for block in response.body.decode("utf-8").replace("\r\n", "\n").split("\n\n"):
         if not block:
             continue
@@ -155,9 +156,13 @@ def parse_openai_stream(response: Response) -> tuple[str, str, str, dict[str, An
         if not isinstance(choices, list):
             raise ContractError("OpenAI stream event is missing choices")
         event_usage = event.get("usage")
+        if event_usage is not None and choices:
+            # The finish chunk carries the request's usage; the trailer repeats it without choices.
+            if len(choices) != 1 or choices[0].get("finish_reason") is None:
+                raise ContractError("OpenAI usage on a chunk other than the finish chunk")
+            finish_usage = event_usage
+            event_usage = None
         if event_usage is not None:
-            if choices:
-                raise ContractError("OpenAI usage event unexpectedly contains choices")
             if usage is not None:
                 raise ContractError("OpenAI stream emitted usage more than once")
             if finish_reason is None:
@@ -193,6 +198,8 @@ def parse_openai_stream(response: Response) -> tuple[str, str, str, dict[str, An
             finish_reason = reason
     if not saw_role or not saw_done or finish_reason is None or usage is None:
         raise ContractError("OpenAI stream did not complete its role/finish/usage/[DONE] contract")
+    if finish_usage is not None and finish_usage != usage:
+        raise ContractError("OpenAI finish-chunk usage differs from the usage trailer")
     prompt, completion = require_usage(usage, "prompt_tokens", "completion_tokens")
     if usage.get("total_tokens") != prompt + completion:
         raise ContractError("OpenAI streamed total_tokens does not equal prompt + completion")
@@ -328,7 +335,105 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
     return terminal_content, terminal_reasoning, terminal
 
 
-def exercise(base_url: str, model: str) -> dict[str, Any]:
+def parse_anthropic_stream(response: Response) -> tuple[str, str, dict[str, Any]]:
+    """Returns the streamed text, the stop reason and the final usage of a Messages stream."""
+    if response.status != 200 or response.content_type != "text/event-stream":
+        raise ContractError(
+            f"Anthropic stream returned status={response.status} "
+            f"content-type={response.content_type}"
+        )
+    text: list[str] = []
+    stop_reason: str | None = None
+    usage: dict[str, Any] | None = None
+    events: list[str] = []
+    for block in response.body.decode("utf-8").replace("\r\n", "\n").split("\n\n"):
+        if not block:
+            continue
+        names = [line[7:] for line in block.splitlines() if line.startswith("event: ")]
+        data = [line[6:] for line in block.splitlines() if line.startswith("data: ")]
+        if len(names) != 1 or len(data) != 1:
+            raise ContractError(f"malformed Anthropic SSE block: {block!r}")
+        try:
+            payload = json.loads(data[0])
+        except json.JSONDecodeError as error:
+            raise ContractError("Anthropic stream contained invalid JSON") from error
+        if payload.get("type") != names[0]:
+            raise ContractError("Anthropic SSE event name differs from its payload type")
+        events.append(names[0])
+        if names[0] == "content_block_delta":
+            delta = payload.get("delta", {})
+            if delta.get("type") == "text_delta":
+                text.append(delta.get("text", ""))
+        elif names[0] == "message_delta":
+            stop_reason = payload.get("delta", {}).get("stop_reason")
+            usage = payload.get("usage")
+    if not events or events[0] != "message_start" or events[-1] != "message_stop":
+        raise ContractError("Anthropic stream is not framed by message_start/message_stop")
+    if stop_reason is None or not isinstance(usage, dict):
+        raise ContractError("Anthropic stream has no message_delta stop reason and usage")
+    return "".join(text), stop_reason, usage
+
+
+def exercise_tools(base_url: str, model: str) -> str:
+    """A tool-declaring request runs under the Engine's tool grammar and returns a valid choice."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "What is the weather in Paris? Use the tool."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Current weather of a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        "max_completion_tokens": 512,
+        "temperature": 0,
+    }
+    response = json_response(base_url, "POST", "/v1/chat/completions", payload)
+    choice = response["choices"][0]
+    calls = choice.get("message", {}).get("tool_calls") or []
+    for call in calls:
+        function = call.get("function", {})
+        if function.get("name") != "get_weather":
+            raise ContractError(f"tool call names an undeclared tool: {function.get('name')!r}")
+        try:
+            arguments = json.loads(function.get("arguments", ""))
+        except json.JSONDecodeError as error:
+            raise ContractError("tool call arguments are not JSON") from error
+        if not isinstance(arguments, dict) or not isinstance(arguments.get("city"), str):
+            raise ContractError("tool call arguments do not match the declared schema")
+    if choice.get("finish_reason") == "tool_calls" and not calls:
+        raise ContractError("finish_reason tool_calls without a tool call")
+    return choice.get("finish_reason")
+
+
+def exercise_image(base_url: str, model: str, input_tokens: int) -> int:
+    image_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": _IMAGE_DATA_URI}},
+                {"type": "text", "text": "What is visible? Answer briefly."},
+            ],
+        }
+    ]
+    image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
+    image_prompt_tokens, _ = require_usage(
+        image_response.get("usage"), "prompt_tokens", "completion_tokens"
+    )
+    if image_prompt_tokens <= input_tokens:
+        raise ContractError("image request did not expand the prompt through the Vision frontend")
+    return image_prompt_tokens
+
+
+def exercise(base_url: str, model: str, vision: bool) -> dict[str, Any]:
     models = json_response(base_url, "GET", "/v1/models")
     entries = models.get("data")
     if models.get("object") != "list" or not isinstance(entries, list) or len(entries) != 1:
@@ -376,8 +481,10 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         raise ContractError("streamed reasoning differs from the non-streaming greedy response")
     if stream_finish != nonstream["choices"][0]["finish_reason"]:
         raise ContractError("streamed and non-streaming finish reasons differ")
-    if stream_usage != nonstream["usage"]:
-        raise ContractError("streamed and non-streaming usage differs")
+    # The usage details carry per-request timings; the token counts must agree.
+    counted_keys = ("prompt_tokens", "completion_tokens", "total_tokens")
+    if any(stream_usage.get(key) != nonstream["usage"].get(key) for key in counted_keys):
+        raise ContractError("streamed and non-streaming usage token counts differ")
 
     responses_input = "Reply with a single short word."
     response_count = json_response(
@@ -455,21 +562,9 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         if deleted != {"id": response_id, "object": "response.deleted", "deleted": True}:
             raise ContractError("Responses delete returned the wrong object")
 
-    image_messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": _IMAGE_DATA_URI}},
-                {"type": "text", "text": "What is visible? Answer briefly."},
-            ],
-        }
-    ]
-    image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
-    image_prompt_tokens, _ = require_usage(
-        image_response.get("usage"), "prompt_tokens", "completion_tokens"
-    )
-    if image_prompt_tokens <= input_tokens:
-        raise ContractError("image request did not expand the prompt through the Vision frontend")
+    image_prompt_tokens: int | None = None
+    if vision:
+        image_prompt_tokens = exercise_image(base_url, model, input_tokens)
 
     anthropic = json_response(base_url, "POST", "/v1/messages", anthropic_prompt)
     if anthropic.get("type") != "message" or anthropic.get("role") != "assistant":
@@ -484,6 +579,24 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     )
     if anthropic_input_tokens != input_tokens:
         raise ContractError("Anthropic usage input_tokens differs from count_tokens")
+    anthropic_stream = request(
+        base_url, "POST", "/v1/messages", {**anthropic_prompt, "temperature": 0, "stream": True}
+    )
+    streamed_text, streamed_stop, streamed_usage = parse_anthropic_stream(anthropic_stream)
+    anthropic_greedy = json_response(
+        base_url, "POST", "/v1/messages", {**anthropic_prompt, "temperature": 0}
+    )
+    greedy_text = "".join(
+        block.get("text", "")
+        for block in anthropic_greedy["content"]
+        if block.get("type") == "text"
+    )
+    if streamed_text != greedy_text or streamed_stop != anthropic_greedy.get("stop_reason"):
+        raise ContractError("Anthropic streamed output differs from greedy non-streaming output")
+    if streamed_usage.get("output_tokens") != anthropic_greedy["usage"].get("output_tokens"):
+        raise ContractError("Anthropic streamed output_tokens differs from non-streaming usage")
+
+    tool_finish_reason = exercise_tools(base_url, model)
 
     return {
         "format": "ninfer_serve_contract_v2",
@@ -495,6 +608,8 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "responses_output_tokens": response_output_tokens,
         "image_prompt_tokens": image_prompt_tokens,
         "anthropic_stop_reason": anthropic["stop_reason"],
+        "anthropic_stream_stop_reason": streamed_stop,
+        "tool_finish_reason": tool_finish_reason,
     }
 
 
@@ -503,11 +618,18 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:18080")
     parser.add_argument("--model", required=True)
     parser.add_argument("--health-timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="skip the image request, for a target without Vision (qwen3.8-flash-next)",
+    )
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     wait_for_health(base_url, args.health_timeout)
-    print(json.dumps(exercise(base_url, args.model), ensure_ascii=False, indent=2))
+    print(
+        json.dumps(exercise(base_url, args.model, not args.text_only), ensure_ascii=False, indent=2)
+    )
 
 
 if __name__ == "__main__":

@@ -26,17 +26,20 @@ namespace ninfer::ops {
  *   BF16 `[5120,T]`, q/gate are BF16 `[6144,T]`, and k/v are BF16 `[1024,T]`.
  * - NVFP4 BlockScaleK16M128x4 `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16_CTRL.
+ * - NVFP4 BlockScaleK16M128x4 `[13312,2560]`, with row counts `[6144,512,6144,512]`. `x` is
+ *   BF16 `[2560,T]`, q/gate are BF16 `[6144,T]`, and k/v are BF16 `[512,T]`.
  * - FP8_E4M3FN_ROW_BF16S RowScale `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16_CTRL. Its represented weight is each signed E4M3FN code times the exact BF16 row
  *   multiplier.
  *
  * `T` is the positive token extent of the Op contract. BF16_CTRL admits only
- * LinearPolicy::A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8. Its A16 route is registered
- * at T=1 and below the W4A4 cutover (T < kA4AttnInputMinTokens); AllowA4 selects activation
- * quantization to NVFP4 from that cutover and AllowA8 selects row-scaled E4M3 activation compute
- * at T>=2, so both admit every positive T, while A16Only at a wider T throws
+ * LinearPolicy::A16Only. NVFP4 `[14336,5120]` admits A16Only, AllowA4 and AllowA8. Its A16 route
+ * is registered at T=1 and below the W4A4 cutover (T < kA4AttnInputMinTokens); AllowA4 selects
+ * activation quantization to NVFP4 from that cutover and AllowA8 selects row-scaled E4M3
+ * activation compute at T>=2, so both admit every positive T, while A16Only at a wider T throws
  * std::invalid_argument. The per16-scale partial accumulation preserves the original represented
- * NVFP4 weights. FP8 admits A16Only and AllowA8 at every positive T.
+ * NVFP4 weights. NVFP4 `[13312,2560]` admits only A16Only, at every positive T. FP8 admits
+ * A16Only and AllowA8 at every positive T.
  *
  * The oracle evaluates every projection independently with naive FP64 accumulation from the
  * logical values represented by the persistent weight and BF16 activation. The final four BF16

@@ -41,6 +41,8 @@ CTEST_ARGS=()
 WEIGHT_VARS=(
   NINFER_QWEN3_8_27B_NVFP4_WEIGHTS
   NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS
+  NINFER_QWEN3_8_FLASH_NEXT_WEIGHTS
+  NINFER_QWEN3_8_FLASH_NEXT_NGRAM_TABLE
 )
 
 while [[ $# -gt 0 ]]; do
@@ -100,6 +102,12 @@ weight_filenames() {
         qwen3_8_27b_nvfp4_dflash_w8.ninfer \
         qwen3_8_27b_nvfp4_dflash_nvfp4_codebook.ninfer
       ;;
+    NINFER_QWEN3_8_FLASH_NEXT_WEIGHTS)
+      printf '%s\n' qwen3.8-flash-next-f3-fp8-nvfp4.ninfer
+      ;;
+    NINFER_QWEN3_8_FLASH_NEXT_NGRAM_TABLE)
+      printf '%s\n' ngram_table.int8.bin
+      ;;
   esac
 }
 
@@ -110,6 +118,9 @@ weight_tests() {
       ;;
     NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS)
       echo "ninfer_qwen3_8_27b_dflash_real_test, logprobs, recovery-kv"
+      ;;
+    NINFER_QWEN3_8_FLASH_NEXT_WEIGHTS|NINFER_QWEN3_8_FLASH_NEXT_NGRAM_TABLE)
+      echo "ninfer_qwen3_8_flash_next_engine_real_test, program-parity"
       ;;
   esac
 }
@@ -456,6 +467,7 @@ run_python_suite() {
   (cd "$ROOT" && "$py" -m pytest \
     tests/artifact \
     tests/targets/qwen3_6_27b \
+    tests/targets/qwen3_8_flash_next \
     tests/test_bench_matrix.py \
     tests/test_serve_corpus.py)
 }

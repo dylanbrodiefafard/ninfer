@@ -129,8 +129,9 @@ inline void validate_speculative_backend(SpeculativeBackend backend) {
     throw std::invalid_argument("invalid speculative backend");
 }
 
-[[nodiscard]] constexpr bool
-context_checkpoint_capture_available(bool allow_prefix_reuse, SpeculativeBackend spec) noexcept {
+// Backend/reuse mode only; Engine also checks the registered target's capability.
+[[nodiscard]] constexpr bool context_checkpoint_mode_available(bool allow_prefix_reuse,
+                                                               SpeculativeBackend spec) noexcept {
     return allow_prefix_reuse && spec == SpeculativeBackend::DFlash;
 }
 
@@ -138,21 +139,37 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
-    // Packed/chain DFlash verify width. 0 selects the k-dependent default.
+    // 27B packed/chain verify width; 0 selects the k-dependent default. Flash-Next requires 0.
     std::uint32_t dflash_verify_width = 0;
-    // Startup-only: capture extra draft-K graphs and lock live K at argmax E[Y]/T(k,C,L).
+    // Startup-only: capture extra K arms and select live K from measured target-specific
+    // throughput.
     bool adaptive_draft = false;
     // DFlash2 draft temperature for p-less requests: drafts are drawn from the 16-candidate
     // path-select softmax at this temperature and verified against their true proposal q, which
     // keeps the target distribution exact. Unset, each chain round uses the temperature the online
     // proposal calibration predicts is best for the request's p-less temperature and the round's
-    // draft length. A value pins it for every round; <= 0 drafts greedily (argmax).
+    // draft length. A value pins it for every round; zero drafts greedily (argmax).
     std::optional<float> dflash_p_less_draft_temperature;
 };
 
 struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
+
+// qwen3.8-flash-next: complete four-token blocks one QSA query selects beyond its tail.
+enum class QsaSelectBudget : std::uint8_t {
+    Blocks512,
+    Blocks1024,
+    Blocks2048,
+};
+
+// Parses the block count of `--qsa-select-budget`: 512, 1024 or 2048.
+[[nodiscard]] inline QsaSelectBudget parse_qsa_select_budget_flag(std::string_view raw) {
+    if (raw == "512") { return QsaSelectBudget::Blocks512; }
+    if (raw == "1024") { return QsaSelectBudget::Blocks1024; }
+    if (raw == "2048") { return QsaSelectBudget::Blocks2048; }
+    throw std::invalid_argument("--qsa-select-budget must be 512, 1024 or 2048");
+}
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
@@ -199,6 +216,11 @@ struct EngineOptions {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    // qwen3.8-flash-next only, and required by it: the 8-bit n-gram (PLE) table file. Other
+    // targets reject a non-empty path.
+    std::filesystem::path ngram_table_path;
+    // qwen3.8-flash-next only; unset selects 512 blocks. Other targets reject a value.
+    std::optional<QsaSelectBudget> qsa_select_budget;
     // Diagnostic baseline: disable repetition exclusions and internal regeneration,
     // without disabling tool grammar or changing the requested sampling law.
     bool generation_recovery = true;
@@ -789,6 +811,12 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t cuda_graph_observed_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
+    // Device expert cache of a target with host-resident routed experts (0 otherwise): the
+    // bytes of its own slot allocations, and the capacity of its slots over KV-pool pages, which
+    // it holds only while no request reserves them (the KV pool takes them back on demand). The
+    // second lies inside kv_payload_bytes and is an upper bound, not the current holding.
+    std::size_t expert_cache_bytes      = 0;
+    std::size_t expert_cache_flex_bytes = 0;
     // Pinned host memory for checkpoint images (per-lane rewrite images plus the
     // context-checkpoint head pool), allocated and prefaulted at startup, separate from
     // kv_ram_capacity_bytes.

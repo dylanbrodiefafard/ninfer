@@ -38,9 +38,10 @@ struct GdnReplayFoldRow {
  * convolution history is tail_3(old_history || conv_record[path[0]], ...,
  * conv_record[path[path_length-1]]).
  *
- * The Op admits the two registered all-layer geometries only, owns no workspace or metadata
- * allocation, and does not read query or generate token output. The four record planes are
- * read-only, disjoint, and do not overlap either state region.
+ * The record width T is 1..16. The Op admits the two registered all-layer geometries only, 48 or
+ * 36 GDN layers of 16 q/k heads, 48 value heads of 128, and 10240 convolution channels; it owns no
+ * workspace or metadata allocation, and does not read query or generate token output. The four
+ * record planes are read-only, disjoint, and do not overlap either state region.
  */
 void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                      std::span<const GdnReplayFoldRow> rows, cudaStream_t stream);

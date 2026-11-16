@@ -38,6 +38,9 @@ struct RamLadderHead {
     std::size_t recurrent_bytes = 0;
     std::size_t hidden_bytes    = 0;
     std::size_t dflash_bytes    = 0;
+    // Complete Flash-Next continuation (GDN, PLE history and tail logits), in its target-owned
+    // exact host-image layout. The pinned bytes live through copies_done.
+    std::span<const std::byte> flash_next_state;
     // The head's fence; capture re-records it after the host-callback reads of the images.
     cudaEvent_t copies_done = nullptr;
 };
@@ -79,6 +82,7 @@ struct RamLadderImage {
     std::size_t recurrent_bytes = 0;
     std::size_t hidden_bytes    = 0;
     std::size_t dflash_bytes    = 0;
+    std::span<const std::byte> flash_next_state;
 };
 
 struct RamCaptureSource {
@@ -120,6 +124,10 @@ struct RamCaptureSource {
     const Tensor* tail_hidden               = nullptr;
     const Tensor* rewrite_checkpoint_hidden = nullptr;
 
+    // Flash-Next uses these complete pinned images instead of the family GDN/hidden fields.
+    // Transport treats their registered target layout as exact bytes, never as family state.
+    std::span<const std::byte> flash_next_state;
+    std::span<const std::byte> flash_next_rewrite;
     std::vector<RamLadderHead> ladder_heads;
 
     std::uint64_t disk_entry_id = 0;
@@ -145,8 +153,12 @@ struct RamRestoreTarget {
     Tensor* tail_hidden               = nullptr;
     Tensor* rewrite_checkpoint_hidden = nullptr;
 
-    PrefixReusePath reuse    = PrefixReusePath::FullReset;
-    std::uint32_t reuse_base = 0;
+    std::span<std::byte> flash_next_state;
+    std::span<std::byte> flash_next_rewrite;
+    // Orders all previous readers/writers of both images; re-recorded after host copies.
+    cudaEvent_t flash_next_writable = nullptr;
+    PrefixReusePath reuse           = PrefixReusePath::FullReset;
+    std::uint32_t reuse_base        = 0;
     // False when the request drops the entry's rewrite checkpoint on an append or staged
     // restore: nothing reads that set, so it is not restored. A rewrite-checkpoint restore
     // likewise skips the frontier set it overwrites.
@@ -228,12 +240,11 @@ public:
     void retire_live_image(std::uint64_t id);
     void wait_live_image(std::uint64_t id);
     [[nodiscard]] bool live_image_ready(std::uint64_t id) const;
-    [[nodiscard]] static std::size_t
-    live_image_budget(const PagedKVPool& text, const PagedKVPool* backend, std::uint32_t text_pages,
-                      std::uint32_t backend_pages, std::size_t ledger_tokens,
-                      std::size_t identity_bytes, std::size_t conv_bytes,
-                      std::size_t recurrent_bytes, std::size_t hidden_bytes,
-                      std::size_t cyclic_bytes, std::size_t checkpoint_count);
+    [[nodiscard]] static std::size_t live_image_budget(
+        const PagedKVPool& text, const PagedKVPool* backend, std::uint32_t text_pages,
+        std::uint32_t backend_pages, std::size_t ledger_tokens, std::size_t identity_bytes,
+        std::size_t conv_bytes, std::size_t recurrent_bytes, std::size_t hidden_bytes,
+        std::size_t cyclic_bytes, std::size_t checkpoint_count, std::size_t flash_next_bytes = 0);
     [[nodiscard]] RamCaptureResult capture(const RamCaptureSource& source);
     [[nodiscard]] bool is_system_prompt(std::uint64_t entry_id) const;
     [[nodiscard]] bool has_system_prompt(const PreparedPromptData& prompt,
@@ -283,6 +294,8 @@ public:
         std::size_t hidden_bytes                     = 0;
         std::size_t rewrite_hidden_bytes             = 0;
         std::size_t cyclic_bytes                     = 0;
+        std::span<const std::byte> flash_next_state;
+        std::span<const std::byte> flash_next_rewrite;
         std::vector<RamLadderImage> ladder_images;
     };
 
@@ -388,6 +401,8 @@ private:
         RewriteCheckpointHidden,
         DflashLocal,
         DflashRewriteCheckpoint,
+        FlashNextCurrent,
+        FlashNextRewrite,
         Count
     };
 

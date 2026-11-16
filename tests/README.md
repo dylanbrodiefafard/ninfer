@@ -157,8 +157,10 @@ GPU tests fail if there is no usable CUDA device. CTest skip (`77`) is only for
 opt-in real-artifact Engine tests when the corresponding weights env is unset.
 Frontend tests that need the official HF tokenizer skip those cases when
 `NINFER_OFFICIAL_TOKENIZER_DIR` (or the maintainer checkout paths) is unset;
-synthetic tokenizer coverage still runs. `ninfer_gqa_attention_test --full`
-restores the complete Cartesian matrix; CTest uses the route-boundary unit set.
+synthetic tokenizer coverage still runs. The frontend test also compares the prompt tokens of
+the Qwen3.8-Flash-Next checkpoint's frontend resources with the 27B ones when
+`NINFER_FLASH_NEXT_FRONTEND_DIR` names the directory holding them.
+`ninfer_gqa_attention_test --full` restores the complete Cartesian matrix; CTest uses the route-boundary unit set.
 
 Run a focused target for a localized change:
 
@@ -204,6 +206,50 @@ python3 -m pytest \
   tests/artifact tests/targets/qwen3_6_27b \
   tests/test_bench_matrix.py tests/test_serve_corpus.py
 ```
+
+`ninfer_qwen3_8_flash_next_engine_real_test` and `ninfer_qwen3_8_flash_next_program_parity_real_test`
+need `NINFER_QWEN3_8_FLASH_NEXT_WEIGHTS` (`qwen3.8-flash-next-f3-fp8-nvfp4.ninfer`) and
+`NINFER_QWEN3_8_FLASH_NEXT_NGRAM_TABLE` (`ngram_table.int8.bin`), and each load pins about 50 GB of
+host memory (start them with at least 70 GB free). The first runs one four-lane Engine: four
+concurrent greedy requests are compared with solo runs by the near-tie/logprob criterion, requests whose reservations exceed the shared QSA
+pool wait and still equal their solo runs, a short prompt finishes inside a long prompt's prefill,
+and decode and mid-prefill cancellation leave a later request unchanged. The second compares greedy
+Engine output with the target Program's own prefill and decode on a two-super-chunk prompt.
+The same executable's `--reuse-parity` mode measures default versus independently shifted cold
+routes and requires retained/restored logits to match the shifted route byte-for-byte. Its
+`--ram-tiers` and `--disk-tiers` modes check fresh-lane checkpoint restore, exact-prefix and
+suffix/decode behavior, source-preserving disposable turns and exact system-prefix logits.
+`--live-tiers` checks funded output-window growth and cross-lane sampled continuation after both
+in-place and relocated parked-credit growth. `--conversation-ram-bench` measures six transcript
+identities competing for four lanes and 8192 MiB of RAM, using
+`NINFER_FLASH_NEXT_BENCH_TOKENS` (at least 50,000 I32 token IDs).
+
+The manual `--verify-parity` mode is the native DFlash2 numerical gate, outside the default
+registered CTest suite. It teacher-forces packed W=2,3,4 chains on width-one greedy continuations,
+compares top-1 and KL against independent same-column B=W decode and W-wide ordinary-prefill
+floors, checks exact canonical continuation/frontier preservation on rejection, and checks
+subsequent ordinary decode. Accepted state is compared exactly with ordinary execution of the
+same width. Cross-width greedy equality is not required. The floor is qualified;
+[native qualification status](../docs/maintainer/qwen3.8-flash-next-plan.md#native-dflash2-qualification-status)
+records the measurements. It also compares logical-width-one deferred commits exactly with
+ordinary width-one decode, and partial prefixes independently of rejected future columns.
+With the explicit DFlash2 companion artifact, `--dflash-program` checks fixed versus picker-forced
+K0..3, standard/p-less sampling, token-count histograms, partial publication, cyclic wrap and zero
+publication after pending context and root fallback. Two consecutive B2 K0 roots also match
+ordinary same-batch width-one complete images exactly, protecting refreshed record contents. `--dflash-engine` checks fixed/adaptive
+ragged packets, streamed logprobs, stop/cancel handling and unsupported context capture.
+`--dflash-retained`, `--dflash-ram-tiers`, `--dflash-disk-tiers` and `--dflash-live-tiers` run the
+corresponding ownership/restore cases with speculation enabled. Live cases include standard and
+p-less sampling, preserved calibration and all fifteen request rounds across suspension.
+`ninfer_flash_next_ple_feeder_test` additionally checks independent proposal histories, repeatable
+proposal reads and preservation through EOS before an ordinary decode. The CPU-only
+`tests/targets/qwen3_8_flash_next/test_dflash_conversion.py` checks append transport, fused row
+ordering and direct kernel/codebook words without a model artifact.
+
+`ninfer_flash_next_kv_tiers_test` needs no artifact: at real GDN/PLE/QSA geometry it checks the
+complete base (116,139,008-byte) and DFlash2 (158,184,704-byte) continuations and canonical QSA
+page images across RAM and reopened raw/Zstd disk stores, including current/rewrite/occupy
+rollback, pending features, seeded calibration and disjoint physical page mappings.
 
 The C++ prefix, RAM-tier, and three-tier disk integration tests load a full artifact and run
 the real Engine. Use `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` for the DFlash prefix,

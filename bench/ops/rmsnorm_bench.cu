@@ -225,7 +225,7 @@ void run(const Shape& shape, int tokens, Route route, bool profile) {
         } else if (route == Route::CandidateB1024) {
             launch_plain_candidate<1024>(shape, x.p, weight.p, out.p, rows, stream);
         } else if (shape.gated) {
-            ops::gated_rmsnorm(tx, tw, tz, 1.0e-6f, tout, stream);
+            ops::gated_rmsnorm(tx, tw, tz, ops::RmsNormGate::Silu, 1.0e-6f, tout, stream);
         } else {
             ops::rmsnorm(tx, tw, 1.0e-6f, shape.unit_offset, tout, stream);
         }

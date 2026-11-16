@@ -38,8 +38,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     }
-    if (options.draft_tokens == 0 || options.draft_tokens > 15) {
-        throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");
+    if (options.draft_tokens > 15) {
+        throw std::invalid_argument(
+            "--spec dflash requires --draft-tokens in [0,15]; target bounds apply");
     }
     if (options.dflash_verify_width != 0 &&
         (options.dflash_verify_width < 2 || options.dflash_verify_width > 16)) {

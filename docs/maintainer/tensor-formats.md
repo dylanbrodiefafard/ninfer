@@ -1,13 +1,13 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the eleven persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. Container framing, physical byte layouts, checkpoint
 assignment, kernels, and runtime-state codecs are defined separately.
 
 ## 1. Registered formats
 
-NInfer has exactly nine persistent numeric tensor formats in four categories.
+NInfer has exactly eleven persistent numeric tensor formats in five categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -34,6 +34,14 @@ The block-scaled floating-point weight format is:
 
 The row-scaled floating-point weight format is `FP8_E4M3FN_ROW_BF16S`: one finite
 signed E4M3FN code per weight and one BF16 multiplier per row (Section 3.4).
+
+The routed-expert FP4 formats store the experts of the Qwen3.8-Flash-Next study store
+(Section 3.5); their per-matrix multiplier and F3 book are separate model-role tensors:
+
+| Canonical name | Code | K group | Block scale | Matrix field |
+|---|---|---:|---|---|
+| `F3G32_E4M3FN` | 3-bit index into an eight-entry E2M1 book | 32 | one E4M3FN word/group | one FP32 multiplier, one book |
+| `E2M1G16_E4M3FN` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one FP32 multiplier |
 
 This is a closed registry, not a template from which arbitrary scalar types, bit widths, and group
 sizes may be constructed. In particular, `FP16`, `I64`, `Q4G32_F16S`, `Q6G128_F16S`, and
@@ -146,7 +154,7 @@ One format may have more than one deliberately supported layout, but every layou
 exactly the same direct words or logical codes and scales. The currently registered layouts are
 `contiguous-le-v1` for direct words, `row-split-k128-v1` for grouped signed-integer formats, and
 `blockscale-k16-m128x4-v1` for `NVFP4`. Their byte order, plane packing, padding, swizzle, divisor
-placement, and alignment rules belong to the layout registry, not to these nine numeric formats.
+placement, and alignment rules belong to the layout registry, not to these eleven numeric formats.
 
 ### 2.7 Compute profile and kernel support
 
@@ -350,6 +358,28 @@ then evaluate the complete Op on represented public inputs in FP32/FP64.
 Private A8 activation quantization is an implementation profile, not part of this
 persistent weight identity. Layout producers check all code and scale values;
 the runtime reader checks framing and geometry, as for the other trusted artifacts.
+
+### 3.5 Routed-expert FP4 formats: `F3G32_E4M3FN` and `E2M1G16_E4M3FN`
+
+Both formats represent the matrices of routed SwiGLU experts. For a matrix `[N,K]` with code
+`c[n,k]`, E4M3FN scale word `s[n,g]` (group `g = floor(k/G)`), and FP32 matrix multiplier `m`:
+
+```text
+E2M1G16_E4M3FN : W[n,k] = decode_e2m1(c[n,k])           * decode_e4m3fn(s[n,g]) * m,  G = 16
+F3G32_E4M3FN   : W[n,k] = decode_e2m1(book[c[n,k]])     * decode_e4m3fn(s[n,g]) * m,  G = 32
+```
+
+E2M1 and E4M3FN decode as in Section 3.3. An E2M1G16 code is any of the 16 E2M1 words. An F3G32
+code is an index `0..7` into the matrix's book of eight E2M1 words; the book word stores entry `v`
+in bits `4v..4v+3`. Scale words admit only nonnegative finite E4M3FN words, as for `NVFP4`. The
+multiplier `m` is a finite nonnegative FP32 multiplier, not a divisor; unlike `NVFP4`'s `d_w` it is
+not part of the tensor payload. The model contract stores the multipliers and books as separate
+direct tensors and assigns them to each matrix. The only registered layout is
+`moe-expert-tiles-v1`, in which one tensor holds whole experts.
+
+The producer copies codes, scales, multipliers, and books from the selected source quantization
+without requantizing or canonicalizing them. The independent decode oracle is the formula above;
+an operator oracle starts from it and the represented public activation.
 
 ## 4. Grouped signed-integer tensor model
 
@@ -701,7 +731,7 @@ meanings defined here.
 
 ## 9. Checkpoint and model boundary
 
-This registry does not say where any of the nine formats are used. A checkpoint numeric-format
+This registry does not say where any of the eleven formats are used. A checkpoint numeric-format
 document must separately define, for every persisted source tensor or derived tensor:
 
 - its source checkpoint identity and source tensor or derivation;
@@ -833,7 +863,8 @@ to the container and layout contracts. This numeric-format decision does not lea
 questions open:
 
 - persistent quantized weights use the four grouped signed-integer identities,
-  `NVFP4`, or `FP8_E4M3FN_ROW_BF16S`; no spelling constructs another scheme;
+  `NVFP4`, `FP8_E4M3FN_ROW_BF16S`, or the two routed-expert FP4 formats; no spelling constructs
+  another scheme;
 - direct persistent tensors use only `BF16`, `FP32`, and `I32`, with the exact logical words in
   Section 3.1;
 - quantization groups run along the final logical dimension and never cross a leading coordinate;

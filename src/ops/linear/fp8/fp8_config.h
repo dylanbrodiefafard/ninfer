@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -119,43 +120,61 @@ struct Fp8A16SmallTMmaSchedule {
     static constexpr int kRowsPerLoaderWarp = kRowsPerCta / KWarps;
 };
 
-using Fp8AttnInputGeometry       = Fp8Geometry<14336, 5120>;
-using Fp8GdnInputGeometry        = Fp8Geometry<16384, 5120>;
-using Fp8MlpGateUpGeometry       = Fp8Geometry<34816, 5120>;
-using Fp8VocabularyGeometry      = Fp8Geometry<248320, 5120>;
-using Fp8Residual6144Geometry    = Fp8Geometry<5120, 6144>;
-using Fp8Residual17408Geometry   = Fp8Geometry<5120, 17408>;
-using Fp8Activation5120Geometry  = Fp8ActivationGeometry<5120>;
-using Fp8Activation6144Geometry  = Fp8ActivationGeometry<6144>;
-using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
+using Fp8AttnInputGeometry      = Fp8Geometry<14336, 5120>;
+using Fp8GdnInputGeometry       = Fp8Geometry<16384, 5120>;
+using Fp8MlpGateUpGeometry      = Fp8Geometry<34816, 5120>;
+using Fp8Vocabulary5120Geometry = Fp8Geometry<248320, 5120>;
+using Fp8Vocabulary2560Geometry = Fp8Geometry<248320, 2560>;
+using Fp8Residual6144Geometry   = Fp8Geometry<5120, 6144>;
+using Fp8Residual17408Geometry  = Fp8Geometry<5120, 17408>;
+// Qwen3.8-Flash-Next (hidden 2560) Text projections: the q|k|v|z GDN input parent
+// [10240+6144,2560] is the split-output gdn_input_proj Op; the GDN and attention output
+// [2560,6144] is a generic Linear problem.
+using Fp8FlashNextGdnInputGeometry = Fp8Geometry<16384, 2560>;
+using Fp8FlashNextMixerOutGeometry = Fp8Geometry<2560, 6144>;
+using Fp8Activation5120Geometry    = Fp8ActivationGeometry<5120>;
+using Fp8Activation6144Geometry    = Fp8ActivationGeometry<6144>;
+using Fp8Activation17408Geometry   = Fp8ActivationGeometry<17408>;
 
 inline constexpr std::int32_t kFp8VocabularyFirstA16SmallTMmaT = 1;
 inline constexpr std::int32_t kFp8VocabularyLastA16SmallTMmaT  = 48;
 inline constexpr std::int32_t kFp8VocabularyFirstA16GemmT      = 42;
 
-template <int ActiveTokens>
+// Width tiers of the vocabulary-head small-T MMA, measured on the RTX 5090 at K=5120; the K=2560
+// head takes the same tiers without its own measurement. A CTA advances K in groups of 64 columns
+// per warp, so the group must divide K: the T<=8 tier's 1024-column sixteen-warp group divides
+// K=5120 but not K=2560, where that tier takes the 512-column eight-warp group of the T<=24 tier.
+template <class Geometry, int ActiveTokens>
 struct Fp8VocabularyA16SmallTMmaProductionSchedule {
     static_assert(ActiveTokens >= kFp8VocabularyFirstA16SmallTMmaT);
     static_assert(ActiveTokens <= kFp8VocabularyLastA16SmallTMmaT);
+    static_assert(std::is_same_v<Geometry, Fp8Vocabulary5120Geometry> ||
+                  std::is_same_v<Geometry, Fp8Vocabulary2560Geometry>);
 
-    static constexpr int kTileTokens     = ActiveTokens <= 8    ? 8
-                                           : ActiveTokens <= 16 ? 16
-                                           : ActiveTokens <= 24 ? 24
-                                           : ActiveTokens <= 32 ? 32
-                                           : ActiveTokens <= 40 ? 40
-                                                                : 48;
-    static constexpr int kKWarps         = ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4);
+    static constexpr int kTileTokens = ActiveTokens <= 8    ? 8
+                                       : ActiveTokens <= 16 ? 16
+                                       : ActiveTokens <= 24 ? 24
+                                       : ActiveTokens <= 32 ? 32
+                                       : ActiveTokens <= 40 ? 40
+                                                            : 48;
+    static constexpr int kWidestKWarps =
+        std::is_same_v<Geometry, Fp8Vocabulary5120Geometry> ? 16 : 8;
+    static constexpr int kKWarps = ActiveTokens <= 8 ? kWidestKWarps : (ActiveTokens <= 24 ? 8 : 4);
     static constexpr int kMinBlocksPerSm = kKWarps == 16 ? 1 : 2;
     using Type = Fp8A16SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocksPerSm>;
+    static_assert((Geometry::kInputRows % Type::kGroupK) == 0);
 };
 
 enum class Fp8Problem : std::uint8_t {
     AttnInput,
     GdnInput,
     MlpGateUp,
-    Vocabulary,
+    Vocabulary5120,
+    Vocabulary2560,
     Residual6144,
     Residual17408,
+    FlashNextGdnInput,
+    FlashNextMixerOut,
 };
 
 inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -165,12 +184,18 @@ inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32
             input_rows == Fp8GdnInputGeometry::kInputRows) ||
            (output_rows == Fp8MlpGateUpGeometry::kOutputRows &&
             input_rows == Fp8MlpGateUpGeometry::kInputRows) ||
-           (output_rows == Fp8VocabularyGeometry::kOutputRows &&
-            input_rows == Fp8VocabularyGeometry::kInputRows) ||
+           (output_rows == Fp8Vocabulary5120Geometry::kOutputRows &&
+            input_rows == Fp8Vocabulary5120Geometry::kInputRows) ||
+           (output_rows == Fp8Vocabulary2560Geometry::kOutputRows &&
+            input_rows == Fp8Vocabulary2560Geometry::kInputRows) ||
            (output_rows == Fp8Residual6144Geometry::kOutputRows &&
             input_rows == Fp8Residual6144Geometry::kInputRows) ||
            (output_rows == Fp8Residual17408Geometry::kOutputRows &&
-            input_rows == Fp8Residual17408Geometry::kInputRows);
+            input_rows == Fp8Residual17408Geometry::kInputRows) ||
+           (output_rows == Fp8FlashNextGdnInputGeometry::kOutputRows &&
+            input_rows == Fp8FlashNextGdnInputGeometry::kInputRows) ||
+           (output_rows == Fp8FlashNextMixerOutGeometry::kOutputRows &&
+            input_rows == Fp8FlashNextMixerOutGeometry::kInputRows);
 }
 
 inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -186,9 +211,13 @@ inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t inp
         input_rows == Fp8MlpGateUpGeometry::kInputRows) {
         return Fp8Problem::MlpGateUp;
     }
-    if (output_rows == Fp8VocabularyGeometry::kOutputRows &&
-        input_rows == Fp8VocabularyGeometry::kInputRows) {
-        return Fp8Problem::Vocabulary;
+    if (output_rows == Fp8Vocabulary5120Geometry::kOutputRows &&
+        input_rows == Fp8Vocabulary5120Geometry::kInputRows) {
+        return Fp8Problem::Vocabulary5120;
+    }
+    if (output_rows == Fp8Vocabulary2560Geometry::kOutputRows &&
+        input_rows == Fp8Vocabulary2560Geometry::kInputRows) {
+        return Fp8Problem::Vocabulary2560;
     }
     if (output_rows == Fp8Residual6144Geometry::kOutputRows &&
         input_rows == Fp8Residual6144Geometry::kInputRows) {
@@ -197,6 +226,14 @@ inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t inp
     if (output_rows == Fp8Residual17408Geometry::kOutputRows &&
         input_rows == Fp8Residual17408Geometry::kInputRows) {
         return Fp8Problem::Residual17408;
+    }
+    if (output_rows == Fp8FlashNextGdnInputGeometry::kOutputRows &&
+        input_rows == Fp8FlashNextGdnInputGeometry::kInputRows) {
+        return Fp8Problem::FlashNextGdnInput;
+    }
+    if (output_rows == Fp8FlashNextMixerOutGeometry::kOutputRows &&
+        input_rows == Fp8FlashNextMixerOutGeometry::kInputRows) {
+        return Fp8Problem::FlashNextMixerOut;
     }
     throw std::invalid_argument("unsupported FP8 problem");
 }
@@ -231,6 +268,20 @@ struct Fp8LinearDecodeProductionSchedule<Fp8Residual17408Geometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
 };
 
+// The Flash-Next problems stream 42 MB ([16384,2560]) and 15.7 MB ([2560,6144]) per call. Four
+// warps of two rows with 16-value lanes and a phase unroll factor of two measured fastest for the
+// GDN parent (7% ahead of the eight-warp, 8-value form); for the narrow output every measured
+// candidate lies within 0.5% of the same back-to-back launch time.
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8FlashNextGdnInputGeometry> {
+    using Type = Fp8GemvSchedule<4, 2, 16, 4, Fp8CodeCache::Default, 2, 4>;
+};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8FlashNextMixerOutGeometry> {
+    using Type = Fp8GemvSchedule<4, 2, 16, 4, Fp8CodeCache::Default, 2, 4>;
+};
+
 inline constexpr std::int32_t kFp8FirstSmallT = 2;
 inline constexpr std::int32_t kFp8LastSmallT  = 24;
 
@@ -251,6 +302,12 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual6144Geometry> = kFp
 
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual17408Geometry> = kFp8LastSmallT;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8FlashNextGdnInputGeometry> = 8;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8FlashNextMixerOutGeometry> = 8;
 
 // RTX 5090 cold-cache winners for contiguous Linear output. Each geometry owns its measured
 // schedule ranges; fused semantic Ops reuse the mainloop but retain independent route frontiers.
@@ -327,6 +384,41 @@ struct Fp8LinearSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveTokens>
     using Type = Fp8SmallTSchedule<8, 2, kValuesPerLane, ActiveTokens, 1,
                                    Fp8SmallTActivationAccess::TokenPacked, Fp8CodeCache::Default, 1,
                                    Fp8SmallTBlockOrder::RowsContiguous, 1>;
+};
+
+// The Flash-Next problems' SIMT widths T=2..8: four warps of two rows (eight rows per CTA) with
+// 16-value lanes and a phase unroll factor of two. Above T=8 the per-lane activation registers and
+// loads grow with T and the small-T MMA takes over.
+template <int ActiveTokens>
+struct Fp8FlashNextSmallTProductionSchedule {
+    static_assert(ActiveTokens >= kFp8FirstSmallT && ActiveTokens <= 8);
+    using Type =
+        Fp8SmallTSchedule<4, 2, 16, ActiveTokens, 1, Fp8SmallTActivationAccess::TokenPacked,
+                          Fp8CodeCache::Default, 2, Fp8SmallTBlockOrder::RowsContiguous, 2>;
+};
+
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8FlashNextGdnInputGeometry, ActiveTokens> {
+    static_assert(ActiveTokens <= kFp8LinearSmallTMax<Fp8FlashNextGdnInputGeometry>);
+    using Type = typename Fp8FlashNextSmallTProductionSchedule<ActiveTokens>::Type;
+};
+
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8FlashNextMixerOutGeometry, ActiveTokens> {
+    static_assert(ActiveTokens <= kFp8LinearSmallTMax<Fp8FlashNextMixerOutGeometry>);
+    using Type = typename Fp8FlashNextSmallTProductionSchedule<ActiveTokens>::Type;
+};
+
+// Small-T MMA column tiers of the Flash-Next problems, measured on the RTX 5090: eight K warps
+// (512-column groups) through 24 columns, four (256-column groups) for 32 and 48. Each tile masks
+// the columns beyond T.
+template <class Geometry, int TileTokens>
+struct Fp8FlashNextA16SmallTMmaProductionSchedule {
+    static_assert(std::is_same_v<Geometry, Fp8FlashNextGdnInputGeometry> ||
+                  std::is_same_v<Geometry, Fp8FlashNextMixerOutGeometry>);
+    static constexpr int kKWarps = TileTokens <= 24 ? 8 : 4;
+    using Type                   = Fp8A16SmallTMmaSchedule<kKWarps, TileTokens, 2>;
+    static_assert((Geometry::kInputRows % Type::kGroupK) == 0);
 };
 
 } // namespace ninfer::ops::detail

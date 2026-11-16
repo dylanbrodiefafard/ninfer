@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/ninfer/ops/grouped_dynamic_conv.h
-// Match: D=5120, G=320, group_size=16, kernel=2, contiguous BF16 activations.
+// Match: D in {5120,2560}, G=D/16, group_size=16, kernel=2, contiguous BF16 activations.
 
 #include "ops/common/math.h"
 #include "ops/common/warp.cuh"
@@ -49,16 +49,20 @@ __global__ void grouped_dynamic_conv_bf16_gemv_kernel(const __nv_bfloat16* x,
     }
 }
 
-template <bool kPrepare>
+// One thread owns one channel d of one (t,b) column: grid.x covers D in blocks of
+// kGroupedDynamicConvConvBlock channels and grid.y the T*B columns. Prepare reads the [4G]
+// projection column, finish the [2G] stash; the first lane of each 16-channel group stashes its two
+// phase-1 coefficients. No shared memory or synchronization.
+template <int kD, bool kPrepare>
 __global__ void grouped_dynamic_conv_kernel(const __nv_bfloat16* hidden,
                                             const __nv_bfloat16* base_kernel,
                                             const __nv_bfloat16* dynamic_src, __nv_bfloat16* out,
                                             __nv_bfloat16* finish_dynamic, std::int32_t tokens,
                                             std::int32_t batch) {
-    constexpr std::int32_t kD      = 5120;
-    constexpr std::int32_t kGroups = 320;
     constexpr std::int32_t kGroup  = 16;
-    constexpr std::int32_t kProj   = 1280;
+    constexpr std::int32_t kGroups = kD / kGroup;
+    constexpr std::int32_t kProj   = 4 * kGroups;
+    static_assert(kD % kGroup == 0);
 
     const std::int32_t d =
         static_cast<std::int32_t>(blockIdx.x) * blockDim.x + static_cast<std::int32_t>(threadIdx.x);
@@ -101,19 +105,20 @@ __global__ void grouped_dynamic_conv_kernel(const __nv_bfloat16* hidden,
 }
 
 // One CTA owns a complete (t,b) column; adjacent lanes own adjacent BF16 pairs.
-// The 512-thread CTA holds all D=5120 BF16 pairs in registers.
-// Phase-1 base pairs are D-fastest, coefficients are [320,2,T,B], and t=0 reads no history.
+// The Block-thread CTA holds all D/2 BF16 pairs in registers, D/(2*Block) per thread.
+// Phase-1 base pairs are D-fastest, coefficients are [D/16,2,T,B], and t=0 reads no history.
 // Shared storage contains one FP32 sum per warp and one inverse RMS. block_reduce_sum fences
 // warp publication/reduction; the final CTA barrier publishes the inverse to every lane.
 // Disjoint, 4-byte-aligned BF16 storage is required; 64-bit column offsets support positive T.
-template <int Block>
+template <int Hidden, int Block>
 __launch_bounds__(Block) __global__ void grouped_dynamic_conv_finish_residual_rmsnorm_kernel(
     const __nv_bfloat162* hidden, const __nv_bfloat162* base, const __nv_bfloat16* dynamic,
     __nv_bfloat162* residual, const __nv_bfloat162* weight, __nv_bfloat162* out,
     std::int32_t tokens, float epsilon) {
-    constexpr int kPairs          = 2560;
+    constexpr int kPairs          = Hidden / 2;
+    constexpr int kGroups         = Hidden / 16;
     constexpr int kPairsPerThread = kPairs / Block;
-    static_assert(kPairs % Block == 0);
+    static_assert(Hidden % 16 == 0 && kPairs % Block == 0);
     const std::int64_t column      = static_cast<std::int64_t>(blockIdx.x);
     const std::int64_t column_base = column * kPairs;
     const bool has_previous        = column % tokens != 0;
@@ -129,8 +134,9 @@ __launch_bounds__(Block) __global__ void grouped_dynamic_conv_finish_residual_rm
                                        : make_float2(0.0F, 0.0F);
         const float2 base0       = __bfloat1622float2(base[2 * kPairs + pair]);
         const float2 base1       = __bfloat1622float2(base[3 * kPairs + pair]);
-        const float coefficient0 = __bfloat162float(dynamic[column * 640 + group]);
-        const float coefficient1 = __bfloat162float(dynamic[column * 640 + 320 + group]);
+        const float coefficient0 = __bfloat162float(dynamic[column * 2 * kGroups + group]);
+        const float coefficient1 =
+            __bfloat162float(dynamic[column * 2 * kGroups + kGroups + group]);
         // This qualified profile retains finish storage rounding in registers.
         const __nv_bfloat162 finished = __floats2bfloat162_rn(
             (base0.x + coefficient0) * current.x + (base1.x + coefficient1) * previous.x,
@@ -145,7 +151,7 @@ __launch_bounds__(Block) __global__ void grouped_dynamic_conv_finish_residual_rm
     __shared__ float warp_sums[Block / kWarpSize];
     __shared__ float inverse;
     const float sum = block_reduce_sum<Block>(squares, warp_sums);
-    if (threadIdx.x == 0) { inverse = rsqrtf(sum / 5120.0F + epsilon); }
+    if (threadIdx.x == 0) { inverse = rsqrtf(sum / static_cast<float>(Hidden) + epsilon); }
     __syncthreads();
 #pragma unroll
     for (int item = 0; item < kPairsPerThread; ++item) {

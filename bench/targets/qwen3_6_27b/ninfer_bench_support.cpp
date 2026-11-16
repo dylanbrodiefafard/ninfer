@@ -342,6 +342,9 @@ std::string usage_text(std::string_view program) {
         << "                              greater than zero\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
+        << "  --ngram-table <path>        n-gram table file (required by qwen3.8-flash-next)\n"
+        << "  --qsa-select-budget <512|1024|2048>  QSA blocks per query (qwen3.8-flash-next,\n"
+        << "                              default: 512)\n"
         << "  --profile-measured          bracket measured repetition or contention with CUDA "
            "profiler API\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
@@ -452,6 +455,10 @@ BenchOptions parse_args(int argc, char** argv) {
             options.device = parse_nonnegative(value("--device"), "device");
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--ngram-table") {
+            options.ngram_table_path = value("--ngram-table");
+        } else if (arg == "--qsa-select-budget") {
+            options.qsa_select_budget = parse_qsa_select_budget_flag(value("--qsa-select-budget"));
         } else if (arg == "--profile-measured") {
             options.profile_measured = true;
         } else if (arg == "-o" || arg == "--output") {

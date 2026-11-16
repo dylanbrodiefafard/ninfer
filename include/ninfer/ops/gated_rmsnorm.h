@@ -6,13 +6,21 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace ninfer::ops {
 
+/** Activation applied to the gate z: SiLU (Qwen3.6-27B GDN) or sigmoid (Qwen3.8-Flash-Next GDN). */
+enum class RmsNormGate : std::uint8_t {
+    Silu,
+    Sigmoid,
+};
+
 /**
- * Applies RMS normalization over ne[0] and an elementwise SiLU gate. For each logical row r:
+ * Applies RMS normalization over ne[0] and an elementwise gate. For each logical row r:
  *
  *   inv_r    = 1 / sqrt((1/D) * sum_d x[d,r]^2 + eps)
- *   ideal[d,r] = x[d,r] * inv_r * weight[d] * SiLU(z[d,r]).
+ *   ideal[d,r] = x[d,r] * inv_r * weight[d] * act(z[d,r]),  act = SiLU or sigmoid per `gate`.
  *
  * `x`, `z`, and `out` are same-shaped contiguous BF16 tensors, `weight` is contiguous BF16 [D],
  * and eps is positive and finite. This form does not apply a unit offset to weight. Inputs and
@@ -22,13 +30,14 @@ namespace ninfer::ops {
  * and accumulator precision are implementation choices. There is no workspace or persistent state
  * side effect.
  */
-void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
-                   cudaStream_t stream);
+void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, RmsNormGate gate,
+                   float eps, Tensor& out, cudaStream_t stream);
 
 /**
- * gated_rmsnorm over x/z [128, 48, T] (D=128 per head) whose BF16 result, bit-identical to
- * gated_rmsnorm's, is published only as an A8 activation (ninfer/ops/a8_activation.h) of
- * [6144,T]: one scale per token column covers all 48 heads. weight is BF16 [128].
+ * gated_rmsnorm with the SiLU gate over x/z [128, 48, T] (D=128 per head) whose BF16 result,
+ * bit-identical to gated_rmsnorm's, is published only as an A8 activation
+ * (ninfer/ops/a8_activation.h) of [6144,T]: one scale per token column covers all 48 heads. weight
+ * is BF16 [128].
  *
  * x/z are contiguous, 16-byte aligned BF16 with T >= 1; activation.codes is 16-byte aligned. No
  * input overlaps an output. The codes/scales are checked exactly against the A8 codec of the
@@ -38,9 +47,10 @@ void gated_rmsnorm_a8(const Tensor& x, const Tensor& weight, const Tensor& z, fl
                       A8Activation& activation, cudaStream_t stream);
 
 /**
- * gated_rmsnorm over x/z [128, 48, T] (D=128 per head) whose BF16 result, bit-identical to
- * gated_rmsnorm's, is published only as an NVFP4 activation (ninfer/ops/a4_activation.h) of
- * [6144,T] for a weight with activation.input_scale_divisor. weight is BF16 [128].
+ * gated_rmsnorm with the SiLU gate over x/z [128, 48, T] (D=128 per head) whose BF16 result,
+ * bit-identical to gated_rmsnorm's, is published only as an NVFP4 activation
+ * (ninfer/ops/a4_activation.h) of [6144,T] for a weight with activation.input_scale_divisor. weight
+ * is BF16 [128].
  *
  * x/z are contiguous, 16-byte aligned BF16 with T >= 1. No input overlaps an output. The
  * codes/scales are checked exactly against the A4 codec of the gated_rmsnorm output. Invalid

@@ -197,10 +197,10 @@ The version-2 registry contains:
 
 | Namespace | Registered identities | Authority |
 |---|---|---|
-| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `FP8_E4M3FN_ROW_BF16S` | [`tensor-formats.md`](tensor-formats.md) |
+| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `FP8_E4M3FN_ROW_BF16S`, `F3G32_E4M3FN`, `E2M1G16_E4M3FN` | [`tensor-formats.md`](tensor-formats.md) |
 | `model_id` | `qwen3.8-27b` | [Qwen3.8-27B artifact reference](qwen3.8-27b-artifact.md) |
 | `(model_id, weights_id)` | `qwen3.8-27b/nvfp4` | [Qwen3.8-27B artifact reference](qwen3.8-27b-artifact.md) |
-| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `row-scale-v1` | [`storage-layouts.md`](storage-layouts.md) |
+| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `row-scale-v1`, `moe-expert-tiles-v1` | [`storage-layouts.md`](storage-layouts.md) |
 | resource encoding | `raw-bytes-v1` | [`storage-layouts.md`](storage-layouts.md) |
 
 There are no retired tombstones at this revision.

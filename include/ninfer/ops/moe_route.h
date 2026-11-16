@@ -1,0 +1,42 @@
+#pragma once
+
+#include "core/tensor.h"
+
+#include <cuda_runtime.h> // cudaStream_t
+
+#include <cstdint>
+
+namespace ninfer::ops {
+
+// Qwen3.8-Flash-Next routing: 512 routed experts, ten per token, plus one shared expert.
+inline constexpr std::int32_t kMoeExperts = 512;
+inline constexpr std::int32_t kMoeTopK    = 10;
+// Rows of the packed control projection whose FP32 output moe_route consumes: the 512 router
+// rows, the shared-expert gate row, and zero rows padding the matrix to a 32-row tile multiple.
+inline constexpr std::int32_t kMoeSharedGateRow = kMoeExperts;
+inline constexpr std::int32_t kMoeControlRows   = 544;
+
+/**
+ * Op: moe_route
+ *
+ * For each token t, with r = logits[0..511, t] (router logits) and s = logits[512, t] (the
+ * shared-expert gate logit):
+ *
+ *   p             = softmax(r)                                   over all 512 experts
+ *   expert_ids    = the ten experts of largest p in descending order; equal FP32 logits keep
+ *                   the lower expert id first (a stable descending sort)
+ *   route_weights = p[expert_ids] / sum(p[expert_ids])           (renormalized over the ten)
+ *   shared_scale  = sigmoid(s)
+ *
+ * logits is FP32 [544,T] (rows 513..543 are ignored); expert_ids is I32 [10,T]; route_weights is
+ * FP32 [10,T]; shared_scale is FP32 [T]. All are contiguous, 16-byte aligned and pairwise
+ * disjoint; T >= 1; logits are finite. The oracle evaluates p in FP64 from the represented FP32
+ * logits. Ids are exact. The implementation evaluates the weights as exp(r_i - r_max) normalized
+ * over the selected ten in FP32, which equals the renormalized full softmax mathematically. No
+ * workspace. Invalid arguments throw std::invalid_argument. Asynchronous on stream and
+ * graph-capturable for a fixed T.
+ */
+void moe_route(const Tensor& logits, Tensor& expert_ids, Tensor& route_weights,
+               Tensor& shared_scale, cudaStream_t stream);
+
+} // namespace ninfer::ops

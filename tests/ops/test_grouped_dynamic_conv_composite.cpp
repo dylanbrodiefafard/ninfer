@@ -14,8 +14,6 @@
 
 namespace {
 using namespace ninfer;
-constexpr int kD         = 5120;
-constexpr int kG         = 320;
 constexpr float kEpsilon = 1.0e-6F;
 // Complete composition criteria include finish-storage error in the unfused baseline.
 constexpr test::ReductionCriterion kNormCriterion{1.85e-3, 1.0e-5, 3.4e-3};
@@ -53,16 +51,20 @@ test::GuardedDeviceBuffer upload(const std::vector<std::uint16_t>& values) {
     return result;
 }
 
-int run(int batch, int width, bool cancellation, bool composite = true) {
+// hidden is a registered width D; G = D/16 conv groups.
+int run(int hidden_width, int batch, int width, bool cancellation, bool composite = true) {
+    const int kD              = hidden_width;
+    const int kG              = ops::grouped_dynamic_conv_groups(hidden_width);
     const std::size_t columns = static_cast<std::size_t>(batch) * width;
     const std::size_t elems   = columns * kD;
     const auto hidden         = fixture(elems, 17U, 1.0F);
-    const auto base           = fixture(4 * kD, 31U, 0.5F);
-    const auto dynamic        = fixture(columns * 2 * kG, 47U, 0.25F);
-    auto residual             = fixture(elems, 67U, 1.0F);
-    auto gain                 = fixture(kD, 79U, cancellation ? 16.0F : 1.0F);
-    gain[0]                   = test::f32_to_bf16(0.0F);
-    gain[1]                   = test::f32_to_bf16(-1.0F);
+    const auto base =
+        fixture(static_cast<std::size_t>(4) * static_cast<std::size_t>(kD), 31U, 0.5F);
+    const auto dynamic = fixture(columns * 2 * kG, 47U, 0.25F);
+    auto residual      = fixture(elems, 67U, 1.0F);
+    auto gain          = fixture(kD, 79U, cancellation ? 16.0F : 1.0F);
+    gain[0]            = test::f32_to_bf16(0.0F);
+    gain[1]            = test::f32_to_bf16(-1.0F);
     std::vector<double> conv(elems), residual_ideal(elems), residual_boundary(elems), norm(elems);
     for (std::size_t col = 0; col < columns; ++col) {
         for (int d = 0; d < kD; ++d) {
@@ -143,8 +145,8 @@ int run(int batch, int width, bool cancellation, bool composite = true) {
     const auto residual_got = test::from_device_bf16(r.data(), elems);
     const auto norm_got     = test::from_device_bf16(y.data(), elems);
     char label[96];
-    std::snprintf(label, sizeof(label), "B=%d W=%d cancellation=%d composite=%d", batch, width,
-                  cancellation, composite);
+    std::snprintf(label, sizeof(label), "D=%d B=%d W=%d cancellation=%d composite=%d", kD, batch,
+                  width, cancellation, composite);
     int failures                  = graph_failures;
     double maximum_residual_error = 0.0;
     std::vector<double> envelope_squared(columns, 0.0);
@@ -245,18 +247,29 @@ int run(int batch, int width, bool cancellation, bool composite = true) {
 
 int main(int argc, char** argv) {
     try {
-        if (test::sanitizer_scope(argc, argv)) { return run(6, 12, false); }
+        if (test::sanitizer_scope(argc, argv)) {
+            return run(5120, 6, 12, false) + run(2560, 12, 8, false) == 0 ? 0 : 1;
+        }
         int failures = 0;
         for (const int batch : {1, 2, 6, 8}) {
             for (const int width : {1, 3, 8, 12, 16}) {
                 for (const bool composite : {false, true}) {
-                    failures += run(batch, width, false, composite);
-                    failures += run(batch, width, true, composite);
+                    failures += run(5120, batch, width, false, composite);
+                    failures += run(5120, batch, width, true, composite);
                 }
             }
         }
-        failures += run(1, 32, false, false);
-        failures += run(1, 32, false, true);
+        failures += run(5120, 1, 32, false, false);
+        failures += run(5120, 1, 32, false, true);
+        // Flash-Next drafter: proposal widths W=2..8 at one to twelve packed requests.
+        for (const int batch : {1, 5, 12}) {
+            for (const int width : {1, 2, 8}) {
+                for (const bool composite : {false, true}) {
+                    failures += run(2560, batch, width, false, composite);
+                    failures += run(2560, batch, width, true, composite);
+                }
+            }
+        }
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

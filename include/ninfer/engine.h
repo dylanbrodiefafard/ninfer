@@ -74,6 +74,8 @@ public:
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;
+    // Requires both a target implementing context checkpoints and an enabled reuse/DFlash mode.
+    [[nodiscard]] bool context_checkpoint_capture_available(bool allow_prefix_reuse) const;
     // The exact bytes a vocabulary token decodes to, special tokens included. One token may hold a
     // partial UTF-8 sequence. Throws std::out_of_range for an id outside the vocabulary.
     [[nodiscard]] std::string token_bytes(TokenId token) const;

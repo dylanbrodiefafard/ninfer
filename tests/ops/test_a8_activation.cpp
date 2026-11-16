@@ -149,7 +149,7 @@ int run_gated_rmsnorm_a8(std::int32_t tokens) {
     const Tensor tz(dz.p, DType::BF16, {kGdnHeadDim, kGdnHeads, tokens});
     const Tensor tw(dw.p, DType::BF16, {kGdnHeadDim});
     Tensor treference(reference.p, DType::BF16, {kGdnHeadDim, kGdnHeads, tokens});
-    ops::gated_rmsnorm(tx, tw, tz, kEps, treference, nullptr);
+    ops::gated_rmsnorm(tx, tw, tz, ops::RmsNormGate::Silu, kEps, treference, nullptr);
     ops::A8Activation view = actual.view();
     ops::gated_rmsnorm_a8(tx, tw, tz, kEps, view, nullptr);
     cuda_synchronize();

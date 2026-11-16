@@ -8,6 +8,10 @@
 
 namespace ninfer::ops::detail {
 
+// Split store of the [16384,K] q|k|v|z parent (K=5120 or 2560): parent rows [0,10240) go to
+// contiguous BF16 qkv [10240,T] and rows [10240,16384) to contiguous BF16 z [6144,T]. A vector
+// store covers eight rows starting at a multiple of eight, which never crosses the range boundary,
+// and needs 16-byte-aligned bases.
 struct Nvfp4GdnInputOutput {
     static constexpr std::int32_t kQkvRows = 10240;
     static constexpr std::int32_t kZRows   = 6144;

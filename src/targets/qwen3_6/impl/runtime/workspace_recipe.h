@@ -278,7 +278,7 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens,
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::query_size, tokens),
         matrix(allocator, DType::BF16, Config::query_size + 2 * Config::kv_size, tokens),
-        allocator.alloc(DType::BF16, {ops::kGroupedDynamicConvGroups, 2, tokens}),
+        allocator.alloc(DType::BF16, {ops::grouped_dynamic_conv_groups(Config::hidden), 2, tokens}),
         matrix(allocator, DType::BF16, Config::hidden, tokens),
         matrix(allocator, DType::BF16, Config::hidden, tokens),
     };
@@ -299,7 +299,7 @@ DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens, const Tenso
         hidden,
         matrix(allocator, DType::BF16, Config::intermediate, tokens),
         matrix(allocator, DType::BF16, 2 * Config::intermediate, tokens),
-        allocator.alloc(DType::BF16, {ops::kGroupedDynamicConvGroups, 2, tokens}),
+        allocator.alloc(DType::BF16, {ops::grouped_dynamic_conv_groups(Config::hidden), 2, tokens}),
         matrix(allocator, DType::BF16, Config::hidden, tokens),
     };
 }

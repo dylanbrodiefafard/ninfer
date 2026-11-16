@@ -9,8 +9,16 @@ SpeculativeOptions resolve_speculative_startup(const std::filesystem::path& arti
                                                const SpeculativeOptions& requested) {
     if (selection == SpeculativeSelection::Explicit) { return requested; }
     const artifact::Reader reader(artifact_path);
-    if (reader.identity().model_id != "qwen3.8-27b" || reader.identity().weights_id != "nvfp4" ||
-        reader.find("dflash/feature_projection") == nullptr) {
+    if (reader.find("dflash/feature_projection") == nullptr) { return requested; }
+    if (reader.identity().model_id == "qwen3.8-flash-next" &&
+        reader.identity().weights_id == "f3-fp8-nvfp4") {
+        SpeculativeOptions resolved;
+        resolved.backend        = SpeculativeBackend::DFlash;
+        resolved.draft_tokens   = 3;
+        resolved.adaptive_draft = true;
+        return resolved;
+    }
+    if (reader.identity().model_id != "qwen3.8-27b" || reader.identity().weights_id != "nvfp4") {
         return requested;
     }
     SpeculativeOptions resolved;

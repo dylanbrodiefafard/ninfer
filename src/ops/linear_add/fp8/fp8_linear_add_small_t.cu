@@ -80,7 +80,10 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:
     case Fp8Problem::MlpGateUp:
-    case Fp8Problem::Vocabulary:
+    case Fp8Problem::Vocabulary5120:
+    case Fp8Problem::Vocabulary2560:
+    case Fp8Problem::FlashNextGdnInput:
+    case Fp8Problem::FlashNextMixerOut:
         break;
     }
     throw std::invalid_argument("fp8 linear_add small-T: unsupported problem");

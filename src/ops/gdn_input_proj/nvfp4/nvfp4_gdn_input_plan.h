@@ -13,12 +13,19 @@
 
 namespace ninfer::ops::detail {
 
-[[nodiscard]] std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy,
+// input_rows selects the registered parent: [16384,5120] or [16384,2560].
+[[nodiscard]] std::size_t nvfp4_gdn_input_workspace_capacity_bytes(std::int32_t input_rows,
+                                                                   LinearPolicy policy,
                                                                    std::int32_t min_tokens,
                                                                    std::int32_t max_tokens);
 
+// The T=1 GEMV of either registered parent, selected by weight.k.
 void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                    cudaStream_t stream);
+
+// The BF16-activation W4A8-family MMA of the [16384,2560] parent at T>=2.
+void nvfp4_gdn_input_a16_mma_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                    cudaStream_t stream);
 
 void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream);

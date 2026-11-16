@@ -83,6 +83,10 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
     case Nvfp4Problem::MtpFc:
         launch_admitted<Nvfp4MtpFcGeometry, Nvfp4Problem::MtpFc>(x, weight, out, stream);
         return;
+    case Nvfp4Problem::FlashNextDflashSelector:
+        launch_admitted<Nvfp4FlashNextDflashSelectorGeometry,
+                        Nvfp4Problem::FlashNextDflashSelector>(x, weight, out, stream);
+        return;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:
     case Nvfp4Problem::MlpGateUp:
@@ -90,6 +94,13 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
     case Nvfp4Problem::DflashFeature:
     case Nvfp4Problem::DflashQkv:
     case Nvfp4Problem::DflashAttnOut:
+    case Nvfp4Problem::FlashNextMixerOut:
+    case Nvfp4Problem::FlashNextDflashFeature:
+    case Nvfp4Problem::FlashNextDflashQkv:
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+    case Nvfp4Problem::FlashNextDflashGateUp:
+    case Nvfp4Problem::FlashNextDflashDown:
+    case Nvfp4Problem::FlashNextDflashConvProj:
         break;
     }
     throw std::invalid_argument("nvfp4 linear SmallT: the problem has no SmallT route");

@@ -28,17 +28,18 @@ DeviceBuffer upload(const std::vector<std::uint16_t>& values) {
     return result;
 }
 
-void run(int batch, int width, int repeat) {
-    constexpr int kD            = ops::kGroupedDynamicConvHidden;
-    constexpr int kG            = ops::kGroupedDynamicConvGroups;
+void run(int hidden_width, int batch, int width, int repeat) {
+    const int kD                = hidden_width;
+    const int kG                = ops::grouped_dynamic_conv_groups(hidden_width);
     const auto columns          = static_cast<std::size_t>(batch) * static_cast<std::size_t>(width);
     const auto elems            = columns * kD;
     const auto initial_residual = fixture(elems, 67U, 1.0F);
     auto hidden                 = upload(fixture(elems, 17U, 1.0F));
-    auto base                   = upload(fixture(4 * kD, 31U, 0.5F));
-    auto dynamic                = upload(fixture(columns * 2 * kG, 47U, 0.25F));
-    auto residual               = upload(initial_residual);
-    auto weight                 = upload(fixture(kD, 79U, 1.0F));
+    auto base =
+        upload(fixture(static_cast<std::size_t>(4) * static_cast<std::size_t>(kD), 31U, 0.5F));
+    auto dynamic  = upload(fixture(columns * 2 * kG, 47U, 0.25F));
+    auto residual = upload(initial_residual);
+    auto weight   = upload(fixture(kD, 79U, 1.0F));
     DeviceBuffer finished(elems * 2), normalized(elems * 2);
     Tensor hidden_t(hidden.p, DType::BF16, {kD, width, batch});
     Tensor base_t(base.p, DType::BF16, {kD, 2, 2});
@@ -72,28 +73,32 @@ void run(int batch, int width, int repeat) {
             if (iteration >= 20) { samples.push_back(time); }
         }
         const auto timing = bench::summarize_timings(std::move(samples));
-        std::printf("%s B=%d T=%d nodes=%zu median_us=%.6f min_us=%.6f p95_us=%.6f "
+        std::printf("%s D=%d B=%d T=%d nodes=%zu median_us=%.6f min_us=%.6f p95_us=%.6f "
                     "cache=warm-L2 reset=excluded\n",
-                    composite ? "finish_residual_rmsnorm" : "finish+residual+plain_rmsnorm", batch,
-                    width, graph.nodes(), timing.median_us, timing.min_us, timing.p95_us);
+                    composite ? "finish_residual_rmsnorm" : "finish+residual+plain_rmsnorm", kD,
+                    batch, width, graph.nodes(), timing.median_us, timing.min_us, timing.p95_us);
     }
 }
 } // namespace
 
 int main(int argc, char** argv) {
     try {
+        int hidden = 5120;
         int batch  = 6;
         int width  = 8;
         int repeat = 100;
         for (int index = 1; index < argc; ++index) {
             const std::string_view argument(argv[index]);
             if (argument == "--help") {
-                std::printf("usage: %s [--batch B] [--width T] [--repeat N]\n", argv[0]);
+                std::printf("usage: %s [--hidden 5120|2560] [--batch B] [--width T] [--repeat N]\n",
+                            argv[0]);
                 return 0;
             }
             if (index + 1 == argc) { throw std::invalid_argument("missing option value"); }
             const int value = bench::parse_number<int>(argv[++index], argument);
-            if (argument == "--batch") {
+            if (argument == "--hidden") {
+                hidden = value;
+            } else if (argument == "--batch") {
                 batch = value;
             } else if (argument == "--width") {
                 width = value;
@@ -103,10 +108,12 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("unknown option");
             }
         }
-        if (batch < 1 || batch > 12 || width < 1 || width > 16 || repeat < 1 || repeat > 100000) {
-            throw std::invalid_argument("requires B=1..12, T=1..16, repeat=1..100000");
+        if (!ops::grouped_dynamic_conv_hidden_registered(hidden) || batch < 1 || batch > 12 ||
+            width < 1 || width > 16 || repeat < 1 || repeat > 100000) {
+            throw std::invalid_argument(
+                "requires D in {5120,2560}, B=1..12, T=1..16, repeat=1..100000");
         }
-        run(batch, width, repeat);
+        run(hidden, batch, width, repeat);
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

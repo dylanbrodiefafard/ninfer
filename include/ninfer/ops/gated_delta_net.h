@@ -67,7 +67,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
  * BF16 [128,Hv,W,B], g/beta are FP32 [Hv,W,B], and `ssm_states` is contiguous FP32
  * [128,128,Hv,Slots]. `initial_state_slots` and `snapshot_base_slots` are contiguous I32 [B].
  * `valid_columns` is either contiguous I32 [B], with every value in [1,W], or an empty Tensor
- * meaning every row has W valid columns. B=1 accepts every positive W; B=2..8 accepts W=1..16.
+ * meaning every row has W valid columns. B=1 accepts every positive W; B=2..12 accepts W=1..16.
  *
  * Row b starts from initial_state_slots[b] and writes the state after valid column j to
  * snapshot_base_slots[b]+j. Invalid-tail output columns are exact BF16 zero and do not mutate
@@ -87,7 +87,10 @@ void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
  * Evaluates B independent normalized Gated DeltaNet recurrences from absolute state-pool slots
  * without modifying any state. q/k are BF16 [128,Hq,T,B], v/out are BF16 [128,Hv,T,B], g/beta
  * are FP32 [Hv,T,B], and ssm_states is FP32 [128,128,Hv,S]. The ReplaySSM execution domain is
- * B=1..12 and T=2..16, with Hq=16 and Hv in {32,48}. scale is 1/sqrt(128).
+ * B=1..12 and T=1..16 for chains and T=2..16 for trees, with Hq=16 and Hv=48. scale is
+ * 1/sqrt(128). A chain applies, per valid column, the arithmetic of gated_delta_net_snapshot at
+ * the same B and T, so its output is bit-identical to that form's while the source pool stays
+ * untouched; T=1 is the read-only counterpart of a width-one decode step.
  *
  * valid_columns is empty for dense rows or device I32 [B], with every caller-supplied extent in
  * [1,T]. initial_state_slots is device I32 [B] containing absolute slots in [0,S). For each valid

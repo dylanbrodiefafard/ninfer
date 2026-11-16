@@ -28,6 +28,18 @@ constexpr Sha256Digest kReasoningEffortTemplateDigest{
     0xd3, 0xe2, 0xa7, 0x25, 0xb6, 0xc2, 0x58, 0x6a, 0xaa, 0x3a, 0x8a, 0xf9, 0xd7, 0xa8, 0x10, 0x41,
 };
 
+// Qwen3.8-Flash-Next ships the ReasoningEffort template with one change: each assistant body,
+// from the text after `<|im_start|>assistant\n` through its `<|im_end|>`, is wrapped in a
+// Hugging Face `{%- generation %}...{%- endgeneration %}` block, and the header and trailing
+// newline move into separate output statements around it. The block only marks assistant spans
+// for training masks and emits its body unchanged, and the whitespace control on the new tags
+// and their neighbours strips all template whitespace between them, so both templates render
+// byte-identical prompts and share one semantics.
+constexpr Sha256Digest kFlashNextReasoningEffortTemplateDigest{
+    0xaf, 0x16, 0xf6, 0x54, 0x96, 0x8d, 0x47, 0xd0, 0x9a, 0x6c, 0x60, 0x4e, 0x00, 0x37, 0x0b, 0x12,
+    0xdb, 0xc2, 0x1f, 0x76, 0x45, 0x6f, 0x59, 0xc9, 0xe9, 0x8b, 0x82, 0xe8, 0x4d, 0x9f, 0x63, 0x75,
+};
+
 constexpr std::string_view kLowReasoningInstructions =
     "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
     "the conclusion without unnecessary elaboration.";
@@ -786,7 +798,8 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     if (digest == kThinkingToggleTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
     }
-    if (digest == kReasoningEffortTemplateDigest) {
+    if (digest == kReasoningEffortTemplateDigest ||
+        digest == kFlashNextReasoningEffortTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
     }
     throw std::invalid_argument("unsupported frontend/chat_template.jinja (sha256 " +

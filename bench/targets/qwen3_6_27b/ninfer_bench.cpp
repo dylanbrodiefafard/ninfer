@@ -483,6 +483,8 @@ int main(int argc, char** argv) {
         engine_options.speculative.dflash_verify_width = options.dflash_verify_width;
         engine_options.speculative.adaptive_draft      = options.adaptive_draft;
         engine_options.use_cuda_graph                  = options.use_cuda_graph;
+        engine_options.ngram_table_path                = options.ngram_table_path;
+        engine_options.qsa_select_budget               = options.qsa_select_budget;
 
         ninfer::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;

@@ -118,6 +118,51 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
     return failures;
 }
 
+// The packed FP32 form: a and b are unrounded FP32 rows 0..47 and 48..95 of one [96,T] tensor.
+int run_packed_case(std::int32_t tokens, std::uint32_t seed) {
+    const std::size_t elements = static_cast<std::size_t>(kHeads) * tokens;
+    std::vector<float> a(elements), b(elements), a_log(kHeads), dt_bias(kHeads);
+    fill_uniform(a, seed, -8.0F, 8.0F);
+    fill_uniform(b, seed + 1u, -8.0F, 8.0F);
+    fill_uniform(a_log, seed + 2u, -2.0F, 1.0F);
+    fill_uniform(dt_bias, seed + 3u, -1.0F, 1.0F);
+    std::vector<float> packed(2 * elements);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t h = 0; h < kHeads; ++h) {
+            const std::size_t i = static_cast<std::size_t>(t) * kHeads + h;
+            packed[static_cast<std::size_t>(t) * 2 * kHeads + h]          = a[i];
+            packed[static_cast<std::size_t>(t) * 2 * kHeads + kHeads + h] = b[i];
+        }
+    }
+    std::vector<double> reference_g, reference_beta;
+    gating_oracle(a, b, a_log, dt_bias, reference_g, reference_beta);
+
+    DeviceBuffer device_packed  = to_device(packed);
+    DeviceBuffer device_a_log   = to_device(a_log);
+    DeviceBuffer device_dt_bias = to_device(dt_bias);
+    GuardedDeviceBuffer device_g(elements * sizeof(float));
+    GuardedDeviceBuffer device_beta(elements * sizeof(float));
+    device_g.fill(0xff);
+    device_beta.fill(0xff);
+    Tensor tensor_ab(device_packed.p, DType::FP32, {2 * kHeads, tokens});
+    Tensor tensor_a_log(device_a_log.p, DType::FP32, {kHeads});
+    Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {kHeads});
+    Tensor tensor_g(device_g.data(), DType::FP32, {kHeads, tokens});
+    Tensor tensor_beta(device_beta.data(), DType::FP32, {kHeads, tokens});
+    ops::gdn_gating_packed(tensor_ab, tensor_a_log, tensor_dt_bias, tensor_g, tensor_beta, nullptr);
+    cuda_synchronize();
+
+    const std::string label = "gdn_gating_packed T=" + std::to_string(tokens);
+    int failures            = 0;
+    failures += verify_pointwise((label + " g").c_str(), read_fp32(device_g.data(), elements),
+                                 reference_g, kGdnGatingFp32);
+    failures += verify_pointwise((label + " beta").c_str(), read_fp32(device_beta.data(), elements),
+                                 reference_beta, kGdnGatingFp32);
+    failures += device_g.verify_guards((label + " g").c_str());
+    failures += device_beta.verify_guards((label + " beta").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -132,6 +177,8 @@ int main() {
     failures += run_case(128, 0x303u, false);
     failures += run_case(4096, 0x404u, false);
     failures += run_case(17, 0x505u, true);
+    failures += run_packed_case(1, 0x606u);
+    failures += run_packed_case(130, 0x707u);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating correctness\n";
     return failures == 0 ? 0 : 1;

@@ -8,10 +8,11 @@
 #include "ops/common/memory.cuh"
 #include "ops/kernel/a4_activation.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
-#include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
 
 #include <cuda_bf16.h>
@@ -98,7 +99,7 @@ void launch_gemm(const Weight& weight, Output output, Nvfp4W4a4Workspace workspa
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
     const Nvfp4SwiGluRows<Schedule> row_policy{};
-    const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    const float alpha = nvfp4_w4a4_alpha(weight, "nvfp4 linear_swiglu");
     launch_nvfp4_w4a4_mma<Geometry, Schedule, Nvfp4IdentityEpilogue, Output,
                           Nvfp4SwiGluRows<Schedule>, true, Cache::cg>(
         grid, stream, activation, static_cast<const std::uint8_t*>(weight.qdata),
@@ -139,7 +140,7 @@ void nvfp4_linear_swiglu_w4a4_project(const Weight& weight, std::int32_t tokens,
                                       cudaStream_t stream) {
     const Nvfp4W4a4Route route = nvfp4_w4a4_route(Nvfp4Problem::MlpGateUp, tokens);
     if (route == Nvfp4W4a4Route::Tma) {
-        const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+        const float alpha = nvfp4_w4a4_alpha(weight, "nvfp4 linear_swiglu");
         launch_nvfp4_linear_swiglu_w4a4_tma(
             activation.codes, activation.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
@@ -157,7 +158,7 @@ void nvfp4_linear_swiglu_w4a4_project_a4(const Weight& weight, std::int32_t toke
                                          float output_input_scale_divisor, cudaStream_t stream) {
     const Nvfp4W4a4Route route = nvfp4_w4a4_route(Nvfp4Problem::MlpGateUp, tokens);
     if (route == Nvfp4W4a4Route::Tma) {
-        const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+        const float alpha = nvfp4_w4a4_alpha(weight, "nvfp4 linear_swiglu");
         launch_nvfp4_linear_swiglu_w4a4_tma_a4(
             activation.codes, activation.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output.codes, output.scales,

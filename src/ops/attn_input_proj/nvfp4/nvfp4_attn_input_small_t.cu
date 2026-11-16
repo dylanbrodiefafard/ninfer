@@ -1,6 +1,7 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 
 #include "core/device.h"
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_small_t.cuh"
 
@@ -15,36 +16,6 @@ namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
                         cudaStream_t);
-
-struct Nvfp4AttentionInputSmallTOutput {
-    __nv_bfloat16* query;
-    __nv_bfloat16* key;
-    __nv_bfloat16* gate;
-    __nv_bfloat16* value;
-
-    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
-                                          float result) const {
-        constexpr std::int32_t kQueryRows  = 6144;
-        constexpr std::int32_t kKeyRows    = 1024;
-        constexpr std::int32_t kGateRows   = 6144;
-        constexpr std::int32_t kKeyBegin   = kQueryRows;
-        constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
-        constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;
-        const __nv_bfloat16 result_bf16    = __float2bfloat16_rn(result);
-
-        if (parent_row < kKeyBegin) {
-            query[static_cast<std::int64_t>(token) * kQueryRows + parent_row] = result_bf16;
-        } else if (parent_row < kGateBegin) {
-            key[static_cast<std::int64_t>(token) * kKeyRows + parent_row - kKeyBegin] = result_bf16;
-        } else if (parent_row < kValueBegin) {
-            gate[static_cast<std::int64_t>(token) * kGateRows + parent_row - kGateBegin] =
-                result_bf16;
-        } else {
-            value[static_cast<std::int64_t>(token) * kKeyRows + parent_row - kValueBegin] =
-                result_bf16;
-        }
-    }
-};
 
 // RTX 5090 cold-cache winner for the four-output epilogue at the A16 widths below the W4A4
 // cutover: eight-warp CTAs with the activation columns staged in shared memory.
@@ -66,7 +37,7 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
 
-    const Nvfp4AttentionInputSmallTOutput output{
+    const Nvfp4AttentionInput5120Output output{
         static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data),

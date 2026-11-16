@@ -101,6 +101,14 @@ add_library(ninfer_ops STATIC
   ops/launcher/rope.cu
   ops/launcher/sampling.cu
   ops/launcher/grouped_dynamic_conv.cu
+  ops/launcher/hyper_connection.cu
+  ops/launcher/stream_mean.cu
+  ops/launcher/qsa.cu
+  ops/launcher/bf16_projection.cu
+  ops/launcher/moe_route.cu
+  ops/launcher/moe_expert_cache.cu
+  ops/launcher/moe_experts.cu
+  ops/launcher/ple.cu
   ops/launcher/dflash2_path_select.cu
   ops/launcher/scalar.cu
   ops/launcher/scatter.cu
@@ -127,10 +135,12 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/fp8/fp8_attn_input_a8.cu
   ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
+  ops/attn_input_proj/nvfp4/nvfp4_attn_input_a16_mma.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_quantized.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
+  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_a16_mma.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_quantized.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp
@@ -195,6 +205,7 @@ add_library(ninfer_ops STATIC
   ops/linear/fp8/fp8_format.cpp
   ops/linear/fp8/fp8_a16_small_t_mma.cu
   ops/linear/fp8/fp8_a16_gemm_mma.cu
+  ops/linear/fp8/fp8_a16_mixer_out.cu
   ops/linear/fp8/fp8_a8.cu
   ops/linear/fp8/fp8_dispatch.cpp
   ops/wrapper/add_bias.cpp
@@ -231,6 +242,14 @@ add_library(ninfer_ops STATIC
   ops/wrapper/rope.cpp
   ops/wrapper/sampling.cpp
   ops/wrapper/grouped_dynamic_conv.cpp
+  ops/wrapper/hyper_connection.cpp
+  ops/wrapper/stream_mean.cpp
+  ops/wrapper/qsa.cpp
+  ops/wrapper/bf16_projection.cpp
+  ops/wrapper/moe_route.cpp
+  ops/wrapper/moe_expert_cache.cpp
+  ops/wrapper/moe_experts.cpp
+  ops/wrapper/ple.cpp
   ops/wrapper/dflash2_path_select.cpp
   ops/wrapper/scalar.cpp
   ops/wrapper/scatter.cpp
@@ -290,6 +309,7 @@ target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
+add_subdirectory(targets/qwen3_8_flash_next)
 
 target_include_directories(ninfer_engine PRIVATE ${ZSTD_INCLUDE_DIRS})
 if(ZSTD_CFLAGS_OTHER)

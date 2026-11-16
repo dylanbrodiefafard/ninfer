@@ -25,6 +25,9 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::BlockScaleK16M128x4V1;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return StorageLayout::RowScaleV1;
+    case NumericFormat::F3G32_E4M3FN:
+    case NumericFormat::E2M1G16_E4M3FN:
+        return StorageLayout::MoeExpertTilesV1;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -49,6 +52,9 @@ QType qtype_for(NumericFormat format) {
         return QType::NVFP4;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return QType::FP8_E4M3FN_ROW_BF16S;
+    case NumericFormat::F3G32_E4M3FN:
+    case NumericFormat::E2M1G16_E4M3FN:
+        throw std::invalid_argument("routed-expert records are not Weight matrices");
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -184,6 +190,9 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
     if (format == NumericFormat::NVFP4) {
         throw std::invalid_argument(
             "materialized_weight: NVFP4 requires target-validated weight and input divisors");
+    }
+    if (storage_layout_for(format) == StorageLayout::MoeExpertTilesV1) {
+        throw std::invalid_argument("materialized_weight: routed-expert records are not matrices");
     }
     if (storage_layout_for(format) == StorageLayout::ContiguousLeV1) {
         return contiguous_weight(materialized, handle, format, rows, columns);

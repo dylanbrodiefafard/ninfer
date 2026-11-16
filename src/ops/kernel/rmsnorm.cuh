@@ -18,7 +18,8 @@ namespace ninfer::ops {
 enum class RmsEpilogue {
     Offset,
     Plain,
-    Gated,
+    Gated,        // weight * SiLU(z)
+    SigmoidGated, // weight * sigmoid(z)
 };
 
 // Which representations of the normalized row a kernel publishes: the BF16 tensor, the
@@ -32,11 +33,17 @@ enum class RmsOutput {
     Bf16AndA4,
 };
 
+// Whether an epilogue reads the gate z; every kernel loads z only for these.
+template <RmsEpilogue Epilogue>
+inline constexpr bool kRmsEpilogueReadsGate =
+    Epilogue == RmsEpilogue::Gated || Epilogue == RmsEpilogue::SigmoidGated;
+
 template <RmsEpilogue Epilogue>
 __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weight, float z) {
     if constexpr (Epilogue == RmsEpilogue::Offset) { weight += 1.0f; }
     float value = x * inv * weight;
     if constexpr (Epilogue == RmsEpilogue::Gated) { value *= silu(z); }
+    if constexpr (Epilogue == RmsEpilogue::SigmoidGated) { value *= sigmoid(z); }
     return value;
 }
 
@@ -77,7 +84,7 @@ rmsnorm_warp_row(const __nv_bfloat162* x_row, const __nv_bfloat162* weight,
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
             float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(z_row[pair]); }
+            if constexpr (kRmsEpilogueReadsGate<Epilogue>) { zf = __bfloat1622float2(z_row[pair]); }
             normalized[k] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
@@ -103,7 +110,7 @@ __launch_bounds__(Block) __global__
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 normalized[kRmsWarpMaxPairsPerLane];
     rmsnorm_warp_row<Epilogue>(x + row_base, weight,
-                               Epilogue == RmsEpilogue::Gated ? z + row_base : nullptr, d, eps,
+                               kRmsEpilogueReadsGate<Epilogue> ? z + row_base : nullptr, d, eps,
                                lane, normalized);
 #pragma unroll
     for (int k = 0; k < kRmsWarpMaxPairsPerLane; ++k) {
@@ -200,7 +207,7 @@ __launch_bounds__(Block) __global__
     const float2 w1 = __bfloat1622float2(weight[pair1]);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
-    if constexpr (Epilogue == RmsEpilogue::Gated) {
+    if constexpr (kRmsEpilogueReadsGate<Epilogue>) {
         z0 = __bfloat1622float2(z[row_base + pair0]);
         z1 = __bfloat1622float2(z[row_base + pair1]);
     }
@@ -269,7 +276,7 @@ rmsnorm_cta_bf16x2_body(const __nv_bfloat162* x, const __nv_bfloat162* weight,
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
             float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) {
+            if constexpr (kRmsEpilogueReadsGate<Epilogue>) {
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
             const auto normalized =
@@ -408,7 +415,7 @@ rmsnorm_generic_body(const __nv_bfloat16* x, const __nv_bfloat16* weight, const 
         const float xv           = __bfloat162float(x[index]);
         const float wv           = __bfloat162float(weight[i]);
         float zv                 = 0.0f;
-        if constexpr (Epilogue == RmsEpilogue::Gated) { zv = __bfloat162float(z[index]); }
+        if constexpr (kRmsEpilogueReadsGate<Epilogue>) { zv = __bfloat162float(z[index]); }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
     }
 }

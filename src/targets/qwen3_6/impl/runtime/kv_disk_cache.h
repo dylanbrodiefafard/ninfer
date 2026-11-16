@@ -117,7 +117,8 @@ struct DiskCheckpointImageTarget {
     std::size_t hidden_bytes    = 0;
     void* dflash                = nullptr;
     std::size_t dflash_bytes    = 0;
-    cudaEvent_t writable        = nullptr;
+    std::span<std::byte> flash_next_state;
+    cudaEvent_t writable = nullptr;
 };
 
 struct DiskRestoredHost {
@@ -153,8 +154,13 @@ struct DiskRestoreTarget {
     Tensor* tail_hidden               = nullptr;
     Tensor* rewrite_checkpoint_hidden = nullptr;
 
-    PrefixReusePath reuse    = PrefixReusePath::FullReset;
-    std::uint32_t reuse_base = 0;
+    // Pinned target-owned images; the caller keeps them through restore completion/cancel.
+    std::span<std::byte> flash_next_state;
+    std::span<std::byte> flash_next_rewrite;
+    // Joins every previous reader/writer of both destination images before CPU decode writes.
+    cudaEvent_t flash_next_writable = nullptr;
+    PrefixReusePath reuse           = PrefixReusePath::FullReset;
+    std::uint32_t reuse_base        = 0;
     // False when the request drops the entry's rewrite checkpoint on an append or staged
     // restore: nothing reads that set, so it is not restored. A rewrite-checkpoint restore
     // likewise skips the frontier set it overwrites.

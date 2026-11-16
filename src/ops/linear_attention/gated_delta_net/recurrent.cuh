@@ -439,7 +439,10 @@ struct FoldGeometry {
     static_assert(ConvChannels % 128 == 0);
 };
 
+// The two registered all-layer fold geometries: 48 GDN layers (Qwen3.6-family 27B) and 36
+// (Qwen3.8-Flash-Next), both Hq 16 / Hv 48 with 10240 convolution channels.
 using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
+using FoldGeometry36x48 = FoldGeometry<36, 16, 48, 10240>;
 
 template <class Geometry>
 struct FoldAccess {

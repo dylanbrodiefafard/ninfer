@@ -34,10 +34,11 @@ template's default. An artifact whose template does not expose effort rejects th
 
 GPU residency is frozen when the Engine starts:
 
-- omitting `--spec` selects adaptive DFlash2 K7 and the optimized proposal head when the
-  supported Qwen3.8 NVFP4 artifact contains `dflash/`; a base artifact stays non-speculative;
-- `--spec none` omits speculative weights and state and the optimized proposal head;
-- `--spec dflash` loads the Qwen3.8-27B DFlash2 companion when `dflash/` is present;
+- omitting `--spec` selects adaptive DFlash2 K7 with the optimized head for Qwen3.8-27B NVFP4,
+  or adaptive K0..3 with the full shared head for Flash-Next, when the companion is present;
+  a base artifact stays non-speculative;
+- `--spec none` disables speculation; Flash-Next still validates and materializes a stored companion;
+- `--spec dflash` requires the registered target's complete DFlash2 companion;
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
@@ -112,10 +113,13 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-CLI startup inspects the artifact directory and enables adaptive DFlash2 with up to seven draft
+For Qwen3.8-27B, CLI startup inspects the artifact directory and enables adaptive DFlash2 with up to seven draft
 tokens and the optimized proposal head when its companion is present. Otherwise speculation stays
 off. `--spec none` explicitly disables it; explicit `--spec dflash` settings override the defaults.
-The supported backend is Qwen3.8-27B NVFP4 DFlash2, with chain draft windows from one to seven. MTP execution is disabled in the Engine,
+Qwen3.8-27B NVFP4 DFlash2 supports chain windows from one to seven. Flash-Next supports K=0..3,
+including root-only K0, automatic chain width K+1, and measured-time adaptive selection per batch
+size. Its full shared FP8 head is used; `--lm-head-draft` and `--dflash-verify-width` are rejected.
+MTP execution is disabled in the Engine,
 CLI, and server. Stored MTP tensors do not enable execution or affect the cache fingerprint.
 The companion is text-only internally, but a `--vision` Engine supplies it target hidden
 features after Vision embedding composition and uses target MRoPE positions for verification.
@@ -175,6 +179,8 @@ The RTX 5090 tree investigation is in
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--context-checkpoints off\|on\|a,b,c` | automatic prefill ladder: `off` captures none, `on` uses the standard marks (24576, 36864, 53248, 77824, 102400, 151552), and a comma list sets custom marks. `on` and custom lists require DFlash, selected automatically or with `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark, not the raw named size. Turn-rollback and turn (rewrite) checkpoints do not depend on the ladder. | `off` |
+| `--ngram-table PATH` | qwen3.8-flash-next only, and required by it: the 8-bit n-gram (PLE) table file (`ngram_table.int8.bin`); other targets reject it | unset |
+| `--qsa-select-budget 512\|1024\|2048` | qwen3.8-flash-next only: complete four-token QSA blocks each query attends to beyond its tail | `512` |
 | `--capture-context-checkpoint` | pin the current resume frontier `E` on an exact-hit / decode-only request (the same one-slot turn-rollback head automatic occupy-append already writes). A fresh one-shot run has `E == 0`, so this is a no-op unless a retained lane already exists in the process. | off |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
@@ -296,6 +302,43 @@ delta, so other processes on the GPU can move it, and it does not fail startup. 
 `min(12n, 24+6n)` MiB and DFlash2 budgets `16+4.75n` MiB for `n` `(draft length, batch size, topology)`
 executables (244 MiB for adaptive drafting up to seven tokens and four-way concurrency). All graphs are prepared at startup; changing adaptive draft length or
 processing a full prefill chunk uses the already reserved runtime storage.
+**qwen3.8-flash-next.** The second registered identity, `qwen3.8-flash-next/f3-fp8-nvfp4`, keeps
+its routed experts in pinned host memory (about 50 GB; a load needs at least 70 GB of free host
+RAM) behind a VRAM expert cache, and requires `--ngram-table`. Its KV pool is the QSA attention
+state of all requests: `--kv-dtype nvfp4` (default, about 11.4 KiB per token) or `bf16` (about
+28.6 KiB); `--kv-capacity N` shares N tokens among the lanes and `auto` reserves
+`--max-concurrency` × `--max-context` tokens. The expert cache takes every byte left after the
+weights, that pool, the Program's activations and workspace and a 1 GiB reserve (prefill
+streaming windows borrow cache slots for each windowed super-chunk), so `--kv-capacity-headroom`
+does not apply. On top of that, the pool lends the cache its unreserved pages in extents of 244
+NVFP4 pages (15,616 tokens, 84 expert records) or 122 BF16 pages, and takes an extent back before a
+request maps its pages, so an `auto` pool sized for every lane's whole context costs the cache only
+what requests actually reserve. Serve prints both parts on its KV capacity line as
+`expert-cache=<own slots>+kv-lendable=<lendable pool bytes>`, the CLI as `gpu expert cache`. A prompt is processed in 16,384-token super-chunks of `--prefill-chunk`-token
+steps; the super-chunk is the unit between which other requests decode and a short prompt may
+start. A complete DFlash2 companion enables adaptive K0..3 automatically, with a full shared
+proposal head. `--spec none` disables it; `--spec dflash --draft-tokens K` fixes K in [0,3], and
+`--adaptive-draft` turns that value into the ceiling. The picker uses observed seconds per
+published token with bounded exploration. All graphs, features and draft context are funded
+before sizing the expert cache. The target rejects `--lm-head-draft`, `--dflash-verify-width`, `--context-checkpoints`,
+`--vision`, `--kv-dtype int8`, `--sage`, `--keep-frac`, `--xattn-tau` and `--no-cuda-graph`;
+Engine scoring supports only the prefill schedule. Idle lanes retain exact continuation state:
+matching current prefixes prefill only the suffix, and matching saved frontend rewrite or occupy
+boundaries restore exact GDN/PLE state before suffix prefill. Other common-prefix positions are
+misses, even inside a retained QSA page. The last sampled output token is not yet appended and is
+therefore not part of the reusable current frontier. `--no-prefix-reuse` disables retention and
+reuse. `cache_write: false` forks into independent allocations without consuming the source;
+without a spare lane or secured RAM that can preserve the original, admission reports overload.
+Disposable retained state is evicted before ordinary state. `--kv-ram-capacity` and the inclusive
+`--kv-disk-capacity` tier retain complete QSA/GDN/PLE/tail-logit state, including active DFlash2
+cyclic KV, pending features and calibration, under the shared FIFO,
+claim, exact-checkpoint and source-preservation contracts. RAM-on execution funds output windows
+of at most 8192 tokens and can suspend settled continuations to secured RAM under KV pressure.
+`--kv-ram-system-prompts` keeps RAM-only system anchors. Flash-Next checkpoint images use a
+startup-fixed pinned slab outside the RAM-tier budget; that slab plus the RAM arena must leave
+at least 4096 MiB available. SSD startup fingerprints all artifact tensors and the complete
+external n-gram table, so enabling disk caching reads both once for numerical identity.
+
 Checkpoint images live in one pinned host slab that startup allocates, prefaults, and registers
 outside `--kv-ram-capacity`: each lane's turn (rewrite) checkpoint image of the GDN state
 (146.8 MiB on Qwen3.8-27B, plus 40 MiB of DFlash local K/V), and with DFlash a pool of

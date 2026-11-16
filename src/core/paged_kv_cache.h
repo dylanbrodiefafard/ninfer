@@ -140,11 +140,32 @@ public:
     [[nodiscard]] const Tensor& block_tables() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
 
+    // Every page is in exactly one of three states: free (in the free set), mapped (by one
+    // allocation), or withheld (lent, with its bytes, to another owner of the pool's memory).
+    // Entitlement is accounting over the whole pool: a pool with withheld pages can admit
+    // entitlement that only restoring them can materialize, and the owner that withheld them
+    // restores runs before such a materialization, which otherwise throws std::logic_error.
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;
+    [[nodiscard]] std::uint32_t withheld_pages() const noexcept;
     [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
     [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
+
+    // Whether every page of the run [first, first + count) is free; false for a run that is
+    // empty or leaves the pool.
+    [[nodiscard]] bool pages_free(std::uint32_t first, std::uint32_t count) const noexcept;
+    // Moves the free run [first, first + count) to the withheld state, so no allocation maps its
+    // pages until restore_pages. The pool never reads or writes page bytes, so the run's bytes
+    // in every plane belong to the borrower until then. Throws std::invalid_argument unless
+    // every page of the run is free.
+    void withhold_pages(std::uint32_t first, std::uint32_t count);
+    // Returns the withheld run [first, first + count) to the free set; after validation nothing
+    // allocates or throws. Its bytes are whatever
+    // the borrower left, so only consumers that never read a slot before writing it may map
+    // restored pages without zero_pages. Throws std::invalid_argument unless every page of the
+    // run is withheld.
+    void restore_pages(std::uint32_t first, std::uint32_t count);
 
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
@@ -166,10 +187,14 @@ private:
     PagedKVPoolSpec spec_;
     std::vector<Tensor> planes_;
     Tensor block_tables_;
+    // Free page ids in ascending order.
     std::vector<std::int32_t> free_page_ids_;
     std::vector<bool> row_in_use_;
+    // page_withheld_[g]: page g is withheld.
+    std::vector<bool> page_withheld_;
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
+    std::uint32_t withheld_pages_ = 0;
 };
 
 class PagedKVAllocation {

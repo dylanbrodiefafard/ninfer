@@ -1,5 +1,6 @@
 #include "ninfer/ops/gated_delta_net.h"
 
+#include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -45,6 +46,60 @@ int verify_equal(const std::string& label, const std::vector<std::uint32_t>& lhs
     if (lhs == rhs) { return 0; }
     std::cerr << label << ": FP32 bits differ\n";
     return 1;
+}
+
+// The BF16 output criterion of the gated_delta_net oracle tests.
+constexpr ReductionCriterion kOutputCriterion{/*relative_l2=*/4.1e-3, /*gross_absolute=*/5.0e-6,
+                                              /*gross_relative_to_max_reference=*/5.5e-3};
+
+// Compares every row's valid output prefix with the complete FP64 recurrence evaluated from the
+// represented BF16 q/k/v, FP32 g/beta and the row's FP32 initial slot.
+int verify_output_oracle(const std::string& label, std::int32_t value_heads, std::int32_t width,
+                         const std::vector<std::int32_t>& valid_columns,
+                         const std::vector<std::int32_t>& initial_slots,
+                         const std::vector<std::uint16_t>& q_bits,
+                         const std::vector<std::uint16_t>& k_bits,
+                         const std::vector<std::uint16_t>& v_bits, const std::vector<float>& g,
+                         const std::vector<float>& beta, const std::vector<float>& state,
+                         const std::vector<std::uint16_t>& output_bits) {
+    constexpr std::int32_t kQkHeads = 16;
+    const std::size_t qk_column     = static_cast<std::size_t>(kStateDim) * kQkHeads;
+    const std::size_t value_column  = static_cast<std::size_t>(kStateDim) * value_heads;
+    const std::size_t gate_column   = static_cast<std::size_t>(value_heads);
+    const std::size_t slot_elements = static_cast<std::size_t>(kStateDim) * value_column;
+    std::vector<double> actual;
+    std::vector<double> expected;
+    for (std::size_t row = 0; row < valid_columns.size(); ++row) {
+        const std::int32_t valid = valid_columns[row];
+        const std::size_t first  = row * static_cast<std::size_t>(width);
+        const std::size_t count  = static_cast<std::size_t>(valid);
+        gdn_ref::Inputs input;
+        input.head_dim    = kStateDim;
+        input.qk_heads    = kQkHeads;
+        input.value_heads = value_heads;
+        input.tokens      = valid;
+        for (std::size_t index = first * qk_column; index < (first + count) * qk_column; ++index) {
+            input.q.push_back(bf16_to_f32(q_bits[index]));
+            input.k.push_back(bf16_to_f32(k_bits[index]));
+        }
+        for (std::size_t index = first * value_column; index < (first + count) * value_column;
+             ++index) {
+            input.v.push_back(bf16_to_f32(v_bits[index]));
+            actual.push_back(static_cast<double>(bf16_to_f32(output_bits[index])));
+        }
+        input.g.assign(g.begin() + static_cast<std::ptrdiff_t>(first * gate_column),
+                       g.begin() + static_cast<std::ptrdiff_t>((first + count) * gate_column));
+        input.beta.assign(beta.begin() + static_cast<std::ptrdiff_t>(first * gate_column),
+                          beta.begin() +
+                              static_cast<std::ptrdiff_t>((first + count) * gate_column));
+        const auto initial = static_cast<std::size_t>(initial_slots[row]) * slot_elements;
+        input.state.assign(state.begin() + static_cast<std::ptrdiff_t>(initial),
+                           state.begin() + static_cast<std::ptrdiff_t>(initial + slot_elements));
+        const gdn_ref::Result reference =
+            gdn_ref::evaluate(input, 1.0 / std::sqrt(static_cast<double>(kStateDim)), true);
+        expected.insert(expected.end(), reference.out.begin(), reference.out.end());
+    }
+    return verify_reduction(label.c_str(), actual, expected, kOutputCriterion);
 }
 
 struct DeviceTreeSchedule {
@@ -167,6 +222,9 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         from_device<std::uint16_t>(record_out, value_elements);
     failures +=
         verify_equal("replay record output" + suffix, snapshot_output_bits, record_output_bits);
+    failures += verify_output_oracle("replay record FP64 output oracle" + suffix, value_heads,
+                                     width, valid_columns, initial_slots, q_bits, k_bits, v_bits, g,
+                                     beta, state, record_output_bits);
 
     const std::vector<std::uint16_t> key_bits_after =
         from_device<std::uint16_t>(key_record, qk_elements);
@@ -725,6 +783,10 @@ int main() {
     }
 
     int failures = 0;
+    // Width-one chains: the read-only record of a K0 root, dense and masked, B=1/5/12.
+    failures += run_case(48, 1, 1, {}, 1691U);
+    failures += run_case(48, 1, 5, {1, 1, 1, 1, 1}, 1693U);
+    failures += run_case(48, 1, 12, {}, 1697U);
     failures += run_case(48, 2, 1, {}, 1701U);
     failures += run_case(48, 16, 1, {7}, 1711U);
     failures += run_case(48, 6, 4, {6, 5, 4, 3}, 1721U);

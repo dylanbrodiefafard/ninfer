@@ -4,9 +4,10 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
-#include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
+#include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
 
 namespace ninfer::ops::detail {
 namespace {
@@ -38,7 +39,7 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4W4a4Workspac
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN,
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
-    const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    const float alpha = nvfp4_w4a4_alpha(weight, "nvfp4 gdn_input_proj");
     const Nvfp4GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
                                      static_cast<__nv_bfloat16*>(z.data)};
     launch_nvfp4_w4a4_mma<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4GdnInputOutput>(
@@ -69,7 +70,7 @@ void nvfp4_gdn_input_w4a4_project(const Weight& weight, std::int32_t tokens,
                                   cudaStream_t stream) {
     const Nvfp4W4a4Route route = nvfp4_w4a4_route(Nvfp4Problem::GdnInput, tokens);
     if (route == Nvfp4W4a4Route::Tma) {
-        const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+        const float alpha = nvfp4_w4a4_alpha(weight, "nvfp4 gdn_input_proj");
         launch_nvfp4_w4a4_tma_gdn(
             activation.codes, activation.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(qkv.data),

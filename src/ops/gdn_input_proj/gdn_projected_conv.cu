@@ -11,10 +11,14 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// Grid (ceil(Channels / blockDim.x), B), one thread per channel row of batch row blockIdx.y; the
+// thread walks the row's W columns in order with its three-tap history in registers. No shared
+// memory or barrier. state_read is not __restrict__: a snapshot Publish writes the same pool,
+// although only to the channel element its own thread has already loaded.
 template <int Channels, int QueryRows, int KeyRows, int ValueRows, int StaticWidth, class Publish>
 __global__ void gdn_projected_conv_kernel(
     const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
-    const __nv_bfloat16* __restrict__ state_read, const std::int32_t* __restrict__ valid_columns,
+    const __nv_bfloat16* state_read, const std::int32_t* __restrict__ valid_columns,
     const std::int32_t* __restrict__ initial_state_slots, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value, std::int32_t width,
     Publish publish) {
@@ -221,6 +225,18 @@ void gdn_projected_conv_record_launch(const Tensor& conv_record, const Tensor& c
                                          : nullptr;
     dispatch(conv_record, conv_weight, conv_states, valid_columns, initial_state_slots, parent_ptr,
              query, key, value, NoHistoryPublish{}, stream);
+}
+
+void gdn_projected_conv_snapshot_launch(const Tensor& projected, const Tensor& conv_weight,
+                                        Tensor& conv_states, const Tensor& valid_columns,
+                                        const Tensor& initial_state_slots,
+                                        const Tensor& snapshot_base_slots, Tensor& query,
+                                        Tensor& key, Tensor& value, cudaStream_t stream) {
+    const SnapshotHistoryPublish publish{static_cast<__nv_bfloat16*>(conv_states.data),
+                                         static_cast<const std::int32_t*>(snapshot_base_slots.data),
+                                         projected.ne[0]};
+    dispatch(projected, conv_weight, conv_states, valid_columns, initial_state_slots, nullptr,
+             query, key, value, publish, stream);
 }
 
 } // namespace ninfer::ops::detail

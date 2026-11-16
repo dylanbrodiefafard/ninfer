@@ -24,7 +24,6 @@ constexpr std::int32_t kVocab             = 248320;
 constexpr std::int32_t kLastFrontendToken = 248076;
 constexpr std::int32_t kMaskToken         = 248077;
 constexpr std::int32_t kW8TextD           = 5120;
-constexpr std::int32_t kFp8D              = 5120;
 constexpr std::int32_t kDenseRows         = 2304;
 constexpr std::int32_t kDenseD            = 1152;
 constexpr std::int32_t kW8Group           = 32;
@@ -272,8 +271,9 @@ struct Fp8Row {
 
 class Fp8Table {
 public:
-    Fp8Table()
-        : code_plane_bytes_(static_cast<std::size_t>(kVocab) * kFp8D),
+    // A [248320,d] table; the registered FP8 widths are 5120 and 2560.
+    explicit Fp8Table(std::int32_t d)
+        : d_(d), code_plane_bytes_(static_cast<std::size_t>(kVocab) * d),
           scale_offset_(align_up(code_plane_bytes_, 256)),
           payload_(scale_offset_ + static_cast<std::size_t>(kVocab) * 2) {
         for (const std::int32_t row : repeated_ids(8)) {
@@ -293,15 +293,15 @@ public:
         result.qhigh            = nullptr;
         result.scales           = base + scale_offset_;
         result.high_plane_bytes = 0;
-        result.group_size       = kFp8D;
-        result.group            = kFp8D;
+        result.group_size       = d_;
+        result.group            = d_;
         result.ndim             = 2;
         result.shape[0]         = kVocab;
-        result.shape[1]         = kFp8D;
+        result.shape[1]         = d_;
         result.padded_shape[0]  = kVocab;
-        result.padded_shape[1]  = kFp8D;
+        result.padded_shape[1]  = d_;
         result.n                = kVocab;
-        result.k                = kFp8D;
+        result.k                = d_;
         result.scale_ne[0]      = kVocab;
         result.scale_nb[0]      = 2;
         result.scale_nb[1]      = static_cast<std::int64_t>(kVocab) * 2;
@@ -311,13 +311,13 @@ public:
     }
 
     std::vector<double> oracle(const std::vector<std::int32_t>& ids) const {
-        std::vector<double> result(static_cast<std::size_t>(kFp8D) * ids.size());
+        std::vector<double> result(static_cast<std::size_t>(d_) * ids.size());
         for (std::size_t t = 0; t < ids.size(); ++t) {
             const Fp8Row* row = find(ids[t]);
             if (row == nullptr) throw std::out_of_range("FP8 oracle row was not materialized");
             const double scale = static_cast<double>(bf16_to_f32(row->scale));
-            for (std::int32_t d = 0; d < kFp8D; ++d) {
-                result[t * static_cast<std::size_t>(kFp8D) + d] =
+            for (std::int32_t d = 0; d < d_; ++d) {
+                result[t * static_cast<std::size_t>(d_) + d] =
                     decode_e4m3fn(row->codes[static_cast<std::size_t>(d)]) * scale;
             }
         }
@@ -328,7 +328,7 @@ public:
         int failures = payload_.verify_guards(label);
         for (const Fp8Row& row : rows_) {
             std::vector<std::uint8_t> got(row.codes.size());
-            payload_.copy_to_host(got.data(), got.size(), static_cast<std::size_t>(row.id) * kFp8D);
+            payload_.copy_to_host(got.data(), got.size(), static_cast<std::size_t>(row.id) * d_);
             failures += verify_exact(label, got, row.codes);
             std::uint8_t scale_bytes[2]{};
             payload_.copy_to_host(scale_bytes, sizeof(scale_bytes),
@@ -351,20 +351,20 @@ private:
     }
 
     void add_row(std::int32_t id) {
-        Fp8Row row{id, std::vector<std::uint8_t>(kFp8D),
+        Fp8Row row{id, std::vector<std::uint8_t>(d_),
                    id == 0    ? std::uint16_t{0}
                    : id == 1  ? std::uint16_t{1}
                    : id == 42 ? std::uint16_t{0x0080}
                    : id == kMaskToken
                        ? f32_to_bf16(1.15625f)
                        : f32_to_bf16(0.0017f + 0.00031f * static_cast<float>(id % 13))};
-        for (std::int32_t d = 0; d < kFp8D; ++d) {
+        for (std::int32_t d = 0; d < d_; ++d) {
             auto code = static_cast<std::uint8_t>(d + id * 37);
             if ((code & 0x7fu) == 0x7fu) --code;
             row.codes[d] = id == 0 ? 0 : code;
         }
         payload_.copy_from_host(row.codes.data(), row.codes.size(),
-                                static_cast<std::size_t>(id) * kFp8D);
+                                static_cast<std::size_t>(id) * d_);
         const std::uint8_t scale_bytes[]{static_cast<std::uint8_t>(row.scale),
                                          static_cast<std::uint8_t>(row.scale >> 8)};
         payload_.copy_from_host(scale_bytes, sizeof(scale_bytes),
@@ -372,6 +372,7 @@ private:
         rows_.push_back(std::move(row));
     }
 
+    std::int32_t d_;
     std::size_t code_plane_bytes_;
     std::size_t scale_offset_;
     GuardedDeviceBuffer payload_;
@@ -399,16 +400,17 @@ int run_quantized_case(const char* label, Table& table, const std::vector<std::i
     return failures;
 }
 
-int test_fp8() {
-    Fp8Table table;
+int test_fp8(std::int32_t d) {
+    Fp8Table table(d);
     DeviceContext device;
-    int failures = 0;
+    const std::string label = "FP8 embedding [248320," + std::to_string(d) + "]";
+    int failures            = 0;
     for (int tokens : {1, 2, 4, 6, 16, 48, 49, 128, 257, 1024}) {
         auto ids = repeated_ids(tokens);
         GuardedDeviceBuffer input_storage(ids.size() * sizeof(std::int32_t));
-        GuardedDeviceBuffer output(ids.size() * kFp8D * sizeof(std::uint16_t));
+        GuardedDeviceBuffer output(ids.size() * d * sizeof(std::uint16_t));
         Tensor input(input_storage.data(), DType::I32, {tokens});
-        Tensor result(output.data(), DType::BF16, {kFp8D, tokens});
+        Tensor result(output.data(), DType::BF16, {d, tokens});
         Weight weight = table.weight();
         input_storage.copy_from_host(ids.data(), input_storage.bytes());
         cuda_synchronize();
@@ -433,12 +435,12 @@ int test_fp8() {
             std::vector<std::uint16_t> expected(oracle.size());
             for (std::size_t i = 0; i < oracle.size(); ++i)
                 expected[i] = f32_to_bf16(static_cast<float>(oracle[i]));
-            failures += verify_exact("FP8 embedding rounded bits", actual, expected);
-            failures += output.verify_guards("FP8 embedding");
-            failures += verify_input("FP8 embedding", input_storage, ids);
+            failures += verify_exact((label + " rounded bits").c_str(), actual, expected);
+            failures += output.verify_guards(label.c_str());
+            failures += verify_input(label.c_str(), input_storage, ids);
         }
     }
-    return failures + table.verify_unchanged("FP8 embedding weights");
+    return failures + table.verify_unchanged((label + " weights").c_str());
 }
 
 int test_w8() {
@@ -515,7 +517,8 @@ int main() {
     int failures = 0;
     try {
         failures += test_dense();
-        failures += test_fp8();
+        failures += test_fp8(5120);
+        failures += test_fp8(2560);
         failures += test_w8();
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';

@@ -22,7 +22,7 @@ inline constexpr char kDiskTombstoneMagic[8]   = {'N', 'I', 'D', 'K', 'T', 'B', 
 inline constexpr char kDiskPackSetMagic[8]     = {'N', 'I', 'D', 'K', 'P', 'S', '0', '1'};
 inline constexpr char kDiskObjectMapMagic[8]   = {'N', 'I', 'D', 'K', 'O', 'M', '0', '1'};
 
-inline constexpr std::uint32_t kDiskFormatVersion         = 8;
+inline constexpr std::uint32_t kDiskFormatVersion         = 9;
 inline constexpr std::uint32_t kDiskPageHeaderBytes       = 16;
 inline constexpr std::uint32_t kDiskPageIoAlignment       = 4096;
 inline constexpr std::uint32_t kDiskCodecHeaderBytes      = 24;
@@ -37,18 +37,22 @@ enum class DiskCodec : std::uint8_t {
 };
 
 enum class DiskStateKind : std::uint8_t {
-    CurrentGdn     = 1,
-    RewriteGdn     = 2,
-    RollbackGdn    = 3,
-    LadderGdn      = 4,
-    TailHidden     = 5,
-    RewriteHidden  = 6,
-    RollbackHidden = 7,
-    LadderHidden   = 8,
-    DflashLocal    = 9,
-    DflashRewrite  = 10,
-    DflashRollback = 11,
-    DflashLadder   = 12,
+    CurrentGdn        = 1,
+    RewriteGdn        = 2,
+    RollbackGdn       = 3,
+    LadderGdn         = 4,
+    TailHidden        = 5,
+    RewriteHidden     = 6,
+    RollbackHidden    = 7,
+    LadderHidden      = 8,
+    DflashLocal       = 9,
+    DflashRewrite     = 10,
+    DflashRollback    = 11,
+    DflashLadder      = 12,
+    FlashNextCurrent  = 13,
+    FlashNextRewrite  = 14,
+    FlashNextRollback = 15,
+    FlashNextLadder   = 16,
 };
 
 enum class DiskObjectKind : std::uint8_t {
@@ -69,10 +73,11 @@ struct DiskCodecHeader {
 struct DiskCheckpointSlot {
     std::uint32_t frontier = 0;
     PrefixHash128 hash{};
-    ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
-    std::uint64_t gdn_id       = 0;
-    std::uint64_t hidden_id    = 0;
-    std::uint64_t dflash_id    = 0;
+    ContextCheckpointKind kind  = ContextCheckpointKind::Ladder;
+    std::uint64_t gdn_id        = 0;
+    std::uint64_t hidden_id     = 0;
+    std::uint64_t dflash_id     = 0;
+    std::uint64_t flash_next_id = 0;
 };
 
 // Describes one plane in the canonical packed logical-page image. Physical resident-page
@@ -112,7 +117,12 @@ struct DiskFingerprint {
     std::uint32_t cyclic_padded       = 0;
     std::int32_t cyclic_kv_heads      = 0;
     std::int32_t cyclic_head_dim      = 0;
-    std::uint32_t snapshot_version    = kDiskFormatVersion;
+    // Flash-Next's target-owned continuation layout includes every GDN slot, PLE history and
+    // tail logits. Its numerical identity also binds the external table and QSA selection.
+    std::uint64_t flash_next_state_bytes = 0;
+    std::string flash_next_ngram_identity;
+    std::uint32_t flash_next_select_budget = 0;
+    std::uint32_t snapshot_version         = kDiskFormatVersion;
     std::vector<DiskPlaneSchema> text_planes;
     std::vector<DiskPlaneSchema> backend_planes;
 };
@@ -132,14 +142,16 @@ struct DiskMeta {
     std::uint32_t rewrite_frontier        = 0;
     PrefixHash128 hash_f{};
     PrefixHash128 hash_c{};
-    std::uint64_t ledger_id         = 0;
-    std::uint64_t identity_id       = 0;
-    std::uint64_t current_gdn_id    = 0;
-    std::uint64_t current_hidden_id = 0;
-    std::uint64_t current_cyclic_id = 0;
-    std::uint64_t rewrite_gdn_id    = 0;
-    std::uint64_t rewrite_hidden_id = 0;
-    std::uint64_t rewrite_cyclic_id = 0;
+    std::uint64_t ledger_id             = 0;
+    std::uint64_t identity_id           = 0;
+    std::uint64_t current_gdn_id        = 0;
+    std::uint64_t current_hidden_id     = 0;
+    std::uint64_t current_cyclic_id     = 0;
+    std::uint64_t rewrite_gdn_id        = 0;
+    std::uint64_t rewrite_hidden_id     = 0;
+    std::uint64_t rewrite_cyclic_id     = 0;
+    std::uint64_t current_flash_next_id = 0;
+    std::uint64_t rewrite_flash_next_id = 0;
     DiskCheckpointSlot rollback;
     std::array<DiskCheckpointSlot, 2> ladders{};
     std::vector<std::uint64_t> main_page_ids;

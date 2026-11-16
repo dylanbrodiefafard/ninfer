@@ -16,6 +16,7 @@ The initial storage registry contains exactly these identities:
 | `blockscale-k16-m128x4-v1` | tensor layout | `NVFP4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 | `row-scale-v1` | tensor layout | `FP8_E4M3FN_ROW_BF16S` | positive rank 2 `[N,K]` | 256 bytes |
+| `moe-expert-tiles-v1` | tensor layout | `F3G32_E4M3FN`, `E2M1G16_E4M3FN` | rank 3 `[E,H,I]`, `H % 128 == 0`, `I % 128 == 0` | 256 bytes |
 
 These are closed identities, not templates. A format/layout combination not present in the table is
 unsupported. In particular, a direct format cannot use a quantized layout, grouped
@@ -305,7 +306,58 @@ Only the code/scale gap is padded (zero bytes); no per-row or trailing padding i
 present. Codes and scales are preserved bit-exactly, including signed-zero codes.
 This layout accepts only `FP8_E4M3FN_ROW_BF16S`; it does not transpose or repack at load.
 
-## 6. `raw-bytes-v1`
+## 6. `moe-expert-tiles-v1`
+
+The logical shape `[E,H,I]` is `E` routed SwiGLU experts of hidden width `H` and intermediate
+width `I`. Expert `e` holds gate `G` and up `U`, each `[I,H]` (row = intermediate index, K =
+hidden index), and down `D` `[H,I]` (row = hidden index, K = intermediate index). Codes and scales
+are the words of Section 3.5 of [`tensor-formats.md`](tensor-formats.md); the multipliers and books
+are not in this payload. `include/ninfer/ops/moe_experts.h` is the consumer of this byte order.
+
+The payload is `E` records, record `e` at `e * record_bytes`. A record is a sequence of chunks of
+`B` bytes, each covering 32 local rows and 128 consecutive K:
+
+```text
+B(E2M1G16) = 4096/16 + 4096/2   = 2304
+B(F3G32)   = 4096/32 + 4096*3/8 = 1664
+
+gate|up chunk (r, q) at (r * H/128 + q) * B,                  r in [0, I/16), q in [0, H/128)
+down chunk    (r, q) at ((I/16) * (H/128) + r * I/128 + q) * B, r in [0, H/32),  q in [0, I/128)
+record_bytes = align_up(((I/16) * (H/128) + (H/32) * (I/128)) * B, 256)
+payload_bytes = E * record_bytes
+```
+
+Bytes between the last chunk and `record_bytes` are zero. Chunk `(r, q)` covers K `128 q + kappa`,
+`kappa` in `[0,128)`. In a gate|up chunk local row `rho < 16` is gate row `16 r + rho` and
+`rho >= 16` is up row `16 r + rho - 16`; in a down chunk local row `rho` is down row `32 r + rho`.
+Lane `L = 4 g + c` (`L` in `[0,32)`) owns local rows `rho_k = g + 8 k` (`k` in `[0,4)`) and K
+offsets `kappa = 32 c + i` (`i` in `[0,32)`).
+
+F3G32 chunk. Each `(rho_k, c)` is one unit of 32 codes, code `i` at K offset `32 c + i`, with one
+scale:
+
+```text
+byte 4 L + k                                  the unit's E4M3FN scale          (bytes [0,128))
+u32 at 128 + 16 (32 j + L) + 4 k, j in [0,3)  code word w_j: nibble n (bits 4n..4n+3) holds code
+                                              8 j + n in its low three bits and bit j of code
+                                              24 + n in its high bit
+```
+
+E2M1G16 chunk. Every 16 consecutive K of a row share one scale:
+
+```text
+byte 8 L + 2 k + h                                     scale of row rho_k, K offsets
+                                                       32 c + 16 h .. 32 c + 16 h + 15  (bytes [0,256))
+byte 256 + 16 (32 j + L) + 4 k + b, j, b in [0,4)      codes of row rho_k at K offset 32 c + 8 j + 2 b
+                                                       (low nibble) and the next K (high nibble)
+```
+
+Multi-byte words are little-endian. For `H = 2560`, `I = 640` a record has 800 gate|up and 400
+down chunks: 1,996,800 bytes for F3G32 and 2,764,800 for E2M1G16, both multiples of 256, so every
+record of a 256-byte aligned payload is 256-byte aligned. Layout decoding recovers the natural
+`[rows,K]` code and `[rows,K/G]` scale words of each matrix exactly.
+
+## 7. `raw-bytes-v1`
 
 `raw-bytes-v1` is a required-resource encoding, not a tensor layout. Its enclosing object payload is
 the resource byte string itself:
@@ -320,7 +372,7 @@ trailing padding. The resource object's JSON `bytes` is its exact nonzero length
 returns the complete span unchanged. A model contract assigns a resource name and interprets those
 bytes; the common encoding does not infer that meaning from the name.
 
-## 7. Decode boundary
+## 8. Decode boundary
 
 Layout decoding yields only persistent logical words:
 
@@ -331,6 +383,8 @@ Layout decoding yields only persistent logical words:
   matrix-level FP32 weight divisor;
 - `raw-bytes-v1` yields the enclosing resource bytes.
 - `row-scale-v1` yields signed E4M3FN code words and exact BF16 row multipliers.
+- `moe-expert-tiles-v1` yields each expert's natural-order gate, up, and down code and E4M3FN
+  scale words.
 
 Dequantized values follow the reconstruction rule in `tensor-formats.md`. This document does
 not select a quantization encoder, output dtype, accumulation dtype, kernel, runtime device layout,

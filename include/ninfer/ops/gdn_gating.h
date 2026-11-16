@@ -21,4 +21,13 @@ namespace ninfer::ops {
 void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
                 Tensor& g, Tensor& beta, cudaStream_t stream);
 
+/**
+ * gdn_gating over the packed FP32 projection of Qwen3.8-Flash-Next: `ab` is contiguous FP32
+ * [96,T] whose rows 0..47 are a and rows 48..95 are b for each token (the output of one [96,2560]
+ * bf16_projection). Formula, oracle, A_log/dt_bias/g/beta contracts, and the non-overlap rule are
+ * those of gdn_gating; T >= 1. Invalid arguments throw std::invalid_argument.
+ */
+void gdn_gating_packed(const Tensor& ab, const Tensor& A_log, const Tensor& dt_bias, Tensor& g,
+                       Tensor& beta, cudaStream_t stream);
+
 } // namespace ninfer::ops

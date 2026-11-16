@@ -76,36 +76,23 @@ int main() {
                   context_limit.message.find("128") != std::string::npos,
               "context rejection lost its HTTP classification or capacity details");
 
-    auto capture_code = [](bool requested, bool reuse, ninfer::SpeculativeBackend spec) {
+    auto capture_code = [](bool requested, bool available) {
         try {
-            ninfer::serve::reject_unavailable_context_checkpoint_capture(requested, reuse, spec);
+            ninfer::serve::reject_unavailable_context_checkpoint_capture(requested, available);
             return std::string();
         } catch (const ninfer::serve::ApiException& error) { return error.error().code; }
     };
-    auto capture_status = [](bool requested, bool reuse, ninfer::SpeculativeBackend spec) {
+    auto capture_status = [](bool requested, bool available) {
         try {
-            ninfer::serve::reject_unavailable_context_checkpoint_capture(requested, reuse, spec);
+            ninfer::serve::reject_unavailable_context_checkpoint_capture(requested, available);
             return 0;
         } catch (const ninfer::serve::ApiException& error) { return error.error().status; }
     };
-    failures += check(
-        !ninfer::context_checkpoint_capture_available(true, ninfer::SpeculativeBackend::Mtp) &&
-            ninfer::context_checkpoint_capture_available(true,
-                                                         ninfer::SpeculativeBackend::DFlash) &&
-            !ninfer::context_checkpoint_capture_available(true, ninfer::SpeculativeBackend::None) &&
-            !ninfer::context_checkpoint_capture_available(false, ninfer::SpeculativeBackend::Mtp),
-        "pin availability is not prefix-reuse plus a speculative backend");
-    failures += check(capture_code(true, true, ninfer::SpeculativeBackend::None) ==
-                              "context_checkpoint_unavailable" &&
-                          capture_status(true, true, ninfer::SpeculativeBackend::None) == 400,
-                      "no-spec capture did not return HTTP 400 context_checkpoint_unavailable");
-    failures += check(capture_code(true, false, ninfer::SpeculativeBackend::DFlash) ==
-                          "context_checkpoint_unavailable",
-                      "--no-prefix-reuse capture did not return context_checkpoint_unavailable");
-    failures += check(capture_code(false, true, ninfer::SpeculativeBackend::None).empty() &&
-                          capture_code(true, true, ninfer::SpeculativeBackend::Mtp) ==
-                              "context_checkpoint_unavailable" &&
-                          capture_code(true, true, ninfer::SpeculativeBackend::DFlash).empty(),
+    failures +=
+        check(capture_code(true, false) == "context_checkpoint_unavailable" &&
+                  capture_status(true, false) == 400,
+              "unsupported target or mode did not return HTTP 400 context_checkpoint_unavailable");
+    failures += check(capture_code(false, false).empty() && capture_code(true, true).empty(),
                       "available or unrequested capture was rejected");
 
     httplib::Request messages_request;

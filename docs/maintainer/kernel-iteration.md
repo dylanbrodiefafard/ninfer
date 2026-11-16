@@ -67,6 +67,26 @@ For example, source-correlated NVFP4-to-FP8 codec instruction overhead can admit
 sign-assembly rewrite despite unchanged DRAM bytes. Exhaustive device codec comparison,
 generated-instruction inspection, and complete-Op timing establish whether it is useful.
 
+`--idea profiled_new_family` admits a different legal SM120 execution family at a
+DRAM-classified point when the current kernel is well below the byte roof. It requires all of
+the following, and reports each missing or failing item as `measure`:
+
+- a positive finite public-Op `--measured-us` whose model-byte rate (model bytes over the
+  measured time) is below 60% of the sustained read ceiling, and, when same-kernel
+  `--profiled-dram-gbs` is supplied, a profiled DRAM rate below the same limit;
+- a concrete `--hypothesis` and its candidate `--candidate-atom`, with `--operand-terms` MMAs
+  per tile product (2 for a BF16 hi+lo operand split). The candidate floor is
+  `max(t_mem, t_issue)`, where `t_issue` counts the atom over output rows on MMA-M and tokens
+  padded to MMA-N, times the operand terms, at the atom's calibrated `kdev mma` rate (or
+  `--candidate-mma-per-s`). The floor must be below the measured time.
+
+It refuses a kernel already near the roof, a candidate whose floor cannot beat the measurement,
+and anything SM120-illegal. An Op realized as several kernels is gated once per projection,
+with that kernel's time from the public-Op run. The candidate must meet the Op's unchanged
+oracle criteria; an operand split is an implementation profile, not a precision change. Pick
+the route crossover from public-Op measurements and keep the current route wherever it is
+faster. `new_family` and `force_mma_small_t` stay refused at DRAM points.
+
 The byte roof is a lower bound, not proof that the current launch saturates memory.
 `--idea grid_underfill --profiled-ctas N --profiled-dram-gbs R` admits output-row
 partitioning inside the existing family only after same-kernel NCU evidence shows fewer

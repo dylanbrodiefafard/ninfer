@@ -147,6 +147,14 @@ void launch_nvfp4_w4a4_tma_linear_add(Nvfp4Problem problem, const std::uint8_t* 
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
     case Nvfp4Problem::MtpFc:
+    case Nvfp4Problem::FlashNextMixerOut:
+    case Nvfp4Problem::FlashNextDflashFeature:
+    case Nvfp4Problem::FlashNextDflashQkv:
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+    case Nvfp4Problem::FlashNextDflashGateUp:
+    case Nvfp4Problem::FlashNextDflashDown:
+    case Nvfp4Problem::FlashNextDflashConvProj:
+    case Nvfp4Problem::FlashNextDflashSelector:
         return;
     }
 }

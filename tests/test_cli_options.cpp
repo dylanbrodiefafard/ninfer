@@ -106,6 +106,20 @@ int main() {
     failures += check(custom.context_checkpoint_marks == std::vector<std::uint32_t>{8192u, 16384u},
                       "--context-checkpoints custom list was not parsed");
 
+    const ninfer::cli::Options flash_next =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--ngram-table", "table.bin",
+               "--qsa-select-budget", "2048"});
+    failures += check(flash_next.ngram_table_path == "table.bin" &&
+                          flash_next.qsa_select_budget == ninfer::QsaSelectBudget::Blocks2048,
+                      "--ngram-table / --qsa-select-budget were not parsed");
+    failures += check(!on.qsa_select_budget.has_value() && on.ngram_table_path.empty(),
+                      "omitted Flash-Next options were not left unset");
+    bool bad_budget = false;
+    try {
+        (void)parse({"ninfer", "model.ninfer", "--prompt", "hi", "--qsa-select-budget", "768"});
+    } catch (const std::invalid_argument&) { bad_budget = true; }
+    failures += check(bad_budget, "an unsupported --qsa-select-budget was accepted");
+
     failures += check(ninfer::cli::usage_text("ninfer").find("--capture-context-checkpoint") !=
                           std::string::npos,
                       "CLI help omits --capture-context-checkpoint");

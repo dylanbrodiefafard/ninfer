@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Deterministic NIAH (needle-in-a-haystack) position-fixture generator.
 
-The single source of truth for the NIAH (needle-in-a-haystack) position
-fixtures. A fixture is a pure, deterministic function of two coordinates:
-
-    length   -> target document length in characters (~4.1 chars/token)
-  (length, position) -> a fixture with the needle spliced at that position
+The single source of truth for standard and structured-answer NIAH fixtures.
+A fixture is a deterministic function of suite, length, and position/layout.
+Length selects a prefix of the shared essay; standard positions select a needle
+insertion depth. Distributed hard suites use position names as five layout IDs.
 
 Content comes from the clean "master stream" -- the needle-free master document
 (the longest committed fixture, default examples/cli/messages/long_niah_256k.json).
@@ -14,11 +13,12 @@ share one master (no per-cell content drift). The needle is a single distinctive
 "OFFICIAL RECORD" line, spliced in as a standalone line at the requested
 fractional depth of the document.
 
-The question is NON-LEAKING by design: it states the answer FORM
-(ORCHID=<code>; COLOR=<color>) but NOT the values, so a correct answer requires
-actually retrieving the needle from the document (a non-vacuous gate). The old
-question echoed the exact answer, which made every NIAH gate vacuous; this is the
-defect fix.
+Standard questions specify the answer form without its values. Hard suites
+cover multi-value retrieval, multi-query binding, variable tracking, frequency
+aggregation, and a prose-style fact. Their JSON answer contracts are stored in
+fixture metadata outside the messages; the scorer never sends that metadata.
+Use --suite and --out-dir to generate local panels without adding large fixtures
+to the repository.
 
 Deterministic and pure: stdlib only, no randomness, no network. Re-running with
 the same arguments reproduces the identical fixture byte-for-byte, so committed
@@ -52,7 +52,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
+from collections import Counter
 from pathlib import Path
 
 # --- Fixture content (single source of truth) --------------------------------
@@ -97,6 +99,7 @@ POS_FRACTION = {
     "end": 1.0,
 }
 NEEDLE_LINE_RE = re.compile(r"[^\n]*OFFICIAL RECORD[^\n]*")
+HARD_SUITES = ("multi-value", "multi-query", "variable-tracking", "aggregation", "in-distribution")
 
 # Multi-key mode (RULER-style): the target record sits at the requested depth among same-form
 # distractor records spread evenly through the document, including near-miss relay names. A
@@ -258,6 +261,157 @@ def build_fixture(
     ]
 
 
+def build_hard_fixture(master: str, length_name: str, pos_name: str, suite: str) -> dict:
+    """Build a structured-answer task; answer metadata is never part of the messages.
+
+    Distributed suites use the five position names as deterministic layout IDs:
+    records span the essay, while their values/order vary by layout. Only the
+    in-distribution suite places one fact at the named document depth.
+    """
+    variant = list(POS_FRACTION).index(pos_name)
+    rng = random.Random(20261115 + variant)
+    essay = master[: LENGTH_CHARS[length_name]]
+    boundary = _line_boundary(essay, len(essay))
+    if boundary:
+        essay = essay[: boundary + 1]
+    entries = []
+    scoring = "json-set"
+    array_instruction = (
+        "Return only a JSON array of strings, in any order, with no Markdown or other text."
+    )
+    if suite in ("multi-value", "multi-query"):
+        keys = ("KEY_AXON", "KEY_BIRCH", "KEY_CEDAR", "KEY_DELTA")
+        codes = [str(10000 + (variant * 1777 + i * 7919 + 42871) % 90000) for i in range(24)]
+        if suite == "multi-value":
+            target = keys[variant % len(keys)]
+            pairs = [
+                (target if i % 4 == 0 else f"KEY_DECOY_{i}", value) for i, value in enumerate(codes)
+            ]
+            expected = [value for key, value in pairs if key == target]
+            question = (
+                f"List every value associated with {target} in the registry entries. "
+                + array_instruction
+            )
+        else:
+            pairs = [
+                (keys[i // 6] if i % 6 == 0 else f"KEY_DECOY_{i}", value)
+                for i, value in enumerate(codes)
+            ]
+            expected = {key: value for key, value in pairs if key in keys}
+            scoring = "json-object"
+            question = (
+                "Return the registry values as a JSON object with exactly these keys: "
+                + ", ".join(keys)
+                + ". Values must be strings. Return only raw JSON, with no Markdown or other text."
+            )
+        rng.shuffle(pairs)
+        entries = [f"Registry entry: {key} -> {value}." for key, value in pairs]
+    elif suite == "variable-tracking":
+        names = [f"X{i}" for i in range(1, 25)]
+        rng.shuffle(names)
+        roots = [str(52871 + variant * 1807 + i * 5311) for i in range(4)]
+        values = {}
+        for wave in range(6):
+            for chain in range(4):
+                name = names[wave * 4 + chain]
+                source = roots[chain] if wave == 0 else names[(wave - 1) * 4 + chain]
+                values[name] = source if wave == 0 else values[source]
+                entries.append(f"Assignment: {name}={source};")
+        target = roots[variant % 4]
+        expected = sorted(name for name, value in values.items() if value == target)
+        question = (
+            "Execute the marked Assignment statements from beginning to end. "
+            "Each right-hand variable reads its current value. "
+            f"Which variables have final value {target}? Include all of them. " + array_instruction
+        )
+    elif suite == "aggregation":
+        words = [
+            "acorn",
+            "badger",
+            "cedar",
+            "dahlia",
+            "elm",
+            "falcon",
+            "garnet",
+            "hazel",
+            "ibis",
+            "jasper",
+            "kelp",
+            "larch",
+            "maple",
+            "newt",
+            "otter",
+            "pebble",
+            "quartz",
+            "raven",
+            "spruce",
+            "thrush",
+            "urchin",
+            "violet",
+            "willow",
+            "yarrow",
+        ]
+        words = words[variant * 3 :] + words[: variant * 3]
+        frequencies = [42, 36, 30] + [9 + i % 3 for i in range(21)]
+        tokens = [
+            word for word, count in zip(words, frequencies, strict=True) for _ in range(count)
+        ]
+        rng.shuffle(tokens)
+        counts = Counter(tokens)
+        expected = [word for word, _ in counts.most_common(3)]
+        for i in range(16):
+            fragment = tokens[len(tokens) * i // 16 : len(tokens) * (i + 1) // 16]
+            entries.append(f"Word list fragment {i + 1}: [{', '.join(fragment)}]")
+        question = (
+            "Combine all 16 marked Word list fragments, ignoring the surrounding essay. "
+            "Which three words occur most frequently in the combined list? There are no ties "
+            "at the cutoff. " + array_instruction
+        )
+    elif suite == "in-distribution":
+        company = ("AlderWorks", "CopperBench", "JuniperLabs", "MorrowDesk", "NorthstarTools")[
+            variant
+        ]
+        code = str(72634 + variant * 2179)
+        fact = (
+            f"For example, the founder of {company} told me that the first decision they made "
+            f"was to use {code} as the access code for their private archive. It was an arbitrary "
+            "choice, but writing it in a notebook saved them more trouble than any of the "
+            "elaborate systems they considered later. "
+        )
+        fraction = POS_FRACTION[pos_name]
+        cut = round(len(essay) * fraction)
+        if 0 < cut < len(essay):
+            sentence = essay.rfind(". ", 0, cut)
+            cut = sentence + 2 if sentence >= 0 else _line_boundary(essay, cut)
+        essay = essay[:cut] + fact + essay[cut:]
+        expected = [code]
+        question = (
+            f"What access code did the founder of {company} choose for the private archive? "
+            + array_instruction
+        )
+    else:
+        raise ValueError(f"unknown hard suite: {suite}")
+    # Insert deepest first so every depth refers to the unmodified essay.
+    for i in reversed(range(len(entries))):
+        essay = _splice_line(essay, (i + 0.5) / len(entries), entries[i])
+    return {
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {
+                "role": "user",
+                "content": PREFIX + "<document>\n" + essay + "\n</document>\n\n" + question,
+            },
+        ],
+        "niah": {
+            "suite": suite,
+            "length": length_name,
+            "layout": pos_name,
+            "scoring": scoring,
+            "expected": expected,
+        },
+    }
+
+
 def default_path(length_name: str, pos_name: str, multikey: bool = False) -> str:
     """mid keeps the legacy bare name (long_niah_8k.json); every other position
     gets a suffix (long_niah_8k_start.json, ...). Multi-key cells are always suffixed
@@ -269,7 +423,9 @@ def default_path(length_name: str, pos_name: str, multikey: bool = False) -> str
     return f"examples/cli/messages/long_niah_{length_name}_{pos_name}.json"
 
 
-def write_fixture(fixture: list[dict], rel_path: str, length_name: str, pos_name: str) -> None:
+def write_fixture(
+    fixture: list[dict] | dict, rel_path: str, length_name: str, pos_name: str
+) -> None:
     root = _repo_root()
     out = Path(rel_path) if Path(rel_path).is_absolute() else (Path(root) / rel_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -291,7 +447,11 @@ def main() -> None:
         help="target document length preset",
     )
     ap.add_argument("--position", default="mid", choices=[*sorted(POS_FRACTION), "all"])
-    ap.add_argument("--out", default="", help="explicit output path (relative to repo root)")
+    ap.add_argument("--out", default="", help="explicit output path for one fixture")
+    ap.add_argument(
+        "--out-dir", type=Path, help="write generated fixture basenames into this directory"
+    )
+    ap.add_argument("--suite", choices=("standard", *HARD_SUITES), default="standard")
     ap.add_argument(
         "--multikey",
         action="store_true",
@@ -299,16 +459,24 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    if args.multikey and args.suite != "standard":
+        ap.error("--multikey applies only to --suite standard")
+    if args.out and (args.position == "all" or args.out_dir):
+        ap.error("--out requires one position and cannot be combined with --out-dir")
     root = _repo_root()
     master = extract_master(root / args.master)
 
-    positions = sorted(POS_FRACTION) if args.position == "all" else [args.position]
+    positions = list(POS_FRACTION) if args.position == "all" else [args.position]
     for pos in positions:
-        fixture = build_fixture(master, args.length, pos, args.multikey)
-        if args.out and args.position != "all":
-            write_fixture(fixture, args.out, args.length, pos)
+        if args.suite == "standard":
+            fixture = build_fixture(master, args.length, pos, args.multikey)
+            path = default_path(args.length, pos, args.multikey)
         else:
-            write_fixture(fixture, default_path(args.length, pos, args.multikey), args.length, pos)
+            fixture = build_hard_fixture(master, args.length, pos, args.suite)
+            path = f"examples/cli/messages/long_niah_{args.suite.replace('-', '_')}_{args.length}_{pos}.json"
+        if args.out_dir:
+            path = str(args.out_dir / Path(path).name)
+        write_fixture(fixture, args.out or path, args.length, pos)
 
 
 if __name__ == "__main__":

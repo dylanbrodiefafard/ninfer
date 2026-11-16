@@ -74,6 +74,14 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
     case Nvfp4Problem::MtpFc:
+    case Nvfp4Problem::FlashNextMixerOut:
+    case Nvfp4Problem::FlashNextDflashFeature:
+    case Nvfp4Problem::FlashNextDflashQkv:
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+    case Nvfp4Problem::FlashNextDflashGateUp:
+    case Nvfp4Problem::FlashNextDflashDown:
+    case Nvfp4Problem::FlashNextDflashConvProj:
+    case Nvfp4Problem::FlashNextDflashSelector:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

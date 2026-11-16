@@ -59,6 +59,9 @@ struct ServeOptions {
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     std::vector<std::uint32_t> context_checkpoint_marks;
+    // qwen3.8-flash-next only.
+    std::filesystem::path ngram_table_path;
+    std::optional<QsaSelectBudget> qsa_select_budget;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

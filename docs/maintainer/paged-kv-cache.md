@@ -528,6 +528,35 @@ logical pages are as contiguous as possible in the plane slab; however, a contig
 admission condition. When no contiguous run can be found, any free pages are used, and the request must
 not be rejected for that reason. Active pages are not relocated.
 
+### 5.5 Withheld pages
+
+Every page of a pool is in exactly one of three states:
+
+| State | Meaning |
+|---|---|
+| free | in the pool's sorted free set; the next materialization may take it |
+| mapped | owned by one allocation, which may publish it in a block-table row |
+| withheld | lent, with its bytes in every plane, to another owner of the pool's memory |
+
+`PagedKVPool::withhold_pages(first, count)` moves a run of free pages to the withheld state and
+`restore_pages(first, count)` returns a withheld run to the free set; either throws unless every page of
+the run is in the expected state, and `pages_free` tests a run. Withheld pages are never mapped, so no
+block table names them and no KV consumer reads or writes them; the pool itself never touches page
+bytes, so the borrower owns a withheld run's bytes until it restores the run. Restored pages hold the
+borrower's bytes; that is safe exactly for consumers that already need no zeroing of recycled pages
+(§13, invariant 8).
+
+Withholding changes neither entitlement nor admission. `can_reserve` and
+`can_replace_entitlement` still count withheld pages as pool capacity, and `free_pages()` counts only
+the free set, so a materialization the entitlement admits can find too few free pages while runs are
+withheld. The borrower therefore restores enough runs before any materialization of the pool;
+`take_pages` throws `std::logic_error` otherwise. The only borrower is the Qwen3.8-Flash-Next expert
+cache, which lends whole extents of unreserved QSA pages to its F3 slot pool
+(`KvExpertExtents`, [Flash-Next plan](qwen3.8-flash-next-plan.md#kv-pages-as-expert-cache-slots-2026-11-15)).
+Its ordering contract: a run is restored, and the cache's slots over it borrowed, on the compute stream
+before any lane maps its pages; a run is withheld only when every page is free, after the compute
+stream has waited for the copy stream and after the block-table unmap of its last owner.
+
 ---
 
 ## 6. Per-sequence allocation bundle
@@ -1043,6 +1072,19 @@ arena. Optional capture failure preserves request progress. The planner continue
 longest-ready-prefix ranking across all retained classes. A missing system image behind an already
 longer selected frontier does not force a cold restart just to populate an auxiliary entry.
 
+Flash-Next stores its target-owned complete continuation image in named current/rewrite and
+rollback state sections, independently of the family's GDN/hidden sections. The exact image is
+all 36 GDN convolution/recurrent slots, BF16 PLE history, and BF16 tail logits, in the layout
+owned by its `State`; raw n-gram history is reconstructed from the committed token ledger. The
+base image is 116,139,008 bytes. DFlash2 extends it to 158,184,704 bytes with five-layer cyclic
+KV, four pending feature columns and explicitly serialized calibration metadata. Pending features
+must either accompany the image or be appended before retaining its lane; zero publication
+restores any materialized cyclic slots and their pending count. New requests reset calibration;
+live RAM resume preserves it and carries cumulative request statistics in the saved request record.
+Image ownership fences protect both host copies and disk decode into caller-owned pinned images.
+The SSD fingerprint additionally binds the complete image byte extent, QSA selection budget and
+a SHA-256 digest of the external n-gram table's numerical contents.
+
 ### 10.5 Inclusive SSD third tier
 
 `--kv-disk-capacity` enables an inclusive SSD store of completed bundles and requires
@@ -1061,7 +1103,7 @@ Consuming the claim releases request ownership but does not delete the durable e
 available. C=1 does not submit restore reads until the selected retained victim has been captured
 and its GPU pages released.
 
-Disk format v8 stores objects in reusable, 4 KiB-aligned extents in per-kind pack files of at
+Disk format v9 stores objects in reusable, 4 KiB-aligned extents in per-kind pack files of at
 most 1 GiB under `packs/1`. `PACKSET` selects an object-index epoch and reserves monotonically
 increasing object IDs; its epoch does not identify a second payload copy. The immutable base
 map and CRC-framed Put/Delete/Move journal resolve stable object IDs to extents. Record codecs and
@@ -1128,7 +1170,7 @@ size, logical plane schema, speculative backend, and persistent GDN/DFlash state
 strict compatibility boundaries. Vision media identity remains in each entry's exact identity
 record, so changed image or video content cannot reuse a stored prefix.
 
-The v8 fingerprint binds model/weights identity and a SHA-256 digest of target-selected tensor
+The v9 fingerprint binds model/weights identity and a SHA-256 digest of target-selected tensor
 names, shapes, numeric formats, storage layouts, encoded byte ranges, and their contents. The
 artifact reader maps logical row selections to registered code/scale/divisor ranges and hashes
 in canonical name/range order; dependency selection belongs to each target package. For 27B:
@@ -1161,7 +1203,7 @@ the disk image stores one lane and restore selects a destination lane. Sampling 
 token count, transport settings, RAM/disk budgets, compression choice, GPU resident capacity, and
 request concurrency do not invalidate a directory unless they also change the recorded per-lane
 geometry. Model/weights identity identifies the target's fixed mathematical contract; code changes
-that invalidate persistent state must advance the snapshot version. Pre-v8 stores are rejected
+that invalidate persistent state must advance the snapshot version. Pre-v9 stores are rejected
 rather than silently adopted or automatically deleted.
 
 Exact-frontier reuse also requires a valid target tail-hidden image. In particular, speculative
@@ -1406,7 +1448,9 @@ evict it, and must not lower the active concurrency guarantee.
     position selects a physical slot only through `p mod 4096`, and the two do not share writable backing
     storage;
 20. MTP Vision prefill, as well as prefix reuse and ordinary tail rounds under any selected backend, must
-    not degrade a sequence into one that lacks that backend's continuation state.
+    not degrade a sequence into one that lacks that backend's continuation state;
+21. a page is free, mapped, or withheld (§5.5); a withheld page is never mapped, and a page is withheld
+    only while no allocation maps it and no transfer on any stream still reads or writes it as KV.
 
 ---
 

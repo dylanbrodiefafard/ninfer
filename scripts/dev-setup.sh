@@ -50,9 +50,14 @@ if ! [[ "$MEMORY_GIB" =~ ^[1-9][0-9]*$ ]] || ((MEMORY_GIB * 1024 * 1024 >= host_
 fi
 memory_args=(--memory "${MEMORY_GIB}g" --memory-swap "${MEMORY_GIB}g")
 
+# The GPU is requested through CDI rather than --gpus: CDI lists the NVIDIA device nodes in the
+# container spec, so the systemd cgroup driver records them in the scope's DeviceAllow and they
+# survive `systemctl daemon-reload` and `docker update`. --gpus grants them outside systemd, and
+# a reload then revokes them (NVML "Unknown Error"). The rules resolve through /dev/char links,
+# which the host creates with `nvidia-ctk system create-dev-char-symlinks --create-all`.
 create_args=(
   --name "$BUILDER"
-  --gpus all
+  --device nvidia.com/gpu=all
   "${memory_args[@]}"
   # A crashing CUDA process must not hand a multi-gigabyte core to the host crash handler.
   --ulimit core=0
@@ -69,15 +74,10 @@ if ! docker ps -a --format '{{.Names}}' | grep -qx "$BUILDER"; then
   docker create "${create_args[@]}" "$IMAGE" sleep infinity >/dev/null
 fi
 
-# Containers created before the limit existed, or with another value, take it here. Updating a
-# running container rewrites its cgroup and drops its GPU device access, so the update is applied
-# only when the limit differs and the container is restarted afterwards.
+# Containers created with another limit take this one here.
 memory_bytes=$((MEMORY_GIB * 1024 * 1024 * 1024))
 if [[ "$(docker inspect -f '{{.HostConfig.Memory}}' "$BUILDER")" != "$memory_bytes" ]]; then
   docker update "${memory_args[@]}" "$BUILDER" >/dev/null
-  if [[ "$(docker inspect -f '{{.State.Running}}' "$BUILDER")" == "true" ]]; then
-    docker restart "$BUILDER" >/dev/null
-  fi
 fi
 
 if [[ "$(docker inspect -f '{{.State.Running}}' "$BUILDER")" != "true" ]]; then
@@ -85,7 +85,7 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "$BUILDER")" != "true" ]]; then
 fi
 
 # Repair long-lived containers created from an older builder image. CMake
-# FetchContent needs git; xgrammar patches need patch.
+# FetchContent needs git; xgrammar patches need patch; the build links OpenSSL.
 docker exec "$BUILDER" bash -lc '
 pkgs=()
 command -v git >/dev/null 2>&1 || pkgs+=(git)
@@ -94,6 +94,7 @@ command -v python3 >/dev/null 2>&1 || pkgs+=(python3)
 python3 -c "import venv, ensurepip" >/dev/null 2>&1 || pkgs+=(python3-venv)
 command -v ccache >/dev/null 2>&1 || pkgs+=(ccache)
 pkg-config --exists libzstd || pkgs+=(libzstd-dev)
+pkg-config --exists openssl || pkgs+=(libssl-dev)
 if ((${#pkgs[@]})); then
   echo "Installing missing builder packages: ${pkgs[*]}"
   apt-get update -qq

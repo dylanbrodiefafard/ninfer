@@ -415,8 +415,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                           << " layer=" << layer << " row=" << row << "\n";
                 return failures + 1;
             }
-            if (layer == 0 && row == 0 && profile.layers == 30 && width == 2 && rows == 1 &&
-                commits[0] == 2) {
+            if (layer == 0 && row == 0 && commits[0] > 0) {
                 failures += verify_fold_oracle(profile, commits[0], seed, key_records,
                                                value_records, gate_records, actual_recurrent);
             }
@@ -905,6 +904,13 @@ int main() {
     failures += run_case({48, 48, 10240}, 8, 7, {8, 7, 1, 5, 0, 2, 6}, 1861U);
     failures += run_case({48, 48, 10240}, 16, 8, {16, 7, 1, 5, 0, 2, 6, 15}, 1871U);
     failures += run_case({48, 48, 10240}, 8, 12, {8, 7, 1, 5, 0, 2, 6, 3, 8, 4, 1, 6}, 1881U);
+    // The 36-layer pool (Qwen3.8-Flash-Next GDN).
+    failures += run_case({36, 48, 10240}, 4, 4, {4, 0, 2, 3}, 1891U);
+    failures += run_case({36, 48, 10240}, 8, 8, {8, 7, 1, 5, 0, 2, 6, 3}, 1893U);
+    // Width-one records of K0 roots: accepted and rejected roots in one fold.
+    failures += run_case({36, 48, 10240}, 1, 1, {1}, 1895U);
+    failures += run_case({36, 48, 10240}, 1, 5, {1, 0, 1, 1, 0}, 1897U);
+    failures += run_case({36, 48, 10240}, 1, 12, {1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1}, 1899U);
     failures += run_path_fold_case();
     failures += run_identity_path_matches_prefix_fold();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";

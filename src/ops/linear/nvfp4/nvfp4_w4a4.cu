@@ -1,6 +1,7 @@
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
 #include "core/device.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
@@ -20,7 +21,7 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
     const Nvfp4ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data),
                                        Geometry::kOutputRows};
-    const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    const float alpha = nvfp4_w4a4_alpha(weight, "nvfp4 linear");
     launch_nvfp4_w4a4_mma<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4ContiguousOutput>(
         grid, stream, activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
@@ -37,7 +38,7 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4W4a4Works
         pdl::LaunchConfig{dim3((tasks + kThreads - 1) / kThreads), dim3(kThreads), 0, stream},
         nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads>,
         static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales, tokens,
-        weight.input_scale_divisor));
+        nvfp4_input_scale_divisor(weight, "nvfp4 linear")));
 }
 
 // Generic Linear W4A4 for one admitted problem. Only the routes its admitted widths select are
@@ -48,7 +49,7 @@ void launch_problem(Nvfp4W4a4Route route, const Weight& weight, Tensor& out,
     if constexpr (nvfp4_linear_w4a4_route_reachable(Problem, Nvfp4W4a4Route::Tma)) {
         static_assert(Problem == Nvfp4Problem::MtpFc);
         if (route == Nvfp4W4a4Route::Tma) {
-            const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+            const float alpha = nvfp4_w4a4_alpha(weight, "nvfp4 linear");
             launch_nvfp4_w4a4_tma_mtp_fc(
                 workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
                 static_cast<const std::uint8_t*>(weight.scales),
@@ -117,6 +118,14 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     case Nvfp4Problem::DflashAttnOut:
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
+    case Nvfp4Problem::FlashNextMixerOut:
+    case Nvfp4Problem::FlashNextDflashFeature:
+    case Nvfp4Problem::FlashNextDflashQkv:
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+    case Nvfp4Problem::FlashNextDflashGateUp:
+    case Nvfp4Problem::FlashNextDflashDown:
+    case Nvfp4Problem::FlashNextDflashConvProj:
+    case Nvfp4Problem::FlashNextDflashSelector:
         break;
     }
     throw std::logic_error("nvfp4 W4A4 linear: admitted problem without a launcher");

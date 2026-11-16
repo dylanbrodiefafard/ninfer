@@ -67,7 +67,9 @@ struct Weight {
     std::int32_t scale_ne[4]   = {1, 1, 1, 1};
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
-    float input_scale_divisor  = 0.0F;
+    // NVFP4 activation divisor for routes that quantize activations to NVFP4; 0 when the weight
+    // runs only A16 routes.
+    float input_scale_divisor = 0.0F;
 };
 
 } // namespace ninfer

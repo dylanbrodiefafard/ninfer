@@ -7,12 +7,16 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+#include <stdexcept>
 
-void fp8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                 cudaStream_t stream) {
-    using Geometry        = Fp8GdnInputGeometry;
-    using Schedule        = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
+namespace ninfer::ops::detail {
+namespace {
+
+template <class Geometry>
+void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                  cudaStream_t stream) {
+    using Schedule = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
+    static_assert(Geometry::kOutputRows == Fp8GdnInputOutput::kRows);
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
                                    static_cast<__nv_bfloat16*>(z.data)};
@@ -20,6 +24,22 @@ void fp8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const __nv_bfloat16*>(weight.scales), output);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void fp8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                 cudaStream_t stream) {
+    switch (weight.k) {
+    case Fp8GdnInputGeometry::kInputRows:
+        launch_exact<Fp8GdnInputGeometry>(x, weight, qkv, z, stream);
+        return;
+    case Fp8FlashNextGdnInputGeometry::kInputRows:
+        launch_exact<Fp8FlashNextGdnInputGeometry>(x, weight, qkv, z, stream);
+        return;
+    default:
+        throw std::invalid_argument("fp8 gdn_input_proj decode: unsupported input rows");
+    }
 }
 
 } // namespace ninfer::ops::detail

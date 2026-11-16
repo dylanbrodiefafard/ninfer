@@ -19,7 +19,8 @@ using namespace ninfer::test::direct_bf16_weight;
 
 namespace {
 
-constexpr std::int32_t kHidden = ops::kDflash2PathSelectHidden;
+// Width of the 27B cases; run_nvfp4_projection_q_oracle also covers the 2560 Flash-Next width.
+constexpr std::int32_t kHidden = 5120;
 constexpr std::int32_t kRank   = ops::kDflash2PathSelectRank;
 constexpr std::int32_t kTopK   = ops::kDflash2PathSelectTopK;
 
@@ -199,8 +200,8 @@ int run_greedy_case(const char* label, std::int32_t vocab, std::int32_t tokens, 
     Tensor sel_q_t = batch == 1 ? Tensor(device_sel_q.data(), DType::FP32, {kTopK, tokens})
                                 : Tensor(device_sel_q.data(), DType::FP32, {kTopK, tokens, batch});
 
-    const std::size_t workspace_bytes =
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, batch);
+    const std::size_t workspace_bytes = ops::dflash2_path_select_workspace_capacity_bytes(
+        QType::BF16_CTRL, kHidden, tokens, tokens, batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, batch,
                      temperature, 0ull, path_t, workspace, nullptr, nullptr, nullptr, nullptr,
@@ -292,9 +293,9 @@ int run_stochastic_support_case() {
     Tensor succ_t(device_succ.data(), DType::BF16, {kRank, vocab});
     Tensor anchors_t(device_anchors.data(), DType::I32, {1});
     Tensor path_t(device_path.data(), DType::I32, {tokens});
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256,
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
+                                       QType::BF16_CTRL, kHidden, tokens, tokens, 1)));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.6f,
                      42ull, path_t, workspace, nullptr);
     cuda_synchronize();
@@ -359,7 +360,7 @@ int run_stochastic_batch_row_invariance_case() {
     Tensor path_t(device_path.data(), DType::I32, {tokens, batch});
     WorkspaceArena workspace(
         std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
-                                       QType::BF16_CTRL, tokens, tokens, batch)));
+                                       QType::BF16_CTRL, kHidden, tokens, tokens, batch)));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, batch,
                      0.6f, 42ull, path_t, workspace, nullptr);
 
@@ -421,9 +422,9 @@ int run_stochastic_selector_q_case() {
     Tensor path_t(device_path.data(), DType::I32, {tokens});
     Tensor sel_ids_t(device_sel_ids.data(), DType::I32, {kTopK, tokens});
     Tensor sel_q_t(device_sel_q.data(), DType::FP32, {kTopK, tokens});
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256,
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
+                                       QType::BF16_CTRL, kHidden, tokens, tokens, 1)));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.6f,
                      42ull, path_t, workspace, nullptr, nullptr, nullptr, nullptr, &sel_ids_t,
                      &sel_q_t);
@@ -509,9 +510,9 @@ int run_shortlist_remap_case() {
     Tensor ids_t(device_ids.data(), DType::I32, {vocab});
     Tensor anchors_t(device_anchors.data(), DType::I32, {1});
     Tensor path_t(device_path.data(), DType::I32, {tokens});
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256,
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
+                                       QType::BF16_CTRL, kHidden, tokens, tokens, 1)));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.0f,
                      0ull, path_t, workspace, nullptr, &ids_t);
     cuda_synchronize();
@@ -569,9 +570,9 @@ int run_nan_logits_shortlist_case() {
     Tensor ids_t(device_ids.data(), DType::I32, {vocab});
     Tensor anchors_t(device_anchors.data(), DType::I32, {1});
     Tensor path_t(device_path.data(), DType::I32, {tokens});
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256,
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
+                                       QType::BF16_CTRL, kHidden, tokens, tokens, 1)));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.0f,
                      0ull, path_t, workspace, nullptr, &ids_t);
     cuda_synchronize();
@@ -645,9 +646,9 @@ int run_tree_layout_case(std::int32_t width) {
     Tensor rope_t(device_rope.data(), DType::I32, {width, 1});
     Tensor mask_t(device_mask.data(), DType::I32, {width, 1});
     Tensor valid_t(device_valid.data(), DType::I32, {1});
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256,
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
+                                       QType::BF16_CTRL, kHidden, tokens, tokens, 1)));
     ops::dflash2_tree_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
                              frontiers_t, ids_t, parent_t, cache_t, rope_t, mask_t, valid_t,
                              workspace, nullptr);
@@ -757,9 +758,9 @@ int run_tree_compact_case() {
     Tensor rope_t(device_rope.data(), DType::I32, {width, 1});
     Tensor mask_t(device_mask.data(), DType::I32, {width, 1});
     Tensor valid_t(device_valid.data(), DType::I32, {1});
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256,
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
+                                       QType::BF16_CTRL, kHidden, tokens, tokens, 1)));
     ops::dflash2_tree_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
                              frontiers_t, ids_t, parent_t, cache_t, rope_t, mask_t, valid_t,
                              workspace, nullptr);
@@ -864,8 +865,8 @@ int run_nvfp4_codebook_greedy_case(const char* label, std::int32_t tokens, std::
     Weight pred_w = pred_packed.view();
     Weight succ_w = succ_packed.view();
 
-    const std::size_t workspace_bytes =
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, batch);
+    const std::size_t workspace_bytes = ops::dflash2_path_select_workspace_capacity_bytes(
+        QType::BF16_CTRL, kHidden, tokens, tokens, batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     call_path_select(logits_t, hidden_t, device_weight.view(), dummy_code, dummy_code, anchors_t,
                      batch, 0.0f, 0ull, path_t, workspace, nullptr, nullptr, &pred_w, &succ_w);
@@ -948,7 +949,7 @@ int run_mixed_temperature_batch_case() {
     device_configs.copy_from_host(configs.data(), device_configs.bytes());
     WorkspaceArena workspace(
         std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
-                                       QType::BF16_CTRL, tokens, tokens, batch)));
+                                       QType::BF16_CTRL, kHidden, tokens, tokens, batch)));
     ops::dflash2_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
                              positions_t,
                              reinterpret_cast<const ops::SamplingConfig*>(device_configs.data()),
@@ -1065,7 +1066,7 @@ int run_nvfp4_projection_oracle() {
     Tensor anchors_t(device_anchors.data(), DType::I32, {1});
     Tensor path_t(device_path.data(), DType::I32, {tokens});
     const std::size_t workspace_bytes =
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::NVFP4, tokens, tokens, 1);
+        ops::dflash2_path_select_workspace_capacity_bytes(QType::NVFP4, kHidden, tokens, tokens, 1);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.0f,
                      0ull, path_t, workspace, nullptr);
@@ -1257,8 +1258,8 @@ int run_nvfp4_codebook_matches_bf16_accept(const char* label, std::int32_t token
                                    : Tensor(device_bf16.data(), DType::I32, {tokens, batch});
     Tensor nvfp4_path = batch == 1 ? Tensor(device_nvfp4.data(), DType::I32, {tokens})
                                    : Tensor(device_nvfp4.data(), DType::I32, {tokens, batch});
-    const std::size_t workspace_bytes =
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::NVFP4, tokens, tokens, batch);
+    const std::size_t workspace_bytes = ops::dflash2_path_select_workspace_capacity_bytes(
+        QType::NVFP4, kHidden, tokens, tokens, batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     call_path_select(logits_t, hidden_t, projection.view(), pred_t, succ_t, anchors_t, batch, 0.0f,
                      0ull, bf16_path, workspace, nullptr);
@@ -1588,9 +1589,9 @@ int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t w
     Tensor rope_t(device_rope.data(), DType::I32, {width, 1});
     Tensor mask_t(device_mask.data(), DType::I32, {width, 1});
     Tensor valid_t(device_valid.data(), DType::I32, {1});
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256,
-        ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
+                                       QType::BF16_CTRL, kHidden, tokens, tokens, 1)));
     ops::dflash2_tree_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
                              frontiers_t, ids_t, parent_t, cache_t, rope_t, mask_t, valid_t,
                              workspace, nullptr, nullptr, nullptr, nullptr,
@@ -1747,7 +1748,7 @@ int run_tree_batch_row_isolation_case() {
     Tensor valid_t(device_valid.data(), DType::I32, {batch});
     WorkspaceArena workspace(
         std::max<std::size_t>(256, ops::dflash2_path_select_workspace_capacity_bytes(
-                                       QType::BF16_CTRL, tokens, tokens, batch)));
+                                       QType::BF16_CTRL, kHidden, tokens, tokens, batch)));
     ops::dflash2_tree_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
                              frontiers_t, ids_t, parent_t, cache_t, rope_t, mask_t, valid_t,
                              workspace, nullptr);
@@ -1788,6 +1789,164 @@ int run_tree_batch_row_isolation_case() {
 }
 
 } // namespace
+
+// The sampled walk's proposal distribution q is a continuous function of the hidden projection,
+// so this case checks the NVFP4 projection numerically at a registered width. Per hop, the FP64
+// oracle projects the represented hidden column through the exactly decoded weight, scores the
+// exact top-16 shortlist with the device-drawn predecessor, and forms softmax(score / 1). Ids must
+// match the shortlist exactly; q uses a pointwise bound sized for private BF16 storage of the
+// projection (unit-scale scores, so about 2^-8 per score) with no non-finite values admitted.
+int run_nvfp4_projection_q_oracle(std::int32_t hidden_rows, std::int32_t tokens, std::int32_t batch,
+                                  std::uint32_t seed) {
+    constexpr std::int32_t vocab = 96;
+    constexpr PointwiseCriterion q_criterion{/*absolute*/ 1.0e-2, /*relative*/ 0.0};
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 1.0F;
+    input_projection::DevicePackedWeight device_weight(
+        quantized_weight::make_patterned_weight(QType::NVFP4, kRank, hidden_rows, seed, options));
+
+    const std::size_t columns = static_cast<std::size_t>(tokens) * batch;
+    std::vector<float> logits(static_cast<std::size_t>(vocab) * columns);
+    std::vector<float> hidden(static_cast<std::size_t>(hidden_rows) * columns);
+    std::vector<float> pred(static_cast<std::size_t>(kRank) * vocab);
+    std::vector<float> succ(static_cast<std::size_t>(kRank) * vocab);
+    std::vector<std::int32_t> anchors(static_cast<std::size_t>(batch));
+    fill_uniform(logits, seed + 3, -1.0f, 1.0f);
+    fill_uniform(hidden, seed + 5, -1.0f, 1.0f);
+    fill_uniform(pred, seed + 7, -1.0f, 1.0f);
+    fill_uniform(succ, seed + 9, -1.0f, 1.0f);
+    round_to_bf16(logits);
+    round_to_bf16(hidden);
+    round_to_bf16(succ);
+    for (std::int32_t b = 0; b < batch; ++b) {
+        anchors[static_cast<std::size_t>(b)] = (11 + b * 7) % vocab;
+    }
+
+    // h[r, column] in FP64 from the represented hidden and the exactly decoded weight.
+    std::vector<double> projected(static_cast<std::size_t>(kRank) * columns);
+    double squares = 0.0;
+    for (std::size_t col = 0; col < columns; ++col) {
+        const float* column = hidden.data() + col * static_cast<std::size_t>(hidden_rows);
+        for (std::int32_t r = 0; r < kRank; ++r) {
+            const double value =
+                quantized_weight::dot_fp64(device_weight.host, r, column, hidden_rows);
+            projected[col * kRank + static_cast<std::size_t>(r)] = value;
+            squares += value * value;
+        }
+    }
+    // pred and succ are U(-1,1) (variance 1/3); scaling pred by 3 / (16 rms(h)) gives the 256-term
+    // bilinear score unit standard deviation, comparable to the unit-range unary logits, so q is
+    // neither uniform nor one-hot.
+    const double rms_h = std::sqrt(squares / static_cast<double>(projected.size()));
+    for (float& value : pred) { value = static_cast<float>(value * 3.0 / (16.0 * rms_h)); }
+    round_to_bf16(pred);
+
+    const auto logit_bits  = encode_bf16(logits);
+    const auto hidden_bits = encode_bf16(hidden);
+    const auto pred_bits   = encode_bf16(pred);
+    const auto succ_bits   = encode_bf16(succ);
+    GuardedDeviceBuffer device_logits(logit_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_pred(pred_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_succ(succ_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_anchors(anchors.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_path(columns * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_sel_ids(columns * kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_sel_q(columns * kTopK * sizeof(float));
+    device_logits.copy_from_host(logit_bits.data(), device_logits.bytes());
+    device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
+    device_pred.copy_from_host(pred_bits.data(), device_pred.bytes());
+    device_succ.copy_from_host(succ_bits.data(), device_succ.bytes());
+    device_anchors.copy_from_host(anchors.data(), device_anchors.bytes());
+    device_path.fill(0xcd);
+    device_sel_ids.fill(0xcd);
+    device_sel_q.fill(0xcd);
+
+    Tensor logits_t(device_logits.data(), DType::BF16, {vocab, tokens, batch});
+    Tensor hidden_t(device_hidden.data(), DType::BF16, {hidden_rows, tokens, batch});
+    Tensor pred_t(device_pred.data(), DType::BF16, {kRank, vocab});
+    Tensor succ_t(device_succ.data(), DType::BF16, {kRank, vocab});
+    Tensor anchors_t(device_anchors.data(), DType::I32, {batch});
+    Tensor path_t(device_path.data(), DType::I32, {tokens, batch});
+    Tensor sel_ids_t(device_sel_ids.data(), DType::I32, {kTopK, tokens, batch});
+    Tensor sel_q_t(device_sel_q.data(), DType::FP32, {kTopK, tokens, batch});
+    const std::size_t workspace_bytes = ops::dflash2_path_select_workspace_capacity_bytes(
+        QType::NVFP4, hidden_rows, tokens, tokens, batch);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, batch,
+                     1.0f, 97ull, path_t, workspace, nullptr, nullptr, nullptr, nullptr, &sel_ids_t,
+                     &sel_q_t);
+
+    const auto path = from_device<std::int32_t>(device_path.data(), columns);
+    const auto ids  = from_device<std::int32_t>(device_sel_ids.data(), columns * kTopK);
+    const auto q    = from_device<float>(device_sel_q.data(), columns * kTopK);
+    std::vector<double> got_q(columns * kTopK);
+    std::vector<double> expected_q(columns * kTopK);
+    int failures = 0;
+    for (std::int32_t b = 0; b < batch; ++b) {
+        for (std::int32_t t = 0; t < tokens; ++t) {
+            const std::size_t col = static_cast<std::size_t>(b) * tokens + t;
+            std::vector<float> top_val(static_cast<std::size_t>(kTopK),
+                                       -std::numeric_limits<float>::infinity());
+            std::vector<int> top_idx(static_cast<std::size_t>(kTopK), 0x7fffffff);
+            for (std::int32_t v = 0; v < vocab; ++v) {
+                insert_topk(top_val, top_idx, logits[col * vocab + static_cast<std::size_t>(v)], v);
+            }
+            const int prev = t == 0 ? anchors[static_cast<std::size_t>(b)] : path[col - 1];
+            if (prev < 0 || prev >= vocab) {
+                std::cerr << "dflash2_path_select NVFP4 q: predecessor out of vocab\n";
+                return failures + 1;
+            }
+            std::vector<double> score(static_cast<std::size_t>(kTopK));
+            double max_score = -std::numeric_limits<double>::infinity();
+            for (std::int32_t c = 0; c < kTopK; ++c) {
+                const auto cand = static_cast<std::size_t>(top_idx[static_cast<std::size_t>(c)]);
+                double acc      = static_cast<double>(top_val[static_cast<std::size_t>(c)]);
+                for (std::int32_t r = 0; r < kRank; ++r) {
+                    acc += static_cast<double>(pred[static_cast<std::size_t>(prev) * kRank + r]) *
+                           projected[col * kRank + static_cast<std::size_t>(r)] *
+                           static_cast<double>(succ[cand * kRank + static_cast<std::size_t>(r)]);
+                }
+                score[static_cast<std::size_t>(c)] = acc;
+                max_score                          = std::max(max_score, acc);
+            }
+            double total = 0.0;
+            for (double& value : score) {
+                value = std::exp(value - max_score);
+                total += value;
+            }
+            bool path_listed = false;
+            for (std::int32_t slot = 0; slot < kTopK; ++slot) {
+                const std::size_t at = col * kTopK + static_cast<std::size_t>(slot);
+                const auto found =
+                    std::find(top_idx.begin(), top_idx.end(), ids[at]) - top_idx.begin();
+                if (found == kTopK) {
+                    std::cerr << "dflash2_path_select NVFP4 q: id " << ids[at]
+                              << " is outside the top-16 shortlist\n";
+                    ++failures;
+                    continue;
+                }
+                got_q[at]      = static_cast<double>(q[at]);
+                expected_q[at] = score[static_cast<std::size_t>(found)] / total;
+                path_listed    = path_listed || ids[at] == path[col];
+            }
+            if (!path_listed) {
+                std::cerr << "dflash2_path_select NVFP4 q: path token is not a selector id\n";
+                ++failures;
+            }
+        }
+    }
+    const std::string label =
+        "dflash2_path_select NVFP4 projection q D=" + std::to_string(hidden_rows) +
+        " T=" + std::to_string(tokens) + " B=" + std::to_string(batch);
+    failures += verify_pointwise(label, got_q, expected_q, q_criterion);
+    failures += device_path.verify_guards("dflash2_path_select NVFP4 q path");
+    failures += device_sel_ids.verify_guards("dflash2_path_select NVFP4 q selector ids");
+    failures += device_sel_q.verify_guards("dflash2_path_select NVFP4 q selector q");
+    failures += device_weight.verify_preserved("dflash2_path_select NVFP4 q projection");
+    return failures;
+}
 
 int main() {
     if (cuda_unavailable()) {
@@ -1842,6 +2001,12 @@ int main() {
     failures += run_nvfp4_codebook_greedy_case(
         "dflash2_path_select NVFP4 codebook greedy T=5 B=3 V=128", 5, 3, 31u);
     failures += run_nvfp4_projection_oracle();
+    // The Flash-Next drafter selects k=1..7 drafts for one to twelve packed requests at D=2560.
+    failures += run_nvfp4_projection_q_oracle(5120, 5, 2, 61u);
+    failures += run_nvfp4_projection_q_oracle(2560, 1, 1, 63u);
+    failures += run_nvfp4_projection_q_oracle(2560, 7, 1, 65u);
+    failures += run_nvfp4_projection_q_oracle(2560, 3, 12, 67u);
+    failures += run_nvfp4_projection_q_oracle(2560, 7, 6, 69u);
     failures += run_nvfp4_codebook_matches_bf16_accept(
         "dflash2_path_select NVFP4 W_h codebook BF16 vs NVFP4 greedy T=5 V=128", 5, 1, 41u);
     failures += run_nvfp4_codebook_matches_bf16_accept(

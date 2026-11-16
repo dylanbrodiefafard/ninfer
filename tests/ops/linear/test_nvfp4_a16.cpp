@@ -82,6 +82,47 @@ int run_nvfp4_a16() {
         Invocation{30, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
+    // The Flash-Next mixer output [2560,6144] runs the A16 MMA at every T>=2: both sides of each
+    // narrow token-tile boundary (M16/M32/M48, then repeated M64 tiles) through prefill-chunk
+    // widths; AllowA4 keeps A16. Its weight carries no input divisor, as the A16-only artifact
+    // stores it.
+    constexpr std::array flash_next_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{2, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{17, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{48, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{49, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{300, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1000, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    // The Flash-Next DFlash2 drafter's feature, QKV, attention-output, MLP and conv projections run
+    // the A16 MMA at every T>=2: both sides of each narrow token-tile boundary (M16/M32/M48, then
+    // repeated M64 tiles) and, for the 15360-row gate/up, of every eight-token panel count; the
+    // packed proposal reaches T=C*(K+1)<=96 and context prefill chunks are wider. AllowA4 keeps
+    // A16.
+    constexpr std::array drafter_mma_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{2, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{9, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{17, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{24, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{25, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{41, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{49, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{57, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{64, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{300, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
     int failures = 0;
 
     struct TextProblem {
@@ -89,6 +130,9 @@ int run_nvfp4_a16() {
         std::int32_t k;
         std::uint32_t seed;
     };
+
+    failures += run_shape("NVFP4_A16 Flash-Next", ActivationCompute::A16, make_nvfp4_a16_weight,
+                          {2560, 6144, 745U, Comparison::Sampled, true, flash_next_invocations});
 
     for (const TextProblem problem :
          {TextProblem{14336, 5120, 701U}, TextProblem{16384, 5120, 703U},
@@ -114,6 +158,33 @@ int run_nvfp4_a16() {
                           {256, 5120, 721U, Comparison::Sampled, true, selector_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 10240, 723U, Comparison::Sampled, true, mtp_fc_invocations});
+    for (const TextProblem problem : {TextProblem{2560, 12800, 751U}, TextProblem{6144, 2560, 753U},
+                                      TextProblem{2560, 4096, 755U}, TextProblem{15360, 2560, 757U},
+                                      TextProblem{2560, 7680, 759U}}) {
+        failures +=
+            run_shape("NVFP4_A16 Flash-Next drafter", ActivationCompute::A16, make_nvfp4_a16_weight,
+                      {problem.n, problem.k, problem.seed, Comparison::Sampled, true,
+                       drafter_mma_invocations});
+    }
+    failures +=
+        run_shape("NVFP4_A16 Flash-Next drafter", ActivationCompute::A16, make_nvfp4_a16_weight,
+                  {640, 2560, 761U, Comparison::Sampled, true, drafter_mma_invocations});
+    failures +=
+        run_shape("NVFP4_A16 Flash-Next drafter", ActivationCompute::A16, make_nvfp4_a16_weight,
+                  {256, 2560, 763U, Comparison::Sampled, true, selector_invocations});
+    // Packed drafter requests: one to twelve proposals of W=k+1 columns share the MMA reduction
+    // (W>=2) or keep per-request GEMV panels (W=1).
+    constexpr std::array<std::int32_t, 4> drafter_batches{2, 5, 6, 12};
+    for (const std::int32_t width : {1, 2, 4, 8}) {
+        for (const TextProblem problem :
+             {TextProblem{6144, 2560, 765U}, TextProblem{2560, 4096, 767U},
+              TextProblem{15360, 2560, 769U}, TextProblem{2560, 7680, 771U},
+              TextProblem{2560, 12800, 773U}, TextProblem{640, 2560, 775U}}) {
+            failures += run_packed_sequences_matches_panels(
+                "NVFP4_A16 Flash-Next drafter packed", make_nvfp4_a16_weight, problem.n, problem.k,
+                problem.seed, width, drafter_batches, ops::LinearPolicy::AllowA4);
+        }
+    }
     constexpr std::array<std::int32_t, 5> dflash_batches{2, 3, 4, 5, 6};
     // W=1 must remain GEMV panels; widths 2..6 share the same MMA reduction.
     for (const std::int32_t width : {1, 2, 3, 4, 5, 6}) {

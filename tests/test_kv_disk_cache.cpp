@@ -12141,7 +12141,7 @@ int test_misplaced_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx,
         return std::vector<unsigned char>((std::istreambuf_iterator<char>(in)),
                                           std::istreambuf_iterator<char>());
     }();
-    constexpr std::size_t kRollbackFrontierOffset = 148;
+    constexpr std::size_t kRollbackFrontierOffset = 164;
     bool patched                                  = bytes.size() >= kRollbackFrontierOffset + 8;
     std::uint32_t frontier                        = 0;
     std::uint32_t kind                            = 0;

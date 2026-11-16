@@ -50,9 +50,14 @@ def recipe_cmd(card: dict, *, measured_placeholder: bool = False) -> str:
         parts.append("--measured-us <median>")
     elif card.get("measured_us") is not None:
         parts.append(f"--measured-us {card['measured_us']}")
-    for flag in ("bottleneck", "profile_evidence", "hypothesis"):
-        if card.get(flag):
-            parts.append(f"--{flag.replace('_', '-')} {shlex.quote(card[flag])}")
+    for flag in bound.EVIDENCE_FIELDS:
+        if card.get(flag) is not None:
+            parts.append(f"--{flag.replace('_', '-')} {shlex.quote(str(card[flag]))}")
+    candidate = card.get("candidate")
+    if candidate:
+        parts.append(f"--candidate-atom {candidate['atom']}")
+        parts.append(f"--operand-terms {candidate['operand_terms']}")
+        parts.append(f"--candidate-mma-per-s {candidate['mma_per_s']}")
     return " ".join(parts)
 
 
@@ -161,12 +166,14 @@ def _classified(card: dict) -> list[dict]:
                 card["bound"],
                 p["t"],
                 p["phase"],
-                profiled_ctas=card.get("profiled_ctas"),
-                profiled_dram_gbs=card.get("profiled_dram_gbs"),
                 measured_us=card.get("measured_us"),
-                bottleneck=card.get("bottleneck"),
-                profile_evidence=card.get("profile_evidence"),
-                hypothesis=card.get("hypothesis"),
+                measured_read_gbs=(
+                    card["model_bytes"] / (card["measured_us"] * 1e3)
+                    if card.get("measured_us") is not None
+                    else None
+                ),
+                candidate_predicted_us=(card.get("candidate") or {}).get("predicted_us"),
+                **{field: card.get(field) for field in bound.EVIDENCE_FIELDS},
             )
         )
     return rows
@@ -268,9 +275,16 @@ def render_filled(card: dict) -> str:
         lines.append(
             "4. Idea   unknown  — pass --idea <class>. Address the bound or a profiler-attributed cost limiting achieved throughput."
         )
-    for field in ("bottleneck", "profile_evidence", "hypothesis"):
-        if card.get(field):
+    for field in bound.EVIDENCE_FIELDS:
+        if card.get(field) is not None:
             lines.append(f"          {field}: {card[field]}")
+    candidate = card.get("candidate")
+    if candidate:
+        lines.append(
+            f"          candidate: {candidate['atom']} x{candidate['operand_terms']}  "
+            f"t_issue={candidate['t_issue_us']:.2f}us  "
+            f"predicted=max(t_mem, t_issue)={candidate['predicted_us']:.2f}us"
+        )
     if card["sm120"]["legal"]:
         atom = card["mma_atom"]
         lines.append(
@@ -286,6 +300,11 @@ def render_filled(card: dict) -> str:
     elif idea and idea["name"] == "profiled_overhead":
         lines.append(
             "6. Family Bounded profiler-supported change in the current legal family. "
+            + idea["reason"]
+        )
+    elif idea and idea["name"] == "profiled_new_family":
+        lines.append(
+            "6. Family Evidence-gated legal SM120 family at a DRAM point; oracle criteria unchanged. "
             + idea["reason"]
         )
     elif idea and idea["name"] == "grid_underfill":
@@ -399,7 +418,9 @@ Fill this card for a Linear point (host, no GPU):
 Layer 0  bound (host). Predicted time = max(t_mem, t_comp[, t_issue]).
   DRAM (typical decode T≲16; ridge_T≈380 on 27B NVFP4 attn-in): cut extra bytes,
   raise useful work per weight pass (weight_replay, aggregate_T), or use profiled_overhead
-  with a measured baseline, same-kernel attribution, and a bounded hypothesis.
+  with a measured baseline, same-kernel attribution, and a bounded hypothesis. Below 60% of
+  sustained read, profiled_new_family can admit a different legal family whose
+  max(t_mem, candidate t_issue) beats the measured time.
   tensor-core (typical prefill T=1024): tile / TMA / pipeline / epilogue inside the
   existing SM120 NVFP4 family.
   STOP if verdict=refuse or sm120=ILLEGAL. Do not write CUDA.
@@ -550,6 +571,41 @@ def _self_test() -> int:
         "profiled-missing-evidence",
         _classified(missing)[bound.IDEAS.index("profiled_overhead")]["verdict"] == "measure",
     )
+    family = dict(
+        measured_us=9.5,
+        hypothesis="BF16 hi+lo m16n8k16, tokens padded to n8",
+        profiled_dram_gbs=350.0,
+    )
+    new_family = bound.analyze(
+        324,
+        10240,
+        8,
+        "fp8",
+        mma_per_s=61.95e9,
+        idea="profiled_new_family",
+        candidate_atom="bf16",
+        operand_terms=2,
+        candidate_mma_per_s=61.95e9,
+        **family,
+    )
+    check("new-family-go", status_of(new_family) == "go", status_of(new_family))
+    replayed = [*shlex.split(recipe_cmd(new_family))[4:], "--mma-per-s", "61.95e9"]
+    restored_family = bound.analyze_from_args(parser.parse_args(replayed))
+    check(
+        "new-family-roundtrip",
+        all(restored_family[k] == v for k, v in family.items())
+        and restored_family["candidate"] == new_family["candidate"]
+        and restored_family["idea"]["verdict"] == "allow",
+    )
+    check(
+        "new-family-classified",
+        _classified(new_family)[bound.IDEAS.index("profiled_new_family")]["verdict"] == "allow"
+        and _classified(dict(new_family, measured_us=1.0))[
+            bound.IDEAS.index("profiled_new_family")
+        ]["verdict"]
+        == "measure",
+    )
+    check("new-family-readable", "6. Family Evidence-gated" in render_filled(new_family))
     payload = filled_payload(allow)
     check("json-status", payload["status"] == "go")
     check("json-layer2", "--t 1024" in payload["layer2"]["bench"])
@@ -598,6 +654,9 @@ def main(argv=None) -> int:
             args.bottleneck,
             args.profile_evidence,
             args.hypothesis,
+            args.profiled_ctas is not None,
+            args.profiled_dram_gbs is not None,
+            args.candidate_atom,
             args.measured_us is not None,
             args.qtype,
             args.mma_json,

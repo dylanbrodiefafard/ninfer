@@ -22,10 +22,11 @@ namespace oracle = ninfer::test::context_kv;
 constexpr test::ReductionCriterion kA16Criterion{1.0 / 256, 1.0 / 256, 2.0 / 256};
 
 int check_admission(DeviceContext& device, const Weight& weight) {
-    DeviceBuffer input(static_cast<std::size_t>(oracle::kHidden) * 3 * 2);
+    const std::int32_t hidden = weight.k;
+    DeviceBuffer input(static_cast<std::size_t>(hidden) * 3 * 2);
     DeviceBuffer key_storage(1024 * 3 * 2);
     DeviceBuffer value_storage(1024 * 3 * 2);
-    Tensor x(input.p, DType::BF16, {oracle::kHidden, 3});
+    Tensor x(input.p, DType::BF16, {hidden, 3});
     Tensor key(key_storage.p, DType::BF16, {1024, 3});
     Tensor value(value_storage.p, DType::BF16, {1024, 3});
     int failures = test::expect_invalid_argument(
@@ -51,20 +52,21 @@ int check_admission(DeviceContext& device, const Weight& weight) {
 
 int run_case(DeviceContext& device, const Weight& weight, const std::vector<double>& logical,
              std::int32_t width, std::int32_t batch) {
-    const auto tokens  = width * batch;
-    const auto words   = static_cast<std::size_t>(1024) * tokens;
-    const char* format = weight.qtype == QType::NVFP4        ? "NVFP4"
-                         : weight.qtype == QType::W8G32_F16S ? "W8"
-                                                             : "Q4";
-    const auto label   = std::string("context KV ") + format + " W=" + std::to_string(width) +
-                         " B=" + std::to_string(batch);
-    std::vector<float> activation(static_cast<std::size_t>(oracle::kHidden) * tokens);
+    const std::int32_t hidden = weight.k;
+    const auto tokens         = width * batch;
+    const auto words          = static_cast<std::size_t>(1024) * tokens;
+    const char* format        = weight.qtype == QType::NVFP4        ? "NVFP4"
+                                : weight.qtype == QType::W8G32_F16S ? "W8"
+                                                                    : "Q4";
+    const auto label = std::string("context KV ") + format + " H=" + std::to_string(hidden) +
+                       " W=" + std::to_string(width) + " B=" + std::to_string(batch);
+    std::vector<float> activation(static_cast<std::size_t>(hidden) * tokens);
     test::fill_uniform(activation, static_cast<std::uint32_t>(width * 13 + batch), -0.5F, 0.5F);
     test::round_to_bf16(activation);
     auto input = test::to_device_bf16(activation);
     test::GuardedDeviceBuffer key_storage(words * 2);
     test::GuardedDeviceBuffer value_storage(words * 2);
-    Tensor x(input.p, DType::BF16, {oracle::kHidden, tokens});
+    Tensor x(input.p, DType::BF16, {hidden, tokens});
     Tensor key(key_storage.data(), DType::BF16, {1024, tokens});
     Tensor value(value_storage.data(), DType::BF16, {1024, tokens});
     const auto launch = [&] {
@@ -82,12 +84,12 @@ int run_case(DeviceContext& device, const Weight& weight, const std::vector<doub
         }
     }
     std::vector<float> selected_activation;
-    selected_activation.reserve(columns.size() * oracle::kHidden);
+    selected_activation.reserve(columns.size() * hidden);
     for (const auto column : columns) {
-        const auto first = activation.begin() + static_cast<std::int64_t>(column) * oracle::kHidden;
-        selected_activation.insert(selected_activation.end(), first, first + oracle::kHidden);
+        const auto first = activation.begin() + static_cast<std::int64_t>(column) * hidden;
+        selected_activation.insert(selected_activation.end(), first, first + hidden);
     }
-    auto reference = oracle::project(logical, selected_activation);
+    auto reference = oracle::project(hidden, logical, selected_activation);
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures = 0;
@@ -174,9 +176,9 @@ int main(int argc, char** argv) {
         if (test::require_cuda() != 0) { return 1; }
         DeviceContext device;
         constexpr std::uint32_t kSeed = 831;
-        auto packed                   = oracle::make_weight(kSeed, 128.0F);
+        auto packed                   = oracle::make_weight(5120, kSeed, 128.0F);
         const auto logical            = oracle::decode_selected(packed);
-        oracle::verify_exact_codec(logical, kSeed, 128.0F);
+        oracle::verify_exact_codec(5120, logical, kSeed, 128.0F);
         auto payload      = test::to_device(packed.payload);
         const auto weight = packed.device_weight(payload.p);
         int failures      = check_admission(device, weight);
@@ -201,9 +203,9 @@ int main(int argc, char** argv) {
                 failures += run_case(device, weight, logical, width, 1);
             }
         }
-        auto second_packed        = oracle::make_weight(kSeed + 1, 37.5F);
+        auto second_packed        = oracle::make_weight(5120, kSeed + 1, 37.5F);
         const auto second_logical = oracle::decode_selected(second_packed);
-        oracle::verify_exact_codec(second_logical, kSeed + 1, 37.5F);
+        oracle::verify_exact_codec(5120, second_logical, kSeed + 1, 37.5F);
         auto second_payload = test::to_device(second_packed.payload);
         failures +=
             run_case(device, second_packed.device_weight(second_payload.p), second_logical, 4, 2);
@@ -213,7 +215,7 @@ int main(int argc, char** argv) {
         if (!test::sanitizer_scope(argc, argv)) {
             for (const auto qtype : {QType::W8G32_F16S, QType::Q4G64_F16S}) {
                 auto row_split = test::quantized_weight::make_patterned_weight(
-                    qtype, oracle::kParentRows, oracle::kHidden, kSeed + 2,
+                    qtype, oracle::kParentRows, 5120, kSeed + 2,
                     {test::quantized_weight::RowSplitScalePattern::Small,
                      test::quantized_weight::RowSplitCodePattern::Hashed});
                 const auto row_split_logical = oracle::decode_selected_row_split(row_split);
@@ -231,6 +233,29 @@ int main(int argc, char** argv) {
                     row_split.payload) {
                     throw std::runtime_error("context KV: original RowSplit weight modified");
                 }
+            }
+        }
+        {
+            // Flash-Next drafter [6144,2560]: GEMV, the narrow MMA tiles at every proposal width
+            // for one to twelve packed requests, and repeated M64 tiles for prefill chunks.
+            auto narrow_packed        = oracle::make_weight(2560, kSeed + 3, 64.0F);
+            const auto narrow_logical = oracle::decode_selected(narrow_packed);
+            oracle::verify_exact_codec(2560, narrow_logical, kSeed + 3, 64.0F);
+            auto narrow_payload      = test::to_device(narrow_packed.payload);
+            const auto narrow_weight = narrow_packed.device_weight(narrow_payload.p);
+            failures += check_admission(device, narrow_weight);
+            const bool sanitizer = test::sanitizer_scope(argc, argv);
+            const auto shapes =
+                sanitizer ? std::vector<std::array<int, 2>>{{1, 1}, {3, 12}, {8, 6}, {100, 1}}
+                          : std::vector<std::array<int, 2>>{{1, 1},  {1, 12},  {2, 1},   {2, 12},
+                                                            {3, 12}, {4, 12},  {8, 1},   {8, 6},
+                                                            {16, 3}, {100, 1}, {1000, 1}};
+            for (const auto& shape : shapes) {
+                failures += run_case(device, narrow_weight, narrow_logical, shape[0], shape[1]);
+            }
+            if (test::from_device<std::uint8_t>(narrow_payload, narrow_packed.payload.size()) !=
+                narrow_packed.payload) {
+                throw std::runtime_error("context KV: H=2560 persistent weight modified");
             }
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " A16 context KV projection\n";

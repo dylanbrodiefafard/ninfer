@@ -257,51 +257,54 @@ int run_bf16_target() {
     return failures;
 }
 
+// Runs either NVFP4 parent: [14336,5120] with 1024 key/value rows or [13312,2560] with 512.
 int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
                           ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
-    constexpr std::int32_t kHidden = 5120;
+    const std::int32_t hidden      = parent.host.weight.k;
+    const std::int32_t parent_rows = parent.host.weight.n;
     constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
+    const std::int32_t kv_rows     = hidden == 5120 ? 1024 : 512;
     const std::vector<float> activation =
-        make_bf16_activation(kHidden, tokens, 337U + static_cast<std::uint32_t>(tokens));
+        make_bf16_activation(hidden, tokens, 337U + static_cast<std::uint32_t>(tokens));
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
 
     GuardedBf16Tensor query(kQRows, tokens);
     GuardedBf16Tensor gate(kQRows, tokens);
-    GuardedBf16Tensor key(kKvRows, tokens);
-    GuardedBf16Tensor value(kKvRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    GuardedBf16Tensor key(kv_rows, tokens);
+    GuardedBf16Tensor value(kv_rows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
     Tensor q                   = query.tensor();
     Tensor g                   = gate.tensor();
     Tensor k                   = key.tensor();
     Tensor v                   = value.tensor();
     const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
-        QType::NVFP4, 14336, kHidden, policy, tokens, tokens);
+        QType::NVFP4, parent_rows, hidden, policy, tokens, tokens);
     DeviceArena workspace(std::max<std::size_t>(capacity, 256));
     ops::attn_input_proj(x, parent.view(), q, g, k, v, policy, workspace, nullptr);
     cuda_synchronize();
 
-    constexpr std::int32_t kKeyBegin   = kQRows;
-    constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
-    constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
-    int failures                       = 0;
-    const bool a4                      = policy == ops::LinearPolicy::AllowA4 && tokens >= 4;
-    const bool a8                      = policy == ops::LinearPolicy::AllowA8 && tokens >= 4;
+    const std::int32_t key_begin   = kQRows;
+    const std::int32_t gate_begin  = key_begin + kv_rows;
+    const std::int32_t value_begin = gate_begin + kQRows;
+    int failures                   = 0;
+    const bool a4                  = policy == ops::LinearPolicy::AllowA4 && tokens >= 4;
+    const bool a8                  = policy == ops::LinearPolicy::AllowA8 && tokens >= 4;
     constexpr ReductionCriterion a8_criterion{0.04, 1.0 / 256.0, 0.06};
     const ReductionCriterion& criterion =
         a8 ? a8_criterion : (a4 ? kAttnInputProjA4Tolerance : kAttnInputProjA16Tolerance);
     const std::int32_t sample_count = a4 ? kA4SampleRows : 7;
-    const std::string suffix =
-        std::string(" NVFP4 ") + (a8 ? "A8" : (a4 ? "A4" : "A16")) + " T=" + std::to_string(tokens);
-    failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
+    const std::string suffix        = std::string(" NVFP4 K=") + std::to_string(hidden) +
+                                      (a8 ? " A8" : (a4 ? " A4" : " A16")) +
+                                      " T=" + std::to_string(tokens);
+    failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, hidden,
                               tokens, criterion, sample_count);
-    failures += verify_output("attn k" + suffix, key, parent.host, kKeyBegin, kKvRows, activation,
-                              kHidden, tokens, criterion, sample_count);
-    failures += verify_output("attn gate" + suffix, gate, parent.host, kGateBegin, kQRows,
-                              activation, kHidden, tokens, criterion, sample_count);
-    failures += verify_output("attn value" + suffix, value, parent.host, kValueBegin, kKvRows,
-                              activation, kHidden, tokens, criterion, sample_count);
+    failures += verify_output("attn k" + suffix, key, parent.host, key_begin, kv_rows, activation,
+                              hidden, tokens, criterion, sample_count);
+    failures += verify_output("attn gate" + suffix, gate, parent.host, gate_begin, kQRows,
+                              activation, hidden, tokens, criterion, sample_count);
+    failures += verify_output("attn value" + suffix, value, parent.host, value_begin, kv_rows,
+                              activation, hidden, tokens, criterion, sample_count);
     failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
     failures += parent.verify_preserved("attn parent" + suffix);
     return failures;
@@ -453,6 +456,33 @@ int run_nvfp4_target() {
     return failures;
 }
 
+// The [13312,2560] parent admits only A16Only: the T=1 GEMV and the BF16-activation MMA at every
+// T>=2, whose wide tiles change at each eight-token panel count 1..8 (T=64) and repeat beyond.
+// Distinct parent rows make a misrouted query/key/gate/value range visible to the oracle.
+int run_nvfp4_2560_target() {
+    constexpr std::int32_t kHidden     = 2560;
+    constexpr std::int32_t kParentRows = 13312;
+    DevicePackedWeight parent(
+        with_distinct_nvfp4_rows(make_nvfp4_a16_weight(kParentRows, kHidden, 333U)));
+    int failures = 0;
+    for (const std::int32_t tokens :
+         {1, 2, 3, 8, 9, 16, 17, 24, 25, 32, 33, 40, 41, 48, 49, 56, 57, 64, 65, 300, 1000}) {
+        failures += run_nvfp4_target_case(parent, tokens);
+    }
+    if (ops::attn_input_proj_workspace_capacity_bytes(QType::NVFP4, kParentRows, kHidden,
+                                                      ops::LinearPolicy::A16Only, 1, 4096) != 0) {
+        std::cerr << "NVFP4 K=2560 attention input A16 workspace interval is not zero-capacity\n";
+        ++failures;
+    }
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::attn_input_proj_workspace_capacity_bytes(QType::NVFP4, kParentRows, kHidden,
+                                                                 ops::LinearPolicy::AllowA8, 1, 1);
+        },
+        "NVFP4 K=2560 attention input accepted AllowA8");
+    return failures;
+}
+
 constexpr ReductionCriterion kFp8AttnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kAttnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 
@@ -574,6 +604,7 @@ int main(int argc, char** argv) {
     failures += run_fp8_target();
     failures += run_bf16_target();
     failures += run_nvfp4_target();
+    failures += run_nvfp4_2560_target();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

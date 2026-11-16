@@ -100,6 +100,8 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
     if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    if (name == "F3G32_E4M3FN") { return NumericFormat::F3G32_E4M3FN; }
+    if (name == "E2M1G16_E4M3FN") { return NumericFormat::E2M1G16_E4M3FN; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 
@@ -108,6 +110,7 @@ StorageLayout parse_layout(std::string_view name) {
     if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
     if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
     if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
+    if (name == "moe-expert-tiles-v1") { return StorageLayout::MoeExpertTilesV1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 
@@ -453,6 +456,9 @@ Reader::tensor_content_identity(std::span<const TensorContentSelection> selectio
             ranges.push_back({geometry.scale_plane_offset + first * 2, rows * 2});
             break;
         }
+        case StorageLayout::MoeExpertTilesV1:
+            // Rank three; the rank-two row check above already rejected it.
+            throw ArtifactError("expert records have no row selection: " + tensor->name);
         }
     }
     const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(),

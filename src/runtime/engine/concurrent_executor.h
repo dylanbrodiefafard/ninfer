@@ -2718,9 +2718,18 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
-        const auto started           = Clock::now();
-        const PrefillStepResult step = instance_.program->advance_prefill_lane(
-            lane, prefill_pace(instance_.program->prefill_remaining_tokens(lane)));
+        const auto started = Clock::now();
+        PrefillStepResult step;
+        try {
+            step = instance_.program->advance_prefill_lane(
+                lane, prefill_pace(instance_.program->prefill_remaining_tokens(lane)));
+        } catch (...) {
+            // A request-local failure (e.g. an output constraint with no eligible first token)
+            // ends this request alone; anything else fails the Engine.
+            if (!fail_admitted_request(request, lane, std::current_exception())) { throw; }
+            publish_runtime_stats();
+            return;
+        }
         if (request->recovery.attempts != 0) {
             request->recovery.prefill_seconds +=
                 std::chrono::duration<double>(Clock::now() - started).count();
@@ -4040,8 +4049,16 @@ private:
         } else {
             round = instance_.program->decode_batch(lanes, live.budget_span());
         }
+        // Rows the target could not sample fail alone after the others commit (row_errors).
+        std::array<std::uint8_t, kMaximumConcurrency> failed{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (!round.cycle_exclusions[row]) { continue; }
+            failed[row] = round.row_errors[row] != nullptr ? 1U : 0U;
+            if (failed[row] && owner_step) {
+                throw std::logic_error("a mixed decode round reported a row error");
+            }
+        }
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (failed[row] || !round.cycle_exclusions[row]) { continue; }
             const auto& request = slots_[lanes[row]];
             const auto count    = ++request->cycle_exclusions;
             // Bound log traffic in a persistent cycle: first and powers of two;
@@ -4068,6 +4085,7 @@ private:
         std::array<std::uint8_t, kMaximumConcurrency> rejected{};
         std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (failed[row]) { continue; }
             const std::uint32_t lane = lanes[row];
             const auto& request      = slots_[lane];
             const std::uint32_t count =
@@ -4106,23 +4124,40 @@ private:
             finish_reasons[row] = decision.finish_reason;
         }
 
-        instance_.program->resolve_pending_batch(
-            lanes, std::span<const std::uint32_t>(accepted.data(), lanes.size()),
-            std::span<const std::uint8_t>(terminal.data(), lanes.size()),
-            std::span<const std::uint8_t>(cancelled.data(), lanes.size()),
-            std::span<const std::uint8_t>(rejected.data(), lanes.size()));
-
-        ++cumulative_stats_.decode_rounds;
-        if (owner_step) { ++cumulative_stats_.mixed_decode_rounds; }
-        cumulative_stats_.decode_row_rounds += lanes.size();
+        // The target holds no pending round for a failed row, so only the others resolve.
+        RoundMembership resolved;
+        std::array<std::uint32_t, kMaximumConcurrency> resolved_accepted{};
+        std::array<std::uint8_t, kMaximumConcurrency> resolved_terminal{};
+        std::array<std::uint8_t, kMaximumConcurrency> resolved_cancelled{};
+        std::array<std::uint8_t, kMaximumConcurrency> resolved_rejected{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (!cancelled[row] && !rejected[row]) {
+            if (failed[row]) { continue; }
+            resolved_accepted[resolved.size]  = accepted[row];
+            resolved_terminal[resolved.size]  = terminal[row];
+            resolved_cancelled[resolved.size] = cancelled[row];
+            resolved_rejected[resolved.size]  = rejected[row];
+            resolved.lanes[resolved.size++]   = lanes[row];
+        }
+        if (!resolved.empty()) {
+            instance_.program->resolve_pending_batch(
+                resolved.lane_span(),
+                std::span<const std::uint32_t>(resolved_accepted.data(), resolved.size),
+                std::span<const std::uint8_t>(resolved_terminal.data(), resolved.size),
+                std::span<const std::uint8_t>(resolved_cancelled.data(), resolved.size),
+                std::span<const std::uint8_t>(resolved_rejected.data(), resolved.size));
+            ++cumulative_stats_.decode_rounds;
+            if (owner_step) { ++cumulative_stats_.mixed_decode_rounds; }
+            cumulative_stats_.decode_row_rounds += resolved.size;
+        }
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (!failed[row] && !cancelled[row] && !rejected[row]) {
                 cumulative_stats_.committed_decode_tokens += accepted[row];
             }
         }
         publish_hot_runtime_counters();
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (failed[row]) { continue; }
             const std::uint32_t lane = lanes[row];
             const auto request       = slots_[lane];
             if (rejected[row]) {
@@ -4163,6 +4198,22 @@ private:
                 (void)fail_repeated_content(request);
             }
         }
+
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (!failed[row]) { continue; }
+            const std::uint32_t lane = lanes[row];
+            const auto request       = slots_[lane];
+            if (cancelled[row]) {
+                // A cancellation observed at this boundary wins, as for the committed rows.
+                instance_.program->abort_lane(lane);
+                complete_cancelled(request);
+                continue;
+            }
+            if (!fail_admitted_request(request, lane, round.row_errors[row])) {
+                std::rethrow_exception(round.row_errors[row]);
+            }
+        }
+        if (failed != std::array<std::uint8_t, kMaximumConcurrency>{}) { publish_runtime_stats(); }
 
         if (owner_step) {
             const auto request = slots_[*owner];

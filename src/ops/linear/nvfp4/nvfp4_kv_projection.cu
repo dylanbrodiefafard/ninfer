@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -48,11 +49,9 @@ struct KvOutput {
     }
 };
 
-} // namespace
-
-void launch_nvfp4_kv_projection(const Tensor& x, const Weight& weight, Tensor& key, Tensor& value,
-                                cudaStream_t stream, std::int32_t sequence_width) {
-    using Geometry = Nvfp4DflashQkvGeometry;
+template <class Geometry>
+void launch_geometry(const Tensor& x, const Weight& weight, Tensor& key, Tensor& value,
+                     cudaStream_t stream, std::int32_t sequence_width) {
     if (sequence_width == 1) {
         using Schedule        = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
         constexpr int kBlocks = kOutputRows / Schedule::kRowsPerCta;
@@ -93,6 +92,23 @@ void launch_nvfp4_kv_projection(const Tensor& x, const Weight& weight, Tensor& k
         launch_nvfp4_w4a8_mma<Geometry, Nvfp4IdentityEpilogue, KvOutput<0>, KvRows, false,
                               Nvfp4Bf16Activation, kOutputRows>(
             weight, columns, activation, Nvfp4IdentityEpilogue{}, output, stream);
+    }
+}
+
+} // namespace
+
+void launch_nvfp4_kv_projection(const Tensor& x, const Weight& weight, Tensor& key, Tensor& value,
+                                cudaStream_t stream, std::int32_t sequence_width) {
+    switch (resolve_nvfp4_problem(weight.n, weight.k)) {
+    case Nvfp4Problem::DflashQkv:
+        launch_geometry<Nvfp4DflashQkvGeometry>(x, weight, key, value, stream, sequence_width);
+        return;
+    case Nvfp4Problem::FlashNextDflashQkv:
+        launch_geometry<Nvfp4FlashNextDflashQkvGeometry>(x, weight, key, value, stream,
+                                                         sequence_width);
+        return;
+    default:
+        throw std::invalid_argument("nvfp4 linear_kv_projection: unsupported QKV geometry");
     }
 }
 

@@ -68,6 +68,12 @@ const std::string& reasoning_effort_template_source() {
     return source;
 }
 
+const std::string& flash_next_template_source() {
+    static const std::string source = read_template_fixture(
+        NINFER_SOURCE_DIR "/tests/fixtures/frontend/flash_next_chat_template.jinja");
+    return source;
+}
+
 const fi::CompiledChatTemplate& thinking_toggle_template() {
     static const fi::CompiledChatTemplate value =
         fi::CompiledChatTemplate::resolve(thinking_toggle_template_source());
@@ -1146,6 +1152,177 @@ int test_official_resource_guards() {
                   capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
               "Frontend did not expose capabilities from its loaded chat template");
 
+    return failures;
+}
+
+// System, an answered question, then a tool round trip that ends in tool responses, so the last
+// user query precedes two assistant tool-call turns and history before it drops its reasoning.
+std::vector<fi::ChatMessage> flash_next_tools_conversation() {
+    fi::ChatMessage answered   = chat_message(ninfer::ChatRole::Assistant, "4");
+    answered.reasoning_content = "Simple arithmetic.";
+    fi::ChatMessage read       = chat_message(ninfer::ChatRole::Assistant, "");
+    read.reasoning_content     = "Read the file first.";
+    read.tool_calls.push_back({.id             = "c1",
+                               .name           = "read_file",
+                               .arguments_json = R"({"path":"config.json","max_bytes":4096})"});
+    fi::ChatMessage search = chat_message(ninfer::ChatRole::Assistant, "Found ninfer; searching.");
+    search.reasoning_content = "Two searches.";
+    search.tool_calls.push_back(
+        {.id             = "c2",
+         .name           = "search",
+         .arguments_json = R"({"query":"ninfer","filters":{"lang":"c++","n":3}})"});
+    search.tool_calls.push_back(
+        {.id = "c3", .name = "search", .arguments_json = R"({"query":"qwen"})"});
+    return {chat_message(ninfer::ChatRole::System, "Use tools when needed."),
+            chat_message(ninfer::ChatRole::User, "What is 2+2?"),
+            std::move(answered),
+            chat_message(ninfer::ChatRole::User, "Read config.json, then search for its name."),
+            std::move(read),
+            chat_message(ninfer::ChatRole::Tool, R"({"name":"ninfer"})"),
+            std::move(search),
+            chat_message(ninfer::ChatRole::Tool, "first result"),
+            chat_message(ninfer::ChatRole::Tool, "second result")};
+}
+
+std::vector<std::string> flash_next_tool_jsons() {
+    return {
+        R"({"type":"function","function":{"name":"read_file","description":"Read a file.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}})",
+        R"({"type":"function","function":{"name":"search","description":"Search the index.","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}})"};
+}
+
+int test_flash_next_chat_template() {
+    const fi::CompiledChatTemplate flash_next =
+        fi::CompiledChatTemplate::resolve(flash_next_template_source());
+    const ninfer::PromptCapabilities capabilities = flash_next.capabilities();
+    int failures =
+        check(capabilities.enable_thinking && capabilities.reasoning_effort.low &&
+                  capabilities.reasoning_effort.medium && capabilities.reasoning_effort.xhigh &&
+                  capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
+              "Flash-Next chat template did not resolve to ReasoningEffort semantics");
+
+    const std::vector<fi::ChatMessage> messages = flash_next_tools_conversation();
+    fi::ChatRenderOptions base;
+    base.tool_jsons        = flash_next_tool_jsons();
+    base.preserve_thinking = false;
+    std::vector<fi::ChatRenderOptions> variants(7, base);
+    variants[1].preserve_thinking     = true;
+    variants[2].preserve_thinking     = std::nullopt;
+    variants[3].reasoning_effort      = ninfer::ReasoningEffort::Low;
+    variants[4].reasoning_effort      = ninfer::ReasoningEffort::Medium;
+    variants[5].enable_thinking       = false;
+    variants[6].add_generation_prompt = false;
+    for (const fi::ChatRenderOptions& options : variants) {
+        failures += check(flash_next.render(messages, options).text ==
+                              reasoning_effort_template().render(messages, options).text,
+                          "Flash-Next template rendered differently from the 27B template");
+    }
+
+    // Conversation turns after the tools system block, rendered from the Flash-Next
+    // chat_template.jinja by Hugging Face-configured Jinja (trim_blocks, lstrip_blocks,
+    // pass-through generation block, preserve_thinking=false, generation prompt).
+    constexpr std::string_view expected_turns =
+        "<|im_start|>user\nWhat is 2+2?<|im_end|>\n"
+        "<|im_start|>assistant\n4<|im_end|>\n"
+        "<|im_start|>user\nRead config.json, then search for its name.<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nRead the file first.\n</think>\n\n"
+        "<tool_call>\n<function=read_file>\n<parameter=path>\nconfig.json\n</parameter>\n"
+        "<parameter=max_bytes>\n4096\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+        "<|im_start|>user\n<tool_response>\n{\"name\":\"ninfer\"}\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nTwo searches.\n</think>\n\nFound ninfer; searching.\n\n"
+        "<tool_call>\n<function=search>\n<parameter=query>\nninfer\n</parameter>\n"
+        "<parameter=filters>\n{\"lang\": \"c++\", \"n\": 3}\n</parameter>\n</function>\n"
+        "</tool_call>\n<tool_call>\n<function=search>\n<parameter=query>\nqwen\n</parameter>\n"
+        "</function>\n</tool_call><|im_end|>\n"
+        "<|im_start|>user\n<tool_response>\nfirst result\n</tool_response>\n"
+        "<tool_response>\nsecond result\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n";
+    const std::string text          = flash_next.render(messages, base).text;
+    constexpr std::string_view turn = "<|im_end|>\n";
+    const std::size_t system_end    = text.find(turn);
+    failures += check(system_end != std::string::npos &&
+                          std::string_view(text).substr(system_end + turn.size()) == expected_turns,
+                      "Flash-Next tools conversation differs from its Jinja rendering");
+    return failures;
+}
+
+// The template comes from frontend/chat_template.jinja alone when tokenizer_config.json omits
+// chat_template, as Qwen3.8-Flash-Next's does; a present field must still be a string.
+int test_flash_next_frontend_resources() {
+    FrontendResources omitted = resources(flash_next_template_source());
+    nlohmann::json config     = nlohmann::json::parse(omitted.tokenizer_config_json);
+    config.erase("chat_template");
+    omitted.tokenizer_config_json = config.dump();
+    int failures                  = 0;
+    try {
+        const Frontend frontend = FrontendFactory::create_component(omitted, false);
+        failures += check(frontend.prompt_capabilities().reasoning_effort.default_effort ==
+                              ninfer::ReasoningEffort::XHigh,
+                          "Flash-Next frontend did not expose ReasoningEffort capabilities");
+    } catch (const std::invalid_argument& error) {
+        std::cerr << "Flash-Next frontend resources were rejected: " << error.what() << '\n';
+        ++failures;
+    }
+
+    FrontendResources non_string     = omitted;
+    config["chat_template"]          = nlohmann::json::array();
+    non_string.tokenizer_config_json = config.dump();
+    failures +=
+        check(throws_invalid_argument([&] { (void)FrontendFactory::create_component(non_string); }),
+              "non-string tokenizer_config.json.chat_template was accepted");
+
+    // Real checkpoint resources: the Flash-Next frontend must encode the same prompt tokens as
+    // the 27B frontend over the official tokenizer.
+    const char* flash_next_dir = std::getenv("NINFER_FLASH_NEXT_FRONTEND_DIR");
+    if (flash_next_dir == nullptr || flash_next_dir[0] == '\0') {
+        std::cout << "SKIP test_flash_next_frontend_resources real checkpoint: "
+                     "NINFER_FLASH_NEXT_FRONTEND_DIR is unset\n";
+        return failures;
+    }
+    if (skip_without_official_tokenizer("test_flash_next_frontend_resources real checkpoint")) {
+        return failures;
+    }
+    const auto read_resources = [](const std::string& dir) {
+        const auto read = [&](const char* name) { return read_file((dir + "/" + name).c_str()); };
+        return FrontendResources{.tokenizer_json           = read("tokenizer.json"),
+                                 .tokenizer_config_json    = read("tokenizer_config.json"),
+                                 .chat_template_jinja      = read("chat_template.jinja"),
+                                 .generation_config_json   = read("generation_config.json"),
+                                 .preprocessor_config_json = read("preprocessor_config.json"),
+                                 .video_preprocessor_config_json =
+                                     read("video_preprocessor_config.json")};
+    };
+    const Frontend flash_next =
+        FrontendFactory::create_component(read_resources(flash_next_dir), false);
+    const Frontend base =
+        FrontendFactory::create_component(read_resources(official_tokenizer_dir().value()), false);
+
+    const auto text_part = [](std::string text) {
+        return ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}};
+    };
+    const auto message = [&](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage result;
+        result.role = role;
+        result.parts.push_back(text_part(std::move(text)));
+        return result;
+    };
+    ninfer::PromptInput input;
+    input.options.tool_jsons = flash_next_tool_jsons();
+    for (const fi::ChatMessage& source : flash_next_tools_conversation()) {
+        ninfer::ChatMessage target = message(source.role, source.parts.front().text);
+        target.reasoning_content   = source.reasoning_content;
+        for (const fi::ToolCall& call : source.tool_calls) {
+            target.tool_calls.push_back(ninfer::ToolCall{
+                .id = call.id, .name = call.name, .arguments_json = call.arguments_json});
+        }
+        input.messages.push_back(std::move(target));
+    }
+    const auto flash_next_prompt = flash_next.prepare(input);
+    const auto base_prompt       = base.prepare(input);
+    failures += check(!FrontendFactory::inspect(flash_next_prompt).token_ids.empty() &&
+                          FrontendFactory::inspect(flash_next_prompt).token_ids ==
+                              FrontendFactory::inspect(base_prompt).token_ids,
+                      "Flash-Next checkpoint resources encoded different prompt tokens");
     return failures;
 }
 
@@ -3513,6 +3690,8 @@ int main() {
     failures += test_rewrite_checkpoint_trace();
     failures += test_turn_closure_token_frontiers();
     failures += test_official_resource_guards();
+    failures += test_flash_next_chat_template();
+    failures += test_flash_next_frontend_resources();
     failures += test_recovery_fragment(thinking_toggle_template(), false);
     failures += test_recovery_fragment(reasoning_effort_template(), true);
     failures += test_recovery_prompt_splice(frontend);

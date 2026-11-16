@@ -11,16 +11,17 @@
 
 namespace ninfer::test::context_kv {
 
-inline constexpr std::int32_t kHidden       = 5120;
+// The parent QKV weight is [6144,H] at a registered hidden width H in {5120, 2560}.
 inline constexpr std::int32_t kParentRows   = 6144;
 inline constexpr std::int32_t kSelectedRows = 2048;
 inline constexpr std::int32_t kFirstRow     = 4096;
 
-inline std::uint8_t scale_word(std::int32_t row, std::int32_t group, std::uint32_t seed) {
+inline std::uint8_t scale_word(std::int32_t hidden, std::int32_t row, std::int32_t group,
+                               std::uint32_t seed) {
     constexpr std::array<std::uint8_t, 12> scales{0x00, 0x01, 0x07, 0x08, 0x1d, 0x38,
                                                   0x51, 0x7e, 0x81, 0x88, 0xb8, 0xfe};
     const auto hash = quantized_weight::detail::mix64(
-        static_cast<std::uint64_t>(row) * (kHidden / 16) + group + seed);
+        static_cast<std::uint64_t>(row) * (hidden / 16) + group + seed);
     return scales[hash % scales.size()];
 }
 
@@ -43,29 +44,31 @@ inline double decode_scale(std::uint8_t code) {
     return std::copysign(magnitude, (code & 128U) != 0 ? -1.0 : 1.0);
 }
 
-inline std::size_t scale_index(std::int32_t row, std::int32_t group) {
-    return (static_cast<std::size_t>(row / 128) * (kHidden / 64) + group / 4) * 512 +
+inline std::size_t scale_index(std::int32_t hidden, std::int32_t row, std::int32_t group) {
+    return (static_cast<std::size_t>(row / 128) * (hidden / 64) + group / 4) * 512 +
            static_cast<std::size_t>(row % 32) * 16 + static_cast<std::size_t>(row % 128 / 32) * 4 +
            group % 4;
 }
 
-inline quantized_weight::PackedWeight make_weight(std::uint32_t seed, float divisor) {
+inline quantized_weight::PackedWeight make_weight(std::int32_t hidden, std::uint32_t seed,
+                                                  float divisor) {
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = divisor;
     options.input_scale_divisor  = 3.5F;
     auto packed =
-        quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, kHidden, seed, options);
+        quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, hidden, seed, options);
     // Independent coordinate hash breaks the fixture's periodicity across the skipped 4096 rows.
     // Zero, subnormal, ordinary, signed and saturated scales exercise exact stored-value decode.
     // Walk physical storage in order independently of the logical decoder's index formula.
     std::size_t offset = packed.scale_plane_offset;
     for (std::int32_t row_tile = 0; row_tile < kParentRows / 128; ++row_tile) {
-        for (std::int32_t group_tile = 0; group_tile < kHidden / 64; ++group_tile) {
+        for (std::int32_t group_tile = 0; group_tile < hidden / 64; ++group_tile) {
             for (std::int32_t lane = 0; lane < 32; ++lane) {
                 for (std::int32_t quartile = 0; quartile < 4; ++quartile) {
                     for (std::int32_t inner = 0; inner < 4; ++inner) {
-                        packed.payload[offset++] = scale_word(row_tile * 128 + quartile * 32 + lane,
-                                                              group_tile * 4 + inner, seed);
+                        packed.payload[offset++] =
+                            scale_word(hidden, row_tile * 128 + quartile * 32 + lane,
+                                       group_tile * 4 + inner, seed);
                     }
                 }
             }
@@ -74,18 +77,19 @@ inline quantized_weight::PackedWeight make_weight(std::uint32_t seed, float divi
     return packed;
 }
 
-inline void verify_exact_codec(const std::vector<double>& logical, std::uint32_t seed,
-                               float divisor) {
+inline void verify_exact_codec(std::int32_t hidden, const std::vector<double>& logical,
+                               std::uint32_t seed, float divisor) {
     for (std::int32_t selected = 0; selected < kSelectedRows; ++selected) {
         const auto original = kFirstRow + selected;
-        for (std::int32_t column = 0; column < kHidden; ++column) {
+        for (std::int32_t column = 0; column < hidden; ++column) {
             const auto code =
                 static_cast<std::uint8_t>((static_cast<std::uint32_t>(original) * 13U +
                                            static_cast<std::uint32_t>(column) * 7U + seed) &
                                           15U);
-            const auto expected =
-                decode_code(code) * decode_scale(scale_word(original, column / 16, seed)) / divisor;
-            if (logical[static_cast<std::size_t>(selected) * kHidden + column] != expected) {
+            const auto expected = decode_code(code) *
+                                  decode_scale(scale_word(hidden, original, column / 16, seed)) /
+                                  divisor;
+            if (logical[static_cast<std::size_t>(selected) * hidden + column] != expected) {
                 throw std::runtime_error("context KV oracle: exact codec mapping mismatch");
             }
         }
@@ -93,16 +97,17 @@ inline void verify_exact_codec(const std::vector<double>& logical, std::uint32_t
 }
 
 inline std::vector<double> decode_selected(const quantized_weight::PackedWeight& packed) {
-    std::vector<double> logical(static_cast<std::size_t>(kSelectedRows) * kHidden);
+    const std::int32_t hidden = packed.weight.k;
+    std::vector<double> logical(static_cast<std::size_t>(kSelectedRows) * hidden);
     for (std::int32_t selected = 0; selected < kSelectedRows; ++selected) {
         const auto original = kFirstRow + selected;
-        for (std::int32_t column = 0; column < kHidden; ++column) {
+        for (std::int32_t column = 0; column < hidden; ++column) {
             const auto byte =
-                packed.payload[static_cast<std::size_t>(original) * kHidden / 2 + column / 2];
-            const auto code = static_cast<std::uint8_t>((byte >> ((column % 2) * 4)) & 15U);
-            const auto scale =
-                packed.payload[packed.scale_plane_offset + scale_index(original, column / 16)];
-            logical[static_cast<std::size_t>(selected) * kHidden + column] =
+                packed.payload[static_cast<std::size_t>(original) * hidden / 2 + column / 2];
+            const auto code  = static_cast<std::uint8_t>((byte >> ((column % 2) * 4)) & 15U);
+            const auto scale = packed.payload[packed.scale_plane_offset +
+                                              scale_index(hidden, original, column / 16)];
+            logical[static_cast<std::size_t>(selected) * hidden + column] =
                 decode_code(code) * decode_scale(scale) / packed.weight.weight_scale_divisor;
         }
     }
@@ -110,12 +115,13 @@ inline std::vector<double> decode_selected(const quantized_weight::PackedWeight&
 }
 
 inline std::vector<double> decode_selected_row_split(const quantized_weight::PackedWeight& packed) {
-    std::vector<double> logical(static_cast<std::size_t>(kSelectedRows) * kHidden);
+    const std::int32_t hidden = packed.weight.k;
+    std::vector<double> logical(static_cast<std::size_t>(kSelectedRows) * hidden);
     for (std::int32_t selected = 0; selected < kSelectedRows; ++selected) {
-        for (std::int32_t column = 0; column < kHidden; ++column) {
+        for (std::int32_t column = 0; column < hidden; ++column) {
             // The fixture's independent exact signed-code/FP16-scale oracle reads original
             // parent coordinates, without constructing or decoding any production row view.
-            logical[static_cast<std::size_t>(selected) * kHidden + column] =
+            logical[static_cast<std::size_t>(selected) * hidden + column] =
                 quantized_weight::logical_weight_fp64(packed, kFirstRow + selected, column);
         }
     }
@@ -124,22 +130,22 @@ inline std::vector<double> decode_selected_row_split(const quantized_weight::Pac
 
 // Each complete dot accumulates sequentially in FP64 from the original BF16 values and exactly
 // decoded stored weight. Eight columns share host weight reads without changing any dot's order.
-inline std::vector<double> project(const std::vector<double>& weights,
+inline std::vector<double> project(std::int32_t hidden, const std::vector<double>& weights,
                                    const std::vector<float>& activation) {
-    if (weights.size() != static_cast<std::size_t>(kSelectedRows) * kHidden || activation.empty() ||
-        activation.size() % kHidden != 0) {
+    if (weights.size() != static_cast<std::size_t>(kSelectedRows) * hidden || activation.empty() ||
+        activation.size() % hidden != 0) {
         throw std::invalid_argument("context KV oracle: invalid logical matrices");
     }
-    const auto tokens = activation.size() / kHidden;
+    const auto tokens = activation.size() / hidden;
     std::vector<double> output(static_cast<std::size_t>(kSelectedRows) * tokens);
     for (std::int32_t row = 0; row < kSelectedRows; ++row) {
         for (std::size_t first = 0; first < tokens; first += 8) {
             const auto active = std::min<std::size_t>(8, tokens - first);
             std::array<double, 8> sums{};
-            for (std::int32_t column = 0; column < kHidden; ++column) {
-                const auto weight = weights[static_cast<std::size_t>(row) * kHidden + column];
+            for (std::int32_t column = 0; column < hidden; ++column) {
+                const auto weight = weights[static_cast<std::size_t>(row) * hidden + column];
                 for (std::size_t token = 0; token < active; ++token) {
-                    sums[token] += weight * activation[(first + token) * kHidden + column];
+                    sums[token] += weight * activation[(first + token) * hidden + column];
                 }
             }
             for (std::size_t token = 0; token < active; ++token) {

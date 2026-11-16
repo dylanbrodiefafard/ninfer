@@ -50,6 +50,26 @@ int main() {
             explicit_dflash.proposal_head != ProposalHead::Full) {
             throw std::runtime_error("explicit DFlash settings were overridden by the artifact");
         }
+        directory["identity"] = {{"model_id", "qwen3.8-flash-next"},
+                                 {"weights_id", "f3-fp8-nvfp4"}};
+        const auto flash_next = write_fixture(directory, "startup_flash_next_dflash");
+        const auto native =
+            resolve_speculative_startup(flash_next.path, SpeculativeSelection::ArtifactDefault, {});
+        if (native.backend != SpeculativeBackend::DFlash || native.draft_tokens != 3 ||
+            native.proposal_head != ProposalHead::Full || !native.adaptive_draft) {
+            throw std::runtime_error("Flash-Next companion did not select adaptive K3 defaults");
+        }
+        if (resolve_speculative_startup(flash_next.path, SpeculativeSelection::Explicit, {})
+                .backend != SpeculativeBackend::None) {
+            throw std::runtime_error("explicit none was overridden for Flash-Next");
+        }
+        directory["objects"].erase(1);
+        const auto flash_next_base = write_fixture(directory, "startup_flash_next_base");
+        if (resolve_speculative_startup(flash_next_base.path, SpeculativeSelection::ArtifactDefault,
+                                        {})
+                .backend != SpeculativeBackend::None) {
+            throw std::runtime_error("base Flash-Next artifact enabled speculation");
+        }
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

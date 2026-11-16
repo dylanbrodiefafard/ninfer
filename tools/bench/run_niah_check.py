@@ -18,15 +18,25 @@ relative to the repo root (auto-detected) unless given as an absolute path.
     python3 tools/bench/run_niah_check.py --multikey --lengths 8k,32k,64k,128k \
         --exact-answer --temperature 1.5 --runs 2 --label multikey-sampled
 
-Outputs a per-run JSON record under profiles/bench/niah-check/ (gitignored).
+Structured suites use fixture-local answer metadata, never sent to the server:
+    python3 tools/bench/run_niah_check.py --suite multi-value --lengths 32k,128k,260k \
+        --fixture-dir out/needle/prompts --output-dir out/needle/results --key local
+
+Structured scoring requires every expected JSON value or key/value binding and
+no extras; array order is immaterial. Full answers, responses, scores, and timings
+are saved after every trial. API errors fail the gate with exit 2; wrong answers
+return exit 1. Standard fixtures retain substring or --exact-answer scoring.
+Outputs default to profiles/bench/niah-check/ (gitignored).
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -61,7 +71,10 @@ NIAH_MULTIKEY_LENGTHS = ("8k", "32k", "64k", "128k", "240k", "260k")
 NIAH_POSITIONS = ("start", "q25", "mid", "q75", "end")
 
 
-def matrix_cases(lengths, positions, multikey=False):
+HARD_SUITES = ("multi-value", "multi-query", "variable-tracking", "aggregation", "in-distribution")
+
+
+def matrix_cases(lengths, positions, multikey=False, suite="standard", fixture_dir=None):
     """Expand (lengths, positions) into (label, fixture-ref) NIAH matrix cells.
 
     The mid cell uses the bare fixture name (long_niah_{len}.json); every other
@@ -70,7 +83,12 @@ def matrix_cases(lengths, positions, multikey=False):
     out = []
     for length in lengths:
         for pos in positions:
-            if multikey:
+            if suite != "standard":
+                ref = (
+                    f"examples/cli/messages/long_niah_{suite.replace('-', '_')}_{length}_{pos}.json"
+                )
+                label = f"{suite}_{length}_{pos}"
+            elif multikey:
                 ref = f"examples/cli/messages/long_niah_multikey_{length}_{pos}.json"
                 label = f"multikey_{length}_{pos}"
             elif pos == "mid":
@@ -79,6 +97,8 @@ def matrix_cases(lengths, positions, multikey=False):
             else:
                 ref = f"examples/cli/messages/long_niah_{length}_{pos}.json"
                 label = f"context_{length}_{pos}"
+            if fixture_dir is not None:
+                ref = str(Path(fixture_dir) / Path(ref).name)
             out.append((label, ref))
     return out
 
@@ -99,11 +119,68 @@ def resolve_fixture(ref: str) -> Path:
     return p
 
 
-def load_messages(fixture: str) -> list:
-    raw = json.loads(resolve_fixture(fixture).read_text(encoding="utf-8"))
-    if isinstance(raw, list):
-        return raw
-    return raw.get("messages", [])
+def _unique_json_object(pairs: list[tuple]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def score_answer(text: str, expected: list[str] | dict[str, str], scoring: str) -> dict:
+    """Require every expected value/binding, no extras, and an unambiguous raw JSON answer.
+
+    Sets are order-independent but duplicates, non-string values, prose, and
+    Markdown wrappers fail. Object scores preserve key/value bindings. Partial
+    match counts are diagnostics only; the battery gate requires the full answer.
+    """
+    if scoring not in ("json-set", "json-object"):
+        raise ValueError(f"unknown structured scoring: {scoring}")
+    if scoring == "json-set":
+        if (
+            not isinstance(expected, list)
+            or not expected
+            or any(not isinstance(x, str) for x in expected)
+            or len(set(expected)) != len(expected)
+        ):
+            raise ValueError("json-set metadata must contain distinct expected strings")
+    elif (
+        not isinstance(expected, dict)
+        or not expected
+        or any(not isinstance(k, str) or not isinstance(v, str) for k, v in expected.items())
+    ):
+        raise ValueError("json-object metadata must contain expected string bindings")
+    result = {
+        "passed": False,
+        "matched": 0,
+        "expected_count": len(expected),
+        "unexpected": 0,
+        "error": None,
+    }
+    try:
+        answer = json.loads(text, object_pairs_hook=_unique_json_object)
+    except (ValueError, TypeError) as exc:
+        result["error"] = str(exc)
+        return result
+    if scoring == "json-set":
+        if not isinstance(answer, list) or any(not isinstance(x, str) for x in answer):
+            result["error"] = "answer must be an array of strings"
+            return result
+        values, targets = set(answer), set(expected)
+        result["matched"] = len(values & targets)
+        result["unexpected"] = len(values - targets)
+        result["passed"] = values == targets and len(answer) == len(values)
+        if len(answer) != len(values):
+            result["error"] = "answer contains duplicate values"
+    else:
+        if not isinstance(answer, dict) or any(not isinstance(x, str) for x in answer.values()):
+            result["error"] = "answer must be an object with string values"
+            return result
+        result["matched"] = sum(answer.get(key) == value for key, value in expected.items())
+        result["unexpected"] = len(set(answer) - set(expected))
+        result["passed"] = answer == expected
+    return result
 
 
 def post(base: str, key: str, body: dict, timeout: float) -> dict:
@@ -164,6 +241,11 @@ def main() -> int:
         action="store_true",
         help="run the multi-key matrix cells (32 same-form distractor records)",
     )
+    ap.add_argument("--suite", choices=("standard", *HARD_SUITES), default="standard")
+    ap.add_argument(
+        "--fixture-dir", type=Path, help="directory containing generated matrix fixtures"
+    )
+    ap.add_argument("--output-dir", type=Path, default=ROOT / "profiles" / "bench" / "niah-check")
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument(
         "--thinking",
@@ -184,6 +266,10 @@ def main() -> int:
     ap.add_argument("--label", default="niah")
     args = ap.parse_args()
 
+    if args.multikey and args.suite != "standard":
+        ap.error("--multikey applies only to --suite standard")
+    if args.runs < 1:
+        ap.error("--runs must be positive")
     key = load_key(args.key)
     if not key:
         print(
@@ -197,7 +283,7 @@ def main() -> int:
         for ref in args.fixture:
             label = Path(ref).stem
             cases.append((label, ref))
-    elif args.lengths or args.positions or args.multikey:
+    elif args.lengths or args.positions or args.multikey or args.suite != "standard":
         known_lengths = NIAH_MULTIKEY_LENGTHS if args.multikey else NIAH_LENGTHS
         lengths = (
             [p.strip() for p in args.lengths.split(",") if p.strip()]
@@ -220,16 +306,17 @@ def main() -> int:
                 raise SystemExit(
                     f"unknown NIAH position {p!r} (choose from {', '.join(NIAH_POSITIONS)})"
                 )
-        cases = matrix_cases(lengths, positions, args.multikey)
+        cases = matrix_cases(lengths, positions, args.multikey, args.suite, args.fixture_dir)
     else:
         cases = DEFAULT_FIXTURES
 
-    out_dir = ROOT / "profiles" / "bench" / "niah-check"
+    out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     record = {
         "label": args.label,
         "base": args.base,
         "model": args.model,
+        "suite": args.suite,
         "needle": args.needle,
         "exact_answer": args.exact_answer,
         "thinking": args.thinking,
@@ -240,13 +327,38 @@ def main() -> int:
         "cases": [],
     }
 
+    rec_path = out_dir / f"niah-check-{args.label}-{record['ts']}.json"
+    if rec_path.exists():
+        raise SystemExit(f"refusing to replace {rec_path}")
     all_pass = True
+    errors = 0
     for label, ref in cases:
-        messages = load_messages(ref)
+        raw = json.loads(resolve_fixture(ref).read_text(encoding="utf-8"))
+        messages = raw if isinstance(raw, list) else raw["messages"]
+        metadata = raw.get("niah") if isinstance(raw, dict) else None
+        if metadata:
+            # Validate the external answer contract before making an inference request.
+            score_answer("null", metadata["expected"], metadata["scoring"])
+        elif args.suite != "standard":
+            raise ValueError(f"hard-suite fixture lacks answer metadata: {ref}")
         n_prompt_chars = sum(len(m.get("content", "")) for m in messages)
         retrieved = 0
         total = 0
         snippets = []
+        trials = []
+        case_record = {
+            "label": label,
+            "fixture": str(ref),
+            "prompt_chars": n_prompt_chars,
+            "answer_contract": metadata,
+            "retrieved": 0,
+            "total": 0,
+            "recall": 0.0,
+            "passed": False,
+            "snippets": snippets,
+            "trials": trials,
+        }
+        record["cases"].append(case_record)
         for run in range(args.runs):
             body = {
                 "model": args.model,
@@ -263,16 +375,45 @@ def main() -> int:
             t0 = time.perf_counter()
             try:
                 data = post(args.base, key, body, args.timeout)
-            except Exception as exc:
+            except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
                 total += 1
-                snippets.append(f"RUN ERROR: {exc}")
-                print(f"  [{label}] run {run + 1}/{args.runs}: ERROR {exc}")
+                errors += 1
+                all_pass = False
+                error = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, urllib.error.HTTPError):
+                    with exc:
+                        error += ": " + exc.read().decode(errors="replace")
+                snippets.append(f"RUN ERROR: {error}")
+                trials.append({"run": run + 1, "passed": False, "error": error})
+                case_record.update(
+                    retrieved=retrieved, total=total, recall=retrieved / total, passed=False
+                )
+                rec_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+                print(f"  [{label}] run {run + 1}/{args.runs}: ERROR {error}")
                 continue
             wall = time.perf_counter() - t0
             text = content_of(data)
             total += 1
-            ok = (text.strip() == args.needle) if args.exact_answer else (args.needle in text)
+            score = (
+                score_answer(text, metadata["expected"], metadata["scoring"]) if metadata else None
+            )
+            ok = (
+                score["passed"]
+                if score
+                else ((text.strip() == args.needle) if args.exact_answer else (args.needle in text))
+            )
             retrieved += 1 if ok else 0
+            trials.append(
+                {
+                    "run": run + 1,
+                    "seed": body.get("seed"),
+                    "passed": ok,
+                    "answer": text,
+                    "score": score,
+                    "wall_seconds": wall,
+                    "response": data,
+                }
+            )
             status = "PASS" if ok else "FAIL"
             all_pass = all_pass and ok
             preview = text.strip().replace("\n", " ")
@@ -280,27 +421,20 @@ def main() -> int:
                 preview = preview[:240] + "..."
             seed_tag = f" (seed {body['seed']})" if "seed" in body else ""
             snippets.append(f"{status}{seed_tag}: {preview}")
+            case_record.update(
+                retrieved=retrieved,
+                total=total,
+                recall=retrieved / total,
+                passed=retrieved == total,
+            )
+            rec_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
             print(
                 f"  [{label}] run {run + 1}/{args.runs}: {status} "
                 f"(wall {wall:.1f}s, needle={ok})\n      {preview}"
             )
-        passed = retrieved == total and total > 0
-        record["cases"].append(
-            {
-                "label": label,
-                "fixture": str(ref),
-                "prompt_chars": n_prompt_chars,
-                "retrieved": retrieved,
-                "total": total,
-                "recall": (retrieved / total) if total else 0.0,
-                "passed": passed,
-                "snippets": snippets,
-            }
-        )
-
-    rec_path = out_dir / f"niah-check-{args.label}-{record['ts']}.json"
-    rec_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
-    print(f"\nrecord -> {rec_path.relative_to(ROOT)}")
+    record["errors"] = errors
+    rec_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    print(f"\nrecord -> {rec_path}")
     failed_cases = [c for c in record["cases"] if not c["passed"]]
     failed_runs = sum(c["total"] - c["retrieved"] for c in record["cases"])
     total_runs = sum(c["total"] for c in record["cases"])
@@ -314,7 +448,7 @@ def main() -> int:
         f"{failed_runs}/{total_runs} runs failed; "
         f"all cases must retrieve the needle in every run)"
     )
-    return 0 if all_pass else 1
+    return 2 if errors else (0 if all_pass else 1)
 
 
 if __name__ == "__main__":

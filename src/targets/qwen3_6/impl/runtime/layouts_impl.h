@@ -635,13 +635,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout,
                             linear_scratch(DFlashConfig::query_size + 2 * DFlashConfig::kv_size,
                                            DFlashConfig::hidden));
-                    scratch(layout,
-                            std::max({ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::W8G32_F16S, width, width, batch),
-                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::Q4G64_F16S, width, width, batch),
-                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::NVFP4, width, width, batch)}));
+                    scratch(
+                        layout,
+                        std::max({ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                      QType::W8G32_F16S, DFlashConfig::hidden, width, width, batch),
+                                  ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                      QType::Q4G64_F16S, DFlashConfig::hidden, width, width, batch),
+                                  ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                      QType::NVFP4, DFlashConfig::hidden, width, width, batch)}));
                     scratch(layout, linear_scratch(DFlashConfig::hidden, DFlashConfig::query_size));
                 }
                 {
@@ -651,13 +652,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             linear_scratch(2 * DFlashConfig::intermediate, DFlashConfig::hidden));
                     scratch(layout,
                             linear_scratch(DFlashConfig::hidden, DFlashConfig::intermediate));
-                    scratch(layout,
-                            std::max({ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::W8G32_F16S, width, width, batch),
-                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::Q4G64_F16S, width, width, batch),
-                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::NVFP4, width, width, batch)}));
+                    scratch(
+                        layout,
+                        std::max({ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                      QType::W8G32_F16S, DFlashConfig::hidden, width, width, batch),
+                                  ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                      QType::Q4G64_F16S, DFlashConfig::hidden, width, width, batch),
+                                  ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                      QType::NVFP4, DFlashConfig::hidden, width, width, batch)}));
                 }
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
@@ -687,12 +689,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                 QType::W8G32_F16S, logit_rows, DFlashConfig::hidden,
                                 ops::LinearPolicy::A16Only, drafts * batch, drafts * batch));
                 }
-                scratch(layout, std::max({ops::dflash2_path_select_workspace_capacity_bytes(
-                                              QType::W8G32_F16S, drafts, drafts, batch),
-                                          ops::dflash2_path_select_workspace_capacity_bytes(
-                                              QType::Q4G64_F16S, drafts, drafts, batch),
-                                          ops::dflash2_path_select_workspace_capacity_bytes(
-                                              QType::NVFP4, drafts, drafts, batch)}));
+                scratch(
+                    layout,
+                    std::max({ops::dflash2_path_select_workspace_capacity_bytes(
+                                  QType::W8G32_F16S, DFlashConfig::hidden, drafts, drafts, batch),
+                              ops::dflash2_path_select_workspace_capacity_bytes(
+                                  QType::Q4G64_F16S, DFlashConfig::hidden, drafts, drafts, batch),
+                              ops::dflash2_path_select_workspace_capacity_bytes(
+                                  QType::NVFP4, DFlashConfig::hidden, drafts, drafts, batch)}));
                 if constexpr (DFlashConfig::two_block_first > 0) {
                     {
                         auto attention = layout.scope();
@@ -705,12 +709,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                DFlashConfig::hidden));
                         scratch(
                             layout,
-                            std::max({ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::W8G32_F16S, width, width, batch),
-                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::Q4G64_F16S, width, width, batch),
-                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::NVFP4, width, width, batch)}));
+                            std::max(
+                                {ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                     QType::W8G32_F16S, DFlashConfig::hidden, width, width, batch),
+                                 ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                     QType::Q4G64_F16S, DFlashConfig::hidden, width, width, batch),
+                                 ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                     QType::NVFP4, DFlashConfig::hidden, width, width, batch)}));
                         scratch(layout,
                                 linear_scratch(DFlashConfig::hidden, DFlashConfig::query_size));
                     }
@@ -724,12 +729,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                 linear_scratch(DFlashConfig::hidden, DFlashConfig::intermediate));
                         scratch(
                             layout,
-                            std::max({ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::W8G32_F16S, width, width, batch),
-                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::Q4G64_F16S, width, width, batch),
-                                      ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
-                                          QType::NVFP4, width, width, batch)}));
+                            std::max(
+                                {ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                     QType::W8G32_F16S, DFlashConfig::hidden, width, width, batch),
+                                 ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                     QType::Q4G64_F16S, DFlashConfig::hidden, width, width, batch),
+                                 ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                     QType::NVFP4, DFlashConfig::hidden, width, width, batch)}));
                     }
                 }
                 return finish(layout);

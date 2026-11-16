@@ -8,6 +8,7 @@
 #include <iostream>
 #include <new>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -269,6 +270,64 @@ int main() {
     failures += expect_size(bundle[0].page_entitlement(), 2, "failed resize main entitlement");
     failures += expect_size(bundle[1].mapped_page_count(), 2, "failed resize backend mapping");
     failures += expect_size(bundle[1].page_entitlement(), 2, "failed resize backend entitlement");
+
+    // Withheld pages: neither free nor mapped, never taken, and back in the free set in order.
+    auto lend_plan = plan_paged_cache(12, 12, 1, {{ninfer::DType::BF16, 16, 1}});
+    ninfer::DeviceArena lend_arena(lend_plan.bytes);
+    ninfer::PagedKVPool lend_pool({lend_arena.base(), lend_arena.capacity()}, lend_plan.layout);
+    const auto rejects = [](auto&& call) {
+        try {
+            call();
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    lend_pool.withhold_pages(8, 4);
+    lend_pool.withhold_pages(2, 2);
+    failures += expect_size(lend_pool.withheld_pages(), 6, "withheld pages");
+    failures += expect_size(lend_pool.free_pages(), 6, "free pages beside withheld runs");
+    if (!lend_pool.pages_free(4, 4) || lend_pool.pages_free(3, 2) || lend_pool.pages_free(11, 2) ||
+        lend_pool.pages_free(0, 0)) {
+        ++failures;
+        std::cerr << "pages_free misreports a run\n";
+    }
+    if (!rejects([&] { lend_pool.withhold_pages(7, 2); }) ||
+        !rejects([&] { lend_pool.restore_pages(1, 2); }) ||
+        !rejects([&] { lend_pool.restore_pages(10, 4); })) {
+        ++failures;
+        std::cerr << "a withheld run accepted a page in the wrong state\n";
+    }
+    failures += expect_size(lend_pool.withheld_pages(), 6, "rejected runs change nothing");
+    // Entitlement still counts withheld pages; materialization takes only free ones, lowest first.
+    if (!lend_pool.can_reserve(12)) {
+        ++failures;
+        std::cerr << "withheld pages left the entitlement capacity\n";
+    }
+    auto lent_around = lend_pool.reserve(6);
+    lent_around.materialize_pages(6);
+    failures +=
+        expect_page_ids(lent_around.page_ids(), {0, 1, 4, 5, 6, 7}, "mapping skips withheld");
+    bool exhausted = false;
+    try {
+        auto beyond = lend_pool.reserve(1);
+        beyond.materialize_pages(1);
+    } catch (const std::logic_error&) { exhausted = true; }
+    if (!exhausted) {
+        ++failures;
+        std::cerr << "a withheld page was materialized\n";
+    }
+    lend_pool.restore_pages(8, 4);
+    auto after_restore = lend_pool.reserve(4);
+    after_restore.materialize_pages(4);
+    failures += expect_page_ids(after_restore.page_ids(), {8, 9, 10, 11}, "restored run maps");
+    lent_around.release();
+    after_restore.release();
+    lend_pool.restore_pages(2, 2);
+    failures += expect_size(lend_pool.withheld_pages(), 0, "every run restored");
+    failures += expect_size(lend_pool.free_pages(), 12, "every page free again");
+    auto whole = lend_pool.reserve(12);
+    whole.materialize_pages(12);
+    failures += expect_page_ids(whole.page_ids(), {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+                                "free set stays sorted");
 
     return failures == 0 ? 0 : fail("kv cache test failed");
 }

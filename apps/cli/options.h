@@ -41,6 +41,9 @@ struct Options {
         product::SpeculativeSelection::ArtifactDefault;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    // qwen3.8-flash-next only.
+    std::filesystem::path ngram_table_path;
+    std::optional<QsaSelectBudget> qsa_select_budget;
 
     bool capture_context_checkpoint = false;
     std::vector<std::uint32_t> context_checkpoint_marks;

@@ -23,8 +23,9 @@ buffer are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
 server must accept image or video input. Speculative residency is likewise frozen by
 `--spec none|dflash` and `--draft-tokens`. Omitting `--spec` inspects the artifact directory:
-a supported Qwen3.8 NVFP4 file containing DFlash2 selects seven draft tokens, adaptive drafting
-and the optimized proposal head; a base file stays non-speculative. `--spec none` disables
+a supported Qwen3.8-27B NVFP4 file containing DFlash2 selects seven draft tokens, adaptive drafting
+and the optimized proposal head. A Flash-Next companion selects adaptive K0..3 with the full
+shared head. A base file stays non-speculative. `--spec none` disables
 speculation explicitly. MTP execution is disabled.
 `--lm-head-draft` additionally loads the optimized proposal head. Qwen3.8-27B DFlash2 is available
 when `dflash/` is present and can be combined with `--vision`; the text-only companion consumes
@@ -236,7 +237,8 @@ frontier `E` on an exact-hit / decode-only request into the one-slot turn-rollba
 that pin; ladder heads stay. If a ladder or rollback head already sits at this `E`, the
 request succeeds with `captured_tokens = 0` and does not fill the rollback slot. A brand-new
 chat (`E == 0`) is the same quiet no-op. `true` on a server with speculation disabled
-(`--spec none`, or a base artifact without DFlash2) or with `--no-prefix-reuse` returns HTTP 400 `context_checkpoint_unavailable` before the
+(`--spec none`, or a base artifact without DFlash2), on Flash-Next even with DFlash2, or with
+`--no-prefix-reuse` returns HTTP 400 `context_checkpoint_unavailable` before the
 request is enqueued. Anthropic Messages does not accept this object.
 `POST /v1/responses/input_tokens` allows `ninfer` only when omitted or JSON `null`.
 
@@ -905,16 +907,18 @@ curl http://127.0.0.1:8080/v1/models \
 | `--keep-frac F` | Sparge prompt-prefill tile skipping on NVFP4 KV: per 128-query tile, keep the top fraction `F` `(0,1]` of 64-key tiles by mean-Q·mean-K score, plus forced leading-sink and local-window tiles. `1` is dense; decode, verify and ≤6-token chunks stay dense | `1` |
 | `--xattn-tau F` | XAttention prompt-prefill block skipping on NVFP4 KV: keep the 128-key blocks covering attention mass `F` `(0,1]` once more than 8,192 keys are visible. `1` is dense; exclusive with `--keep-frac` below `1`; decode and verify stay dense | `1` |
 | `--spec none\|dflash` | explicit backend override; MTP execution is disabled | DFlash2 if present, otherwise off |
-| `--draft-tokens N` | DFlash2 `1..7` | `7` with automatic DFlash2; otherwise unset |
-| `--adaptive-draft` | pick the live draft arm by `E[Y]/T(arm,C,L)` (nested hop acceptance; DFlash learns engine-global hop hazards from one exploration round in 32, and tree depth hazards from every tree round; forgetting least-squares T; each captured arm measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures chains `{3..N}` plus a `k=2` chain for batches of nine or more, `--draft-tokens 4` stays `{4}`; Qwen3.8 DFlash2 adds the `W=12` tree arm for batches of up to four | on with automatic DFlash2; otherwise off |
-| `--dflash-verify-width N` | pin the draft window's DFlash verify width (`W=k+1` chain, wider: packed tree, at most 16) for every batch size and disable the adaptive tree arm; chain-only targets require `W=k+1` | auto |
+| `--draft-tokens N` | 27B DFlash2 `1..7`; Flash-Next `0..3` | automatic: `7` for 27B, ceiling `3` for Flash-Next; otherwise `0` |
+| `--adaptive-draft` | Flash-Next: measured seconds per published token over K0..N per batch size, bounded exploration. 27B: pick the live draft arm by `E[Y]/T(arm,C,L)` (nested hop acceptance; DFlash learns engine-global hop hazards from one exploration round in 32, and tree depth hazards from every tree round; forgetting least-squares T; each captured arm measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures chains `{3..N}` plus a `k=2` chain for batches of nine or more, `--draft-tokens 4` stays `{4}`; Qwen3.8 DFlash2 adds the `W=12` tree arm for batches of up to four | on with automatic DFlash2; otherwise off |
+| `--dflash-verify-width N` | 27B only: pin the draft window's DFlash verify width (`W=k+1` chain, wider: packed tree, at most 16) for every batch size and disable the adaptive tree arm; chain-only targets require `W=k+1` | auto |
 | `--dflash-p-less-draft-temperature T` | Pins the DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Unset, the engine calibrates it online per p-less `--temperature` and draft length: every chain round scores eight candidate temperatures against the verified target distribution and the next round uses the best ([calibration](performance.md#dflash2-p-less-proposal-calibration-2026-10-03)) | calibrated |
-| `--lm-head-draft` | optimized proposal head | on with automatic DFlash2; otherwise off |
+| `--lm-head-draft` | 27B optimized proposal head; unsupported on Flash-Next | on with automatic 27B DFlash2; otherwise off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--context-checkpoints off\|on\|a,b,c` | automatic prefill ladder: `off` captures none, `on` uses the standard marks (24576, 36864, 53248, 77824, 102400, 151552), and a comma list sets custom marks. `on` and custom lists require DFlash, selected automatically or with `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | `off` |
+| `--ngram-table PATH` | qwen3.8-flash-next only, and required by it: the 8-bit n-gram (PLE) table file (`ngram_table.int8.bin`); other targets reject it | unset |
+| `--qsa-select-budget 512\|1024\|2048` | qwen3.8-flash-next only: complete four-token QSA blocks each query attends to beyond its tail | `512` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--default-thinking-token-budget N\|off` | cap inherited by thinking requests that omit their reasoning budget | `off` |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
@@ -1185,6 +1189,34 @@ processed by one model traversal and, when graphs are enabled, one exact-batch C
 request joins that batch only after its single-request prefill finishes; when it completes or is
 cancelled, the next boundary rebuilds the batch without an empty row.
 
+qwen3.8-flash-next runs the same scheduler with its own Program: an ordinary decode round replays
+one graph; DFlash2 uses two graphs around the host n-gram gather, over all decode-ready lanes
+(`1..12`). A prompt advances one 16,384-token super-chunk per
+prefill step (other requests decode `--mixed-forward-rounds` rounds between steps when the
+remaining prompt is at least `--mixed-forward-min-tokens`, and a short prompt may start on a spare
+lane between two steps of a long one), and admission reserves each request's prompt plus output
+bound in the shared QSA pool (`--kv-capacity`) with RAM off. RAM on uses funded output windows
+of at most 8192 tokens and secured live suspension under actual KV pressure; a request without
+feasible resources waits in the FIFO.
+Completed lanes retain QSA, exact GDN/PLE continuation, n-gram history and committed tokens.
+A matching current prefix or complete saved rewrite/occupy checkpoint reuses that frontier;
+`cached_tokens` reports its exact length and `reuse_source` is `vram_resident`, `host_ram` or
+`host_disk`. Arbitrary common
+prefixes without a complete checkpoint miss. The final sampled output token has not entered the
+model state and is not counted as reused. `cache_write: false` forks independent allocations,
+preserves its source and suppresses checkpoint captures; disposable idle state is evicted first.
+The shared RAM tier and inclusive SSD tier preserve complete QSA/GDN/PLE/tail-logit images,
+including saved rewrite/occupy boundaries. System-prefix anchors remain RAM-only. An ordinary
+source may migrate to RAM to make a disposable destination feasible; the branch itself does
+not persist. A complete DFlash2 companion enables chain-only adaptive K0..3, with the full shared
+FP8 head. Fixed K is selected with `--spec dflash --draft-tokens K`; `--adaptive-draft` uses that
+value as the ceiling. The picker learns seconds per published token independently per batch size,
+with bounded exploration. Its cyclic KV, pending features and calibration accompany retained,
+RAM and SSD continuations; live resume preserves request counters and sampling history. K0 still
+maintains this context and defers publication. `--lm-head-draft`, `--dflash-verify-width` and context
+checkpoints are unsupported. Tools, constraints, reasoning budgets, logprobs and cancellation
+behave as below.
+
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
 CPU/media preparation and completed model results whose response has not yet been released. A full
@@ -1266,7 +1298,9 @@ Automatic sizing evaluates the complete target runtime layout for the chosen con
 dtype, speculative backend, draft window, Vision setting, workspace, and CUDA Graph allowance. It
 uses a direct page-capacity calculation rather than allocation probing. Startup reports the policy,
 resolved capacity, runtime reservation, free memory after weights, automatic headroom, planned
-slack, actual free memory after complete startup, observed Graph memory, the pinned
+slack, actual free memory after complete startup, observed Graph memory, for Qwen3.8-Flash-Next
+the expert cache's own slots and the KV-pool bytes it may hold while they are unreserved
+(`expert-cache=<own>+kv-lendable=<lendable>`), the pinned
 checkpoint-image slab (`ckpt-pin=`) and its context-checkpoint head count (`ckpt-heads=`), and
 pinned-host KV RAM (`kv-ram=`) and disk (`kv-disk=`) occupancy, sizes in MiB. When `--kv-ram-capacity` is enabled, a post-warmup line reprints occupancy,
 periodic throughput lines print live host-resident `kv-ram=` used bytes plus `n=` / `restores=` /

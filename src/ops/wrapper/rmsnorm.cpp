@@ -90,21 +90,24 @@ std::int64_t validate_rmsnorm(const Tensor& x, const Tensor& weight, float eps, 
 }
 
 void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
-                  const Tensor* z, Tensor& out, cudaStream_t stream) {
+                  const Tensor* z, RmsNormGate gate, Tensor& out, cudaStream_t stream) {
     if (validate_rmsnorm(x, weight, eps, z, out) == 0) { return; }
-    detail::rmsnorm_launch(x, weight, eps, unit_offset, z, out, stream);
+    detail::rmsnorm_launch(x, weight, eps, unit_offset, z, gate, out, stream);
 }
 
 } // namespace
 
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              cudaStream_t stream) {
-    rmsnorm_impl(x, weight, eps, unit_offset, nullptr, out, stream);
+    rmsnorm_impl(x, weight, eps, unit_offset, nullptr, RmsNormGate::Silu, out, stream);
 }
 
-void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
-                   cudaStream_t stream) {
-    rmsnorm_impl(x, weight, eps, false, &z, out, stream);
+void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, RmsNormGate gate,
+                   float eps, Tensor& out, cudaStream_t stream) {
+    if (gate != RmsNormGate::Silu && gate != RmsNormGate::Sigmoid) {
+        throw std::invalid_argument("gated_rmsnorm: unknown gate activation");
+    }
+    rmsnorm_impl(x, weight, eps, false, &z, gate, out, stream);
 }
 
 namespace {

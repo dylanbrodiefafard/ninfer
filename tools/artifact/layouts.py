@@ -21,6 +21,7 @@ import torch
 
 from .numeric import (
     DirectFormat,
+    ExpertCodeFormat,
     Fp8RowFormat,
     NumericFormat,
     Nvfp4Format,
@@ -75,6 +76,24 @@ class BlockScaleGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class ExpertTilesGeometry:
+    """Byte geometry of ``moe-expert-tiles-v1`` for ``[experts, hidden, intermediate]``."""
+
+    experts: int
+    hidden: int
+    intermediate: int
+    code_bits: int
+    group_size: int
+    gate_up_tiles: int
+    gate_up_k_chunks: int
+    down_tiles: int
+    down_k_chunks: int
+    chunk_bytes: int
+    record_bytes: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class RowScaleGeometry:
     n: int
     k: int
@@ -114,6 +133,11 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("FP8_E4M3FN_ROW_BF16S",)),
 )
+MOE_EXPERT_TILES_V1 = Layout(
+    "moe-expert-tiles-v1",
+    256,
+    frozenset(("F3G32_E4M3FN", "E2M1G16_E4M3FN")),
+)
 
 LAYOUTS = MappingProxyType(
     {
@@ -123,6 +147,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCKSCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            MOE_EXPERT_TILES_V1,
         )
     }
 )
@@ -258,6 +283,55 @@ def row_scale_geometry(format: str | Fp8RowFormat, shape: Sequence[int]) -> RowS
     )
 
 
+# moe-expert-tiles-v1 chunk geometry. A chunk covers 32 matrix rows and 128 consecutive K; lane
+# L = 4 g + c of a chunk owns rows g + 8 k (k in [0,4)) and K offsets 32 c .. 32 c + 31. A gate|up
+# chunk holds 16 gate rows then the 16 up rows of the same intermediate indices.
+EXPERT_CHUNK_ROWS = 32
+EXPERT_CHUNK_K = 128
+EXPERT_GATE_UP_TILE_ROWS = 16
+EXPERT_CHUNK_LANES = 32
+F3_UNIT_CODES = 32
+
+
+def _expert_chunk_bytes(spec: ExpertCodeFormat) -> int:
+    """Bytes of one chunk: its E4M3FN scale words, then its codes."""
+
+    elements = EXPERT_CHUNK_ROWS * EXPERT_CHUNK_K
+    return elements // spec.group_size + elements * spec.code_bits // 8
+
+
+def expert_tiles_geometry(
+    format: str | ExpertCodeFormat, shape: Sequence[int]
+) -> ExpertTilesGeometry:
+    spec = _format(format)
+    if not isinstance(spec, ExpertCodeFormat):
+        raise ValueError("moe-expert-tiles-v1 requires F3G32_E4M3FN or E2M1G16_E4M3FN")
+    experts, hidden, intermediate = _shape(shape, rank=3)
+    if hidden % EXPERT_CHUNK_K or intermediate % EXPERT_CHUNK_K:
+        raise ValueError("moe-expert-tiles-v1 requires hidden and intermediate divisible by 128")
+    gate_up_tiles = intermediate // EXPERT_GATE_UP_TILE_ROWS
+    gate_up_k_chunks = hidden // EXPERT_CHUNK_K
+    down_tiles = hidden // EXPERT_CHUNK_ROWS
+    down_k_chunks = intermediate // EXPERT_CHUNK_K
+    chunk_bytes = _expert_chunk_bytes(spec)
+    chunks = gate_up_tiles * gate_up_k_chunks + down_tiles * down_k_chunks
+    record_bytes = align_up(chunks * chunk_bytes, PLANE_ALIGNMENT)
+    return ExpertTilesGeometry(
+        experts=experts,
+        hidden=hidden,
+        intermediate=intermediate,
+        code_bits=spec.code_bits,
+        group_size=spec.group_size,
+        gate_up_tiles=gate_up_tiles,
+        gate_up_k_chunks=gate_up_k_chunks,
+        down_tiles=down_tiles,
+        down_k_chunks=down_k_chunks,
+        chunk_bytes=chunk_bytes,
+        record_bytes=record_bytes,
+        payload_bytes=experts * record_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -288,6 +362,10 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row-scale-v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is MOE_EXPERT_TILES_V1:
+        if not isinstance(numeric_spec, ExpertCodeFormat):
+            raise ValueError("moe-expert-tiles-v1 requires an expert code format")
+        return expert_tiles_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
 
 
@@ -1022,15 +1100,291 @@ def dequantize_row_split(
     return physical[:, : geometry.k].to(dtype)
 
 
+@dataclass(frozen=True, slots=True)
+class ExpertMatrixWords:
+    """Natural-order stored words of one routed-expert matrix ``[rows, K]``.
+
+    ``codes`` is uint8 ``[rows, K]``: an E2M1 nibble for ``E2M1G16_E4M3FN`` or a book index in
+    ``0..7`` for ``F3G32_E4M3FN``. ``scales`` is uint8 ``[rows, K / group]`` E4M3FN words.
+    """
+
+    codes: torch.Tensor
+    scales: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class ExpertRecordWords:
+    gate: ExpertMatrixWords
+    up: ExpertMatrixWords
+    down: ExpertMatrixWords
+
+
+def _expert_spec(format: str | ExpertCodeFormat) -> ExpertCodeFormat:
+    spec = _format(format)
+    if not isinstance(spec, ExpertCodeFormat):
+        raise ValueError("expert record codecs require an expert code format")
+    return spec
+
+
+def _check_expert_words(
+    words: ExpertMatrixWords, spec: ExpertCodeFormat, rows: int, columns: int, label: str
+) -> None:
+    if words.codes.dtype != torch.uint8 or tuple(words.codes.shape) != (rows, columns):
+        raise TypeError(f"{label} codes must be uint8 with shape {(rows, columns)}")
+    scale_shape = (rows, columns // spec.group_size)
+    if words.scales.dtype != torch.uint8 or tuple(words.scales.shape) != scale_shape:
+        raise TypeError(f"{label} scales must be uint8 with shape {scale_shape}")
+    if bool((words.codes >> spec.code_bits).any()):
+        raise ValueError(f"{label} codes exceed {spec.code_bits} bits")
+    if bool((((words.scales & 0x80) != 0) | (words.scales == 0x7F)).any()):
+        raise ValueError(f"{label} scales must be nonnegative finite E4M3FN words")
+
+
+def _pack_f3_units(codes: torch.Tensor) -> torch.Tensor:
+    """Pack ``[..., 32]`` book indices into the three little-endian code words of each unit.
+
+    Code ``i < 24`` occupies the low three bits of nibble ``i % 8`` of word ``i // 8``. Bit ``j``
+    of code ``24 + n`` occupies the most significant bit of nibble ``n`` of word ``j``. Returns
+    ``[..., 12]`` bytes, word 0 first.
+    """
+
+    lead = codes.shape[:-1]
+    unit = codes.to(torch.int64)
+    low = unit[..., :24].reshape(*lead, 3, 8)
+    high = unit[..., 24:]
+    planes = torch.arange(3, dtype=torch.int64, device=codes.device).reshape(3, 1)
+    sliced = ((high.unsqueeze(-2) >> planes) & 1) << 3
+    nibble_shift = 4 * torch.arange(8, dtype=torch.int64, device=codes.device)
+    words = ((low | sliced) << nibble_shift).sum(-1)
+    byte_shift = 8 * torch.arange(4, dtype=torch.int64, device=codes.device)
+    return ((words.unsqueeze(-1) >> byte_shift) & 0xFF).to(torch.uint8).reshape(*lead, 12)
+
+
+def _encode_expert_chunks(
+    codes: torch.Tensor, scales: torch.Tensor, spec: ExpertCodeFormat
+) -> torch.Tensor:
+    """Encode ``[chunks, 32, 128]`` codes and their scales as chunk byte strings.
+
+    Local row ``rho = g + 8 k`` and K offset ``32 c + i`` belong to lane ``L = 4 g + c``. F3: the
+    unit scale of (rho, c) is byte ``4 L + k`` and its code word ``j`` is the word at
+    ``128 + 16 (32 j + L) + 4 k``. E2M1: the scale of (rho, c, h) is byte ``8 L + 2 k + h``, and
+    the code byte at ``256 + 16 (32 j + L) + 4 k + b`` holds K offsets ``32 c + 8 j + 2 b`` (low
+    nibble) and the next one (high nibble).
+    """
+
+    chunks = codes.shape[0]
+    lanes_k = (chunks, 4, 8, 4)  # (chunk, k, g, c)
+    if spec.code_bits == 3:
+        scale_bytes = scales.reshape(*lanes_k).permute(0, 2, 3, 1)
+        units = _pack_f3_units(codes.reshape(chunks, EXPERT_CHUNK_ROWS, 4, F3_UNIT_CODES))
+        code_bytes = units.reshape(*lanes_k, 3, 4).permute(0, 4, 2, 3, 1, 5)
+    else:
+        scale_bytes = scales.reshape(*lanes_k, 2).permute(0, 2, 3, 1, 4)
+        packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
+        code_bytes = packed.reshape(*lanes_k, 4, 4).permute(0, 4, 2, 3, 1, 5)
+    return torch.cat((scale_bytes.reshape(chunks, -1), code_bytes.reshape(chunks, -1)), dim=-1)
+
+
+def encode_expert_tiles_record(
+    words: ExpertRecordWords,
+    format: str | ExpertCodeFormat,
+    hidden: int,
+    intermediate: int,
+) -> torch.Tensor:
+    """Encode one routed expert's exact stored words as a ``moe-expert-tiles-v1`` record.
+
+    Gate and up are ``[intermediate, hidden]``, down is ``[hidden, intermediate]``. Gate|up chunk
+    ``(r, q)`` is chunk ``r * hidden / 128 + q``; down chunk ``(r, q)`` follows all gate|up chunks
+    at ``r * intermediate / 128 + q``. Returns a contiguous uint8 tensor of ``record_bytes``;
+    record padding is zero.
+    """
+
+    spec = _expert_spec(format)
+    geometry = expert_tiles_geometry(spec, (1, hidden, intermediate))
+    for label, matrix, rows, columns in (
+        ("gate", words.gate, intermediate, hidden),
+        ("up", words.up, intermediate, hidden),
+        ("down", words.down, hidden, intermediate),
+    ):
+        _check_expert_words(matrix, spec, rows, columns, label)
+
+    def chunked(matrix: torch.Tensor, tiles: int, k_chunks: int) -> torch.Tensor:
+        columns = matrix.shape[-1] // k_chunks
+        return (
+            matrix.reshape(tiles, EXPERT_CHUNK_ROWS, k_chunks, columns)
+            .permute(0, 2, 1, 3)
+            .reshape(tiles * k_chunks, EXPERT_CHUNK_ROWS, columns)
+        )
+
+    def gate_up(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        tiles = geometry.gate_up_tiles
+        stacked = torch.stack(
+            (
+                gate.reshape(tiles, EXPERT_GATE_UP_TILE_ROWS, -1),
+                up.reshape(tiles, EXPERT_GATE_UP_TILE_ROWS, -1),
+            ),
+            dim=1,
+        )
+        return chunked(
+            stacked.reshape(tiles * EXPERT_CHUNK_ROWS, -1), tiles, geometry.gate_up_k_chunks
+        )
+
+    codes = torch.cat(
+        (
+            gate_up(words.gate.codes, words.up.codes),
+            chunked(words.down.codes, geometry.down_tiles, geometry.down_k_chunks),
+        )
+    )
+    scales = torch.cat(
+        (
+            gate_up(words.gate.scales, words.up.scales),
+            chunked(words.down.scales, geometry.down_tiles, geometry.down_k_chunks),
+        )
+    )
+    body = _encode_expert_chunks(codes, scales, spec).reshape(-1)
+    record = torch.zeros(geometry.record_bytes, dtype=torch.uint8)
+    record[: body.numel()] = body
+    return record
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpertMatrixIndex:
+    code_byte: torch.Tensor
+    code_shift: torch.Tensor
+    sliced: torch.Tensor
+    scale_byte: torch.Tensor
+
+
+# Byte distance between consecutive F3 code words w_j of one unit (16 bytes x 32 lanes).
+_F3_WORD_STRIDE = 16 * EXPERT_CHUNK_LANES
+
+
+def _matrix_index(
+    spec: ExpertCodeFormat, chunk_base: torch.Tensor, rho: torch.Tensor, kappa: torch.Tensor
+) -> _ExpertMatrixIndex:
+    """Byte addresses of each matrix element from its chunk, local row and chunk K offset."""
+
+    g, k = rho % 8, rho // 8
+    c, i = kappa // 32, kappa % 32
+    lane = 4 * g + c
+    if spec.code_bits == 3:
+        scale_byte = chunk_base + 4 * lane + k
+        sliced = i >= 24
+        j = torch.where(sliced, torch.zeros_like(i), i // 8)
+        nibble = torch.where(sliced, i - 24, i % 8)
+        code_byte = chunk_base + 128 + 16 * (32 * j + lane) + 4 * k + nibble // 2
+        code_shift = 4 * (nibble % 2) + torch.where(sliced, 3, 0)
+    else:
+        scale_byte = chunk_base + 8 * lane + 2 * k + i // 16
+        sliced = torch.zeros_like(i, dtype=torch.bool)
+        code_byte = chunk_base + 256 + 16 * (32 * (i // 8) + lane) + 4 * k + (i % 8) // 2
+        code_shift = 4 * (i % 2)
+    return _ExpertMatrixIndex(code_byte, code_shift, sliced, scale_byte)
+
+
+@lru_cache(maxsize=4)
+def _expert_record_index(
+    format_name: str, hidden: int, intermediate: int
+) -> tuple[_ExpertMatrixIndex, _ExpertMatrixIndex, _ExpertMatrixIndex]:
+    spec = _expert_spec(format_name)
+    geometry = expert_tiles_geometry(spec, (1, hidden, intermediate))
+    chunk = geometry.chunk_bytes
+
+    def gate_up(row_offset: int) -> _ExpertMatrixIndex:
+        rows = torch.arange(intermediate, dtype=torch.int64).reshape(-1, 1)
+        columns = torch.arange(hidden, dtype=torch.int64).reshape(1, -1)
+        tile = rows // EXPERT_GATE_UP_TILE_ROWS
+        rho = rows % EXPERT_GATE_UP_TILE_ROWS + row_offset
+        base = (tile * geometry.gate_up_k_chunks + columns // EXPERT_CHUNK_K) * chunk
+        base, rho, kappa = torch.broadcast_tensors(base, rho, columns % EXPERT_CHUNK_K)
+        return _matrix_index(spec, base, rho, kappa)
+
+    rows = torch.arange(hidden, dtype=torch.int64).reshape(-1, 1)
+    columns = torch.arange(intermediate, dtype=torch.int64).reshape(1, -1)
+    down_first = geometry.gate_up_tiles * geometry.gate_up_k_chunks
+    tile = rows // EXPERT_CHUNK_ROWS
+    base = (down_first + tile * geometry.down_k_chunks + columns // EXPERT_CHUNK_K) * chunk
+    base, rho, kappa = torch.broadcast_tensors(
+        base, rows % EXPERT_CHUNK_ROWS, columns % EXPERT_CHUNK_K
+    )
+    down = _matrix_index(spec, base, rho, kappa)
+    return gate_up(0), gate_up(EXPERT_GATE_UP_TILE_ROWS), down
+
+
+def _decode_matrix(
+    record: torch.Tensor, index: _ExpertMatrixIndex, spec: ExpertCodeFormat
+) -> ExpertMatrixWords:
+    group_scale = index.scale_byte[:, :: spec.group_size]
+    scales = record[group_scale]
+    first = record[index.code_byte].to(torch.int32) >> index.code_shift
+    if spec.code_bits == 4:
+        return ExpertMatrixWords((first & 0xF).to(torch.uint8), scales)
+    second = record[torch.where(index.sliced, index.code_byte + _F3_WORD_STRIDE, index.code_byte)]
+    third = record[
+        torch.where(index.sliced, index.code_byte + 2 * _F3_WORD_STRIDE, index.code_byte)
+    ]
+    sliced = (
+        (first & 1)
+        | (((second.to(torch.int32) >> index.code_shift) & 1) << 1)
+        | (((third.to(torch.int32) >> index.code_shift) & 1) << 2)
+    )
+    return ExpertMatrixWords(torch.where(index.sliced, sliced, first & 7).to(torch.uint8), scales)
+
+
+def decode_expert_tiles_record(
+    record: Payload,
+    format: str | ExpertCodeFormat,
+    hidden: int,
+    intermediate: int,
+) -> ExpertRecordWords:
+    """Recover the natural-order stored words of one ``moe-expert-tiles-v1`` record.
+
+    The decoder addresses every element from the layout formulas independently of the encoder's
+    tensor reshapes. It rejects nonzero record padding and invalid scale words.
+    """
+
+    spec = _expert_spec(format)
+    geometry = expert_tiles_geometry(spec, (1, hidden, intermediate))
+    if _payload_length(record) != geometry.record_bytes:
+        raise ValueError(
+            f"expert record has {_payload_length(record)} bytes, expected {geometry.record_bytes}"
+        )
+    raw = _payload_tensor(record, torch.device("cpu"))
+    chunks = (
+        geometry.gate_up_tiles * geometry.gate_up_k_chunks
+        + geometry.down_tiles * geometry.down_k_chunks
+    )
+    used = chunks * geometry.chunk_bytes
+    if bool(raw[used:].any()):
+        raise ValueError("expert record padding must be zero")
+    gate, up, down = _expert_record_index(spec.name, hidden, intermediate)
+    words = ExpertRecordWords(
+        _decode_matrix(raw, gate, spec),
+        _decode_matrix(raw, up, spec),
+        _decode_matrix(raw, down, spec),
+    )
+    for label, matrix, rows, columns in (
+        ("gate", words.gate, intermediate, hidden),
+        ("up", words.up, intermediate, hidden),
+        ("down", words.down, hidden, intermediate),
+    ):
+        _check_expert_words(matrix, spec, rows, columns, label)
+    return words
+
+
 __all__ = [
     "BLOCKSCALE_K16_M128X4_V1",
     "CONTIGUOUS_LE_V1",
     "K_ALIGNMENT",
     "LAYOUTS",
+    "MOE_EXPERT_TILES_V1",
     "PLANE_ALIGNMENT",
     "ROW_SCALE_V1",
     "ROW_SPLIT_K128_V1",
     "BlockScaleGeometry",
+    "ExpertMatrixWords",
+    "ExpertRecordWords",
+    "ExpertTilesGeometry",
     "Layout",
     "RowPlanes",
     "RowScaleGeometry",
@@ -1039,16 +1393,19 @@ __all__ = [
     "assemble_row_planes",
     "block_scale_geometry",
     "decode_direct",
+    "decode_expert_tiles_record",
     "decode_fp8_row_scaled_words",
     "decode_nvfp4_words",
     "decode_row_split_codes",
     "dequantize_fp8_row_scaled",
     "dequantize_row_split",
     "encode_direct",
+    "encode_expert_tiles_record",
     "encode_fp8_row_scaled",
     "encode_nvfp4",
     "encode_row_split",
     "encoded_size",
+    "expert_tiles_geometry",
     "gather_row_planes",
     "get_layout",
     "row_scale_geometry",

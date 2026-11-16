@@ -23,6 +23,27 @@ void launch_nvfp4_a16_mma(const Tensor& x, const Weight& weight, Tensor& out, cu
     case Nvfp4Problem::DflashAttnOut:
         run.template operator()<Nvfp4DflashAttnOutGeometry>();
         return;
+    case Nvfp4Problem::FlashNextMixerOut:
+        run.template operator()<Nvfp4FlashNextMixerOutGeometry>();
+        return;
+    case Nvfp4Problem::FlashNextDflashFeature:
+        run.template operator()<Nvfp4FlashNextDflashFeatureGeometry>();
+        return;
+    case Nvfp4Problem::FlashNextDflashQkv:
+        run.template operator()<Nvfp4FlashNextDflashQkvGeometry>();
+        return;
+    case Nvfp4Problem::FlashNextDflashAttnOut:
+        run.template operator()<Nvfp4FlashNextDflashAttnOutGeometry>();
+        return;
+    case Nvfp4Problem::FlashNextDflashConvProj:
+        run.template operator()<Nvfp4FlashNextDflashConvProjGeometry>();
+        return;
+    case Nvfp4Problem::FlashNextDflashGateUp:
+        run.template operator()<Nvfp4FlashNextDflashGateUpGeometry>();
+        return;
+    case Nvfp4Problem::FlashNextDflashDown:
+        run.template operator()<Nvfp4FlashNextDflashDownGeometry>();
+        return;
     default:
         throw std::invalid_argument("NVFP4 A16 MMA: unsupported problem");
     }

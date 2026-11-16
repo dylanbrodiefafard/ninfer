@@ -19,12 +19,12 @@ namespace ninfer::targets::qwen3_6::detail {
 namespace {
 
 constexpr std::uint32_t kRamMagic      = 0x4D41524E;
-constexpr std::uint32_t kRamVersion    = 5;
-constexpr std::size_t kSectionCount    = 12;
+constexpr std::uint32_t kRamVersion    = 6;
+constexpr std::size_t kSectionCount    = 14;
 constexpr std::size_t kHostAlign       = 8;
 constexpr std::size_t kDeviceAlign     = 256;
 constexpr std::size_t kFingerprint     = 56;
-constexpr std::size_t kLadderMetaBytes = 88;
+constexpr std::size_t kLadderMetaBytes = 104;
 
 std::size_t align_up(std::size_t value, std::size_t align) {
     return (value + align - 1) & ~(align - 1);
@@ -169,7 +169,7 @@ struct HeaderView {
     std::vector<RamLadderImage> ladder_images;
 };
 
-constexpr std::size_t kFixedHeader      = 364;
+constexpr std::size_t kFixedHeader      = 396;
 constexpr std::size_t kDiskTicketOffset = 156;
 
 std::size_t header_bytes_for(std::uint32_t text_planes, std::uint32_t backend_planes,
@@ -291,21 +291,30 @@ HeaderView read_header(const void* block, std::size_t bytes) {
         index.hash.lo  = meta.u64();
         index.hash.hi  = meta.u64();
         RamLadderImage image;
-        image.frontier        = index.frontier;
-        image.hash            = index.hash;
-        image.kind            = index.kind;
-        const auto conv_off   = meta.u64();
-        const auto rec_off    = meta.u64();
-        const auto hidden_off = meta.u64();
-        const auto dflash_off = meta.u64();
-        image.conv_bytes      = static_cast<std::size_t>(meta.u64());
-        image.recurrent_bytes = static_cast<std::size_t>(meta.u64());
-        image.hidden_bytes    = static_cast<std::size_t>(meta.u64());
-        image.dflash_bytes    = static_cast<std::size_t>(meta.u64());
-        image.conv            = image.conv_bytes != 0 ? raw + conv_off : nullptr;
-        image.recurrent       = image.recurrent_bytes != 0 ? raw + rec_off : nullptr;
-        image.hidden          = image.hidden_bytes != 0 ? raw + hidden_off : nullptr;
-        image.dflash          = image.dflash_bytes != 0 ? raw + dflash_off : nullptr;
+        image.frontier            = index.frontier;
+        image.hash                = index.hash;
+        image.kind                = index.kind;
+        const auto conv_off       = meta.u64();
+        const auto rec_off        = meta.u64();
+        const auto hidden_off     = meta.u64();
+        const auto dflash_off     = meta.u64();
+        image.conv_bytes          = static_cast<std::size_t>(meta.u64());
+        image.recurrent_bytes     = static_cast<std::size_t>(meta.u64());
+        image.hidden_bytes        = static_cast<std::size_t>(meta.u64());
+        image.dflash_bytes        = static_cast<std::size_t>(meta.u64());
+        image.conv                = image.conv_bytes != 0 ? raw + conv_off : nullptr;
+        image.recurrent           = image.recurrent_bytes != 0 ? raw + rec_off : nullptr;
+        image.hidden              = image.hidden_bytes != 0 ? raw + hidden_off : nullptr;
+        image.dflash              = image.dflash_bytes != 0 ? raw + dflash_off : nullptr;
+        const auto flash_next_off = meta.u64();
+        const auto flash_next_len = meta.u64();
+        if (flash_next_off > h.entry_bytes || flash_next_len > h.entry_bytes - flash_next_off) {
+            throw std::logic_error("RAM Flash-Next checkpoint image is truncated");
+        }
+        if (flash_next_len != 0) {
+            image.flash_next_state = {reinterpret_cast<const std::byte*>(raw + flash_next_off),
+                                      static_cast<std::size_t>(flash_next_len)};
+        }
         h.ladders.push_back(index);
         h.ladder_images.push_back(image);
     }
@@ -1028,7 +1037,13 @@ KVRamCache::HostKvView KVRamCache::host_kv(std::uint64_t entry_id) const {
     view.hidden_bytes             = static_cast<std::size_t>(header.tail_hidden_bytes);
     view.rewrite_hidden_bytes     = static_cast<std::size_t>(header.length[9]);
     view.cyclic_bytes             = static_cast<std::size_t>(header.cyclic_lane_bytes);
-    view.ladder_images            = header.ladder_images;
+    view.flash_next_state         = {
+        reinterpret_cast<const std::byte*>(section_ptr(record.block, header, 12)),
+        static_cast<std::size_t>(header.length[12])};
+    view.flash_next_rewrite = {
+        reinterpret_cast<const std::byte*>(section_ptr(record.block, header, 13)),
+        static_cast<std::size_t>(header.length[13])};
+    view.ladder_images = header.ladder_images;
     (void)raw;
     return view;
 }
@@ -1141,7 +1156,8 @@ std::size_t KVRamCache::live_image_budget(const PagedKVPool& text, const PagedKV
                                           std::size_t ledger_tokens, std::size_t identity_bytes,
                                           std::size_t conv_bytes, std::size_t recurrent_bytes,
                                           std::size_t hidden_bytes, std::size_t cyclic_bytes,
-                                          std::size_t checkpoint_count) {
+                                          std::size_t checkpoint_count,
+                                          std::size_t flash_next_bytes) {
     std::size_t bytes =
         header_bytes_for(static_cast<std::uint32_t>(text.plane_count()),
                          backend ? static_cast<std::uint32_t>(backend->plane_count()) : 0,
@@ -1162,11 +1178,14 @@ std::size_t KVRamCache::live_image_budget(const PagedKVPool& text, const PagedKV
     add(hidden_bytes);
     add(cyclic_bytes);
     add(cyclic_bytes);
+    add(flash_next_bytes);
+    add(flash_next_bytes);
     for (std::size_t i = 0; i < checkpoint_count; ++i) {
         add(conv_bytes);
         add(recurrent_bytes);
         add(hidden_bytes);
         add(cyclic_bytes);
+        add(flash_next_bytes);
     }
     return align_up(bytes, kDeviceAlign);
 }
@@ -1379,6 +1398,13 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
     lengths[10] = source.dflash_local ? source.dflash_local->lane_host_bytes() : 0;
     lengths[11] =
         source.dflash_local && source.rewrite_valid ? source.dflash_local->lane_host_bytes() : 0;
+    lengths[12] = source.flash_next_state.size();
+    lengths[13] = source.rewrite_valid ? source.flash_next_rewrite.size() : 0;
+    if (!source.flash_next_state.empty() &&
+        (source.gdn != nullptr || source.tail_hidden != nullptr ||
+         (source.rewrite_valid && lengths[13] != lengths[12]))) {
+        throw std::invalid_argument("RAM Flash-Next continuation schema is inconsistent");
+    }
     if ((lengths[5] != 0 || lengths[7] != 0) &&
         (source.rewrite_state.conv == nullptr || source.rewrite_state.recurrent == nullptr)) {
         throw std::invalid_argument("RAM capture rewrite checkpoint has no GDN host image");
@@ -1402,20 +1428,25 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
     }
 
     struct LadderLayout {
-        std::uint64_t conv_off   = 0;
-        std::uint64_t rec_off    = 0;
-        std::uint64_t hidden_off = 0;
-        std::uint64_t dflash_off = 0;
-        std::uint64_t conv_len   = 0;
-        std::uint64_t rec_len    = 0;
-        std::uint64_t hidden_len = 0;
-        std::uint64_t dflash_len = 0;
+        std::uint64_t conv_off       = 0;
+        std::uint64_t rec_off        = 0;
+        std::uint64_t hidden_off     = 0;
+        std::uint64_t dflash_off     = 0;
+        std::uint64_t conv_len       = 0;
+        std::uint64_t rec_len        = 0;
+        std::uint64_t hidden_len     = 0;
+        std::uint64_t dflash_len     = 0;
+        std::uint64_t flash_next_off = 0;
+        std::uint64_t flash_next_len = 0;
     };
 
     std::vector<LadderLayout> ladder_layout(source.ladder_heads.size());
     for (std::size_t i = 0; i < source.ladder_heads.size(); ++i) {
         const RamLadderHead& head = source.ladder_heads[i];
-        auto place                = [&](std::size_t bytes, std::uint64_t& off, std::uint64_t& len) {
+        if (head.flash_next_state.size() != lengths[12]) {
+            throw std::invalid_argument("RAM Flash-Next checkpoint geometry mismatch");
+        }
+        auto place = [&](std::size_t bytes, std::uint64_t& off, std::uint64_t& len) {
             if (bytes == 0) { return; }
             cursor = align_up(cursor, kDeviceAlign);
             off    = cursor;
@@ -1426,6 +1457,8 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
         place(head.recurrent_bytes, ladder_layout[i].rec_off, ladder_layout[i].rec_len);
         place(head.hidden_bytes, ladder_layout[i].hidden_off, ladder_layout[i].hidden_len);
         place(head.dflash_bytes, ladder_layout[i].dflash_off, ladder_layout[i].dflash_len);
+        place(head.flash_next_state.size(), ladder_layout[i].flash_next_off,
+              ladder_layout[i].flash_next_len);
     }
     header.entry_bytes  = align_up(cursor, kDeviceAlign);
     header.header_bytes = header_bytes;
@@ -1540,6 +1573,8 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
             w.u64(layout.rec_len);
             w.u64(layout.hidden_len);
             w.u64(layout.dflash_len);
+            w.u64(layout.flash_next_off);
+            w.u64(layout.flash_next_len);
         }
 
         if (lengths[0] != 0) {
@@ -1622,9 +1657,19 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
             host_copies.push_back(
                 {raw + header.offset[11], source.rewrite_state.dflash, lengths[11]});
         }
+        for (const auto& [index, image] :
+             {std::pair{12U, source.flash_next_state}, std::pair{13U, source.flash_next_rewrite}}) {
+            if (lengths[index] != 0) {
+                host_copies.push_back({raw + header.offset[index], image.data(), lengths[index]});
+            }
+        }
         for (std::size_t i = 0; i < source.ladder_heads.size(); ++i) {
             const RamLadderHead& head  = source.ladder_heads[i];
             const LadderLayout& layout = ladder_layout[i];
+            if (layout.flash_next_len != 0) {
+                host_copies.push_back({raw + layout.flash_next_off, head.flash_next_state.data(),
+                                       head.flash_next_state.size()});
+            }
             if (layout.conv_len != 0) {
                 if (head.conv == nullptr) {
                     throw std::invalid_argument("RAM ladder conv image is null");
@@ -1790,6 +1835,11 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
             header.length[9] != target.rewrite_checkpoint_hidden->bytes()) {
             throw std::logic_error("RAM entry rewrite-checkpoint hidden geometry mismatch");
         }
+        if (header.length[12] != target.flash_next_state.size() ||
+            (target.keep_rewrite_checkpoint && header.length[13] != 0 &&
+             header.length[13] != target.flash_next_rewrite.size())) {
+            throw std::logic_error("RAM Flash-Next continuation geometry mismatch");
+        }
         drop_pending_save(entry_id);
     }
     // The block's capture must land before it is read. The scheduler polls copies_ready() while
@@ -1896,7 +1946,26 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
         const bool unpack_rewrite = target.keep_rewrite_checkpoint &&
                                     (!context_head || header.rewrite_frontier <= target.reuse_base);
         std::vector<HostCopy> rewrite_copies;
-        rewrite_copies.reserve(3);
+        rewrite_copies.reserve(5);
+        if (!target.flash_next_state.empty()) {
+            const auto image =
+                context_head ? matched_head->flash_next_state
+                : is_rewrite_checkpoint_restore(target.reuse)
+                    ? std::span<const std::byte>(
+                          reinterpret_cast<const std::byte*>(section_ptr(raw, header, 13)),
+                          static_cast<std::size_t>(header.length[13]))
+                    : std::span<const std::byte>(
+                          reinterpret_cast<const std::byte*>(section_ptr(raw, header, 12)),
+                          static_cast<std::size_t>(header.length[12]));
+            if (image.size() != target.flash_next_state.size()) {
+                throw std::logic_error("RAM selected Flash-Next continuation is incomplete");
+            }
+            rewrite_copies.push_back({target.flash_next_state.data(), image.data(), image.size()});
+        }
+        if (unpack_rewrite && header.length[13] != 0) {
+            rewrite_copies.push_back({target.flash_next_rewrite.data(), raw + header.offset[13],
+                                      static_cast<std::size_t>(header.length[13])});
+        }
         if (unpack_rewrite && target.gdn != nullptr &&
             (header.length[5] != 0 || header.length[7] != 0)) {
             if (target.rewrite_state.conv == nullptr || target.rewrite_state.recurrent == nullptr) {
@@ -1932,8 +2001,8 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
         }
         // After every earlier reader or writer of the lane's image, but not behind the KV and
         // state H2D above: the block's contents completed before prior_done was waited.
-        cudaEvent_t image_fence = target.rewrite_state.copies_done;
-        host_copies_.run(rewrite_copies, std::span(&image_fence, 1), target.stream);
+        const std::array image_fences{target.rewrite_state.copies_done, target.flash_next_writable};
+        host_copies_.run(rewrite_copies, image_fences, target.stream);
     } catch (...) {
         std::lock_guard lock(io_mutex_);
         const auto it = records_.find(entry_id);

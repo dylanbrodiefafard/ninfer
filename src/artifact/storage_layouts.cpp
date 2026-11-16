@@ -82,6 +82,10 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "NVFP4";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
+    case NumericFormat::F3G32_E4M3FN:
+        return "F3G32_E4M3FN";
+    case NumericFormat::E2M1G16_E4M3FN:
+        return "E2M1G16_E4M3FN";
     }
     return {};
 }
@@ -96,6 +100,8 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "blockscale-k16-m128x4-v1";
     case StorageLayout::RowScaleV1:
         return "row-scale-v1";
+    case StorageLayout::MoeExpertTilesV1:
+        return "moe-expert-tiles-v1";
     }
     return {};
 }
@@ -137,6 +143,9 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     }
     if (layout == StorageLayout::RowScaleV1) {
         return row_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::MoeExpertTilesV1) {
+        return expert_tiles_geometry(format, shape).encoded_bytes;
     }
     throw ArtifactError("unknown tensor layout");
 }
@@ -213,6 +222,48 @@ RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::u
     out.scale_plane_bytes = checked_mul(out.rows, 2, "FP8 scale plane bytes");
     out.encoded_bytes =
         checked_add(out.scale_plane_offset, out.scale_plane_bytes, "FP8 tensor encoded size");
+    return out;
+}
+
+ExpertTilesGeometry expert_tiles_geometry(NumericFormat format,
+                                          std::span<const std::uint64_t> shape) {
+    // A chunk covers 32 rows by 128 K: one E4M3FN scale per group, then the codes.
+    constexpr std::uint64_t kChunkRows      = 32;
+    constexpr std::uint64_t kChunkK         = 128;
+    constexpr std::uint64_t kGateUpTileRows = 16;
+    std::uint64_t code_bits                 = 0;
+    std::uint64_t group                     = 0;
+    if (format == NumericFormat::F3G32_E4M3FN) {
+        code_bits = 3;
+        group     = 32;
+    } else if (format == NumericFormat::E2M1G16_E4M3FN) {
+        code_bits = 4;
+        group     = 16;
+    } else {
+        throw ArtifactError("moe-expert-tiles-v1 requires F3G32_E4M3FN or E2M1G16_E4M3FN");
+    }
+    if (shape.size() != 3 || shape[0] == 0 || shape[1] == 0 || shape[2] == 0) {
+        throw ArtifactError("moe-expert-tiles-v1 requires a positive rank-three shape");
+    }
+    if (shape[1] % kChunkK != 0 || shape[2] % kChunkK != 0) {
+        throw ArtifactError(
+            "moe-expert-tiles-v1 requires hidden and intermediate divisible by 128");
+    }
+
+    ExpertTilesGeometry out;
+    out.experts                            = shape[0];
+    out.hidden                             = shape[1];
+    out.intermediate                       = shape[2];
+    constexpr std::uint64_t chunk_elements = kChunkRows * kChunkK;
+    out.chunk_bytes    = chunk_elements / group + chunk_elements * code_bits / 8;
+    out.gate_up_chunks = checked_mul(out.intermediate / kGateUpTileRows, out.hidden / kChunkK,
+                                     "expert gate|up chunks");
+    out.down_chunks =
+        checked_mul(out.hidden / kChunkRows, out.intermediate / kChunkK, "expert down chunks");
+    const auto chunks = checked_add(out.gate_up_chunks, out.down_chunks, "expert chunks");
+    out.record_bytes  = align_up(checked_mul(chunks, out.chunk_bytes, "expert record bytes"),
+                                 kTensorAlignment, "expert record bytes");
+    out.encoded_bytes = checked_mul(out.experts, out.record_bytes, "expert tensor encoded size");
     return out;
 }
 

@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -60,6 +61,70 @@ inline std::vector<float> make_bf16_activation(std::int32_t rows, std::int32_t t
     fill_uniform(values, seed, -0.01F, 0.01F);
     round_to_bf16(values);
     return values;
+}
+
+// An A16-only NVFP4 weight as the Flash-Next artifacts store it: input_scale_divisor 0, so no W4A4
+// route can consume it.
+inline quantized_weight::PackedWeight make_nvfp4_a16_weight(std::int32_t n, std::int32_t k,
+                                                            std::uint32_t seed) {
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 0.0F;
+    return quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
+}
+
+// The patterned NVFP4 fixture repeats each row's codes every 16 rows and its scales every 8 rows,
+// so rows at equal offsets inside 16-aligned output ranges are identical and a misrouted range
+// would still match the oracle. XOR-ing every E2M1 code of a row with a multiplicative hash of the
+// row index gives each range its own weights. The oracle decodes the same modified payload.
+inline quantized_weight::PackedWeight
+with_distinct_nvfp4_rows(quantized_weight::PackedWeight packed) {
+    if (packed.weight.qtype != QType::NVFP4) {
+        throw std::invalid_argument("with_distinct_nvfp4_rows requires an NVFP4 weight");
+    }
+    const std::size_t row_bytes = static_cast<std::size_t>(packed.weight.k) / 2;
+    for (std::int32_t row = 0; row < packed.weight.n; ++row) {
+        const auto mask =
+            static_cast<std::uint8_t>((static_cast<std::uint32_t>(row) * 2654435761U) >> 28);
+        const auto pair     = static_cast<std::uint8_t>(mask | (mask << 4));
+        std::uint8_t* codes = packed.payload.data() + static_cast<std::size_t>(row) * row_bytes;
+        for (std::size_t byte = 0; byte < row_bytes; ++byte) { codes[byte] ^= pair; }
+    }
+    return packed;
+}
+
+// The patterned FP8 fixture repeats each row's codes every 16 rows and its multipliers every 4
+// rows, so rows at equal offsets inside 16-aligned output ranges are identical and a misrouted
+// range would still match the oracle. A per-row/column hash flips code signs, which keeps every
+// E4M3FN code finite, and each row receives its own BF16 multiplier in [2^-9, 2^-8). The oracle
+// decodes the same modified payload.
+inline quantized_weight::PackedWeight
+with_distinct_fp8_rows(quantized_weight::PackedWeight packed) {
+    if (packed.weight.qtype != QType::FP8_E4M3FN_ROW_BF16S) {
+        throw std::invalid_argument("with_distinct_fp8_rows requires an FP8 weight");
+    }
+    const auto mix = [](std::uint32_t value) {
+        value ^= value >> 16;
+        value *= 0x7feb352dU;
+        value ^= value >> 15;
+        value *= 0x846ca68bU;
+        value ^= value >> 16;
+        return value;
+    };
+    const auto row_bytes = static_cast<std::size_t>(packed.weight.k);
+    for (std::int32_t row = 0; row < packed.weight.n; ++row) {
+        const std::uint32_t row_hash = mix(static_cast<std::uint32_t>(row) * 2654435761U);
+        std::uint8_t* codes = packed.payload.data() + static_cast<std::size_t>(row) * row_bytes;
+        for (std::size_t column = 0; column < row_bytes; ++column) {
+            const std::uint32_t hash = mix(row_hash ^ static_cast<std::uint32_t>(column));
+            codes[column] = static_cast<std::uint8_t>(codes[column] ^ ((hash & 1U) << 7));
+        }
+        quantized_weight::detail::store_u16_le(
+            packed.payload,
+            static_cast<std::size_t>(packed.scale_plane_offset) + static_cast<std::size_t>(row) * 2,
+            static_cast<std::uint16_t>(0x3b00U | (row_hash >> 25)));
+    }
+    return packed;
 }
 
 class DevicePackedWeight {

@@ -574,7 +574,7 @@ void Variant::gdn_output_projection(const Tensor& output, const Tensor& norm_wei
         ops::linear_add(activation, weight, residual, stream);
         return;
     }
-    ops::gated_rmsnorm(output, norm_weight, gate, eps, normalized, stream);
+    ops::gated_rmsnorm(output, norm_weight, gate, ops::RmsNormGate::Silu, eps, normalized, stream);
     const Tensor hidden = normalized.view({TextConfig::value_dim, tokens});
     if (panels) {
         for (std::int32_t offset = 0; offset < tokens; offset += route_tokens) {

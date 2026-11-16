@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -172,6 +173,12 @@ struct BatchedGeneratedRound {
     // True when the sampler was armed with a protected, valid cycle exclusion for
     // that row's root selection. This does not claim the unmodified draw differed.
     std::array<bool, kMaximumConcurrency> cycle_exclusions{};
+    // decode_batch only (never a mixed round): a row whose request cannot continue for a
+    // request-local reason found before sampling (an output constraint that leaves no eligible
+    // token). The target produced nothing for it and already released its lane, and the executor
+    // fails that request with this RequestError while the other rows commit normally. Its token
+    // and logprob slots are unspecified.
+    std::array<std::exception_ptr, kMaximumConcurrency> row_errors{};
 };
 
 // Whether other requests are decode-ready while a prefill step runs. An Exclusive step advances
