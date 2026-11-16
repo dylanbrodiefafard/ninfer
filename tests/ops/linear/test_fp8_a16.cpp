@@ -1,5 +1,6 @@
 #include "ops/input_projection_test_common.h"
 #include "ops/linear/linear_test_common.h"
+#include "ops/sanitizer_scope.h"
 
 #include <array>
 #include <cstdint>
@@ -146,15 +147,26 @@ int run_fp8_a16() {
     return failures;
 }
 
+int run_sanitizer() {
+    constexpr std::array invocations{
+        Invocation{9, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    return run_shape("FP8_A16 mixer output sanitizer", ActivationCompute::A16,
+                     make_distinct_fp8_weight,
+                     {2560, 6144, 829U, Comparison::Sampled, true, invocations});
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (!ninfer::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     try {
-        const int failures = run_fp8_a16();
+        const int failures =
+            ninfer::test::sanitizer_scope(argc, argv) ? run_sanitizer() : run_fp8_a16();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

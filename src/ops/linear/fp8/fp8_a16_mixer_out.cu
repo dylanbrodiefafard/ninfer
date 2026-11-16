@@ -64,7 +64,8 @@ template <int TileTokens>
 void launch_small_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Schedule =
         typename Fp8FlashNextA16SmallTMmaProductionSchedule<Geometry, TileTokens>::Type;
-    fp8_a16_small_t_mma_kernel<Geometry, TileTokens, Schedule, Fp8ContiguousOutput, true>
+    fp8_a16_small_t_mma_kernel<Geometry, TileTokens, Schedule, Fp8ContiguousOutput, true,
+                               TileTokens == 16>
         <<<Geometry::kOutputRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),

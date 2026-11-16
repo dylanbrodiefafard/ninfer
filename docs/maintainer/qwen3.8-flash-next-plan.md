@@ -709,6 +709,29 @@ token (well under 1 ms at queue depth 16) before layer 1 of the step.
 
 - **Always resident.** Everything every token uses stays in VRAM for the life of the model and
   never enters the expert cache: head, attention/GDN/QSA projections and controls,
+### FP8 mixer-output double buffering (2026-11-16)
+
+The FP8 A16 mixer-output Linear `[2560,6144]` uses two K512 code/activation staging buffers
+at T=9..16. Its eight K64 warp partitions, FP32 accumulation/reduction and row-scale epilogue
+are unchanged. Static shared memory is 48 KiB; other widths and the 27B vocabulary profiles
+retain the single-buffer instantiation. `tools.kdev recipe --idea profiled_overhead` admitted
+this same-family experiment against the single-buffer staging/wait attribution.
+
+Cold public-Op medians on the RTX 5090, CUDA 13.1, sm_120a (150 repetitions, alternating
+baseline/after/after/baseline, mean of two medians): T=9, 22.528 → 16.384 us (-27.3%);
+T=15, 24.416 → 18.432 us (-24.5%); T=16, 23.552 → 18.432 us (-21.7%). Every width in
+T=9..16 improves. The T=8 control is identical; the T=17 control differs by 0.6%.
+NCU T=15 duration falls from 21.696 to 18.144 us; barrier stall share rises from 11.5% to
+18.9%, so stall shares are not interpreted as recoverable latency or a measured stall-share
+reduction. The kept schedule explicitly overlaps next-group copies with the current MMA.
+
+The complete FP8 Linear FP64-oracle suite passes, including full-output mixer checks, graph
+replay and both vocabulary geometries. Focused memcheck: 0 errors; racecheck: 0 hazards;
+clang-tidy: 0 findings; `-Werror` build passes. Evidence: `out/sol/small-item4-ab.log`,
+`small-item4-oracle.log` and `profiles/ncu/fn_small_item4_{baseline,after}.ncu-rep`.
+This is an Op-only improvement; round-level measurements are omitted because the expected
+round delta is below the established host spread.
+
   hyper-connections, PLE projections, the router and shared-expert gate, and all 48 shared
   experts (the token embedding is a per-token row gather and lives in mapped host memory).
   Shared experts are NVFP4 with GPTQ and MSE scales in the chosen recipe (133 MB, about

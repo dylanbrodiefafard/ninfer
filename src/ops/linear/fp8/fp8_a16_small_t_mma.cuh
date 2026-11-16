@@ -4,7 +4,10 @@
 //
 // A CTA owns sixteen output rows and splits K across compile-time-selected warps. Persistent E4M3
 // codes are widened exactly to BF16 MMA operands; the represented BF16 row multiplier is applied
-// once to the complete FP32 dot product. The public activation is never quantized.
+// once to the complete FP32 dot product. The public activation is never quantized. Optional
+// double buffering overlaps the next K group with MMA using two disjoint code/activation tiles;
+// commit/wait plus CTA barriers protect consumption and reuse, and the final wait drains both
+// stages before their union storage becomes reduction partials.
 
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
@@ -19,7 +22,7 @@
 namespace ninfer::ops::detail {
 
 template <class Geometry, int ActiveTokens, class Schedule, class Output = Fp8ContiguousOutput,
-          bool MaskedColumns = false>
+          bool MaskedColumns = false, bool DoubleBuffered = false>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_small_t_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
@@ -32,6 +35,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
     constexpr int kGroups     = kHidden / kGroupK;
     constexpr int kTileTokens = Schedule::kTileTokens;
     constexpr int kTokenMmas  = kTileTokens / 8;
+    constexpr int kStages     = DoubleBuffered ? 2 : 1;
     static_assert((kHidden % kGroupK) == 0);
     static_assert((Geometry::kOutputRows % kRowsPerCta) == 0);
     static_assert(ActiveTokens >= 1 && ActiveTokens <= kTileTokens);
@@ -40,8 +44,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
 
     union SharedStorage {
         struct {
-            std::uint8_t codes[kRowsPerCta][kGroupK];
-            __nv_bfloat16 activations[kWarps][kTileTokens * kTileK];
+            std::uint8_t codes[kStages][kRowsPerCta][kGroupK];
+            __nv_bfloat16 activations[kStages][kWarps][kTileTokens * kTileK];
         } staging;
 
         float partial[kWarps * kTokenMmas * 32 * 4];
@@ -59,7 +63,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
     const int row0         = static_cast<int>(blockIdx.x) * kRowsPerCta;
     const int live_columns = MaskedColumns ? columns : ActiveTokens;
 
-    const auto stage_activation = [&](int group_k0) {
+    const auto stage_activation = [&](int slot, int group_k0) {
         constexpr auto kActivationCache =
             Schedule::kActivationCache == Fp8A16SmallTMmaCache::Default ? Cache::ca : Cache::cg;
         constexpr bool kPadded =
@@ -70,7 +74,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
             const int token = item / (kTileK / 8);
             const int k8    = item - token * (kTileK / 8);
             auto* destination =
-                &x_shared[warp][token * kTileK + fp8_a16_shared_col_64(token, k8 * 8)];
+                &x_shared[slot][warp][token * kTileK + fp8_a16_shared_col_64(token, k8 * 8)];
             if constexpr (!MaskedColumns && (!kPadded || ActiveTokens == kTileTokens)) {
                 cp_async<16, kActivationCache>(destination,
                                                x + static_cast<std::int64_t>(token) * kHidden +
@@ -86,7 +90,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
         }
     };
 
-    const auto stage_codes = [&](int group_k0) {
+    const auto stage_codes = [&](int slot, int group_k0) {
         constexpr auto kWeightCache =
             Schedule::kWeightCache == Fp8A16SmallTMmaCache::Default ? Cache::ca : Cache::cg;
 #pragma unroll
@@ -94,7 +98,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
             const int row = warp * Schedule::kRowsPerLoaderWarp + row_item;
             for (int chunk = lane; chunk < kGroupK / 16; chunk += 32) {
                 const int swizzled_chunk = chunk ^ (row & 7);
-                cp_async<16, kWeightCache>(&code_shared[row][swizzled_chunk * 16],
+                cp_async<16, kWeightCache>(&code_shared[slot][row][swizzled_chunk * 16],
                                            weight_codes +
                                                static_cast<std::int64_t>(row0 + row) * kHidden +
                                                group_k0 + chunk * 16);
@@ -107,14 +111,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
     const int warp_k0                 = warp * kTileK;
     float accumulators[kTokenMmas][4] = {};
 
-    stage_codes(0);
-    stage_activation(0);
+    stage_codes(0, 0);
+    stage_activation(0, 0);
     cp_commit();
-    cp_wait<0>();
+    if constexpr (DoubleBuffered) {
+        static_assert(kGroups >= 2);
+        stage_codes(1, kGroupK);
+        stage_activation(1, kGroupK);
+        cp_commit();
+    }
+    cp_wait<kStages - 1>();
     __syncthreads();
 
 #pragma unroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
+        const int slot = group_index % kStages;
 #pragma unroll
         for (int k_step = 0; k_step < kTileK / 16; ++k_step) {
             const int code_col        = k_step * 16 + lid * 2;
@@ -122,7 +133,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
                 const int chunk  = (warp_k0 + col) >> 4;
                 const int offset = (chunk ^ (row & 7)) * 16 + (col & 15);
                 return static_cast<unsigned>(
-                    *reinterpret_cast<const std::uint16_t*>(&code_shared[row][offset]));
+                    *reinterpret_cast<const std::uint16_t*>(&code_shared[slot][row][offset]));
             };
             const unsigned a0 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid, code_col));
             const unsigned a1 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col));
@@ -135,7 +146,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
                 const int row = token_mma * 8 + b_row;
                 ldmatrix_x2(
                     b0, b1,
-                    smem_addr(&x_shared[warp][row * kTileK + fp8_a16_shared_col_64(
+                    smem_addr(
+                        &x_shared[slot][warp][row * kTileK + fp8_a16_shared_col_64(
                                                                  row, k_step * 16 + b_k_offset)]));
                 mma_bf16(accumulators[token_mma][0], accumulators[token_mma][1],
                          accumulators[token_mma][2], accumulators[token_mma][3], a0, a1, a2, a3, b0,
@@ -145,11 +157,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
 
         if (group_index + 1 < kGroups) {
             __syncthreads();
-            const int next_k0 = (group_index + 1) * kGroupK;
-            stage_codes(next_k0);
-            stage_activation(next_k0);
-            cp_commit();
-            cp_wait<0>();
+            const int next_group = group_index + kStages;
+            if (next_group < kGroups) {
+                stage_codes(slot, next_group * kGroupK);
+                stage_activation(slot, next_group * kGroupK);
+                cp_commit();
+            }
+            if constexpr (DoubleBuffered) {
+                if (next_group < kGroups) {
+                    cp_wait<1>();
+                } else {
+                    cp_wait<0>();
+                }
+            } else {
+                cp_wait<0>();
+            }
             __syncthreads();
         }
     }
