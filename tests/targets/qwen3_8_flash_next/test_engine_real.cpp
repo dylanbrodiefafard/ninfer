@@ -152,7 +152,10 @@ void program_parity(const Inputs& inputs) {
     const Tokens prompt   = prompt_tokens(kParityPrompt, 7);
     const Tokens expected = program_greedy(inputs, prompt);
     ninfer::Engine engine(engine_options(inputs, 1, kParityContext, kParityContext));
-    const ninfer::GenerationResult result = run(engine, prompt, kParityOutputs);
+    auto request = greedy(kParityOutputs);
+    // Native parity uses the same unconstrained sampling domain as the Program.
+    request.output.raw = true;
+    const auto result  = engine.generate(engine.prepare_tokens(prompt, false), request);
     require(result.finish_reason == ninfer::FinishReason::OutputLimit,
             "parity request did not reach its output limit");
     require_equal(result.generated_token_ids, expected, "Engine against Program greedy decode");
@@ -180,30 +183,39 @@ float bf16(std::uint16_t value) {
 struct DistributionDifference {
     bool top1_equal = false;
     double kl       = 0.0;
+    // Expected minus actual log-sum-exp, for selected-token logprob comparisons.
+    double log_normalizer_delta = 0.0;
 };
+
+struct LogitSummary {
+    std::size_t top1;
+    double log_normalizer;
+};
+
+LogitSummary summarize_logits(std::span<const std::uint16_t> values) {
+    const auto less = [](std::uint16_t a, std::uint16_t b) { return bf16(a) < bf16(b); };
+    const auto top = static_cast<std::size_t>(std::max_element(values.begin(), values.end(), less) -
+                                              values.begin());
+    const double maximum = bf16(values[top]);
+    double sum           = 0.0;
+    for (const auto value : values) { sum += std::exp(bf16(value) - maximum); }
+    return {.top1 = top, .log_normalizer = maximum + std::log(sum)};
+}
 
 DistributionDifference distribution_difference(std::span<const std::uint16_t> actual,
                                                std::span<const std::uint16_t> expected) {
-    const auto less       = [](std::uint16_t a, std::uint16_t b) { return bf16(a) < bf16(b); };
-    const auto top_actual = std::max_element(actual.begin(), actual.end(), less) - actual.begin();
-    const auto top_expected =
-        std::max_element(expected.begin(), expected.end(), less) - expected.begin();
-    const double max_a = bf16(actual[static_cast<std::size_t>(top_actual)]);
-    const double max_e = bf16(expected[static_cast<std::size_t>(top_expected)]);
-    double sum_a       = 0.0;
-    double sum_e       = 0.0;
-    for (std::size_t i = 0; i < actual.size(); ++i) {
-        sum_a += std::exp(bf16(actual[i]) - max_a);
-        sum_e += std::exp(bf16(expected[i]) - max_e);
-    }
-    const double log_a = max_a + std::log(sum_a);
-    const double log_e = max_e + std::log(sum_e);
-    double kl          = 0.0;
+    const auto actual_summary   = summarize_logits(actual);
+    const auto expected_summary = summarize_logits(expected);
+    const double log_a          = actual_summary.log_normalizer;
+    const double log_e          = expected_summary.log_normalizer;
+    double kl                   = 0.0;
     for (std::size_t i = 0; i < actual.size(); ++i) {
         const double e = bf16(expected[i]) - log_e;
         kl += std::exp(e) * (e - (bf16(actual[i]) - log_a));
     }
-    return {.top1_equal = top_actual == top_expected, .kl = kl};
+    return {.top1_equal           = actual_summary.top1 == expected_summary.top1,
+            .kl                   = kl,
+            .log_normalizer_delta = log_e - log_a};
 }
 
 struct VerifyRouteErrors {
@@ -1005,6 +1017,11 @@ void live_tier_suite(const Inputs& inputs) {
                 require(program.grant_window(lane, program.plan_window(lane, 12)),
                         "window growth failed");
             }
+            if (produced == 8 && !suspend) {
+                // Both arms must use the same funded window and proposal geometry.
+                require(program.grant_window(lane, program.plan_window(lane, 16)),
+                        "matched live window growth failed");
+            }
             if (produced == 8 && suspend) {
                 const auto window = program.plan_window(lane, 16);
                 require(program.reserve_suspension_credit(owner, window.suspension_bytes),
@@ -1033,10 +1050,6 @@ void live_tier_suite(const Inputs& inputs) {
                 while (!program.resume_ready(owner)) { std::this_thread::yield(); }
                 program.finish_resume(lane, owner);
                 program.abort_lane(0);
-            }
-            if (produced == 12 && !suspend) {
-                require(program.grant_window(lane, program.plan_window(lane, 16)),
-                        "final window growth failed");
             }
             const std::array<std::uint32_t, 1> lanes{lane};
             const std::array<ninfer::runtime::RoundBudget, 1> budget{{{16U - produced}}};
@@ -1170,68 +1183,15 @@ constexpr std::uint32_t kLongPrompt     = 40000; // super-chunks 16384, 16384, 7
 // before the resumed owner's next super-chunk: one token from prefill, seven from decode.
 constexpr std::uint32_t kInterruptingOutputs = 8;
 
-// Batched against solo logprob criteria (natural log); a cross-lane state leak or a wrong lane
-// mapping changes the distribution far beyond these.
-constexpr std::uint32_t kComparedAlternatives = 5;
-constexpr double kMaximumMeanLogprobGap       = 0.15;
-constexpr double kMaximumLogprobGap           = 2.0;
-constexpr double kMaximumDivergenceGap        = 1.0;
-
-struct ScoredRun {
+struct EngineBatchObservation {
+    Tokens prompt;
     Tokens tokens;
-    std::vector<ninfer::TokenLogprob> logprobs;
+    std::vector<float> selected_logprobs;
 };
 
-ninfer::RequestOptions scored_greedy(std::uint32_t outputs) {
-    ninfer::RequestOptions options = greedy(outputs);
-    options.output.raw             = true;
-    options.output.top_logprobs    = kComparedAlternatives;
-    return options;
-}
+using EngineBatch = std::array<EngineBatchObservation, kLanes>;
 
-ScoredRun scored(ninfer::GenerationResult result) {
-    require(result.finish_reason == ninfer::FinishReason::OutputLimit,
-            "scored request did not reach its output limit");
-    require(result.content_logprobs.size() == result.generated_token_ids.size(),
-            "raw request did not report one logprob record per generated token");
-    return ScoredRun{.tokens   = std::move(result.generated_token_ids),
-                     .logprobs = std::move(result.content_logprobs)};
-}
-
-// Returns the common prefix length after checking the criteria above.
-std::size_t require_near(const ScoredRun& batched, const ScoredRun& solo,
-                         const std::string& label) {
-    require(batched.tokens.size() == solo.tokens.size() && !solo.tokens.empty(),
-            label + ": output lengths differ");
-    require(batched.tokens.front() == solo.tokens.front(), label + ": first tokens differ");
-    std::size_t prefix = 0;
-    double gap_sum     = 0.0;
-    while (prefix < solo.tokens.size() && batched.tokens[prefix] == solo.tokens[prefix]) {
-        const double gap = std::abs(static_cast<double>(batched.logprobs[prefix].logprob) -
-                                    solo.logprobs[prefix].logprob);
-        require(gap <= kMaximumLogprobGap, label + ": logprob gap " + std::to_string(gap) +
-                                               " at token " + std::to_string(prefix));
-        gap_sum += gap;
-        ++prefix;
-    }
-    require(gap_sum / static_cast<double>(prefix) <= kMaximumMeanLogprobGap,
-            label + ": mean logprob gap " + std::to_string(gap_sum / static_cast<double>(prefix)));
-    if (prefix < solo.tokens.size()) {
-        // Same context up to here: the batched choice must be a near-tie in the solo distribution.
-        const ninfer::TokenLogprob& reference = solo.logprobs[prefix];
-        const auto alternatives               = reference.alternatives();
-        const auto chosen = std::find_if(alternatives.begin(), alternatives.end(),
-                                         [&](const ninfer::TokenAlternative& alternative) {
-                                             return alternative.token == batched.tokens[prefix];
-                                         });
-        require(chosen != alternatives.end(), label + ": divergent token at " +
-                                                  std::to_string(prefix) +
-                                                  " is outside the solo top alternatives");
-        require(reference.logprob - chosen->logprob <= kMaximumDivergenceGap,
-                label + ": divergent token at " + std::to_string(prefix) + " is not a near-tie");
-    }
-    return prefix;
-}
+#include "teacher_forced_cases.h"
 
 std::vector<Tokens> concurrent(ninfer::Engine& engine, const std::vector<Tokens>& prompts,
                                std::uint32_t outputs, std::vector<double>* queued = nullptr) {
@@ -1251,34 +1211,52 @@ std::vector<Tokens> concurrent(ninfer::Engine& engine, const std::vector<Tokens>
     return results;
 }
 
-void concurrency_against_solo(ninfer::Engine& engine) {
+EngineBatch concurrent_observations(ninfer::Engine& engine) {
     std::vector<Tokens> prompts;
-    std::vector<ScoredRun> solo;
+    std::vector<ninfer::TokenId> first;
+    auto request                = greedy(kShortOutputs);
+    request.output.raw          = true;
+    request.output.top_logprobs = 1;
     for (std::uint32_t i = 0; i < kLanes; ++i) {
         prompts.push_back(prompt_tokens(kShortPrompt + 17 * i, 100 + i));
-        solo.push_back(scored(engine.generate(engine.prepare_tokens(prompts.back(), false),
-                                              scored_greedy(kShortOutputs))));
+        const auto result = engine.generate(engine.prepare_tokens(prompts.back(), false), request);
+        require(result.finish_reason == ninfer::FinishReason::OutputLimit &&
+                    result.generated_token_ids.size() == kShortOutputs,
+                "solo output limit");
+        first.push_back(result.generated_token_ids.front());
     }
     const ninfer::RuntimeStats before = engine.runtime_stats();
     std::vector<ninfer::GenerationHandle> handles;
     handles.reserve(prompts.size());
     for (const Tokens& prompt : prompts) {
-        handles.push_back(
-            engine.submit(engine.prepare_tokens(prompt, false), scored_greedy(kShortOutputs)));
+        handles.push_back(engine.submit(engine.prepare_tokens(prompt, false), request));
     }
-    std::vector<ScoredRun> batched;
-    batched.reserve(handles.size());
-    for (auto& handle : handles) { batched.push_back(scored(handle.wait())); }
+    EngineBatch observations;
+    for (std::size_t row = 0; row < handles.size(); ++row) {
+        auto result = handles[row].wait();
+        require(result.finish_reason == ninfer::FinishReason::OutputLimit &&
+                    result.generated_token_ids.size() == kShortOutputs,
+                "concurrent output limit");
+        require(result.generated_token_ids.front() == first[row],
+                "C=4 request " + std::to_string(row) + ": first tokens differ");
+        auto& observation  = observations[row];
+        observation.prompt = prompts[row];
+        observation.tokens = std::move(result.generated_token_ids);
+        require(result.content_logprobs.size() == observation.tokens.size(),
+                "raw request lost a selected-token logprob");
+        observation.selected_logprobs.reserve(result.content_logprobs.size());
+        for (std::size_t position = 0; position < result.content_logprobs.size(); ++position) {
+            const auto& record = result.content_logprobs[position];
+            require(record.token == observation.tokens[position], "raw token/logprob alignment");
+            observation.selected_logprobs.push_back(record.logprob);
+        }
+    }
     const ninfer::RuntimeStats after = engine.runtime_stats();
-    std::cout << "C=4 against solo: common prefixes";
-    for (std::uint32_t i = 0; i < kLanes; ++i) {
-        std::cout << ' ' << require_near(batched[i], solo[i], "C=4 request " + std::to_string(i))
-                  << '/' << kShortOutputs;
-    }
-    const std::uint64_t rounds = after.decode_rounds - before.decode_rounds;
-    const std::uint64_t rows   = after.decode_row_rounds - before.decode_row_rounds;
+    const std::uint64_t rounds       = after.decode_rounds - before.decode_rounds;
+    const std::uint64_t rows         = after.decode_row_rounds - before.decode_row_rounds;
     require(rows > rounds, "concurrent requests never shared a decode round");
-    std::cout << "; " << rows << " rows in " << rounds << " decode rounds\n";
+    std::cout << "C=4: first tokens equal; " << rows << " rows in " << rounds << " decode rounds\n";
+    return observations;
 }
 
 void capacity_waits(ninfer::Engine& engine) {
@@ -1372,13 +1350,17 @@ void cancellation(ninfer::Engine& engine) {
 #include "dflash_engine_cases.h"
 
 void engine_suite(const Inputs& inputs) {
-    ninfer::Engine engine(engine_options(inputs, kLanes, kEngineContext, kEngineKvTokens));
-    const ninfer::MemorySummary memory = engine.memory_summary();
-    require(memory.kv_capacity >= kEngineKvTokens, "Engine resolved a smaller KV capacity");
-    concurrency_against_solo(engine);
-    capacity_waits(engine);
-    prefill_interruption(engine);
-    cancellation(engine);
+    EngineBatch observations;
+    {
+        ninfer::Engine engine(engine_options(inputs, kLanes, kEngineContext, kEngineKvTokens));
+        const ninfer::MemorySummary memory = engine.memory_summary();
+        require(memory.kv_capacity >= kEngineKvTokens, "Engine resolved a smaller KV capacity");
+        observations = concurrent_observations(engine);
+        capacity_waits(engine);
+        prefill_interruption(engine);
+        cancellation(engine);
+    }
+    cross_batch_teacher_forcing(inputs, observations);
 }
 
 } // namespace
