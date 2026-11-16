@@ -721,9 +721,49 @@ books.
   at T = 16/20 is PCIe: ten mapped records add 190-250 us at T = 16, their gate|up bytes at the
   48 GB/s mapped-read roof; (2) a concurrent `moe_expert_cache_fill` slows the single-CTA
   grouping kernel from 3 to 40-60 us and the resident gate|up from 108 to 410-450 us at T = 16,
-  because the fill's mapped reads occupy every SM's memory pipeline. Grouping before the fill
-  starts needs the grouping split from `moe_experts` (an interface change) or folded into
-  `moe_expert_cache_admit`.
+  because the fill's mapped reads occupy every SM's memory pipeline. In the Program this costs
+  nothing measurable (next item).
+- **Miss schedule (2026-11-16): the layer is PCIe-bound, not schedule-bound.** A native C=5
+  fixed-K3 lanes trace (base artifact with DFlash, 4096-token prompts, context 8192, 64 rounds,
+  nsys with graph nodes traced, the same run's admit counters) moves 2,259 MB of missed records
+  per round (10,469 NVFP4 + 57,901 F3 misses), and the 48 route-to-merge MoE spans of a round
+  take 48.2 ms: 46.9 GB/s, the mapped-read roof (48 GB/s; 88% of the 53 GB/s copy engine). The
+  rest of the 61.7 ms round is 13.5 ms of dense, attention and drafter work during which PCIe
+  idles. About three quarters of the missed bytes are filter-rejected records that the matmuls
+  read through mapped memory; the admitted fills (230 us median per layer) move about 11 of a
+  layer's 47 MB. Schedules measured, none retained:
+  - *Fill on few CTAs* (12 instead of one per SM). Op bench with a tenth of the routed experts
+    filled and deferred: T = 1 / 4 / 8 / 16 / 20 / 48 take 57 / 135 / 174 / 430 / 483 / 983 us
+    instead of 76 / 155 / 211 / 533 / 621 / 1202 us (the fill alone copies at 44-52 GB/s on 12
+    CTAs; 4 CTAs are below the roof, 8-24 within 11%). With the Program's mix (4% of the routed
+    experts admitted, 14% mapped) every grid from 6 to 170 CTAs and fill-then-compute land within
+    2.5% of each other at T = 4..48 (T = 20: 924-948 us for 45.9 MB, 48-50 GB/s), because the
+    mapped reads keep the link busy whatever the fill does. Program, paired per-layer spans at
+    T = 20 against the 170-CTA control: 0.95 and 1.01 in two runs; lanes K3 C=4/5/6, best of two
+    to four alternating runs, -1.9 / -1.3 / -3.1% ms per round, inside run-to-run noise (single
+    runs moved up to 22%). It also slows the windowed 4096-token prefill's MoE from 3.1 to 18.3
+    ms per layer: the window fill beside prefill GEMMs needs every SM. Generated tokens matched
+    at every C.
+  - *Write-through* (the admitted misses read through mapped memory by the matmul CTAs, which
+    store the record into the slot; no fill kernel, no deferred pass): equal to plain mapped reads
+    and to the 12-CTA fill within run-to-run variation (0-12% at T = 16..48); it adds an Op
+    interface for no gain over the fill.
+  - *Misses' work first* in each matmul launch: 10-36% slower at T = 16 / 20 / 48 (every CTA
+    stalls on PCIe at once and the VRAM work runs after it instead of beside it); expert order,
+    which interleaves the misses, is better.
+  - *route + admit + group in one kernel* (grouping before the fill): grouping costs 52 us beside
+    the fill but the link is busy during it; the three launches take about 15 us per layer, 0.7
+    ms per C=5 round (1.2%), not worth an admit/grouping interface. *Skipping the fill and the
+    empty deferred pair on hit-only layers* saves at most 1.7 us per such layer, and C >= 4
+    rounds have almost none. *One CTA per item at T <= 4* (3 us per gate|up) only reaches C=1,
+    where mapped records make the static grid lose (above).
+  The remaining levers at C = 4-6 are bytes and overlap: fewer missed bytes (admission and
+  cache capacity), copy-engine transfers (53 against 48 GB/s, but the addresses are known only
+  on the device inside the graph), and moving transfers off the layer's critical path, either by
+  prefetching layer l + 1's predicted experts during layer l (route-prediction accuracy on the
+  recorded traces first) or by pipelining two lane groups so one group's dense work overlaps the
+  other's transfers: on this trace a 2 + 3 split routes 11% more distinct experts per layer
+  (123.3 against 111.3) against up to 13.5 ms per round of dense work to hide.
 - **Precision.** A16 only for now. A8 for F3 experts in prefill (one G32 scale per
   `kind::f8f6f4` m16n8k32 step) is the planned compute lever once its study KL and the needle
   battery are measured; A4 is deferred because PCIe, not compute, bounds prefill while experts
