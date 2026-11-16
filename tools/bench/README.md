@@ -338,7 +338,10 @@ These RULER-style tasks use the same generator and scorer, not the official RULE
 |---|---|---|
 | `multi-value` | Six values for one key among 24 registry entries spread across the essay | JSON array containing all six distinct value strings |
 | `multi-query` | Four queried keys among 24 distributed registry entries | JSON object with all four correct string bindings |
-| `variable-tracking` | Four interleaved six-variable assignment chains, 24 statements across the essay | JSON array of every variable whose final value equals the queried number |
+| `variable-tracking-1x3` | One three-variable chain: a numeric root and two copies | JSON array of all three variables |
+| `variable-tracking-1x6` | One six-variable chain: a numeric root and five copies | JSON array of all six variables |
+| `variable-tracking-2x6` | Two interleaved six-variable chains, 12 statements | JSON array of the six variables matching the queried number |
+| `variable-tracking` | Four interleaved six-variable assignment chains, 24 statements (hard endpoint) | JSON array of the six variables matching the queried number |
 | `aggregation` | Three most frequent words across 16 distributed fragments, 318 words total | JSON array of exactly the three winners; no tie at the cutoff |
 | `in-distribution` | One archive-code anecdote inserted into the essay's prose without a record marker | JSON array containing the code string |
 
@@ -358,6 +361,30 @@ python3 tools/bench/run_niah_check.py --suite multi-value --lengths 32k,128k,260
   --positions start,q25,mid,q75,end --fixture-dir out/needle/prompts \
   --output-dir out/needle/results --base http://127.0.0.1:8080 --key local \
   --model qwen3.8-flash-next --max-tokens 192
+```
+
+The variable-tracking ladder increases dependency depth, then same-form distractor chains.
+`1x3` means three variables including the numeric root (two copy hops), not three copy hops.
+Every level uses the same essay, fixed layout seeds, shuffled variable-name pool, and evenly
+spaced statement placement across the document. Interleaved chains alternate one assignment
+per chain per wave; every dependency precedes its use. Other chains have distinct numeric
+roots and are the task distractors; single-chain levels have only the essay as distraction.
+Questions and exact-set scoring are identical across levels, include the root variable, and
+never reveal answer IDs. `variable-tracking` retains the original hard fixtures unchanged.
+The five layouts are five deterministic problems, not repeated greedy samples; use all five
+at each length to locate a configuration's falloff rather than requiring the hardest level
+as an unconditional gate. These custom tasks do not isolate KV error from model capability.
+
+```bash
+for suite in variable-tracking-1x3 variable-tracking-1x6 variable-tracking-2x6 variable-tracking; do
+  for length in 32k 128k 260k; do
+    python3 tools/bench/make_niah_positions.py --suite "$suite" --length "$length" \
+      --position all --out-dir out/needle/ladder/prompts
+  done
+  python3 tools/bench/run_niah_check.py --suite "$suite" --lengths 32k,128k,260k \
+    --fixture-dir out/needle/ladder/prompts --output-dir out/needle/ladder/results \
+    --base http://127.0.0.1:8080 --key local --model qwen3.8-flash-next --max-tokens 192
+done
 ```
 
 Structured scoring is automatic from fixture metadata: JSON arrays are order-independent,

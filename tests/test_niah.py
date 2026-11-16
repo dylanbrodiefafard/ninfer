@@ -44,15 +44,34 @@ class NiahTest(unittest.TestCase):
                                 keys = re.findall(r"KEY_[A-Z]+", question)
                                 expected = {key: dict(entries)[key] for key in keys}
                                 self.assertEqual(len(expected), 4)
-                        elif suite == "variable-tracking":
+                        elif suite.startswith("variable-tracking"):
+                            chains, chain_length = {
+                                "variable-tracking-1x3": (1, 3),
+                                "variable-tracking-1x6": (1, 6),
+                                "variable-tracking-2x6": (2, 6),
+                                "variable-tracking": (4, 6),
+                            }[suite]
                             assignments = re.findall(r"Assignment: (X\d+)=(X\d+|\d+);", document)
-                            self.assertEqual(len(assignments), 24)
+                            self.assertEqual(len(assignments), chains * chain_length)
                             state = {}
                             for name, source in assignments:
                                 state[name] = state[source] if source.startswith("X") else source
+                            self.assertEqual(len(state), chains * chain_length)
+                            self.assertEqual(len(set(state.values())), chains)
+                            # Round-robin interleaving must preserve each chain's dependency order.
+                            for wave in range(1, chain_length):
+                                for chain in range(chains):
+                                    self.assertEqual(
+                                        assignments[wave * chains + chain][1],
+                                        assignments[(wave - 1) * chains + chain][0],
+                                    )
                             target = re.search(r"final value (\d+)", question).group(1)
                             expected = {name for name, value in state.items() if value == target}
-                            self.assertEqual(len(expected), 6)
+                            self.assertEqual(len(expected), chain_length)
+                            self.assertEqual(
+                                fixture,
+                                generator.build_hard_fixture(self.master, length, position, suite),
+                            )
                         elif suite == "aggregation":
                             fragments = re.findall(
                                 r"Word list fragment \d+: \[([^\]]+)\]", document
@@ -87,6 +106,62 @@ class NiahTest(unittest.TestCase):
                         )
                         self.assertTrue(score["passed"])
                         self.assertEqual(score["matched"], len(expected))
+
+    def test_ladder_cli_generation_and_scoring(self) -> None:
+        for suite in (
+            "variable-tracking-1x3",
+            "variable-tracking-1x6",
+            "variable-tracking-2x6",
+            "variable-tracking",
+        ):
+            with self.subTest(suite=suite), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                generate = [
+                    "make_niah_positions",
+                    "--suite",
+                    suite,
+                    "--length",
+                    "32k",
+                    "--position",
+                    "all",
+                    "--out-dir",
+                    str(root),
+                ]
+                with patch("sys.argv", generate), contextlib.redirect_stdout(io.StringIO()):
+                    generator.main()
+                calls = []
+
+                def post(base, key, body, timeout, suite=suite, root=root, calls=calls):
+                    cases = runner.matrix_cases(
+                        ["32k"], runner.NIAH_POSITIONS, suite=suite, fixture_dir=root
+                    )
+                    fixture = json.loads(Path(cases[len(calls)][1]).read_text())
+                    self.assertEqual(body["messages"], fixture["messages"])
+                    self.assertNotIn("niah", body)
+                    calls.append(body)
+                    answer = json.dumps(list(reversed(fixture["niah"]["expected"])))
+                    return {"choices": [{"message": {"content": answer}}]}
+
+                run = [
+                    "run_niah_check",
+                    "--suite",
+                    suite,
+                    "--lengths",
+                    "32k",
+                    "--key",
+                    "test",
+                    "--fixture-dir",
+                    str(root),
+                    "--output-dir",
+                    str(root / "results"),
+                ]
+                with (
+                    patch("sys.argv", run),
+                    patch.object(runner, "post", post),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(runner.main(), 0)
+                self.assertEqual(len(calls), 5)
 
     def test_structured_scoring_requires_all_values_and_bindings(self) -> None:
         target = ["alpha", "beta", "gamma"]

@@ -71,7 +71,16 @@ NIAH_MULTIKEY_LENGTHS = ("8k", "32k", "64k", "128k", "240k", "260k")
 NIAH_POSITIONS = ("start", "q25", "mid", "q75", "end")
 
 
-HARD_SUITES = ("multi-value", "multi-query", "variable-tracking", "aggregation", "in-distribution")
+HARD_SUITES = (
+    "multi-value",
+    "multi-query",
+    "variable-tracking-1x3",
+    "variable-tracking-1x6",
+    "variable-tracking-2x6",
+    "variable-tracking",
+    "aggregation",
+    "in-distribution",
+)
 
 
 def matrix_cases(lengths, positions, multikey=False, suite="standard", fixture_dir=None):

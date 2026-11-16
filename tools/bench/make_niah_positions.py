@@ -20,7 +20,7 @@ fixture metadata outside the messages; the scorer never sends that metadata.
 Use --suite and --out-dir to generate local panels without adding large fixtures
 to the repository.
 
-Deterministic and pure: stdlib only, no randomness, no network. Re-running with
+Deterministic and pure: stdlib only, fixed local PRNG seeds, no network. Re-running with
 the same arguments reproduces the identical fixture byte-for-byte, so committed
 fixtures are reproducible. The master stream is read from a committed fixture,
 never regenerated from scratch.
@@ -99,7 +99,20 @@ POS_FRACTION = {
     "end": 1.0,
 }
 NEEDLE_LINE_RE = re.compile(r"[^\n]*OFFICIAL RECORD[^\n]*")
-HARD_SUITES = ("multi-value", "multi-query", "variable-tracking", "aggregation", "in-distribution")
+# Chain length includes the numeric root assignment; the remaining assignments copy variables.
+VARIABLE_TRACKING_SHAPES = {
+    "variable-tracking-1x3": (1, 3),
+    "variable-tracking-1x6": (1, 6),
+    "variable-tracking-2x6": (2, 6),
+    "variable-tracking": (4, 6),
+}
+HARD_SUITES = (
+    "multi-value",
+    "multi-query",
+    *VARIABLE_TRACKING_SHAPES,
+    "aggregation",
+    "in-distribution",
+)
 
 # Multi-key mode (RULER-style): the target record sits at the requested depth among same-form
 # distractor records spread evenly through the document, including near-miss relay names. A
@@ -306,18 +319,19 @@ def build_hard_fixture(master: str, length_name: str, pos_name: str, suite: str)
             )
         rng.shuffle(pairs)
         entries = [f"Registry entry: {key} -> {value}." for key, value in pairs]
-    elif suite == "variable-tracking":
+    elif suite in VARIABLE_TRACKING_SHAPES:
+        chains, chain_length = VARIABLE_TRACKING_SHAPES[suite]
         names = [f"X{i}" for i in range(1, 25)]
         rng.shuffle(names)
-        roots = [str(52871 + variant * 1807 + i * 5311) for i in range(4)]
+        roots = [str(52871 + variant * 1807 + i * 5311) for i in range(chains)]
         values = {}
-        for wave in range(6):
-            for chain in range(4):
-                name = names[wave * 4 + chain]
-                source = roots[chain] if wave == 0 else names[(wave - 1) * 4 + chain]
+        for wave in range(chain_length):
+            for chain in range(chains):
+                name = names[wave * chains + chain]
+                source = roots[chain] if wave == 0 else names[(wave - 1) * chains + chain]
                 values[name] = source if wave == 0 else values[source]
                 entries.append(f"Assignment: {name}={source};")
-        target = roots[variant % 4]
+        target = roots[variant % chains]
         expected = sorted(name for name, value in values.items() if value == target)
         question = (
             "Execute the marked Assignment statements from beginning to end. "
