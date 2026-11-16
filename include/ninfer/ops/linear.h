@@ -153,7 +153,9 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
  * at `T=width*B` can select a different kernel than sequential C=1 (`T=width`). This entry
  * launches one Linear per sequence by default. Qualified exceptions aggregate the A16 W8
  * vocabulary W=2..8 profile in passes of at most 48 same-reduction columns, aggregate every NVFP4
- * A16 MMA problem at W>=2 in one pass, and aggregate the 27B NVFP4 DFlash conv projection
+ * A16 MMA problem at W>=2 (Flash-Next narrow drafter W<=16 in passes of at most sixteen
+ * same-reduction columns, the other profiles in one pass), and aggregate the 27B NVFP4 DFlash conv
+ * projection
  * `[1280,5120]` (passes of at most 32 columns), the W>=2 W4A4 DFlash MLP, and the Q4 27B draft-head
  * profiles. `T` must be a positive multiple of `sequence_width`.
  * Tensor, weight, aliasing, policy, and workspace requirements match `linear`.

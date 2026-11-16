@@ -151,6 +151,18 @@ using Nvfp4FlashNextDflashDownGeometry     = Nvfp4GemvGeometry<2560, 7680>;
 using Nvfp4FlashNextDflashConvProjGeometry = Nvfp4GemvGeometry<640, 2560>;
 using Nvfp4FlashNextDflashSelectorGeometry = Nvfp4GemvGeometry<256, 2560>;
 
+inline constexpr std::int32_t kNvfp4A16KSplitLastTokens = 16;
+
+// These narrow projections use one eight-warp K reduction through sixteen columns. Packed
+// sequences stay within this token band so their reduction matches independent C=1 calls.
+[[nodiscard]] constexpr bool nvfp4_a16_k_split_problem(std::int32_t output_rows,
+                                                       std::int32_t input_rows) {
+    return (output_rows == 2560 &&
+            (input_rows == 12800 || input_rows == 4096 || input_rows == 7680)) ||
+           (output_rows == 6144 && input_rows == 2560) ||
+           (output_rows == 640 && input_rows == 2560);
+}
+
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation10240Geometry = Nvfp4ActivationGeometry<10240>;

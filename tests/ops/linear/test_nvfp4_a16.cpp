@@ -1,9 +1,11 @@
 #include "ops/linear/linear_test_common.h"
+#include "ops/sanitizer_scope.h"
 
 #include <array>
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <utility>
 
 namespace {
 
@@ -107,8 +109,12 @@ int run_nvfp4_a16() {
     constexpr std::array drafter_mma_invocations{
         Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{2, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{3, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+        Invocation{7, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{9, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{15, CallForm::Policy, ops::LinearPolicy::A16Only, true},
         Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{17, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{24, CallForm::Policy, ops::LinearPolicy::A16Only},
@@ -206,15 +212,32 @@ int run_nvfp4_a16() {
     return failures;
 }
 
+int run_sanitizer() {
+    // Exercise both K-split token tiles, including masked columns, at the real drafter widths.
+    constexpr std::array invocations{
+        Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{15, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    int failures = 0;
+    for (const auto& [n, k] : {std::pair{2560, 12800}, std::pair{6144, 2560}, std::pair{2560, 4096},
+                               std::pair{2560, 7680}, std::pair{640, 2560}}) {
+        failures +=
+            run_shape("NVFP4_A16 Flash-Next sanitizer", ActivationCompute::A16,
+                      make_nvfp4_a16_weight, {n, k, 751U, Comparison::Sampled, true, invocations});
+    }
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (!ninfer::test::linear::cuda_available()) {
         std::cerr << "FAIL: no usable CUDA device\n";
         return 1;
     }
     try {
-        const int failures = run_nvfp4_a16();
+        const int failures =
+            ninfer::test::sanitizer_scope(argc, argv) ? run_sanitizer() : run_nvfp4_a16();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

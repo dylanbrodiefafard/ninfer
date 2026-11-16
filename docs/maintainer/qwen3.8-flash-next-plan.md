@@ -667,6 +667,35 @@ undisturbed base runs). The expected saving is the Op delta, about 0.22 ms of a 
 (1.5%) and 0.52 ms of a ~65 ms C=5 batch round (0.8%); both measured differences are within this
 host's run-to-run spread, so only the direction is claimed at the round level.
 
+### Narrow drafter NVFP4 A16 K-warp split (2026-11-16)
+
+The five narrow Flash-Next drafter Linear geometries use sixteen-output-row CTAs with eight
+K64 warps through T=16. Two shared staging buffers overlap the next K512 group with BF16 MMA;
+E2M1 codes times stored E4M3 scales widen exactly to BF16, with FP32 partials and reduction.
+Packed sequences use passes of at most sixteen same-reduction columns to preserve independent
+C=1 outputs. T=1, wider T, gate/up and all 27B geometries retain their existing routes.
+`tools.kdev recipe --idea profiled_new_family --candidate-atom bf16 --operand-terms 1`
+admitted the measured narrow points. A single-buffer candidate did not improve and was discarded.
+
+Public Linear cold-weight medians, microseconds (RTX 5090, PCIe Gen5, CUDA 13.1, sm_120a;
+150 calls per point, baseline/after/after/baseline, mean of the two medians):
+
+| N,K | T=4 before → after | T=15 before → after |
+|---|---:|---:|
+| 2560,12800 feature | 32.768 → 22.528 | 34.816 → 29.488 |
+| 6144,2560 QKV | 12.288 → 11.264 | 16.384 → 16.384 |
+| 2560,4096 attention output | 14.336 → 10.240 | 14.336 → 12.288 |
+| 2560,7680 down | 21.504 → 15.968 | 22.528 → 18.432 |
+| 640,2560 conv projection | 8.192 → 6.144 | 8.192 → 8.192 |
+
+A T=2..16 cutoff sweep found no slower median in the selected domain. The complete NVFP4 A16
+Linear suite passes against the independent naive FP64 dot-product oracle, including the 27B
+geometries, masked tile boundaries, graph replay and exact packed-versus-panel checks. Focused
+memcheck: 0 errors; racecheck: 0 hazards; clang-tidy: 0 findings; build uses `-Werror`.
+Evidence: `out/sol/small-item2-buffered-ab.log`, `small-item2-cutoff.log` and
+`small-item2-buffered-oracle.log`. These are Op-level gains; no round-throughput gain is claimed
+or measured because the expected round saving is below the established lanes-bench spread.
+
 ## N-gram read budget
 
 Random 4 KiB O_DIRECT reads of the 52 GB table on the boot SSD (SN850X, ext4) measured about

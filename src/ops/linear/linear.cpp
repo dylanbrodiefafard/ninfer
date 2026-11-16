@@ -95,6 +95,11 @@ std::int32_t packed_sequence_group_width(const Tensor& x, const Weight& w,
     }
     if (w.qtype == QType::NVFP4 && sequence_width >= 2 &&
         detail::is_nvfp4_a16_mma_aggregate_problem(w.n, w.k, policy)) {
+        if (detail::nvfp4_a16_k_split_problem(w.n, w.k) &&
+            sequence_width <= detail::kNvfp4A16KSplitLastTokens) {
+            return std::min(x.ne[1],
+                            detail::kNvfp4A16KSplitLastTokens / sequence_width * sequence_width);
+        }
         return x.ne[1];
     }
     if (w.qtype == QType::NVFP4 &&
