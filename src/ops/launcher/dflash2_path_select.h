@@ -5,15 +5,20 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
 
 void dflash2_path_select_bf16_gemv_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                           cudaStream_t stream);
-void dflash2_column_topk_launch(const Tensor& logits, float* split_val, int* split_idx,
-                                float* cand_val, int* cand_idx, const Tensor* logit_token_ids,
-                                cudaStream_t stream);
+// Bytes of split-key scratch dflash2_column_topk_launch needs for `columns` logit columns of at
+// most kDflash2PathSelectMaxLogitRows rows each.
+[[nodiscard]] std::size_t dflash2_column_topk_split_bytes(std::int64_t columns);
+// Writes each column's top-16 values and (mapped) ids in rank order to cand_val/cand_idx
+// [16, T*B]. split_keys holds dflash2_column_topk_split_bytes(T*B) bytes, 16-byte aligned.
+void dflash2_column_topk_launch(const Tensor& logits, std::uint64_t* split_keys, float* cand_val,
+                                int* cand_idx, const Tensor* logit_token_ids, cudaStream_t stream);
 void dflash2_path_select_launch(const float* cand_val, const int* cand_idx,
                                 const Tensor& hidden_proj, const Tensor* pred_bf16,
                                 const Tensor* succ_bf16, const Weight* pred_nvfp4,

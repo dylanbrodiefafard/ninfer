@@ -523,10 +523,9 @@ to kernel latency alone. No other owner's changes were reverted.
 K0 cannot simply use ordinary in-place decode while preserving zero-publication/rejection bytes;
 the read-only width-one record route below removes its full-pool copies without doubling GDN
 state. Grouping is private to moe_experts and cannot be moved ahead of the fill through its current
-completed-fill event interface. The top-k handoff proposes testing 64/128 rather than 32 splits:
-full vocabulary gives 7760 logits/CTA at 32, selecting the expensive sorted-list branch. No kernel
-was authored; exact finite-value/tie-order qualification and sanitizers belong to that Op work.
-Details are in `out/sol/target-perf-op-handoff.md` and the measured backlog dispositions.
+completed-fill event interface. The drafter's column top-16 has since been rebuilt; see
+[Drafter column top-16](#drafter-column-top-16-2026-11-16). Details are in
+`out/sol/target-perf-op-handoff.md` and the measured backlog dispositions.
 
 Qualification after integration: BF16 reference KL **0.00452**, top-1 **98.24%**; split **32/32**
 (KL median `3.46203e-5`, max `0.0091751`); graph/eager B2 **128/128** and B5 **320/320** columns
@@ -607,6 +606,66 @@ with 134 / 765 us GPU busy (fold 108 / 733 us, about 2.1 TB/s of state traffic);
 idle is the most a single captured commit graph could remove, about 0.2% / 0.1% of a round, below
 run-to-run spread. A device-metadata `gdn_replay_fold` form would have no measurable benefit and
 was not added. The fold itself is now the K0 root's main remaining cost over in-place decode.
+
+### Drafter column top-16 (2026-11-16)
+
+`dflash2_path_select` / `dflash2_tree_select` take an exact top-16 of every drafter logit column
+before the Markov walk. Flash-Next has no shortlist head, so each column is the full V=248320;
+the previous fixed 32-split route gave 7760 rows per CTA, kept a sorted private top-16 per thread
+in local memory and merged serially, and cost ~213 us per C=1 K3 round (latency bound; the
+byte floor of 3 columns is under 1 us). The 64/128-split variants of that route were measured
+first: 64 splits cut the Flash-Next Op 3.6-4.4x but slowed the 27B shortlist Op 24-46%; 128
+splits were slower than 64 everywhere. Neither was kept.
+
+Current design (Op header and `src/ops/kernel/dflash2_path_select.cuh`): every BF16 logit maps
+to a unique 64-bit key, the value's 16-bit order key (with -0 folded onto +0) above the
+complemented row, plus a sign-of-zero bit; NaN/+-inf map to 0. Unsigned key order is the Op's
+rank order, so lower-row tie-breaking and finite-value exclusion are properties of the key. A
+split CTA (256 threads, 16 keys per thread from two coalesced 16-byte loads, 4096 rows, 61
+splits at V=248320) takes the 16th-greatest per-thread maximum as a threshold (warp bitonic sort,
+then a three-level bitonic merge of the eight warp lists that every warp computes), compacts the
+at most 256 keys at or above it, and ranks them by counting. A one-CTA-per-column merge repeats
+this over the split keys and decodes values bit-exactly (including -0) and rows (through
+`logit_token_ids`), filling ranks without a finite logit with -inf and row = rank as before.
+Two barriers per CTA; no sort network over the vocabulary. V is now bounded to 262144 rows.
+Eight keys per thread (twice the split CTAs) measured equal or slower and was not kept.
+
+Qualification: the column top-16 is checked bit for bit (values and ids) against an independent
+host sort at V=248320 for C*K columns 1, 3, 8 and 36, the 27B shortlist V=131072 with its row map,
+V=262144, odd V and a misaligned base (row-by-row loads), V=16/100, and adversarial columns
+(cross-split ties, constant, NaN payloads and +-inf with +-max finite at split/column edges,
+interleaved -0/+0 leaders, subnormals, fewer than 16 finite rows with and without the row map,
+all non-finite, and per-thread plateaus that reach the 256-candidate bound). A public-Op case at
+V=248320, T=3, B=5 checks the selector ids exactly and q against the FP64 softmax of the oracle
+top-16. A sign-of-zero mutation fails the test. compute-sanitizer memcheck and racecheck: 0
+errors/hazards. clang-tidy: 0 findings.
+
+Public Op (`ninfer_dflash2_path_select_bench`, one captured Op call with hot logits, BF16 W_h;
+includes the unchanged projection and walk), median us before -> after:
+
+| Head | Shape | Before | After |
+|---|---|---:|---:|
+| Flash-Next V=248320 D=2560 | T=1 B=1 | 230.7 | 15.8 |
+| | T=3 B=1 (C=1 K3) | 242.0 | 26.5 |
+| | T=2 B=4 | 306.0 | 25.6 |
+| | T=3 B=5 (C=5 K3) | 554.9 | 35.9 |
+| | T=3 B=12 | 1090.0 | 51.7 |
+| 27B shortlist V=131072 D=5120 | T=7 B=1 | 87.9 | 45.2 |
+| | T=3 B=12 | 176.2 | 53.6 |
+| 27B full head V=248320 D=5120 | T=7 B=1 | 317.5 | 49.5 |
+
+nsys of the after bench: split + merge are 3.6 + 2.0 us at T=3 B=1 and 7.2 + 2.0 us at T=3 B=5.
+The walk kernel (`dflash2_path_select_kernel`, ~16 us) is now the largest part of the Op.
+
+Round level: fixed-K3 lanes-bench (DFlash companion, 4096-token prompts, 512 greedy outputs per
+request, context 8192, NVFP4 KV, C=1 and C=5 in one process), matched builds `out/opus-topk-base`
+/ `out/opus-topk-after` (same snapshot, only the Op files differ), four repetitions in alternating
+order (logs `out/opus-topk-logs`). Generated tokens are identical in every pair. C=1: base
+178.3/167.9/177.7/168.8, after 169.2/179.4/182.0/181.6 tok/s (mean +2.8%); C=5: base
+218.5/181.7/220.8/175.1, after 223.9/224.5/225.3/227.5 tok/s (+2.6% against the mean of the two
+undisturbed base runs). The expected saving is the Op delta, about 0.22 ms of a ~14.4 ms C=1 round
+(1.5%) and 0.52 ms of a ~65 ms C=5 batch round (0.8%); both measured differences are within this
+host's run-to-run spread, so only the direction is claimed at the round level.
 
 ## N-gram read budget
 

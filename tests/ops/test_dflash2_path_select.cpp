@@ -2,15 +2,20 @@
 
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
+#include "ops/launcher/dflash2_path_select.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -1788,6 +1793,266 @@ int run_tree_batch_row_isolation_case() {
     return failures;
 }
 
+// Column top-16 qualification. The oracle sorts each column's finite represented logits by
+// (value descending, row ascending) with host float comparison, so -0 and +0 tie, subnormals stay
+// distinct, and NaN/+-inf never enter; ranks past the finite count carry -inf and row = rank.
+// Values are compared bit for bit, which also checks the represented sign of zero.
+enum class TopkPattern {
+    HeavyTail,      // random sign times 4 * -log(u): mostly distinct leaders over a dense bulk
+    CoarseTies,     // values in {-1, 0, 1} with sparse 2.0 leaders tied across splits
+    Constant,       // every row 3.0
+    NonFinite,      // NaN payloads, +-inf, and +-max finite at split and column boundaries
+    SignedZeros,    // negative bulk under interleaved -0 and +0 leaders
+    FewFinite,      // five finite rows among NaN and +-inf
+    AllNonFinite,   // NaN, +inf and -inf only
+    Subnormal,      // zero bulk under distinct positive and negative subnormals
+    ThreadPlateaus, // one value per 8-row group, so whole groups tie at the top
+};
+
+std::uint16_t topk_pattern_bits(TopkPattern pattern, std::int32_t vocab, std::int32_t row,
+                                std::mt19937& rng) {
+    constexpr std::uint16_t kPositiveInf = 0x7f80;
+    constexpr std::uint16_t kNegativeInf = 0xff80;
+    constexpr std::uint16_t kQuietNan    = 0x7fc0;
+    constexpr std::uint16_t kNegativeNan = 0xffc1;
+    std::uniform_real_distribution<float> bulk(-8.0f, 8.0f);
+    switch (pattern) {
+    case TopkPattern::HeavyTail: {
+        std::uniform_real_distribution<float> unit(std::numeric_limits<float>::min(), 1.0f);
+        const float magnitude = -4.0f * std::log(unit(rng));
+        return f32_to_bf16((rng() & 1u) != 0 ? magnitude : -magnitude);
+    }
+    case TopkPattern::CoarseTies:
+        if (rng() % 4096u == 0) { return f32_to_bf16(2.0f); }
+        return f32_to_bf16(static_cast<float>(static_cast<int>(rng() % 3u) - 1));
+    case TopkPattern::Constant:
+        return f32_to_bf16(3.0f);
+    case TopkPattern::NonFinite:
+        if (row == vocab - 1 || row == 4096) { return 0x7f7f; }
+        if (row == 4095) { return 0xff7f; }
+        if (row % 97 == 0) { return row % 2 == 0 ? kQuietNan : kNegativeNan; }
+        if (row % 101 == 0) { return kPositiveInf; }
+        if (row % 103 == 0) { return kNegativeInf; }
+        return f32_to_bf16(bulk(rng));
+    case TopkPattern::SignedZeros:
+        if (row % 7 == 0) { return row % 14 == 0 ? std::uint16_t{0x8000} : std::uint16_t{0}; }
+        return f32_to_bf16(-1.0f - std::abs(bulk(rng)));
+    case TopkPattern::FewFinite:
+        if (row == 3 || row == 4095 || row == 4096 || row == vocab / 2 || row == vocab - 1) {
+            return f32_to_bf16(bulk(rng));
+        }
+        return row % 3 == 0 ? kQuietNan : (row % 3 == 1 ? kPositiveInf : kNegativeInf);
+    case TopkPattern::AllNonFinite:
+        return row % 3 == 0 ? kNegativeNan : (row % 3 == 1 ? kPositiveInf : kNegativeInf);
+    case TopkPattern::Subnormal:
+        if (row % 5 == 0) {
+            const auto magnitude = static_cast<std::uint16_t>(1u + rng() % 0x7fu);
+            return row % 10 == 0 ? static_cast<std::uint16_t>(0x8000u | magnitude) : magnitude;
+        }
+        return 0;
+    case TopkPattern::ThreadPlateaus:
+        return f32_to_bf16(static_cast<float>((row / 8) % 256));
+    }
+    return 0;
+}
+
+struct TopkCandidates {
+    std::vector<std::uint32_t> value_bits;
+    std::vector<std::int32_t> ids;
+};
+
+TopkCandidates column_topk_oracle(const std::vector<std::uint16_t>& logits, std::int32_t vocab,
+                                  std::size_t columns, const std::vector<std::int32_t>* token_ids) {
+    TopkCandidates out;
+    out.value_bits.reserve(columns * kTopK);
+    out.ids.reserve(columns * kTopK);
+    std::vector<std::pair<float, std::int32_t>> finite;
+    for (std::size_t col = 0; col < columns; ++col) {
+        finite.clear();
+        for (std::int32_t row = 0; row < vocab; ++row) {
+            const float value = bf16_to_f32(
+                logits[col * static_cast<std::size_t>(vocab) + static_cast<std::size_t>(row)]);
+            if (std::isfinite(value)) { finite.emplace_back(value, row); }
+        }
+        const auto kept = std::min<std::size_t>(kTopK, finite.size());
+        std::partial_sort(finite.begin(), finite.begin() + static_cast<std::ptrdiff_t>(kept),
+                          finite.end(), [](const auto& a, const auto& b) {
+                              return a.first > b.first ||
+                                     (a.first == b.first && a.second < b.second);
+                          });
+        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+            const bool live        = static_cast<std::size_t>(rank) < kept;
+            const float value      = live ? finite[static_cast<std::size_t>(rank)].first
+                                          : -std::numeric_limits<float>::infinity();
+            const std::int32_t row = live ? finite[static_cast<std::size_t>(rank)].second : rank;
+            std::uint32_t bits     = 0;
+            std::memcpy(&bits, &value, sizeof(bits));
+            out.value_bits.push_back(bits);
+            out.ids.push_back(token_ids != nullptr ? (*token_ids)[static_cast<std::size_t>(row)]
+                                                   : row);
+        }
+    }
+    return out;
+}
+
+// Calls the column top-16 directly so values are checked exactly; the public Op exposes them only
+// through the selector softmax. element_offset > 0 misaligns the logits base, which selects the
+// row-by-row load route at a vocabulary that is otherwise vector loaded.
+int run_column_topk_case(const char* label, TopkPattern pattern, std::int32_t vocab,
+                         std::int32_t tokens, std::int32_t batch, bool token_ids = false,
+                         std::size_t element_offset = 0) {
+    const std::size_t columns = static_cast<std::size_t>(tokens) * batch;
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(vocab) * columns);
+    for (std::size_t col = 0; col < columns; ++col) {
+        std::mt19937 rng(static_cast<std::uint32_t>(0x5eed + 7919 * col));
+        for (std::int32_t row = 0; row < vocab; ++row) {
+            logits[col * static_cast<std::size_t>(vocab) + static_cast<std::size_t>(row)] =
+                topk_pattern_bits(pattern, vocab, row, rng);
+        }
+    }
+    std::vector<std::int32_t> ids;
+    if (token_ids) {
+        ids.resize(static_cast<std::size_t>(vocab));
+        for (std::int32_t row = 0; row < vocab; ++row) {
+            ids[static_cast<std::size_t>(row)] =
+                (2 * row + 1) % ops::kDflash2PathSelectCodebookRows;
+        }
+    }
+    const TopkCandidates expected =
+        column_topk_oracle(logits, vocab, columns, token_ids ? &ids : nullptr);
+
+    GuardedDeviceBuffer device_logits((logits.size() + element_offset) * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_ids(std::max<std::size_t>(1, ids.size()) * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_split(
+        ops::detail::dflash2_column_topk_split_bytes(static_cast<std::int64_t>(columns)));
+    GuardedDeviceBuffer device_val(columns * kTopK * sizeof(float));
+    GuardedDeviceBuffer device_idx(columns * kTopK * sizeof(std::int32_t));
+    device_logits.copy_from_host(logits.data(), logits.size() * sizeof(std::uint16_t),
+                                 element_offset * sizeof(std::uint16_t));
+    if (token_ids) { device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t)); }
+    device_val.fill(0xcd);
+    device_idx.fill(0xcd);
+
+    auto* logits_base = static_cast<std::uint16_t*>(device_logits.data()) + element_offset;
+    const Tensor logits_t(logits_base, DType::BF16, {vocab, tokens, batch});
+    const Tensor ids_t(device_ids.data(), DType::I32, {vocab});
+    ops::detail::dflash2_column_topk_launch(
+        logits_t, static_cast<std::uint64_t*>(device_split.data()),
+        static_cast<float*>(device_val.data()), static_cast<int*>(device_idx.data()),
+        token_ids ? &ids_t : nullptr, nullptr);
+    cuda_synchronize();
+
+    const auto got_val = from_device<std::uint32_t>(device_val.data(), columns * kTopK);
+    const auto got_idx = from_device<std::int32_t>(device_idx.data(), columns * kTopK);
+    int failures =
+        verify_exact((std::string(label) + " values").c_str(), got_val, expected.value_bits);
+    failures += verify_exact((std::string(label) + " ids").c_str(), got_idx, expected.ids);
+    failures += device_split.verify_guards(label);
+    failures += device_val.verify_guards(label);
+    failures += device_idx.verify_guards(label);
+    return failures;
+}
+
+// Public Op at the Flash-Next head shape (V=248320, C=5 requests, K=3 drafts). Zero codebooks make
+// every score its unary logit, so the selector ids must be the exact rank-ordered top-16 and q the
+// FP64 softmax of the top-16 logits at the draft temperature; the sampled path is one of them.
+int run_full_vocab_selector_case() {
+    constexpr std::int32_t vocab  = 248320;
+    constexpr std::int32_t tokens = 3;
+    constexpr std::int32_t batch  = 5;
+    constexpr float kTemperature  = 0.6f;
+    constexpr PointwiseCriterion q_criterion{/*absolute*/ 2.0e-6, /*relative*/ 0.0};
+    const std::size_t columns = static_cast<std::size_t>(tokens) * batch;
+    HostWeight host_weight    = make_patterned(kRank, kHidden, 71u);
+    DeviceWeight device_weight(std::move(host_weight));
+
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(vocab) * columns);
+    for (std::size_t col = 0; col < columns; ++col) {
+        std::mt19937 rng(static_cast<std::uint32_t>(0xd1a5 + col));
+        for (std::int32_t row = 0; row < vocab; ++row) {
+            logits[col * static_cast<std::size_t>(vocab) + static_cast<std::size_t>(row)] =
+                topk_pattern_bits(TopkPattern::HeavyTail, vocab, row, rng);
+        }
+    }
+    const TopkCandidates expected = column_topk_oracle(logits, vocab, columns, nullptr);
+    std::vector<std::uint16_t> hidden_bits(static_cast<std::size_t>(kHidden) * columns,
+                                           f32_to_bf16(0.25f));
+    std::vector<std::int32_t> anchors(static_cast<std::size_t>(batch));
+    for (std::int32_t b = 0; b < batch; ++b) { anchors[static_cast<std::size_t>(b)] = 101 + b; }
+
+    GuardedDeviceBuffer device_logits(logits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_codebook(static_cast<std::size_t>(kRank) * vocab *
+                                        sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_anchors(anchors.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_path(columns * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_sel_ids(columns * kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_sel_q(columns * kTopK * sizeof(float));
+    device_logits.copy_from_host(logits.data(), device_logits.bytes());
+    device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
+    device_codebook.fill(0);
+    device_anchors.copy_from_host(anchors.data(), device_anchors.bytes());
+    device_path.fill(0xcd);
+    device_sel_ids.fill(0xcd);
+    device_sel_q.fill(0xcd);
+
+    Tensor logits_t(device_logits.data(), DType::BF16, {vocab, tokens, batch});
+    Tensor hidden_t(device_hidden.data(), DType::BF16, {kHidden, tokens, batch});
+    Tensor codebook_t(device_codebook.data(), DType::BF16, {kRank, vocab});
+    Tensor anchors_t(device_anchors.data(), DType::I32, {batch});
+    Tensor path_t(device_path.data(), DType::I32, {tokens, batch});
+    Tensor sel_ids_t(device_sel_ids.data(), DType::I32, {kTopK, tokens, batch});
+    Tensor sel_q_t(device_sel_q.data(), DType::FP32, {kTopK, tokens, batch});
+    WorkspaceArena workspace(ops::dflash2_path_select_workspace_capacity_bytes(
+        QType::BF16_CTRL, kHidden, tokens, tokens, batch));
+    call_path_select(logits_t, hidden_t, device_weight.view(), codebook_t, codebook_t, anchors_t,
+                     batch, kTemperature, 7ull, path_t, workspace, nullptr, nullptr, nullptr,
+                     nullptr, &sel_ids_t, &sel_q_t);
+
+    const auto path = from_device<std::int32_t>(device_path.data(), columns);
+    const auto ids  = from_device<std::int32_t>(device_sel_ids.data(), columns * kTopK);
+    const auto q    = from_device<float>(device_sel_q.data(), columns * kTopK);
+    int failures =
+        verify_exact("dflash2_path_select full-vocabulary selector ids", ids, expected.ids);
+    std::vector<double> got_q(columns * kTopK);
+    std::vector<double> expected_q(columns * kTopK);
+    for (std::size_t col = 0; col < columns; ++col) {
+        const std::size_t base = col * kTopK;
+        double peak            = -std::numeric_limits<double>::infinity();
+        std::vector<double> logit(kTopK);
+        for (std::int32_t c = 0; c < kTopK; ++c) {
+            float value = 0.0f;
+            std::memcpy(&value, &expected.value_bits[base + static_cast<std::size_t>(c)],
+                        sizeof(value));
+            logit[static_cast<std::size_t>(c)] = static_cast<double>(value) / kTemperature;
+            peak                               = std::max(peak, logit[static_cast<std::size_t>(c)]);
+        }
+        double total = 0.0;
+        for (double& value : logit) {
+            value = std::exp(value - peak);
+            total += value;
+        }
+        bool path_listed = false;
+        for (std::int32_t c = 0; c < kTopK; ++c) {
+            const std::size_t at = base + static_cast<std::size_t>(c);
+            got_q[at]            = static_cast<double>(q[at]);
+            expected_q[at]       = logit[static_cast<std::size_t>(c)] / total;
+            path_listed          = path_listed || (ids[at] == path[col] && q[at] > 0.0f);
+        }
+        if (!path_listed) {
+            std::cerr << "dflash2_path_select full-vocabulary: path " << path[col]
+                      << " is not a selector id with positive q at column " << col << "\n";
+            ++failures;
+        }
+    }
+    failures += verify_pointwise("dflash2_path_select full-vocabulary selector q", got_q,
+                                 expected_q, q_criterion);
+    failures += device_path.verify_guards("dflash2_path_select full-vocabulary path");
+    failures += device_sel_ids.verify_guards("dflash2_path_select full-vocabulary selector ids");
+    failures += device_sel_q.verify_guards("dflash2_path_select full-vocabulary selector q");
+    return failures;
+}
+
 } // namespace
 
 // The sampled walk's proposal distribution q is a continuous function of the hidden projection,
@@ -2013,6 +2278,46 @@ int main() {
         "dflash2_path_select NVFP4 W_h codebook BF16 vs NVFP4 greedy T=5 B=2 V=128", 5, 2, 43u);
     failures += run_nvfp4_codebook_matches_bf16_accept(
         "dflash2_path_select NVFP4 W_h codebook BF16 vs NVFP4 greedy T=5 B=3 V=128", 5, 3, 47u);
+    // Column top-16 at the registered heads: Flash-Next V=248320 with C*K columns for C=1..12 and
+    // K=1..3, and the 27B shortlist V=131072 with its row-to-token map; then adversarial values,
+    // the row-by-row load route (odd V, misaligned base, small V), and the V=262144 bound.
+    failures += run_column_topk_case("column top-16 heavy-tail V=248320 T=3 B=12",
+                                     TopkPattern::HeavyTail, 248320, 3, 12);
+    failures += run_column_topk_case("column top-16 heavy-tail V=248320 T=1 B=1",
+                                     TopkPattern::HeavyTail, 248320, 1, 1);
+    failures += run_column_topk_case("column top-16 heavy-tail V=248320 T=2 B=4",
+                                     TopkPattern::HeavyTail, 248320, 2, 4);
+    failures += run_column_topk_case("column top-16 shortlist V=131072 T=7 B=1",
+                                     TopkPattern::HeavyTail, 131072, 7, 1, true);
+    failures += run_column_topk_case("column top-16 coarse ties V=248320 T=3 B=1",
+                                     TopkPattern::CoarseTies, 248320, 3, 1);
+    failures += run_column_topk_case("column top-16 constant V=248320 T=1 B=2",
+                                     TopkPattern::Constant, 248320, 1, 2);
+    failures += run_column_topk_case("column top-16 non-finite V=248320 T=2 B=1",
+                                     TopkPattern::NonFinite, 248320, 2, 1);
+    failures += run_column_topk_case("column top-16 signed zeros V=248320 T=1 B=1",
+                                     TopkPattern::SignedZeros, 248320, 1, 1);
+    failures += run_column_topk_case("column top-16 five finite V=248320 T=1 B=1",
+                                     TopkPattern::FewFinite, 248320, 1, 1);
+    failures += run_column_topk_case("column top-16 five finite shortlist V=131072 T=1 B=2",
+                                     TopkPattern::FewFinite, 131072, 1, 2, true);
+    failures += run_column_topk_case("column top-16 subnormal V=248320 T=1 B=1",
+                                     TopkPattern::Subnormal, 248320, 1, 1);
+    failures += run_column_topk_case("column top-16 plateaus V=248320 T=2 B=1",
+                                     TopkPattern::ThreadPlateaus, 248320, 2, 1);
+    failures += run_column_topk_case("column top-16 all non-finite V=4100 T=1 B=1",
+                                     TopkPattern::AllNonFinite, 4100, 1, 1);
+    failures += run_column_topk_case("column top-16 odd V=248317 T=2 B=1", TopkPattern::HeavyTail,
+                                     248317, 2, 1);
+    failures += run_column_topk_case("column top-16 misaligned V=248320 T=1 B=3",
+                                     TopkPattern::HeavyTail, 248320, 1, 3, false, 1);
+    failures +=
+        run_column_topk_case("column top-16 V=16 T=2 B=1", TopkPattern::HeavyTail, 16, 2, 1);
+    failures += run_column_topk_case("column top-16 V=100 T=1 B=2 non-finite",
+                                     TopkPattern::NonFinite, 100, 1, 2);
+    failures += run_column_topk_case("column top-16 coarse ties V=262144 T=1 B=1",
+                                     TopkPattern::CoarseTies, 262144, 1, 1);
+    failures += run_full_vocab_selector_case();
     std::cout << (failures ? "FAIL" : "OK") << " dflash2_path_select\n";
     return failures ? 1 : 0;
 }

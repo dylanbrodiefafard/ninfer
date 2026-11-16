@@ -79,6 +79,7 @@ ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES ops/sampling_select_ben
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES ops/linear_pair_bench.cu)
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES ops/mtp_pack_bench.cu)
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES ops/proposal_remap_bench.cu)
+ninfer_add_op_bench(ninfer_dflash2_path_select_bench SOURCES ops/dflash2_path_select_bench.cu)
 ninfer_add_op_bench(ninfer_moe_experts_bench SOURCES ops/moe_experts_bench.cu)
 ninfer_add_op_bench(ninfer_qsa_bench SOURCES ops/qsa_bench.cpp)
 ninfer_add_op_bench(ninfer_lane_batched_state_bench SOURCES ops/lane_batched_state_bench.cu)

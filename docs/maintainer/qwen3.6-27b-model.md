@@ -152,7 +152,7 @@ below are from Hugging Face `z-lab/Qwen3.8-27B-DFlash2` revision
 | target feature layers, zero-based | `5, 19, 33, 47, 61` |
 | feature concat width | `5 × 5120 = 25600` |
 | conv | kernel 2, group 16, two-tap dynamic |
-| selector | rank 256, unsorted top-16 |
+| selector | rank 256, rank-ordered top-16 |
 | full-context DFlash KV pool | none (`full_layers=0`) |
 
 The companion is five dense Qwen3 decoder blocks at 27B width, not a copy of the target's hybrid
@@ -417,7 +417,7 @@ One propose block:
    arithmetic profile, kept in registers. The final MLP performs finish/residual only, so final
    normalization remains restricted to emitted columns. Both tree proposal passes rebind
    current-width views of the same outer panel; startup workspace planning uses that ownership.
-4. Path selector (`dflash2_path_select`): unsorted top-16 of those logits, then the Markov score
+4. Path selector (`dflash2_path_select`): rank-ordered top-16 of those logits, then the Markov score
    `score = unary + ⟨pred_code(prev) ⊙ W_h h_t , succ_code(cand)⟩`. Greedy chooses the maximum.
    Sampling draws from the temperature-scaled 16-way distribution and retains that row as `q`.
    Under p-less the target temperature is not reused for drafting: drafting at the p-less target

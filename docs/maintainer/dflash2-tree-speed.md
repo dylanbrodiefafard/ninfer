@@ -116,7 +116,9 @@ not explain the tree-vs-chain gap, but it capped absolute tok/s.
 ### 1. Split-column top-k for path/tree select (kept)
 
 Top-16 of each draft column is independent of the Markov walk. Launch 32 split blocks per
-column, merge 32 lists of 16, then walk scores on one block per batch. Scoring stays serial
+column, merge 32 lists of 16, then walk scores on one block per batch. The split/merge structure
+is kept; its selection algorithm was replaced on 2026-11-16 (see
+[the current design](qwen3.8-flash-next-plan.md#drafter-column-top-16-2026-11-16)). Scoring stays serial
 FP32 so greedy tokens match the existing oracle tests.
 
 Short greedy CLI (same 29-token primes prompt as the pre-opt nsys): decode **229.7 tok/s**
@@ -525,6 +527,7 @@ was a matched Engine wash; and proposal/target stream overlap has a draft-id dep
 verification while the independent preparation work is too small to offset contention with the
 DRAM-bound proposal path. Those prototypes were removed.
 
+The change below was later superseded by the keyed threshold selection linked in section 1.
 The retained change removes serial sorting and merging from DFlash column top-k. Production splits
 hold at most 16 represented BF16 logits per thread, select 16 ranks through exact warp reductions,
 and reduce the 512 split candidates cooperatively across the merge block. Lower vocabulary index

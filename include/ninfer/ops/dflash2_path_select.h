@@ -27,6 +27,9 @@ inline constexpr int kDflash2PathSelectRngPurpose                   = 16;
 inline constexpr std::int32_t kDflash2TreeMaxWidth                  = 16;
 inline constexpr std::int32_t kDflash2VerifyWidth                   = 12;
 
+// Largest logit row count V; both registered heads (131072 and 248320 rows) lie below it.
+inline constexpr std::int32_t kDflash2PathSelectMaxLogitRows = 262144;
+
 // DFlash2 round extents that the drafter and verify projections are compiled for. A draft window
 // k lies in [1, kDflash2MaxDraftTokens]; its proposal block and chain verify block hold k + 1
 // columns per request, a tree verify block holds k + 2 through kDflash2TreeMaxWidth columns, and
@@ -41,8 +44,11 @@ static_assert(kDflash2MaxChainWidth < kDflash2TreeMaxWidth);
  * Op: dflash2_path_select
  *
  * Math / indexing:
- *   For each column (t,b), let rows[0..15] be the unsorted top-16 logit rows of logits[:,t,b]:
- *   the 16 largest represented logits, with lower row index winning logit ties.
+ *   For each column (t,b), let rows[0..15] be the top-16 logit rows of logits[:,t,b] in rank
+ *   order: the 16 largest represented logits, value descending, with lower row index winning
+ *   logit ties. NaN and +-inf
+ *   logits are never selected; a column with fewer than 16 finite logits fills its remaining
+ *   candidates with unary -inf.
  *   candidates[c] = logit_token_ids[rows[c]] when logit_token_ids is non-null, else rows[c].
  *   unary[c] = logits[rows[c], t, b]. Project the hidden state
  *
@@ -71,7 +77,7 @@ static_assert(kDflash2MaxChainWidth < kDflash2TreeMaxWidth);
  *   uniform.
  *
  *   Then prev[t,b] = path[t,b]. Candidate order does not affect a greedy pick; the sampled
- *   inverse-CDF walk runs in the unsorted top-16 order.
+ *   inverse-CDF walk runs in that rank order.
  *   An internal force_greedy call may override the draft temperature for an intermediate
  *   refinement pass. When selector_ids / selector_q are non-null they receive the 16 candidate
  *   token ids and the proposal distribution q: one-hot at a greedy pick, else the 16-way softmax
@@ -79,8 +85,8 @@ static_assert(kDflash2MaxChainWidth < kDflash2TreeMaxWidth);
  *   Null selectors leave q implicit one-hot at path[t,b].
  *
  * Logical shapes:
- *   logits is contiguous BF16 [V,T] or [V,T,B] with V>=16. hidden is contiguous BF16 [D,T] or
- *   [D,T,B] with D in {5120,2560}. pred_code and succ_code are contiguous BF16
+ *   logits is contiguous BF16 [V,T] or [V,T,B] with 16 <= V <= 262144. hidden is contiguous
+ *   BF16 [D,T] or [D,T,B] with D in {5120,2560}. pred_code and succ_code are contiguous BF16
  *   [256, codebook_rows] (rank fastest) when the NVFP4 codebook weights are null.
  *   When logit_token_ids is null, codebook_rows >= V (identity: logit row is the token id).
  *   When logit_token_ids is non-null it is contiguous I32 [V] mapping each logit row to a token

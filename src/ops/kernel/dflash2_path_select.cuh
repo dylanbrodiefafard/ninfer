@@ -20,7 +20,6 @@ inline constexpr int kDflash2PathSelectRank             = 256;
 inline constexpr int kDflash2PathSelectSuccStride       = kDflash2PathSelectRank + 2;
 inline constexpr int kDflash2PathSelectGemmBlock        = 256;
 inline constexpr int kDflash2PathSelectRngPurposeDevice = 16;
-inline constexpr int kDflash2PathSelectTopkSplits       = 32;
 // Mirrors kDflash2TreeMaxWidth in the public header, which this device header cannot include.
 inline constexpr int kDflash2TreeMaxWidthDevice = 16;
 
@@ -113,233 +112,269 @@ __device__ __forceinline__ float dflash2_path_select_uniform(unsigned long long 
     return static_cast<float>(bits) * (1.0f / 16777216.0f);
 }
 
-__device__ __forceinline__ bool dflash2_logit_better(float value, int index, float best_value,
-                                                     int best_index) {
-    return value > best_value || (value == best_value && index < best_index);
+// Column top-16: dflash2_column_topk_split_kernel then dflash2_column_topk_merge_kernel.
+//
+// Selection keys. Each represented logit maps to one 64-bit key whose unsigned order is the Op's
+// rank order (greater value first, lower row first among equal values):
+//   bits 48..33  16-bit order key of the BF16 value: bits | 0x8000 for a positive value and
+//                ~bits & 0xffff for a negative one, with -0 folded onto +0 so equal values tie.
+//                Finite values land in [0x0080, 0xff7f], so a finite logit's key is never 0;
+//   bits 32..1   ~row as 32 bits, so the lower row of two equal values has the greater key;
+//   bit 0        set for a -0 logit, restoring the represented sign of zero on decode. Rows are
+//                unique, so this bit never decides an order.
+// Non-finite logits and empty slots have key 0 and are never selected. Distinct rows give
+// distinct keys, so the top-16 is the 16 greatest nonzero keys without ties.
+inline constexpr int kDflash2TopkWarps = kDflash2PathSelectBlock / kWarpSizeDevice;
+// Keys each thread holds, loaded as 16-byte groups of eight BF16 logits.
+inline constexpr int kDflash2TopkItems     = 16;
+inline constexpr int kDflash2TopkRowGroup  = 8;
+inline constexpr int kDflash2TopkBlockKeys = kDflash2PathSelectBlock * kDflash2TopkItems;
+// Mirrors kDflash2PathSelectMaxLogitRows in the public header, which this device header cannot
+// include; the launcher rejects a larger V, so split scratch sized from it cannot overflow. The
+// merge block holds every split's 16 keys, so the split count is bounded by
+// kDflash2TopkBlockKeys / 16.
+inline constexpr int kDflash2TopkMaxLogitRows = 262144;
+inline constexpr int kDflash2TopkMaxSplits =
+    (kDflash2TopkMaxLogitRows + kDflash2TopkBlockKeys - 1) / kDflash2TopkBlockKeys;
+static_assert(kDflash2PathSelectBlock == 256 && kDflash2TopkWarps == 8);
+static_assert(kDflash2TopkItems % kDflash2TopkRowGroup == 0 && kDflash2TopkItems % 2 == 0);
+static_assert(kDflash2TopkMaxSplits * kDflash2PathSelectK <= kDflash2TopkBlockKeys);
+
+__device__ __forceinline__ std::uint64_t dflash2_topk_key(std::uint16_t bits, int row) {
+    if ((bits & 0x7f80u) == 0x7f80u) { return 0; }
+    const std::uint64_t negative_zero = bits == 0x8000u ? 1u : 0u;
+    if (negative_zero != 0) { bits = 0; }
+    const std::uint32_t order =
+        (bits & 0x8000u) != 0 ? (~static_cast<std::uint32_t>(bits) & 0xffffu) : (bits | 0x8000u);
+    return (static_cast<std::uint64_t>(order) << 33) |
+           (static_cast<std::uint64_t>(~static_cast<std::uint32_t>(row)) << 1) | negative_zero;
 }
 
-__device__ __forceinline__ void dflash2_insert_topk(float* vals, int* idxs, int cap, float value,
-                                                    int index) {
-    if (cap <= 0 || index < 0 || isnan(value) || isinf(value) ||
-        !dflash2_logit_better(value, index, vals[cap - 1], idxs[cap - 1])) {
-        return;
+__device__ __forceinline__ int dflash2_topk_key_row(std::uint64_t key) {
+    return static_cast<int>(~static_cast<std::uint32_t>(key >> 1));
+}
+
+__device__ __forceinline__ float dflash2_topk_key_value(std::uint64_t key) {
+    const auto order   = static_cast<std::uint32_t>(key >> 33);
+    std::uint32_t bits = (order & 0x8000u) != 0 ? (order & 0x7fffu) : (~order & 0xffffu);
+    if ((key & 1u) != 0) { bits = 0x8000u; }
+    return __uint_as_float(bits << 16);
+}
+
+__device__ __forceinline__ std::uint64_t dflash2_topk_max(std::uint64_t a, std::uint64_t b) {
+    return a > b ? a : b;
+}
+
+__device__ __forceinline__ std::uint64_t dflash2_topk_min(std::uint64_t a, std::uint64_t b) {
+    return a < b ? a : b;
+}
+
+// Bitonic sort of one key per lane; lane l returns the l-th greatest key of the warp.
+__device__ __forceinline__ std::uint64_t dflash2_warp_sort_desc(std::uint64_t value, int lane) {
+#pragma unroll
+    for (int size = 2; size <= kWarpSizeDevice; size <<= 1) {
+#pragma unroll
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            const std::uint64_t other = __shfl_xor_sync(0xffffffffu, value, stride);
+            const bool descending     = (lane & size) == 0;
+            const bool lower          = (lane & stride) == 0;
+            value                     = lower == descending ? dflash2_topk_max(value, other)
+                                                            : dflash2_topk_min(value, other);
+        }
     }
-    int pos = cap - 1;
-    while (pos > 0 && dflash2_logit_better(value, index, vals[pos - 1], idxs[pos - 1])) {
-        vals[pos] = vals[pos - 1];
-        idxs[pos] = idxs[pos - 1];
-        --pos;
+    return value;
+}
+
+// Bitonic merge of a warp-wide bitonic sequence into descending lane order.
+__device__ __forceinline__ std::uint64_t dflash2_warp_merge_desc(std::uint64_t value, int lane) {
+#pragma unroll
+    for (int stride = kWarpSizeDevice / 2; stride > 0; stride >>= 1) {
+        const std::uint64_t other = __shfl_xor_sync(0xffffffffu, value, stride);
+        value =
+            (lane & stride) == 0 ? dflash2_topk_max(value, other) : dflash2_topk_min(value, other);
     }
-    vals[pos] = value;
-    idxs[pos] = index;
+    return value;
+}
+
+// Merges two descending lists whose 16 greatest keys sit in lanes 0..15 of `upper` and `lower`.
+// Lanes 0..15 return the 16 greatest keys of both, descending.
+__device__ __forceinline__ std::uint64_t dflash2_warp_merge_top16(std::uint64_t upper,
+                                                                  std::uint64_t lower, int lane) {
+    const std::uint64_t mirrored = __shfl_sync(0xffffffffu, lower, kWarpSizeDevice - 1 - lane);
+    return dflash2_warp_merge_desc(lane < kDflash2PathSelectK ? upper : mirrored, lane);
+}
+
+struct Dflash2TopkShared {
+    std::uint64_t warp_top[kDflash2TopkWarps * kDflash2PathSelectK];
+    std::uint64_t candidates[kDflash2PathSelectK * kDflash2TopkItems];
+    int count;
+};
+
+// Exact top-16 of the block's keys, kDflash2TopkItems per thread (0 = empty).
+//
+// threshold is the 16th greatest per-thread maximum. Sixteen distinct keys reach it, so every
+// top-16 key is >= threshold, and a key >= threshold lies in one of the exactly 16 threads whose
+// maximum reaches it. When fewer than 16 threads hold a nonzero key, threshold is 0 and those at
+// most 15 threads supply every nonzero key. Either way at most 16 * kDflash2TopkItems keys, one
+// per thread of the block, become candidates, and a candidate's rank among the candidates is its
+// rank in the block. emit(rank, key) runs once for every rank in [0,16) on the thread that owns
+// it; ranks beyond the number of nonzero keys emit key 0.
+//
+// Synchronization: one barrier publishes the warp lists, every warp derives the same threshold
+// from them, and a second barrier publishes the compacted candidates.
+template <class Emit>
+__device__ __forceinline__ void dflash2_block_top16(const std::uint64_t (&keys)[kDflash2TopkItems],
+                                                    Dflash2TopkShared& shared, Emit&& emit) {
+    static_assert(kDflash2PathSelectK * kDflash2TopkItems <= kDflash2PathSelectBlock);
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int lane = tid % kWarpSizeDevice;
+    const int warp = tid / kWarpSizeDevice;
+
+    std::uint64_t thread_max = keys[0];
+#pragma unroll
+    for (int item = 1; item < kDflash2TopkItems; ++item) {
+        thread_max = dflash2_topk_max(thread_max, keys[item]);
+    }
+    const std::uint64_t warp_sorted = dflash2_warp_sort_desc(thread_max, lane);
+    if (lane < kDflash2PathSelectK) {
+        shared.warp_top[warp * kDflash2PathSelectK + lane] = warp_sorted;
+    }
+    if (tid == 0) { shared.count = 0; }
+    __syncthreads();
+
+    // Register r holds warp list 2r descending in lanes 0..15 and list 2r+1 ascending in lanes
+    // 16..31, a bitonic sequence; three merge levels leave the block's 16 greatest thread maxima
+    // in lanes 0..15.
+    std::uint64_t level[kDflash2TopkWarps / 2];
+#pragma unroll
+    for (int r = 0; r < kDflash2TopkWarps / 2; ++r) {
+        const int base = 2 * r * kDflash2PathSelectK;
+        const int slot =
+            lane < kDflash2PathSelectK ? base + lane : base + 3 * kDflash2PathSelectK - 1 - lane;
+        level[r] = dflash2_warp_merge_desc(shared.warp_top[slot], lane);
+    }
+    const std::uint64_t first     = dflash2_warp_merge_top16(level[0], level[1], lane);
+    const std::uint64_t second    = dflash2_warp_merge_top16(level[2], level[3], lane);
+    const std::uint64_t threshold = __shfl_sync(
+        0xffffffffu, dflash2_warp_merge_top16(first, second, lane), kDflash2PathSelectK - 1);
+
+#pragma unroll
+    for (int item = 0; item < kDflash2TopkItems; ++item) {
+        if (keys[item] != 0 && keys[item] >= threshold) {
+            shared.candidates[atomicAdd(&shared.count, 1)] = keys[item];
+        }
+    }
+    __syncthreads();
+
+    const int count = shared.count;
+    if (tid < count) {
+        const std::uint64_t key = shared.candidates[tid];
+        int rank                = 0;
+        for (int other = 0; other < count; ++other) {
+            rank += shared.candidates[other] > key ? 1 : 0;
+        }
+        if (rank < kDflash2PathSelectK) { emit(rank, key); }
+    } else if (tid < kDflash2PathSelectK) {
+        emit(tid, std::uint64_t{0});
+    }
 }
 
 __device__ __forceinline__ std::int64_t dflash2_column_index(int tokens, int t, int b) {
     return static_cast<std::int64_t>(b) * tokens + t;
 }
 
+// grid (splits, T, B), block 256, splits = ceil(V / kDflash2TopkBlockKeys). CTA (s,t,b) reduces
+// rows [s * kDflash2TopkBlockKeys, (s + 1) * kDflash2TopkBlockKeys) of column (t,b) to its 16
+// greatest keys, written in rank order to split_keys[((b*T + t) * splits + s) * 16 + rank].
+// Thread tid holds row groups s * kDflash2TopkBlockKeys + 8 * (g * 256 + tid) + [0,8) for
+// g < kDflash2TopkItems / 8, so each group load is coalesced across the block. vector_rows
+// requires vocab % 8 == 0 and a 16-byte aligned logits base: every group then lies entirely
+// inside or outside the column and loads as one 16-byte vector. Otherwise rows load one by one.
 __launch_bounds__(kDflash2PathSelectBlock) __global__
-    void dflash2_column_topk_split_kernel(const __nv_bfloat16* logits, float* split_val,
-                                          int* split_idx, std::int32_t vocab, std::int32_t tokens,
-                                          std::int32_t batch) {
-    const int split = static_cast<int>(blockIdx.x);
-    const int t     = static_cast<int>(blockIdx.y);
-    const int b     = static_cast<int>(blockIdx.z);
-    const int tid   = static_cast<int>(threadIdx.x);
-    if (split >= kDflash2PathSelectTopkSplits || t >= tokens || b >= batch) { return; }
+    void dflash2_column_topk_split_kernel(const __nv_bfloat16* logits, std::uint64_t* split_keys,
+                                          std::int32_t vocab, std::int32_t splits,
+                                          bool vector_rows) {
+    __shared__ Dflash2TopkShared shared;
+    const int split  = static_cast<int>(blockIdx.x);
+    const int tokens = static_cast<int>(gridDim.y);
+    const int tid    = static_cast<int>(threadIdx.x);
+    const auto column =
+        dflash2_column_index(tokens, static_cast<int>(blockIdx.y), static_cast<int>(blockIdx.z));
+    const auto* column_bits =
+        reinterpret_cast<const std::uint16_t*>(logits) + column * static_cast<std::int64_t>(vocab);
 
-    const int chunk = (vocab + kDflash2PathSelectTopkSplits - 1) / kDflash2PathSelectTopkSplits;
-    const int v0    = split * chunk;
-    const int v1    = v0 + chunk < vocab ? v0 + chunk : vocab;
-
-    float local_val[kDflash2PathSelectK];
-    int local_idx[kDflash2PathSelectK];
+    std::uint64_t keys[kDflash2TopkItems];
 #pragma unroll
-    for (int j = 0; j < kDflash2PathSelectK; ++j) {
-        local_val[j] = -CUDART_INF_F;
-        local_idx[j] = INT_MAX;
-    }
-    if (v0 < v1) {
-        const std::int64_t logit_col =
-            dflash2_column_index(tokens, t, b) * static_cast<std::int64_t>(vocab);
-        // The optimized production shortlist leaves at most 16 rows per thread in each
-        // split. Keep those rows unsorted and select the split's ranks cooperatively below;
-        // sorting every thread's private list costs more than the vocabulary scan.
-        if (v1 - v0 <= kDflash2PathSelectBlock * kDflash2PathSelectK) {
-            int count = 0;
-            for (int v = v0 + tid; v < v1; v += kDflash2PathSelectBlock) {
-                const float value = __bfloat162float(logits[logit_col + v]);
-                if (!isnan(value) && !isinf(value)) {
-                    local_val[count] = value;
-                    local_idx[count] = v;
-                    ++count;
-                }
+    for (int group = 0; group < kDflash2TopkItems / kDflash2TopkRowGroup; ++group) {
+        const int row0            = split * kDflash2TopkBlockKeys +
+                                    (group * kDflash2PathSelectBlock + tid) * kDflash2TopkRowGroup;
+        std::uint64_t* group_keys = keys + group * kDflash2TopkRowGroup;
+        if (row0 >= vocab) {
+#pragma unroll
+            for (int item = 0; item < kDflash2TopkRowGroup; ++item) { group_keys[item] = 0; }
+        } else if (vector_rows) {
+            const uint4 packed           = *reinterpret_cast<const uint4*>(column_bits + row0);
+            const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+            for (int word = 0; word < 4; ++word) {
+                group_keys[2 * word] =
+                    dflash2_topk_key(static_cast<std::uint16_t>(words[word]), row0 + 2 * word);
+                group_keys[2 * word + 1] = dflash2_topk_key(
+                    static_cast<std::uint16_t>(words[word] >> 16), row0 + 2 * word + 1);
             }
         } else {
-            for (int v = v0 + tid; v < v1; v += kDflash2PathSelectBlock) {
-                dflash2_insert_topk(local_val, local_idx, kDflash2PathSelectK,
-                                    __bfloat162float(logits[logit_col + v]), v);
+#pragma unroll
+            for (int item = 0; item < kDflash2TopkRowGroup; ++item) {
+                const int row    = row0 + item;
+                group_keys[item] = row < vocab ? dflash2_topk_key(column_bits[row], row) : 0;
             }
         }
     }
 
-    __shared__ float warp_val[8 * kDflash2PathSelectK];
-    __shared__ int warp_idx[8 * kDflash2PathSelectK];
-    const int warp = tid / 32;
-    const int lane = tid % 32;
-    if (v1 - v0 <= kDflash2PathSelectBlock * kDflash2PathSelectK) {
-        for (int j = 0; j < kDflash2PathSelectK; ++j) {
-            float best_val = -CUDART_INF_F;
-            int best_idx   = INT_MAX;
-#pragma unroll
-            for (int item = 0; item < kDflash2PathSelectK; ++item) {
-                if (local_idx[item] != INT_MAX &&
-                    dflash2_logit_better(local_val[item], local_idx[item], best_val, best_idx)) {
-                    best_val = local_val[item];
-                    best_idx = local_idx[item];
-                }
-            }
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                const float other_val = __shfl_down_sync(0xffffffffu, best_val, offset);
-                const int other_idx   = __shfl_down_sync(0xffffffffu, best_idx, offset);
-                if (dflash2_logit_better(other_val, other_idx, best_val, best_idx)) {
-                    best_val = other_val;
-                    best_idx = other_idx;
-                }
-            }
-            const int selected_idx = __shfl_sync(0xffffffffu, best_idx, 0);
-            if (lane == 0) {
-                const int dst = warp * kDflash2PathSelectK + j;
-                warp_val[dst] = best_val;
-                warp_idx[dst] = best_idx;
-            }
-#pragma unroll
-            for (int item = 0; item < kDflash2PathSelectK; ++item) {
-                if (local_idx[item] == selected_idx) { local_idx[item] = INT_MAX; }
-            }
-        }
-    } else {
-        __shared__ float top_val[kDflash2PathSelectBlock * kDflash2PathSelectK];
-        __shared__ int top_idx[kDflash2PathSelectBlock * kDflash2PathSelectK];
-        const int local_base = tid * kDflash2PathSelectK;
-#pragma unroll
-        for (int j = 0; j < kDflash2PathSelectK; ++j) {
-            top_val[local_base + j] = local_val[j];
-            top_idx[local_base + j] = local_idx[j];
-        }
-        __syncthreads();
-        if (lane == 0) {
-            float merged_val[kDflash2PathSelectK];
-            int merged_idx[kDflash2PathSelectK];
-            for (int j = 0; j < kDflash2PathSelectK; ++j) {
-                merged_val[j] = -CUDART_INF_F;
-                merged_idx[j] = INT_MAX;
-            }
-            const int thread0 = warp * 32;
-            for (int thread = thread0; thread < thread0 + 32; ++thread) {
-                const int row = thread * kDflash2PathSelectK;
-                for (int j = 0; j < kDflash2PathSelectK; ++j) {
-                    if (top_idx[row + j] == INT_MAX) { continue; }
-                    dflash2_insert_topk(merged_val, merged_idx, kDflash2PathSelectK,
-                                        top_val[row + j], top_idx[row + j]);
-                }
-            }
-            const int wbase = warp * kDflash2PathSelectK;
-            for (int j = 0; j < kDflash2PathSelectK; ++j) {
-                warp_val[wbase + j] = merged_val[j];
-                warp_idx[wbase + j] = merged_idx[j];
-            }
-        }
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        float merged_val[kDflash2PathSelectK];
-        int merged_idx[kDflash2PathSelectK];
-        for (int j = 0; j < kDflash2PathSelectK; ++j) {
-            merged_val[j] = -CUDART_INF_F;
-            merged_idx[j] = INT_MAX;
-        }
-        for (int p = 0; p < 8 * kDflash2PathSelectK; ++p) {
-            if (warp_idx[p] == INT_MAX) { continue; }
-            dflash2_insert_topk(merged_val, merged_idx, kDflash2PathSelectK, warp_val[p],
-                                warp_idx[p]);
-        }
-        const std::int64_t out =
-            (dflash2_column_index(tokens, t, b) * kDflash2PathSelectTopkSplits + split) *
-            kDflash2PathSelectK;
-        for (int j = 0; j < kDflash2PathSelectK; ++j) {
-            split_val[out + j] = merged_val[j];
-            split_idx[out + j] = merged_idx[j];
-        }
-    }
+    std::uint64_t* out =
+        split_keys + (column * splits + split) * static_cast<std::int64_t>(kDflash2PathSelectK);
+    dflash2_block_top16(keys, shared, [&](int rank, std::uint64_t key) { out[rank] = key; });
 }
 
+// grid (T, B), block 256. CTA (t,b) merges the column's splits * 16 <= kDflash2TopkBlockKeys
+// split keys (16-byte loads of the key pair at offset 2 * (g * 256 + tid)) into
+// cand_val/cand_idx[(b*T + t) * 16 + rank] in rank order. A rank with no finite logit gets value
+// -inf and row = rank (rank < 16 <= vocab). Rows map through logit_token_ids when it is non-null.
+// split_keys must be 16-byte aligned.
 __launch_bounds__(kDflash2PathSelectBlock) __global__
-    void dflash2_column_topk_merge_kernel(const float* split_val, const int* split_idx,
-                                          float* cand_val, int* cand_idx,
-                                          const std::int32_t* logit_token_ids, std::int32_t vocab,
-                                          std::int32_t tokens, std::int32_t batch) {
-    const int t   = static_cast<int>(blockIdx.x);
-    const int b   = static_cast<int>(blockIdx.y);
-    const int tid = static_cast<int>(threadIdx.x);
-    if (t >= tokens || b >= batch) { return; }
+    void dflash2_column_topk_merge_kernel(const std::uint64_t* split_keys, float* cand_val,
+                                          int* cand_idx, const std::int32_t* logit_token_ids,
+                                          std::int32_t splits) {
+    __shared__ Dflash2TopkShared shared;
+    const int tid     = static_cast<int>(threadIdx.x);
+    const auto column = dflash2_column_index(
+        static_cast<int>(gridDim.x), static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y));
+    const int count = splits * kDflash2PathSelectK;
+    const auto* src = reinterpret_cast<const ulonglong2*>(split_keys + column * count);
 
-    const std::int64_t column = dflash2_column_index(tokens, t, b);
-    const std::int64_t src    = column * kDflash2PathSelectTopkSplits * kDflash2PathSelectK;
-    constexpr int kCandidates = kDflash2PathSelectTopkSplits * kDflash2PathSelectK;
-    constexpr int kPerThread  = kCandidates / kDflash2PathSelectBlock;
-    static_assert(kPerThread * kDflash2PathSelectBlock == kCandidates);
-    float local_val[kPerThread];
-    int local_idx[kPerThread];
+    // At most kDflash2TopkMaxSplits * 16 keys exist, so only the first kPairs key pairs per
+    // thread can be live; the rest are compile-time empty.
+    constexpr int kPairs =
+        kDflash2TopkMaxSplits * kDflash2PathSelectK / (2 * kDflash2PathSelectBlock);
+    static_assert(kPairs * 2 * kDflash2PathSelectBlock ==
+                      kDflash2TopkMaxSplits * kDflash2PathSelectK &&
+                  2 * kPairs <= kDflash2TopkItems);
+    std::uint64_t keys[kDflash2TopkItems] = {};
 #pragma unroll
-    for (int item = 0; item < kPerThread; ++item) {
-        const int offset = tid + item * kDflash2PathSelectBlock;
-        local_val[item]  = split_val[src + offset];
-        local_idx[item]  = split_idx[src + offset];
+    for (int pair = 0; pair < kPairs; ++pair) {
+        const int at = pair * kDflash2PathSelectBlock + tid;
+        ulonglong2 two{0, 0};
+        if (2 * at < count) { two = src[at]; }
+        keys[2 * pair]     = two.x;
+        keys[2 * pair + 1] = two.y;
     }
 
-    __shared__ float reduce_val[kDflash2PathSelectBlock];
-    __shared__ int reduce_idx[kDflash2PathSelectBlock];
     const std::int64_t dst = column * kDflash2PathSelectK;
-    // The split stage contributes 32 exact top-16 lists. Select each final rank with
-    // the same value/index ordering as insertion_topk, but spread the 512 candidates
-    // across the block instead of serially merging them on thread zero.
-    for (int rank = 0; rank < kDflash2PathSelectK; ++rank) {
-        float best_val = -CUDART_INF_F;
-        int best_idx   = INT_MAX;
-#pragma unroll
-        for (int item = 0; item < kPerThread; ++item) {
-            if (local_idx[item] != INT_MAX &&
-                dflash2_logit_better(local_val[item], local_idx[item], best_val, best_idx)) {
-                best_val = local_val[item];
-                best_idx = local_idx[item];
-            }
-        }
-        reduce_val[tid] = best_val;
-        reduce_idx[tid] = best_idx;
-        __syncthreads();
-        for (int stride = kDflash2PathSelectBlock / 2; stride > 0; stride >>= 1) {
-            if (tid < stride &&
-                dflash2_logit_better(reduce_val[tid + stride], reduce_idx[tid + stride],
-                                     reduce_val[tid], reduce_idx[tid])) {
-                reduce_val[tid] = reduce_val[tid + stride];
-                reduce_idx[tid] = reduce_idx[tid + stride];
-            }
-            __syncthreads();
-        }
-        const int selected_idx = reduce_idx[0];
-        if (tid == 0) {
-            const int row = selected_idx != INT_MAX ? selected_idx : (rank < vocab ? rank : 0);
-            cand_val[dst + rank] = reduce_val[0];
-            cand_idx[dst + rank] = logit_token_ids != nullptr ? logit_token_ids[row] : row;
-        }
-#pragma unroll
-        for (int item = 0; item < kPerThread; ++item) {
-            if (local_idx[item] == selected_idx) { local_idx[item] = INT_MAX; }
-        }
-        __syncthreads();
-    }
+    dflash2_block_top16(keys, shared, [&](int rank, std::uint64_t key) {
+        const int row        = key != 0 ? dflash2_topk_key_row(key) : rank;
+        cand_val[dst + rank] = key != 0 ? dflash2_topk_key_value(key) : -CUDART_INF_F;
+        cand_idx[dst + rank] = logit_token_ids != nullptr ? logit_token_ids[row] : row;
+    });
 }
 
 __device__ __forceinline__ float dflash2_markov_score_serial(const __nv_bfloat16* hidden_proj,

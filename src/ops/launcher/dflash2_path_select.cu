@@ -4,7 +4,9 @@
 #include "ops/kernel/dflash2_path_select.cuh"
 #include "core/device.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 
@@ -21,23 +23,33 @@ void dflash2_path_select_bf16_gemv_launch(const Tensor& x, const Weight& weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void dflash2_column_topk_launch(const Tensor& logits, float* split_val, int* split_idx,
-                                float* cand_val, int* cand_idx, const Tensor* logit_token_ids,
-                                cudaStream_t stream) {
+std::size_t dflash2_column_topk_split_bytes(std::int64_t columns) {
+    return static_cast<std::size_t>(columns) * kDflash2TopkMaxSplits * kDflash2PathSelectK *
+           sizeof(std::uint64_t);
+}
+
+void dflash2_column_topk_launch(const Tensor& logits, std::uint64_t* split_keys, float* cand_val,
+                                int* cand_idx, const Tensor* logit_token_ids, cudaStream_t stream) {
     const std::int32_t vocab  = logits.ne[0];
     const std::int32_t tokens = logits.ne[1];
     const std::int32_t batch  = logits.ne[2];
-    const dim3 split_grid(static_cast<unsigned int>(kDflash2PathSelectTopkSplits),
-                          static_cast<unsigned int>(tokens), static_cast<unsigned int>(batch));
+    if (vocab < kDflash2PathSelectK || vocab > kDflash2TopkMaxLogitRows) {
+        throw std::invalid_argument("dflash2_column_topk: V must be in [16,262144]");
+    }
+    const std::int32_t splits = (vocab + kDflash2TopkBlockKeys - 1) / kDflash2TopkBlockKeys;
+    const bool vector_rows    = vocab % kDflash2TopkRowGroup == 0 &&
+                                reinterpret_cast<std::uintptr_t>(logits.data) % 16 == 0;
+    const dim3 split_grid(static_cast<unsigned int>(splits), static_cast<unsigned int>(tokens),
+                          static_cast<unsigned int>(batch));
     dflash2_column_topk_split_kernel<<<split_grid, kDflash2PathSelectBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data), split_val, split_idx, vocab, tokens, batch);
+        static_cast<const __nv_bfloat16*>(logits.data), split_keys, vocab, splits, vector_rows);
     CUDA_CHECK(cudaGetLastError());
     const dim3 merge_grid(static_cast<unsigned int>(tokens), static_cast<unsigned int>(batch));
     dflash2_column_topk_merge_kernel<<<merge_grid, kDflash2PathSelectBlock, 0, stream>>>(
-        split_val, split_idx, cand_val, cand_idx,
+        split_keys, cand_val, cand_idx,
         logit_token_ids != nullptr ? static_cast<const std::int32_t*>(logit_token_ids->data)
                                    : nullptr,
-        vocab, tokens, batch);
+        splits);
     CUDA_CHECK(cudaGetLastError());
 }
 
