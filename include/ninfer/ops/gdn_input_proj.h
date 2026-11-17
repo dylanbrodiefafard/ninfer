@@ -80,8 +80,9 @@ void gdn_input_proj(const A4Activation& x, const Weight& query_key_value_z_weigh
  * Returns the transient capacity for a snapshot profile. `batch_size` is exact and the query
  * covers every W in the inclusive width interval. The registered [16384,5120] W=1 snapshot runs
  * one fused T=1 GEMV per sequence and needs no transient plane; any other width throws. The
- * [16384,2560] parent (A16Only) stages its projection and reports 20480 * max_width * batch_size
- * bytes.
+ * [16384,2560] parent (A16Only) reports zero when the whole interval uses the fused FP8
+ * projection/convolution; otherwise it reports 20480 * batch_size bytes per column of the
+ * largest staged width within the interval.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
@@ -128,10 +129,11 @@ void gdn_input_proj(const A4Activation& x, const Weight& query_key_value_z_weigh
  * policy and FP8 A16Only and AllowA8; every admitted policy runs the A16 fused T=1 GEMV once per
  * request, so each row keeps its single-request arithmetic profile. At K=2560 both qtypes admit
  * only A16Only: one A16 projection covers all W*B columns (the parent is read once per call),
- * its BF16 q/k/value projection is staged in the workspace, and a slot-indexed convolution
- * consumes it. That staging, like the projection's reduction route, depends on the packed column
- * count W*B, so a row matches a B=1 call on the same inputs within the A16 criterion rather than
- * bit for bit; the snapshot history is the same BF16 projection in either case. Other widths,
+ * and a slot-indexed convolution consumes its BF16-rounded q/k/value projection. The FP8
+ * single-request decode fuses convolution into the projection epilogue; other profiles stage it
+ * in the workspace. The projection's reduction route depends on the packed column count W*B,
+ * so a row matches a B=1 call on the same inputs within the A16 criterion rather than bit for
+ * bit; the snapshot history is the same BF16 projection in either case. Other widths,
  * policies, and parents throw std::invalid_argument.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
@@ -198,8 +200,9 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * A16Only/AllowA8 but uses qualified A16 arithmetic throughout W=2..16; its batches preserve the
  * C=1 panel reduction and fused/materialized convolution profile. Both [16384,2560] parents admit
  * only A16Only over B=1..12 with T=1..16 chains and T=2..16 trees: one A16 projection over all
- * T*B columns writes conv_record, and the convolution consumes that BF16 record, so a row matches a
- * B=1 call within the A16 criterion rather than bit for bit. That projection and convolution are
+ * T*B columns writes conv_record, and convolution consumes that BF16-represented projection
+ * (directly in fused FP8 decode, from the record otherwise), so a row matches a B=1 call
+ * within the A16 criterion rather than bit for bit. That projection and convolution are
  * the ones gdn_input_proj_conv_snapshot runs at the same T and B, so a chain's query/key/value/z
  * and its conv_record are bit-identical to that snapshot's outputs and newest history tap; at T=1
  * this is the read-only counterpart of a width-one decode step. Unregistered policies or widths

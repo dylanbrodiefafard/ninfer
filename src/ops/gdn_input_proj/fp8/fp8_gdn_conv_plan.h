@@ -43,6 +43,29 @@ inline constexpr std::int32_t kFp8GdnConvMaxBatch = 12;
     return verified && fp8_gdn_conv_fused_width(width);
 }
 
+// The [16384,2560] parent's single-column, single-request GEMV fuses convolution. The
+// convolution consumes a BF16-rounded projection and requires no transient plane.
+[[nodiscard]] constexpr bool fp8_gdn_decode_conv_fused(std::int32_t width,
+                                                       std::int32_t batch) noexcept {
+    return width == 1 && batch == 1;
+}
+
+// The wrapper validates the [16384,2560] parent, W=B=1 and tensor/state ownership before
+// calling these launchers. State publication and record side effects match the public Op;
+// CUDA launch failures propagate on stream. Neither launcher allocates storage.
+void fp8_gdn_snapshot_decode_2560_launch(const Tensor& x, const Weight& weight,
+                                         const Tensor& conv_weight, Tensor& conv_states,
+                                         const Tensor& valid_columns, const Tensor& initial_slots,
+                                         const Tensor& snapshot_base_slots, Tensor& query,
+                                         Tensor& key, Tensor& value, Tensor& z,
+                                         cudaStream_t stream);
+
+void fp8_gdn_record_decode_2560_launch(const Tensor& x, const Weight& weight,
+                                       const Tensor& conv_weight, const Tensor& conv_states,
+                                       const Tensor& valid_columns, const Tensor& initial_slots,
+                                       Tensor& conv_record, Tensor& query, Tensor& key,
+                                       Tensor& value, Tensor& z, cudaStream_t stream);
+
 // The W=1 snapshot of one request.
 void fp8_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                     const Tensor& conv_weight, Tensor& conv_states,

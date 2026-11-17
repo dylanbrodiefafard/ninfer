@@ -2,6 +2,8 @@
 #include "core/device.h"
 
 #include "ops/input_projection_test_common.h"
+#include "ops/sanitizer_scope.h"
+#include "core/decode_graph.h"
 #include "ops/fp8_activation_ref.h"
 #include "ninfer/ops/dflash2_path_select.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
@@ -781,11 +783,11 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
 }
 
 // [16384,2560] parents (Qwen3.8-Flash-Next GDN), A16Only: one projection over all W*B packed
-// columns writes the record, then the slot-indexed convolution reads it. Every shape is checked
+// columns writes the BF16 record and convolves those represented values. Every shape is checked
 // against the FP64 oracle, and each lane against a B=1 call on its own inputs under the same A16
 // criterion (the B=1 call projects a different packed column count, so the comparison is not
 // bitwise).
-int run_flash_next_record(QType qtype) {
+int run_flash_next_record(QType qtype, bool sanitizer = false) {
     constexpr std::int32_t kHidden    = 2560;
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
@@ -854,9 +856,23 @@ int run_flash_next_record(QType qtype) {
             return 1;
         }
         WorkspaceArena workspace(256);
-        ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid, initial, record, q, k,
-                                        v, z, workspace, nullptr,
-                                        parent_indices.empty() ? nullptr : &parents);
+        if (qtype == QType::FP8_E4M3FN_ROW_BF16S && width == 1 && batch == 1) {
+            DeviceContext context;
+            DecodeGraphDefinition definition;
+            DecodeGraphExecutable graph;
+            CUDA_CHECK(cudaDeviceSynchronize());
+            definition.capture(context.stream, [&] {
+                ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid, initial,
+                                                record, q, k, v, z, workspace, context.stream);
+            });
+            graph.instantiate(definition);
+            graph.launch(context.stream);
+            CUDA_CHECK(cudaStreamSynchronize(context.stream));
+        } else {
+            ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid, initial, record,
+                                            q, k, v, z, workspace, nullptr,
+                                            parent_indices.empty() ? nullptr : &parents);
+        }
         for (std::int32_t row = 0; row < batch; ++row) {
             Tensor valid_row = dense ? Tensor{} : valid.slice(0, row, 1);
             Tensor parent_row;
@@ -910,9 +926,9 @@ int run_flash_next_record(QType qtype) {
             const Tensor bases_tensor(device_bases.p, DType::I32, {batch});
             Tensor sq_tensor = view(sq, kQueryRows), sk_tensor = view(sk, kKeyRows),
                    sv_tensor = view(sv, kValueRows), sz_tensor = view(sz, kZRows);
-            WorkspaceArena snapshot_workspace(
-                ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                    qtype, kRows, kHidden, ops::LinearPolicy::A16Only, batch, width, width));
+            WorkspaceArena snapshot_workspace(std::max<std::size_t>(
+                1, ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                       qtype, kRows, kHidden, ops::LinearPolicy::A16Only, batch, width, width)));
             ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, snapshot_states, valid,
                                               initial, bases_tensor, sq_tensor, sk_tensor,
                                               sv_tensor, sz_tensor, snapshot_workspace, nullptr);
@@ -954,6 +970,7 @@ int run_flash_next_record(QType qtype) {
     int failures = 0;
     // Width-one chains: the read-only record of a K0 root, dense and masked, B=1/5/12.
     failures += run_shape(1, 1, {}, {}, 1405U);
+    if (sanitizer) { return failures; }
     failures += run_shape(1, 5, {1, 1, 1, 1, 1}, {}, 1407U);
     failures += run_shape(1, 12, {}, {}, 1409U);
     failures += run_shape(2, 1, {}, {}, 1411U);
@@ -976,12 +993,17 @@ int run_flash_next_record(QType qtype) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cerr << "FAIL: no usable CUDA device\n";
         return 1;
     }
 
+    if (sanitizer_scope(argc, argv)) {
+        const int failures = run_flash_next_record(QType::FP8_E4M3FN_ROW_BF16S, true);
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 GDN decode record sanitizer\n";
+        return failures == 0 ? 0 : 1;
+    }
     int failures = 0;
     failures += run_nvfp4_tree_chain_matches_sequential_fused();
     failures += run_batched_record_qualification(QType::NVFP4, ops::LinearPolicy::AllowA8);

@@ -1,6 +1,9 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
+#include "ops/sanitizer_scope.h"
+#include "core/decode_graph.h"
+#include "core/device.h"
 
 #include <cuda_runtime.h>
 
@@ -713,7 +716,7 @@ int run_fp8() {
 }
 
 // [16384,2560] parents (Qwen3.8-Flash-Next GDN), A16Only: one projection over all W*B packed
-// columns, BF16 staging in the workspace, and the slot-indexed convolution.
+// columns and a slot-indexed convolution of the BF16-rounded projection.
 DevicePackedWeight make_flash_next_parent(QType qtype) {
     constexpr std::int32_t kHidden = 2560;
     constexpr std::int32_t kRows   = 16384;
@@ -798,12 +801,12 @@ int run_flash_next_lane_equivalence(QType qtype, DevicePackedWeight& parent, std
 
     const std::size_t batched_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         qtype, kRows, kHidden, ops::LinearPolicy::A16Only, batch, width, width);
-    WorkspaceArena batched_workspace(batched_bytes);
+    WorkspaceArena batched_workspace(std::max<std::size_t>(1, batched_bytes));
     ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, batched_view, valid, initial, base, q,
                                       k, v, z, batched_workspace, nullptr);
     const std::size_t lane_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         qtype, kRows, kHidden, ops::LinearPolicy::A16Only, 1, width, width);
-    WorkspaceArena lane_workspace(lane_bytes);
+    WorkspaceArena lane_workspace(std::max<std::size_t>(1, lane_bytes));
     for (std::int32_t row = 0; row < batch; ++row) {
         Tensor q_row = q_lane.slice(2, row, 1), k_row = k_lane.slice(2, row, 1),
                v_row = v_lane.slice(2, row, 1), z_row = z_lane.slice(2, row, 1);
@@ -863,7 +866,7 @@ int run_flash_next_lane_equivalence(QType qtype, DevicePackedWeight& parent, std
     return failures;
 }
 
-int run_flash_next(QType qtype) {
+int run_flash_next(QType qtype, bool sanitizer = false) {
     constexpr std::int32_t kHidden    = 2560;
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
@@ -879,10 +882,6 @@ int run_flash_next(QType qtype) {
         const std::size_t workspace_bytes =
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                 qtype, kRows, kHidden, ops::LinearPolicy::A16Only, batch, width, width);
-        if (workspace_bytes != static_cast<std::size_t>(20480) * width * batch) {
-            std::cerr << name << " K=2560 snapshot workspace is not the BF16 projection plane\n";
-            ++failures;
-        }
         return run_batched_case(
             name + " K=2560 A16 B=" + std::to_string(batch) + " W=" + std::to_string(width),
             kHidden, kValueRows, kZRows, width, batch, std::move(valid_columns), conv_weight,
@@ -900,13 +899,29 @@ int run_flash_next(QType qtype) {
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
                 Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
-                                                  snapshot_base, q, k, v, z, workspace, nullptr);
+                if (qtype == QType::FP8_E4M3FN_ROW_BF16S && width == 1 && batch == 1) {
+                    DeviceContext context;
+                    DecodeGraphDefinition definition;
+                    DecodeGraphExecutable graph;
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    definition.capture(context.stream, [&] {
+                        ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid,
+                                                          initial, snapshot_base, q, k, v, z,
+                                                          workspace, context.stream);
+                    });
+                    graph.instantiate(definition);
+                    graph.launch(context.stream);
+                    CUDA_CHECK(cudaStreamSynchronize(context.stream));
+                } else {
+                    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
+                                                      snapshot_base, q, k, v, z, workspace,
+                                                      nullptr);
+                }
             });
     };
-    // W=1 decode (the GEMV route at B=1, the packed routes from B=2), multi-column snapshots
-    // with mixed valid prefixes, and a long single-row snapshot.
     failures += run_batched(1, 1, {}, 1321U);
+    if (sanitizer) { return failures; }
+    // Include wider packed projections, mixed valid prefixes and a long single-row snapshot.
     failures += run_batched(1, 4, {}, 1323U);
     failures += run_batched(1, 12, {}, 1327U);
     failures += run_batched(4, 4, {4, 3, 1, 2}, 1329U);
@@ -939,12 +954,17 @@ int run_flash_next(QType qtype) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cerr << "FAIL: no usable CUDA device\n";
         return 1;
     }
 
+    if (sanitizer_scope(argc, argv)) {
+        const int failures = run_flash_next(QType::FP8_E4M3FN_ROW_BF16S, true);
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 GDN decode snapshot sanitizer\n";
+        return failures == 0 ? 0 : 1;
+    }
     int failures = 0;
     for (const ops::LinearPolicy policy :
          {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4, ops::LinearPolicy::AllowA8}) {

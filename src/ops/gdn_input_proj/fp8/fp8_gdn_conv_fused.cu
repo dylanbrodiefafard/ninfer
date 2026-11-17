@@ -16,6 +16,34 @@ namespace {
 
 using Geometry = Fp8GdnInputGeometry;
 
+// The hidden-2560 GEMV convolution consumes the same BF16 projection as its materialized
+// profile. Round before the epilogue so the record, history and convolution share that value.
+template <class Publish>
+struct Fp8GdnBf16DecodeOutput {
+    GdnConvOutput<1, Publish> destination;
+
+    __device__ __forceinline__ void store(int parent_row, int token, float projected) const {
+        destination.store(parent_row, token, __bfloat162float(__float2bfloat16_rn(projected)));
+    }
+};
+
+template <class Publish>
+void launch_decode_2560(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                        const Tensor& conv_states, const Tensor& valid_columns,
+                        const Tensor& initial_slots, Tensor& query, Tensor& key, Tensor& value,
+                        Tensor& z, Publish publish, cudaStream_t stream) {
+    using DecodeGeometry = Fp8FlashNextGdnInputGeometry;
+    using Schedule       = typename Fp8LinearDecodeProductionSchedule<DecodeGeometry>::Type;
+    const Fp8GdnBf16DecodeOutput<Publish> output{make_gdn_conv_output<1>(
+        conv_weight, conv_states, valid_columns, initial_slots, query, key, value, z, publish)};
+    fp8_gemv_kernel<DecodeGeometry, Schedule>
+        <<<DecodeGeometry::kOutputRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const __nv_bfloat16*>(weight.scales), output);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 using RecordLaunch = void (*)(const Tensor&, const Weight&, const Tensor&, const Tensor&,
                               const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
                               Tensor&, cudaStream_t, const std::int32_t*);
@@ -110,6 +138,31 @@ void fp8_gdn_record_fused_launch(const Tensor& x, const Weight& weight, const Te
     launchers[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record, query, key,
         value, z, stream, parents);
+}
+
+void fp8_gdn_snapshot_decode_2560_launch(const Tensor& x, const Weight& weight,
+                                         const Tensor& conv_weight, Tensor& conv_states,
+                                         const Tensor& valid_columns, const Tensor& initial_slots,
+                                         const Tensor& snapshot_base_slots, Tensor& query,
+                                         Tensor& key, Tensor& value, Tensor& z,
+                                         cudaStream_t stream) {
+    launch_decode_2560(
+        x, weight, conv_weight, conv_states, valid_columns, initial_slots, query, key, value, z,
+        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
+                               static_cast<const std::int32_t*>(snapshot_base_slots.data),
+                               kGdnChannels},
+        stream);
+}
+
+void fp8_gdn_record_decode_2560_launch(const Tensor& x, const Weight& weight,
+                                       const Tensor& conv_weight, const Tensor& conv_states,
+                                       const Tensor& valid_columns, const Tensor& initial_slots,
+                                       Tensor& conv_record, Tensor& query, Tensor& key,
+                                       Tensor& value, Tensor& z, cudaStream_t stream) {
+    launch_decode_2560(
+        x, weight, conv_weight, conv_states, valid_columns, initial_slots, query, key, value, z,
+        RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data), kGdnChannels, 1},
+        stream);
 }
 
 } // namespace ninfer::ops::detail

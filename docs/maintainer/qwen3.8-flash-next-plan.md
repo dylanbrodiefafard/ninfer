@@ -696,19 +696,6 @@ Evidence: `out/sol/small-item2-buffered-ab.log`, `small-item2-cutoff.log` and
 `small-item2-buffered-oracle.log`. These are Op-level gains; no round-throughput gain is claimed
 or measured because the expected round saving is below the established lanes-bench spread.
 
-## N-gram read budget
-
-Random 4 KiB O_DIRECT reads of the 52 GB table on the boot SSD (SN850X, ext4) measured about
-101K pages/s at 8 threads and 193K at 16 (178K at 32), 2026-11-14. A prompt needs at most 16
-rows per token (fewer after the row cache), so a 4K-token prompt costs about 0.3 s of reads.
-Rows depend only on token ids, so the reader fetches chunk k+1's rows while chunk k computes;
-only the first chunk's reads (about 40 ms for 512 tokens) are exposed. Decode reads 16 rows per
-token (well under 1 ms at queue depth 16) before layer 1 of the step.
-
-## Expert residency design (step 9)
-
-- **Always resident.** Everything every token uses stays in VRAM for the life of the model and
-  never enters the expert cache: head, attention/GDN/QSA projections and controls,
 ### FP8 mixer-output double buffering (2026-11-16)
 
 The FP8 A16 mixer-output Linear `[2560,6144]` uses two K512 code/activation staging buffers
@@ -732,6 +719,65 @@ clang-tidy: 0 findings; `-Werror` build passes. Evidence: `out/sol/small-item4-a
 This is an Op-only improvement; round-level measurements are omitted because the expected
 round delta is below the established host spread.
 
+### Narrow NVFP4 M32 row partition (2026-11-16, rejected)
+
+BN16 instead of BN32 at A16 M32 was admitted by `tools.kdev --idea grid_underfill`: NCU
+showed 80 CTAs and 304–337 GB/s at the four N=2560 geometries, and 20 CTAs / 81 GB/s at
+N=640, K=2560. It passed the complete NVFP4 A16 FP64-oracle suite, but did not improve
+cold public Linear latency (150 repetitions, baseline/after/after/baseline). At T=20,
+feature `[2560,12800]` stays 38.912 us, attention output `[2560,4096]` stays 16.384 us,
+mixer output `[2560,6144]` rises 20.480 → 21.504 us, down `[2560,7680]` rises
+24.576 → 26.320 us, and conv `[640,2560]` stays 10.240 us. Down at T=32 regresses 16.7%.
+The candidate and candidate-only tests were removed; BN32 remains selected. Evidence:
+`out/sol/small-item7-{gates,ab,oracle}.log`. No round benchmark or sanitizer campaign was
+run for the discarded implementation.
+
+### FP8 GDN projection/convolution epilogue (2026-11-16)
+
+The `[16384,2560]` FP8 GDN parent fuses convolution into its existing GEMV at W=B=1 for
+both snapshot and read-only record calls. The epilogue rounds the FP32 projection to BF16
+before convolution and uses the shared snapshot/record publishers, preserving the represented
+record, BF16 history transition and exact snapshot-versus-record outputs. The snapshot needs
+zero transient bytes instead of the 20,480-byte projection plane. Other shapes and qtypes,
+including the C=5 K3 verify path and all 27B profiles, retain their existing implementations.
+
+Cold complete-public-Op CUDA Graph medians on RTX 5090 / CUDA 13.1 / sm_120a, 150 samples per
+point in baseline/final/final/baseline order: snapshot and record both improve
+34.816 → 32.768 us (-5.9%, each final repetition 32.768 us). C=5 W=4 remains 38.912 us.
+The 27B NVFP4/A8 W=4 control remains 36.864 us; its FP8/A16 control spans 63.488–65.280 us
+with no implementation change. The public benchmark supports both parent formats and hidden
+sizes via `--qtype nvfp4|fp8 --hidden 5120|2560 --policy a16|a4|a8`.
+
+Broader fusion was rejected after the same public-Op-first qualification. Packed SIMT at
+C=5 W=1 regresses snapshot 36.864 → 40.960 us and record 36.864 → 38.912 us. Gathering
+complete rows from the existing K-warp MMA for a convolution epilogue regresses C=5 W=4
+38.912 → 51.200 us and other measured MMA points by 10.5–56.1%. Those candidates, their
+row-gather machinery and candidate-only tests were removed. `tools.kdev profiled_overhead`
+admitted the bounded experiments from the same-kernel node trace / NCU attribution.
+
+Final qualification: both complete snapshot/record FP64-oracle suites pass, including the
+27B geometries, graph execution of the fused decode, exact record/snapshot equality,
+source-state preservation and own-initial-slot overlap. Focused memcheck: 0 errors for each
+form; racecheck: 0 hazards/errors/warnings. `-Werror` build and clang-tidy (five affected TUs,
+0 diagnostics) pass; fresh read-only Sol review passes. Evidence:
+`out/sol/small-item5-final-{ab,snapshot-oracle,record-oracle}.log` and the corresponding
+`final-{snapshot,record}-{memcheck,racecheck}.log` files. No round-throughput gain is claimed:
+C=5 K3 is unchanged, and the approximately 0.07 ms C=1 width-one round saving implied by
+36 GDN layers is below the established host lanes-bench spread.
+
+## N-gram read budget
+
+Random 4 KiB O_DIRECT reads of the 52 GB table on the boot SSD (SN850X, ext4) measured about
+101K pages/s at 8 threads and 193K at 16 (178K at 32), 2026-11-14. A prompt needs at most 16
+rows per token (fewer after the row cache), so a 4K-token prompt costs about 0.3 s of reads.
+Rows depend only on token ids, so the reader fetches chunk k+1's rows while chunk k computes;
+only the first chunk's reads (about 40 ms for 512 tokens) are exposed. Decode reads 16 rows per
+token (well under 1 ms at queue depth 16) before layer 1 of the step.
+
+## Expert residency design (step 9)
+
+- **Always resident.** Everything every token uses stays in VRAM for the life of the model and
+  never enters the expert cache: head, attention/GDN/QSA projections and controls,
   hyper-connections, PLE projections, the router and shared-expert gate, and all 48 shared
   experts (the token embedding is a per-token row gather and lives in mapped host memory).
   Shared experts are NVFP4 with GPTQ and MSE scales in the chosen recipe (133 MB, about

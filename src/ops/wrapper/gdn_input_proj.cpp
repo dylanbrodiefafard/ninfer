@@ -373,6 +373,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
 // projection over all W*B packed columns, which reads the parent once for the whole batch, with a
 // slot-indexed convolution over the BF16 projection; the BF16 projection is private staging
 // covered by the A16 criterion (the snapshot's persistent history is BF16 in every route).
+// The FP8 W=B=1 GEMV fuses convolution into its row epilogue, consuming the same
+// BF16-rounded projection without a staging plane.
 bool flash_next_parent(const Weight& weight) {
     constexpr std::int32_t kFlashNextHidden = 2560;
     return weight.k == kFlashNextHidden;
@@ -450,6 +452,13 @@ void dispatch_flash_next_snapshot(const Tensor& x, const Weight& weight, const T
                                                 &z};
     require_parent_nonoverlap(weight, tensors, workspace, kOp);
 
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S &&
+        detail::fp8_gdn_decode_conv_fused(geometry.width, geometry.batch)) {
+        detail::fp8_gdn_snapshot_decode_2560_launch(
+            x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
+            snapshot_base_slots, query, key, value, z, stream);
+        return;
+    }
     auto scope = workspace.scope();
     const DeviceSpan plane_storage =
         workspace.alloc_bytes(flash_next_snapshot_plane_bytes(geometry.batch, geometry.width));
@@ -488,6 +497,13 @@ void dispatch_flash_next_record(const Tensor& x, const Weight& weight, const Ten
         &conv_record, &query,       &key,         &value,         &z};
     require_parent_nonoverlap(weight, tensors, workspace, kOp);
 
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S && !parent_index_active(parent_index) &&
+        detail::fp8_gdn_decode_conv_fused(geometry.width, geometry.batch)) {
+        detail::fp8_gdn_record_decode_2560_launch(x, weight, conv_weight, conv_states,
+                                                  valid_columns, initial_state_slots, conv_record,
+                                                  query, key, value, z, stream);
+        return;
+    }
     // The projection lands in the observable record, which the convolution then reads.
     flash_next_project(x, weight, conv_record, z, geometry, stream);
     detail::gdn_projected_conv_record_launch(
@@ -815,6 +831,10 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         input_rows == detail::Fp8FlashNextGdnInputGeometry::kInputRows &&
         policy == LinearPolicy::A16Only) {
         require_snapshot_capacity_domain(batch_size, min_width, max_width);
+        if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
+            detail::fp8_gdn_decode_conv_fused(max_width, batch_size)) {
+            return 0;
+        }
         return flash_next_snapshot_plane_bytes(batch_size, max_width);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&

@@ -471,13 +471,15 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 
 ## GDN input projection/convolution/snapshot Op benchmark
 
-`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.8-27B NVFP4
-`gdn_input_proj_conv_snapshot` form at T=1 (ordinary decode) and the chain
-`gdn_input_proj_conv_record` form at the DFlash2 chain-verify widths T=2..8, both for `B=1..12`.
+`ninfer_gdn_input_proj_conv_snapshot_bench` measures public GDN projection/convolution Ops
+with `--qtype nvfp4|fp8` and `--hidden 5120|2560`. The K=5120 parents use
+`gdn_input_proj_conv_snapshot` at T=1 and chain `gdn_input_proj_conv_record` at T=2..8;
+K=2560 also admits width-one records and multi-column snapshots. Both use B=1..12.
 The timed body is exactly one complete public Op call; the benchmark does not include private
 launchers, candidate selection, duplicated compositions, or route labels. The default sweep is
-`T=1..6`. The default `a8` policy is the one the record admits; the reported profile names the
-caller policy, not a private resolved route.
+`T=1..6`. `--policy a16|a4|a8` defaults to a8 for NVFP4/K=5120 (the record's admitted policy)
+and a16 otherwise. The reported profile names the caller policy, not a private resolved route.
+The header and CSV identify the hidden dimension.
 
 CUDA Graph replay is the default execution mode. The graph contains external timing event nodes
 around the complete Op body, while L2 eviction stays outside the timed interval. Cold-cache results
@@ -497,6 +499,9 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_conv_snapshot_benc
 ./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
   --tokens 6 --batch 3 --valid-columns 6,3,1 --form record \
   --execution graph --cache cold --warmup 10 --repeat 100
+./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+  --qtype fp8 --hidden 2560 --policy a16 --tokens 4 --batch 5 --form record \
+  --execution graph --cache cold --repeat 150
 ```
 
 `--execution eager|both` is available only to attribute launch behavior; it calls the same public

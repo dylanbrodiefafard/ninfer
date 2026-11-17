@@ -1,4 +1,4 @@
-// Public Qwen3.6 GDN projection/convolution Snapshot and ReplaySSM Record benchmark.
+// Public GDN projection/convolution Snapshot and ReplaySSM Record benchmark.
 //
 // The timed body is exactly one selected gdn_input_proj_conv_*() public Op call.
 // Production dispatch, kernel topology, and workspace use remain behind that contract.
@@ -32,7 +32,6 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kHidden             = 5120;
 constexpr std::int32_t kQueryRows          = 2048;
 constexpr std::int32_t kKeyRows            = 2048;
 constexpr std::int32_t kValueRows          = 6144;
@@ -81,14 +80,16 @@ struct TokenSweep {
 
 struct Options {
     TokenSweep tokens;
-    Form form                      = Form::Both;
-    ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA8;
-    Execution execution            = Execution::Graph;
-    CacheMode cache                = CacheMode::Both;
-    int warmup                     = 10;
-    int repeat                     = 100;
-    std::uint64_t flush_bytes      = kDefaultFlushBytes;
-    std::int32_t batch             = 1;
+    Form form                 = Form::Both;
+    ops::LinearPolicy policy  = ops::LinearPolicy::AllowA8;
+    QType qtype               = QType::NVFP4;
+    std::int32_t hidden       = 5120;
+    Execution execution       = Execution::Graph;
+    CacheMode cache           = CacheMode::Both;
+    int warmup                = 10;
+    int repeat                = 100;
+    std::uint64_t flush_bytes = kDefaultFlushBytes;
+    std::int32_t batch        = 1;
     std::vector<std::int32_t> valid_columns;
     std::string csv_out;
 };
@@ -195,11 +196,11 @@ std::vector<std::int32_t> parse_valid_columns(std::string_view text) {
     return values;
 }
 
-ops::LinearPolicy parse_nvfp4_policy(std::string_view value) {
+ops::LinearPolicy parse_policy(std::string_view value) {
     if (value == "a16") return ops::LinearPolicy::A16Only;
     if (value == "a4") return ops::LinearPolicy::AllowA4;
     if (value == "a8") return ops::LinearPolicy::AllowA8;
-    throw std::invalid_argument("--nvfp4-policy must be a16, a4 or a8");
+    throw std::invalid_argument("--policy must be a16, a4 or a8");
 }
 
 void usage(const char* argv0) {
@@ -207,7 +208,9 @@ void usage(const char* argv0) {
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
                  "  --form snapshot|record|both  Default both: snapshot at T=1, record above.\n"
-                 "  --nvfp4-policy a16|a4|a8     Default a8; the record requires a8.\n"
+                 "  --qtype nvfp4|fp8            Parent storage format (default nvfp4).\n"
+                 "  --hidden 5120|2560           Parent input rows (default 5120).\n"
+                 "  --policy a16|a4|a8           Default a8 for NVFP4/5120, a16 otherwise.\n"
                  "  --tokens T                    Exact token extent.\n"
                  "  --sweep START:END[:STEP]      Token sweep (default 1:6).\n\n"
                  "  --batch B                     Snapshot [1,12], record [1,12] (default 1).\n"
@@ -227,6 +230,7 @@ Options parse_options(int argc, char** argv) {
     Options options;
     bool have_tokens = false;
     bool have_sweep  = false;
+    bool have_policy = false;
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
         const auto next = [&](const char* label) -> std::string_view {
@@ -235,8 +239,23 @@ Options parse_options(int argc, char** argv) {
         };
         if (argument == "--form") {
             options.form = parse_form(next("form"));
-        } else if (argument == "--nvfp4-policy") {
-            options.nvfp4_policy = parse_nvfp4_policy(next("NVFP4 policy"));
+        } else if (argument == "--policy") {
+            options.policy = parse_policy(next("policy"));
+            have_policy    = true;
+        } else if (argument == "--hidden") {
+            options.hidden = parse_positive_i32(next("hidden"), "hidden");
+            if (options.hidden != 5120 && options.hidden != 2560) {
+                throw std::invalid_argument("--hidden must be 5120 or 2560");
+            }
+        } else if (argument == "--qtype") {
+            const auto qtype = next("qtype");
+            if (qtype == "nvfp4") {
+                options.qtype = QType::NVFP4;
+            } else if (qtype == "fp8") {
+                options.qtype = QType::FP8_E4M3FN_ROW_BF16S;
+            } else {
+                throw std::invalid_argument("--qtype must be nvfp4 or fp8");
+            }
         } else if (argument == "--tokens") {
             const std::int32_t tokens = parse_positive_i32(next("tokens"), "tokens");
             options.tokens            = {tokens, tokens, 1};
@@ -270,6 +289,9 @@ Options parse_options(int argc, char** argv) {
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(argument));
         }
+    }
+    if (!have_policy && (options.qtype != QType::NVFP4 || options.hidden == 2560)) {
+        options.policy = ops::LinearPolicy::A16Only;
     }
     if (have_tokens && have_sweep) {
         throw std::invalid_argument("--tokens and --sweep are mutually exclusive");
@@ -307,15 +329,19 @@ std::vector<Execution> selected_executions(Execution execution) {
     return {execution};
 }
 
-// NVFP4 registers the snapshot for ordinary decode (T=1) and the ReplaySSM record for verify
-// widths (T>=2).
-std::vector<Form> selected_forms(Form form, std::int32_t tokens) {
+// K=5120 registers snapshots for ordinary decode and records for verify widths; K=2560 also
+// admits multi-column snapshots and width-one chain records.
+std::vector<Form> selected_forms(Form form, std::int32_t tokens, std::int32_t hidden) {
     if (form == Form::Snapshot) {
-        if (tokens != 1) { throw std::invalid_argument("the snapshot is registered for T=1"); }
+        if (hidden == 5120 && tokens != 1) {
+            throw std::invalid_argument("the K=5120 snapshot is registered for T=1");
+        }
         return {Form::Snapshot};
     }
     if (form == Form::Record) {
-        if (tokens < 2) { throw std::invalid_argument("ReplaySSM Record requires T>=2"); }
+        if (hidden == 5120 && tokens < 2) {
+            throw std::invalid_argument("the K=5120 record requires T>=2");
+        }
         return {Form::Record};
     }
     if (tokens == 1) return {Form::Snapshot};
@@ -359,10 +385,13 @@ const char* policy_name(ops::LinearPolicy policy) {
                : (policy == ops::LinearPolicy::AllowA4 ? "a4" : "a16");
 }
 
-class Nvfp4Fixture {
+class PackedFixture {
 public:
-    Nvfp4Fixture(std::size_t flush_bytes, ops::LinearPolicy policy)
-        : parent_(bench::make_nvfp4_weight(kChannels + kZRows, kHidden)),
+    PackedFixture(std::size_t flush_bytes, ops::LinearPolicy policy, QType qtype,
+                  std::int32_t hidden)
+        : hidden_(hidden),
+          parent_(qtype == QType::NVFP4 ? bench::make_nvfp4_weight(kChannels + kZRows, hidden)
+                                        : bench::make_fp8_weight(kChannels + kZRows, hidden)),
           conv_weight_(bench::make_bf16(static_cast<std::size_t>(kChannels) * 4)),
           flush_(flush_bytes), policy_(policy) {
         CUDA_CHECK(cudaMemset(flush_.p, 0xa5, flush_.bytes));
@@ -374,23 +403,26 @@ public:
     }
 
     [[nodiscard]] const char* profile() const noexcept {
+        if (parent_.weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+            return policy_ == ops::LinearPolicy::AllowA8 ? "fp8-a8" : "fp8-a16";
+        }
         return policy_ == ops::LinearPolicy::AllowA8
                    ? "nvfp4-a8"
                    : (policy_ == ops::LinearPolicy::AllowA4 ? "nvfp4-a4" : "nvfp4-a16");
     }
 
     [[nodiscard]] GdnGeometry geometry() const noexcept {
-        return {kHidden, kQueryRows, kKeyRows, kValueRows, kZRows};
+        return {hidden_, kQueryRows, kKeyRows, kValueRows, kZRows};
     }
 
     [[nodiscard]] std::size_t workspace_capacity(Form form, std::int32_t batch,
                                                  std::int32_t tokens) const {
         if (form == Form::Record) {
             return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                QType::NVFP4, kChannels + kZRows, kHidden, policy_, batch, tokens, tokens);
+                parent_.weight.qtype, kChannels + kZRows, hidden_, policy_, batch, tokens, tokens);
         }
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, kChannels + kZRows, kHidden, policy_, batch, tokens, tokens);
+            parent_.weight.qtype, kChannels + kZRows, hidden_, policy_, batch, tokens, tokens);
     }
 
     void launch(Form form, const Tensor& x, Tensor& conv_states, const Tensor& initial,
@@ -414,6 +446,7 @@ public:
     }
 
 private:
+    std::int32_t hidden_;
     bench::PackedQuantizedWeight parent_;
     DeviceBuffer conv_weight_;
     DeviceBuffer flush_;
@@ -675,14 +708,14 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
     stream << "profile,form,tokens,batch,execution,timed_scope,cache,median_us,min_us,p95_us,"
-              "workspace_bytes,warmup,repeat,flush_bytes,build_type,gpu,cuda_runtime\n";
+              "workspace_bytes,warmup,repeat,flush_bytes,hidden,build_type,gpu,cuda_runtime\n";
     for (const Result& result : results) {
         stream << result.profile << ',' << form_name(result.form) << ',' << result.tokens << ','
                << result.batch << ',' << execution_name(result.execution)
                << ",full_gdn_input_proj_conv_device_body," << cache_name(result.cache) << ','
                << result.stats.median_us << ',' << result.stats.min_us << ',' << result.stats.p95_us
                << ',' << result.workspace_bytes << ',' << options.warmup << ',' << options.repeat
-               << ',' << options.flush_bytes << ','
+               << ',' << options.flush_bytes << ',' << options.hidden << ','
 #ifdef NDEBUG
                << "Release"
 #else
@@ -696,7 +729,7 @@ template <class Fixture>
 void run_fixture(Fixture& fixture, const Options& options, cudaStream_t stream,
                  std::vector<Result>& results) {
     for (std::int32_t tokens : selected_tokens(options.tokens)) {
-        for (const Form form : selected_forms(options.form, tokens)) {
+        for (const Form form : selected_forms(options.form, tokens, options.hidden)) {
             std::vector<Result> point = run_point(fixture, form, tokens, options, stream);
             for (const Result& result : point) { print_result(result); }
             results.insert(results.end(), std::make_move_iterator(point.begin()),
@@ -711,17 +744,19 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         DeviceContext context;
-        std::printf(
-            "# op=gdn_input_proj_conv form=%s format=nvfp4 nvfp4_policy=%s gpu=%s sm=%d "
-            "batch=%d execution=%s "
-            "timed_scope=full_public_op_device_body cold_flush_mib=%llu\n",
-            options.form == Form::Both ? "both" : form_name(options.form),
-            policy_name(options.nvfp4_policy), context.props.name, context.sm(), options.batch,
-            options.execution == Execution::Both ? "both" : execution_name(options.execution),
-            static_cast<unsigned long long>(options.flush_bytes >> 20));
+        std::printf("# op=gdn_input_proj_conv form=%s format=%s hidden=%d policy=%s gpu=%s sm=%d "
+                    "batch=%d execution=%s "
+                    "timed_scope=full_public_op_device_body cold_flush_mib=%llu\n",
+                    options.form == Form::Both ? "both" : form_name(options.form),
+                    options.qtype == QType::NVFP4 ? "nvfp4" : "fp8", options.hidden,
+                    policy_name(options.policy), context.props.name, context.sm(), options.batch,
+                    options.execution == Execution::Both ? "both"
+                                                         : execution_name(options.execution),
+                    static_cast<unsigned long long>(options.flush_bytes >> 20));
 
         std::vector<Result> results;
-        Nvfp4Fixture fixture(static_cast<std::size_t>(options.flush_bytes), options.nvfp4_policy);
+        PackedFixture fixture(static_cast<std::size_t>(options.flush_bytes), options.policy,
+                              options.qtype, options.hidden);
         run_fixture(fixture, options, context.stream, results);
         write_csv(options.csv_out, results, options, context);
         return 0;
