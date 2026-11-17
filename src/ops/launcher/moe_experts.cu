@@ -273,7 +273,7 @@ struct MatmulParams {
     const std::uint8_t* shared_record = nullptr; // NVFP4G16 record, 256-byte aligned
     const float* shared_matrix_scales = nullptr; // [3]
     const std::uint64_t* expert_table = nullptr;
-    const std::uint64_t* deferred     = nullptr; // Deferred range: untagged slot addresses
+    const std::uint64_t* deferred     = nullptr; // Deferred range: untagged slot or span addresses
     JobRange range                    = JobRange::All;
     const float* matrix_scales        = nullptr;
     const std::int32_t* sorted        = nullptr;

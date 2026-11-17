@@ -46,6 +46,9 @@ enum class LogitColumns : std::uint8_t {
     All,
 };
 
+/** Whether decode and verification rounds stage predicted expert records ahead of each layer. */
+enum class ExpertStaging : std::uint8_t { Disabled, Enabled };
+
 struct ForwardOptions {
     // Widest sub-chunk, in [1, ops::kMoeMaxTokens]: the token count each layer's Ops take at once.
     // Per-call activations and workspaces are sized for it.
@@ -72,6 +75,9 @@ struct ForwardOptions {
     // in docs/maintainer/qwen3.8-flash-next-plan.md ("Prefill measurements").
     std::size_t expert_window_bytes = 0;
     std::int32_t window_min_tokens  = 512;
+    // Predictive expert staging of decode and verification rounds (the Forward class comment); it
+    // changes no result, only when records cross PCIe. Disabled allocates no staging storage.
+    ExpertStaging expert_staging = ExpertStaging::Enabled;
 };
 
 /**
@@ -114,6 +120,17 @@ struct ExpertCacheCounts {
 // The pool whose slots the prefill streaming windows borrow: the F3 pool, the larger one, whose
 // 256-aligned slots hold records of either codec packed by moe_expert_cache_window.
 inline constexpr ops::MoeExpertCodec kWindowCodec = ops::MoeExpertCodec::F3G32;
+
+// Predictive staging (the Forward class comment). Layer 1 is not staged: its predictor input is
+// layer 0's MoE input, which the first speculative graph computes before the host's n-gram gather
+// between the two graphs.
+inline constexpr std::int32_t kFirstStagedLayer = 2;
+// A staged layer's predecessor runs in the same graph or eager pass, which joins its fill-stream
+// work: the speculative graphs split the layers at kPleLayer.
+static_assert(kFirstStagedLayer > kPleLayer);
+// Ranked predictions per token that moe_expert_cache_stage scores: the prefix of moe_route's ten
+// that recovered the most missed bytes within the per-layer budget in the recorded C=4/5 traces.
+inline constexpr std::int32_t kStagingCandidates = 4;
 
 // Ranked alternatives each sampled token reports (ops::token_logprobs' K).
 inline constexpr std::int32_t kReportedAlternatives = 20;
@@ -176,6 +193,28 @@ struct SampledRows {
  * and copies the egress back. QSA selection is captured for the lane capacity: the uploaded slot
  * sets each replay's visible prefix.
  *
+ * With ExpertStaging::Enabled, decode and verification rounds stage the records predicted for each
+ * layer l in [kFirstStagedLayer, 48) into VRAM while layer l's mixer runs, a policy-neutral overlay
+ * on the cache: on the fill stream, once layer l - 1's MoE input x exists, layer l's router applied
+ * to x (bf16_projection and moe_route) predicts every token's ranked experts; after layer l - 1's
+ * admitted fill, moe_expert_cache_stage places the best non-resident candidates of the first
+ * kStagingCandidates ranks within the layer's byte budget (the bytes the staging fill copies during
+ * the measured dense window before the layer routes) in one staging span; and once layer l - 1's
+ * moe_experts has read the span, a fill of ops::kMoeStagingFillBlocks CTAs copies them from mapped
+ * host memory. Layer l's admit waits only for the stage (which reads the tables admit changes) and
+ * runs on the real tables as without staging; its admitted misses are filled from the stage's
+ * source column (a device-to-device copy for a staged record) after the staging copy on the fill
+ * stream, and moe_experts reads the staged misses admit did not admit from the span through its
+ * deferral (moe_expert_cache_defer), whose ready event follows both copies. A copy that outlasts
+ * the dense window therefore delays only the deferred experts, while the resident and mapped ones
+ * compute. Records, routes, admissions, CLOCK and frequency state, and outputs are exactly those of
+ * the round without staging; a wrong prediction costs only its copy. The predictor's input stays
+ * valid because layer l - 1's moe_experts waits for its fill, which follows the predictor on the
+ * fill stream. The stage column alternates between two columns by layer parity, because layer
+ * l - 1's moe_expert_cache_defer on the main stream may still read its column while layer l's
+ * stage runs on the fill stream; the source column has one copy, since its only reader, the
+ * layer's admitted fill, precedes the next stage on the fill stream. Prefill chunks do not stage.
+ *
  * The model, state, feeder and expert residency must outlive the Forward, which owns the chunk
  * activations, the transient workspace (sized at construction for max_chunk_tokens, the lane
  * count and the lane capacity), and the pinned staging. Calls come from one thread. Errors throw
@@ -202,9 +241,9 @@ public:
     static void validate(const ForwardOptions& options);
 
     // Device bytes a Forward with these options allocates over `state` (its lane count and lane
-    // capacity): the super-chunk and sub-chunk activations, the decode frames and the transient
-    // workspace (the streaming windows borrow cache slots). CUDA Graph instantiation is not
-    // included.
+    // capacity): the super-chunk and sub-chunk activations, the decode frames, the staging storage
+    // and the transient workspace (the streaming windows borrow cache slots). CUDA Graph
+    // instantiation is not included.
     [[nodiscard]] static std::size_t
     device_bytes(const ModelView& model, const ForwardOptions& options, const State& state);
 
@@ -482,6 +521,29 @@ private:
         alignas(16) std::array<std::int32_t, kDflashWidth * kMaxLanes> count_patch;
     };
 
+    // Predictive staging (the class comment): the predictor's control, ids, weights and shared
+    // scale over the widest round's tokens, the I64 [512,2] stage columns (column l % 2 for layer
+    // l), the I64 [512] source column and deferral, and the staging span; empty with
+    // ExpertStaging::Disabled.
+    struct StagingStorage {
+        Tensor control;  // FP32 [544,T]
+        Tensor ids;      // I32 [10,T]
+        Tensor weights;  // FP32 [10,T]
+        Tensor shared;   // FP32 [T]
+        Tensor stage;    // I64 [512,2]
+        Tensor source;   // I64 [512]
+        Tensor deferred; // I64 [512]: a staged layer's moe_experts deferral
+        DeviceSpan span; // staging_span_bytes(widest round)
+    };
+    template <class Allocator>
+    static StagingStorage allocate_staging(Allocator& allocator, const ForwardOptions& options,
+                                           std::int32_t lanes);
+    [[nodiscard]] static std::size_t plan_staging_bytes(const ForwardOptions& options,
+                                                        std::int32_t lanes);
+    // Whether `layer` of `chunk` stages (ExpertStaging::Enabled, an unstreamed round, layer >=
+    // kFirstStagedLayer).
+    [[nodiscard]] bool stages(std::int32_t layer, const SubChunk& chunk, bool streamed) const;
+
     struct VerifyStorage {
         Tensor ingress;
         Tensor ple_states; // BF16 [9,10240,C + W*C]; canonical copies precede compact snapshots.
@@ -599,6 +661,7 @@ private:
     WorkspaceArena work_;
     ChunkStorage chunk_;
     VerifyStorage verify_;
+    StagingStorage staging_;
     std::optional<PinnedHostBuffer> verify_ingress_staging_;
     std::optional<PinnedHostBuffer> verify_commit_staging_;
     std::optional<PinnedHostBuffer> spec_ingress_staging_, spec_egress_staging_;
@@ -633,6 +696,13 @@ private:
     CudaStream fill_stream_;
     CudaEvent admitted_;
     CudaEvent filled_;
+    // Staging (the class comment): input_ready_ (stream_) after a layer's MoE read lets the fill
+    // stream predict the next layer; stage_planned_ (fill stream) after the next layer's stage
+    // gates that layer's admit; experts_done_ (stream_) after a layer's moe_experts frees the span
+    // for the next layer's copy.
+    CudaEvent input_ready_;
+    CudaEvent stage_planned_;
+    CudaEvent experts_done_;
     // The two streaming windows are window_slots_ consecutive F3 slots each (0 when none stream),
     // borrowed from the cache for each windowed super-chunk at borrowed_first_ (-1 between
     // super-chunks). Per window, the events order its placement column and records (fill_stream_)

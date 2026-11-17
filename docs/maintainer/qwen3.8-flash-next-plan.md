@@ -973,8 +973,8 @@ books.
   The remaining levers at C = 4-6 are bytes and overlap: fewer missed bytes (admission and
   cache capacity), copy-engine transfers (53 against 48 GB/s, but the addresses are known only
   on the device inside the graph), and moving transfers off the layer's critical path, either by
-  prefetching layer l + 1's predicted experts during layer l (route-prediction accuracy on the
-  recorded traces first) or by pipelining two lane groups so one group's dense work overlaps the
+  prefetching layer l's predicted experts during its dense window (implemented: "Predictive
+  expert staging" below) or by pipelining two lane groups so one group's dense work overlaps the
   other's transfers: on this trace a 2 + 3 split routes 11% more distinct experts per layer
   (123.3 against 111.3) against up to 13.5 ms per round of dense work to hide.
 - **Precision.** A16 only for now. A8 for F3 experts in prefill (one G32 scale per
@@ -1554,6 +1554,64 @@ reports `expert-cache=17.50 GiB+kv-lendable=5.15 GiB`:
 | 4 | 189.0 | 290.3 (+54%) | 206.1 | 309.0 (+50%) |
 | 5 | 191.1 | 291.4 (+52%) | 209.7 | 318.4 (+52%) |
 | 6 | 181.3 | 271.4 (+50%) | 207.5 | 298.6 (+44%) |
+
+## Predictive expert staging (2026-11-17)
+
+Decode and verification rounds copy each layer's predicted non-resident experts into a VRAM
+staging span while the layer's dense mixer runs, so the layer's misses read from VRAM instead of
+the PCIe link. The overlay is policy-neutral: the cache state, routes, admissions and outputs are
+those of the unstaged round, and a wrong prediction costs only its copy.
+
+- **Probe.** A dummy 12-CTA fill of 5.8 MB per layer into a spare span, without consumers, cost
+  +0.45 ms per round at C=5 on prompt group A and +1.05-1.1 ms at A C=4 and B C=4 and C=5.
+  Nsight showed the 132 us fill ending 22 us after the route on average, so the cost was the
+  overrun rather than link or SM contention; that set the go decision and the budget below.
+- **Prediction.** Layer l's own router applied to layer l - 1's MoE input (`bf16_projection` on
+  `moe_control`, then `moe_route`), on the fill stream as soon as that input exists. Candidates
+  are the first four ranks of every token, scored by integer reciprocal-rank weights
+  W_j = 360360 / (4 + j), resident experts skipped, ties to the lower id.
+- **Ops.** `moe_expert_cache_stage` (one CTA) places the ranked candidates greedily in the
+  layer's byte budget and writes the stage column (span address or 0) and the source column
+  (span address with the codec tag for a placed record, the host record otherwise).
+  `moe_expert_cache_fill` with `kMoeStagingFillBlocks` = 12 CTAs copies the placed records;
+  the layer's admitted misses are then filled from the source column, a device-to-device copy
+  for a staged record. `moe_expert_cache_defer` merges the fill column (admitted slots) over the
+  stage column into the `moe_experts` deferral, so staged misses that admit did not admit are
+  read from the span. Each Op has an exact host-oracle test (random tables, codecs, budgets and
+  exact-fit boundaries; real-record staging, promotion and deferral, eagerly and in a replayed
+  graph), clean under memcheck, racecheck and synccheck.
+- **Schedule.** Layer l's admit waits only for layer l's stage (which reads the tables admit
+  changes). The staging copy for layer l waits for layer l - 1's `moe_experts`, the span's last
+  reader, and precedes layer l's admitted fill on the fill stream, whose event is the deferral's
+  ready event. A late copy therefore delays only the deferred experts while the resident and
+  mapped ones compute. The stage column alternates by layer parity, because layer l - 1's defer
+  may still read it while layer l stages. Layers 2-47 stage (layer 0 runs in spec graph A,
+  layer 1 starts graph B); prefill chunks do not.
+- **Budget.** Per layer (window_ns - 5000) x 46 B/ns, with the dense window measured as
+  75,300 + 1,670 T ns for GDN layers and 93,000 + 1,750 T ns for QSA layers at T round tokens;
+  the span is the largest budget at the widest round, funded in the activations arena before
+  slot sizing, at fixed graph addresses.
+- **Identity.** Same binary, staging on and off (`--expert-staging`), lanes-trace C=5 K3,
+  48 rounds: routes, counters and the final owner, referenced, CLOCK-hand and frequency state
+  identical. Every bench below produced identical tokens to its base.
+- **Device timeline** (nsys, C=5 K3, 96 outputs, per staged layer, window plus route-to-admit
+  plus admit-to-merge): prompt group A 1,027.4 -> 971.9 us, group B 1,019.7 -> 962.6 us
+  (about -2.6 ms per round on each). The 12-CTA copy takes 91 us at the median and ends before
+  the layer routes (median lateness 0); the dense window grows 7-8 us per layer.
+- **Lanes bench** (fixed K3, 4096-token prompts, 512 outputs, prompt offset 0 = A and 8 = B,
+  alternating base and staged builds on the shared host). C=5 only, four pairs per group,
+  median ms per round: A 60.92 -> 57.37, B 63.96 -> 59.07. An earlier three-pair sweep over
+  C = 1, 4, 5, 6 (mean paired delta): A C=1 -0.54, C=4 -2.34, C=5 -5.59, C=6 -7.17; B C=1
+  -0.09, while B C=4-6 were dominated by runs whose every C rose 8-12 ms together (host
+  interference) and are inconclusive. C=1 does not regress, so staging stays enabled there.
+  At the default per-batch K table (K2 at C=5, `--adaptive-draft`), one pair per group:
+  A 59.72 -> 46.34, B 51.13 -> 50.06 ms per round, identical tokens and rounds; single pairs on
+  this host bound the sign, not the size.
+- **Rejected variants.** Admit waiting for the staging copy, with `moe_experts` reading the
+  source column as its expert table, puts the copy on the critical path whenever it overruns the
+  window: two alternating C=5 pairs per group measured A -0.46 and +2.35, B +1.14 and -1.62 ms
+  per round, against -2.2 (A) and -2.8 (B) for the deferral design in the same session. A
+  high-priority fill stream and a separate predictor stream changed nothing measurable.
 
 ## Levers against the baseline
 

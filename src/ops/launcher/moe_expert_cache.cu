@@ -308,14 +308,15 @@ __device__ __forceinline__ uint4* table_word(std::uint64_t bits) {
     return reinterpret_cast<uint4*>(bits); // NOLINT(performance-no-int-to-ptr)
 }
 
-// Grid moe_expert_cache_fill_blocks(SMs), block 256. Thread t owns fill entries 2t and 2t+1 of the
-// layer's column; a warp scan and a scan of the eight warp totals give word_prefix[e], the first
-// 16-byte word of pending record e in the concatenation of pending records (ascending e), with
-// word_prefix[512] the total. After the barrier, global word index w = (blockIdx * 256 + thread)
-// + k * gridDim * 256 strides over the total, kFillUnroll words per iteration with their loads
-// issued before any store. The tables are only read, so CTAs never synchronize with each other.
+// Grid `blocks` CTAs (one per SM, or a few for a staging fill), block 256. Thread t owns fill
+// entries 2t and 2t+1 of the layer's column; a warp scan and a scan of the eight warp totals give
+// word_prefix[e], the first 16-byte word of pending record e in the concatenation of pending
+// records (ascending e), with word_prefix[512] the total. After the barrier, global word index
+// w = (blockIdx * 256 + thread) + k * gridDim * 256 strides over the total, kFillUnroll words per
+// iteration with their loads issued before any store. The tables are only read, so CTAs never
+// synchronize with each other.
 __global__ void __launch_bounds__(kFillThreads)
-    moe_expert_cache_fill_kernel(const std::uint64_t* __restrict__ host_ptr,
+    moe_expert_cache_fill_kernel(const std::uint64_t* __restrict__ source_ptr,
                                  const std::uint64_t* __restrict__ fill_ptr, int layer) {
     __shared__ std::uint64_t word_prefix[kMoeExperts + 1];
     __shared__ std::uint64_t source[kMoeExperts];
@@ -329,14 +330,14 @@ __global__ void __launch_bounds__(kFillThreads)
     std::uint64_t mine = 0;
 #pragma unroll
     for (int i = 0; i < kFillEntriesPerThread; ++i) {
-        const int expert         = kFillEntriesPerThread * thread + i;
-        const int entry          = layer * kMoeExperts + expert;
-        const std::uint64_t slot = fill_ptr[entry];
-        const std::uint64_t host = host_ptr[entry];
+        const int expert                   = kFillEntriesPerThread * thread + i;
+        const int entry                    = layer * kMoeExperts + expert;
+        const std::uint64_t slot           = fill_ptr[entry];
+        const std::uint64_t record_address = source_ptr[entry];
         const std::uint64_t record =
-            (host & kCodecTagMask) == 0 ? kMoeNvfp4RecordBytes : kMoeF3RecordBytes;
+            (record_address & kCodecTagMask) == 0 ? kMoeNvfp4RecordBytes : kMoeF3RecordBytes;
         words[i]       = slot != 0 ? record / 16 : 0;
-        source[expert] = host & ~kCodecTagMask;
+        source[expert] = record_address & ~kCodecTagMask;
         target[expert] = slot;
         mine += words[i];
     }
@@ -382,7 +383,7 @@ __global__ void __launch_bounds__(kFillThreads)
                     }
                 }
                 const std::uint64_t offset = (word - word_prefix[low]) * 16;
-                // The record is device-mapped host memory, immutable while enqueued work reads it.
+                // The source record (mapped host or staged VRAM) is immutable while this copy runs.
                 value[k]       = __ldcs(table_word(source[low] + offset));
                 destination[k] = table_word(target[low] + offset);
             }
@@ -429,6 +430,106 @@ __global__ void __launch_bounds__(kWindowThreads)
         streamed && prefix + bytes <= window_bytes ? window_base + prefix : std::uint64_t{0};
 }
 
+constexpr int kStageThreads = kMoeExperts;
+// W_j = kStageWeightScale / (4 + j): 1 / (4 + j) scaled by lcm(4..13), exact for j in [0,10).
+constexpr unsigned kStageWeightScale = 360360;
+// The largest score: kMoeMaxTokens tokens each giving one expert all ten weights.
+static_assert(static_cast<unsigned long long>(kMoeMaxTokens) *
+                      (kStageWeightScale / 4 + kStageWeightScale / 5 + kStageWeightScale / 6 +
+                       kStageWeightScale / 7 + kStageWeightScale / 8 + kStageWeightScale / 9 +
+                       kStageWeightScale / 10 + kStageWeightScale / 11 + kStageWeightScale / 12 +
+                       kStageWeightScale / 13) <=
+                  0xffffffffULL,
+              "stage scores must fit U32");
+constexpr std::uint64_t kNotPlaced = ~std::uint64_t{0};
+
+// Grid 1, block 512; thread e owns expert e. Phases, separated by block barriers:
+//   1. score[e] = 0;
+//   2. the block strides over the k T (token, rank) pairs, adding W_j to score[id] with shared
+//      U32 atomics (integer, so the sums are exact in any order);
+//   3. thread e reads its table entries; a candidate keeps its score as its key, any other expert
+//      writes key 0 (a candidate's score is positive). It sets offset[e] = kNotPlaced and, as a
+//      candidate, counts the keys ahead of it (larger, or equal at a lower expert): its rank r,
+//      where it writes order[r] = e and bytes[r] = n_e. Every thread reads all 512 keys in the same
+//      order, so each read is a shared-memory broadcast;
+//   4. thread 0 walks order[0..count) while the remaining budget can hold an F3 record (the
+//      smallest), placing each record that fits at the running offset: offset[e] = used;
+//   5. thread e writes stage_ptr[e] and source[e].
+// key aliases score: thread e reads score[e] and writes key[e] = score[e] or 0 at the same index,
+// and the other threads read keys only after the next barrier.
+__global__ void __launch_bounds__(kStageThreads)
+    moe_expert_cache_stage_kernel(const std::int32_t* __restrict__ predicted, int tokens,
+                                  int candidates, const std::uint64_t* __restrict__ expert_ptr,
+                                  const std::uint64_t* __restrict__ host_ptr,
+                                  std::uint64_t staging_base, std::uint64_t budget_bytes,
+                                  std::uint64_t* __restrict__ stage_ptr,
+                                  std::uint64_t* __restrict__ source) {
+    __shared__ unsigned key[kMoeExperts];
+    __shared__ int order[kMoeExperts];
+    __shared__ unsigned bytes[kMoeExperts];
+    __shared__ std::uint64_t offset[kMoeExperts];
+    const int expert = static_cast<int>(threadIdx.x);
+
+    key[expert] = 0;
+    __syncthreads();
+    const int pairs = candidates * tokens;
+    for (int pair = expert; pair < pairs; pair += kStageThreads) {
+        const int token = pair / candidates;
+        const int rank  = pair - token * candidates;
+        const int id    = predicted[token * kMoeTopK + rank];
+        if (id >= 0 && id < kMoeExperts) {
+            atomicAdd(&key[id], kStageWeightScale / static_cast<unsigned>(4 + rank));
+        }
+    }
+    __syncthreads();
+
+    const std::uint64_t host     = host_ptr[expert];
+    const std::uint64_t resident = expert_ptr[expert];
+    const bool streamed          = resident == host;
+    const unsigned score         = streamed ? key[expert] : 0U;
+    key[expert]                  = score;
+    offset[expert]               = kNotPlaced;
+    const int count              = __syncthreads_count(score != 0U ? 1 : 0);
+    if (score != 0U) {
+        int rank = 0;
+        for (int other = 0; other < kMoeExperts; ++other) {
+            const unsigned theirs = key[other];
+            rank += theirs > score || (theirs == score && other < expert) ? 1 : 0;
+        }
+        order[rank] = expert;
+        bytes[rank] = (host & kCodecTagMask) == 0 ? kMoeNvfp4RecordBytes : kMoeF3RecordBytes;
+    }
+    __syncthreads();
+
+    if (expert == 0) {
+        std::uint64_t used = 0;
+        for (int rank = 0; rank < count && budget_bytes - used >= kMoeF3RecordBytes; ++rank) {
+            if (used + bytes[rank] <= budget_bytes) {
+                offset[order[rank]] = used;
+                used += bytes[rank];
+            }
+        }
+    }
+    __syncthreads();
+
+    const std::uint64_t placed = offset[expert];
+    const std::uint64_t stage  = placed == kNotPlaced ? 0 : staging_base + placed;
+    stage_ptr[expert]          = stage;
+    source[expert]             = stage != 0 ? stage | (host & kCodecTagMask) : host;
+}
+
+constexpr int kDeferThreads = kMoeExperts;
+
+// Grid 1, block 512: thread e writes entry e. No shared memory or barriers.
+__global__ void __launch_bounds__(kDeferThreads)
+    moe_expert_cache_defer_kernel(const std::uint64_t* __restrict__ fill_ptr,
+                                  const std::uint64_t* __restrict__ stage_ptr,
+                                  std::uint64_t* __restrict__ deferred) {
+    const int expert         = static_cast<int>(threadIdx.x);
+    const std::uint64_t slot = fill_ptr[expert];
+    deferred[expert]         = slot != 0 ? slot : stage_ptr[expert];
+}
+
 constexpr int kLendThreads = 256;
 
 // Grid ceil(count / 256), block 256: thread i of the grid owns slot first + i of the range, an
@@ -466,9 +567,20 @@ void moe_expert_cache_window_launch(const std::uint64_t* expert_ptr, const std::
     CUDA_CHECK(cudaGetLastError());
 }
 
-void moe_expert_cache_fill_launch(const std::uint64_t* host_ptr, const std::uint64_t* fill_ptr,
+void moe_expert_cache_stage_launch(const std::int32_t* predicted, std::int32_t tokens,
+                                   std::int32_t candidates, const std::uint64_t* expert_ptr,
+                                   const std::uint64_t* host_ptr, std::uint64_t staging_base,
+                                   std::uint64_t budget_bytes, std::uint64_t* stage_ptr,
+                                   std::uint64_t* source, cudaStream_t stream) {
+    moe_expert_cache_stage_kernel<<<1, kStageThreads, 0, stream>>>(
+        predicted, tokens, candidates, expert_ptr, host_ptr, staging_base, budget_bytes, stage_ptr,
+        source);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void moe_expert_cache_fill_launch(const std::uint64_t* source_ptr, const std::uint64_t* fill_ptr,
                                   std::int32_t layer, std::int32_t blocks, cudaStream_t stream) {
-    moe_expert_cache_fill_kernel<<<blocks, kFillThreads, 0, stream>>>(host_ptr, fill_ptr, layer);
+    moe_expert_cache_fill_kernel<<<blocks, kFillThreads, 0, stream>>>(source_ptr, fill_ptr, layer);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -492,6 +604,12 @@ void moe_expert_cache_lend_launch(MoeExpertSlotPoolArgs pool, std::uint64_t* exp
     const int blocks = (count + kLendThreads - 1) / kLendThreads;
     moe_expert_cache_lend_kernel<<<blocks, kLendThreads, 0, stream>>>(
         pool, expert_ptr, host_ptr, slot_index, first, count, lend);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void moe_expert_cache_defer_launch(const std::uint64_t* fill_ptr, const std::uint64_t* stage_ptr,
+                                   std::uint64_t* deferred, cudaStream_t stream) {
+    moe_expert_cache_defer_kernel<<<1, kDeferThreads, 0, stream>>>(fill_ptr, stage_ptr, deferred);
     CUDA_CHECK(cudaGetLastError());
 }
 

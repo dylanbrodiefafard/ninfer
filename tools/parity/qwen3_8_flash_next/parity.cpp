@@ -80,6 +80,8 @@ Options:
   --window F           each of the two prefill streaming windows holds fraction F in [0,1] of the
                        largest layer's expert records (default 1; 0 disables streaming)
   --window-min-tokens N  narrowest super-chunk that streams through the windows (default 512)
+  --expert-staging on|off  predictive expert staging of decode and verification rounds (default
+                       on); it changes when records cross PCIe, never a result
   --calib-counts PATH  '<i8' .npy [48,512] routing counts for the cache's warm start
   --kv-format F        QSA state format: nvfp4 (default) or bf16
   --lanes L,..         lanes-check: batch sizes (default 2,4,12); lanes-bench: concurrencies
@@ -161,9 +163,10 @@ struct Options {
     std::int32_t context       = 0;
     std::int32_t budget        = 512;
     // Expert-cache MiB; negative sizes the cache from free device memory.
-    std::int64_t expert_cache_mib  = -1;
-    double window                  = 1.0;
-    std::int32_t window_min_tokens = 512;
+    std::int64_t expert_cache_mib    = -1;
+    double window                    = 1.0;
+    std::int32_t window_min_tokens   = 512;
+    fn::ExpertStaging expert_staging = fn::ExpertStaging::Enabled;
     std::filesystem::path calib_counts;
     ninfer::ops::QsaKvFormat kv_format = ninfer::ops::QsaKvFormat::NVFP4G16;
     // Lane modes: the batch sizes (lanes-check) or concurrencies (lanes-bench).
@@ -283,6 +286,13 @@ Options parse(std::span<char*> args) {
             }
         } else if (flag == "--window-min-tokens") {
             options.window_min_tokens = parse_int(value(), flag);
+        } else if (flag == "--expert-staging") {
+            const std::string_view staging = value();
+            if (staging != "on" && staging != "off") {
+                throw std::invalid_argument("--expert-staging: on or off");
+            }
+            options.expert_staging =
+                staging == "on" ? fn::ExpertStaging::Enabled : fn::ExpertStaging::Disabled;
         } else if (flag == "--expert-cache-mib") {
             options.expert_cache_mib = parse_int(value(), flag);
         } else if (flag == "--calib-counts") {
@@ -510,6 +520,7 @@ fn::ProgramOptions program_options_for(const Options& options, std::int32_t cont
                     options.lanes_trace_mode &&
                     options.speculative.backend != ninfer::SpeculativeBackend::None,
                 .window_min_tokens = options.window_min_tokens,
+                .expert_staging    = options.expert_staging,
             },
         .speculative          = options.speculative,
         .expert_window_layers = options.window,
@@ -1216,6 +1227,7 @@ int run_lanes_check(const Options& options, std::span<const std::int32_t> stream
 //   frequency.npy, frequency_lookups.npy  exact post-prefill admission-filter state
 //   trace.json   slot counts and, per bucket of --bucket rounds, the device counters' lookups and
 //                misses per codec
+//   final/       the same cache and frequency state after the last round
 int run_lanes_trace(const Options& options, std::span<const std::int32_t> stream_tokens) {
     const std::int32_t prompt_tokens = options.prompt_lengths.front();
     const std::int32_t rounds        = options.decode_tokens;
@@ -1335,6 +1347,8 @@ int run_lanes_trace(const Options& options, std::span<const std::int32_t> stream
                    << counts.misses[1] << "]}" << (last ? "\n" : ",\n");
         }
         report << "],\"published_tokens\":" << published_tokens << "}\n";
+        std::filesystem::create_directories(dir / "final");
+        dump_cache_state(program, dir / "final", device);
         if (!report) { throw std::runtime_error("cannot write trace.json"); }
         std::cerr << "C=" << lanes << ": traced " << rounds << " rounds\n";
     }

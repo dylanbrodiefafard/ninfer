@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace ninfer::ops {
 
@@ -190,10 +191,12 @@ enum class MoeCacheAdmission : std::uint8_t {
  *   moe_expert_cache_fill, on the same stream or on a second stream that waits for an event
  *   recorded after admit; (3) either commit and then moe_experts with this layer's column of
  *   expert_ptr as its expert table (reading every admitted record from its slot), or that
- *   moe_experts with a MoeExpertsDeferral of this layer's fill_ptr column and an event recorded
- *   after the fill, and then commit. Commit always follows the fill. All tensors and pool
- *   metadata are pairwise disjoint device memory. Calls sharing counters run in stream order (one
- *   stream): the single CTA adds each counter with one plain read-modify-write, no atomics.
+ *   moe_experts with a MoeExpertsDeferral of this layer's fill_ptr column (or of its
+ *   moe_expert_cache_defer merge with a staging column, which reads the fill column before commit)
+ *   and an event recorded after the fill, and then commit. Commit always follows the fill. All
+ *   tensors and pool metadata are pairwise disjoint device memory. Calls sharing counters run in
+ *   stream order (one stream): the single CTA adds each counter with one plain read-modify-write,
+ *   no atomics.
  *
  * Workspace: none.
  *
@@ -251,38 +254,51 @@ void moe_expert_cache_return(const MoeExpertCache& cache, MoeExpertCodec codec,
 }
 
 /**
+ * CTAs of a staging fill (the records moe_expert_cache_stage places), which copies while another
+ * layer's dense kernels run. On the RTX 5090 at PCIe Gen5 x16, 12 CTAs copy F3 records at 44-52
+ * GB/s, within reach of the mapped-read roof, while 4 CTAs fall below it; the other SMs stay free
+ * for the kernels beside the copy.
+ */
+inline constexpr std::int32_t kMoeStagingFillBlocks = 12;
+
+/**
  * Op: moe_expert_cache_fill
  *
  * For every e in [0,512) with fill_ptr[e,layer] != 0, copies the moe_expert_record_bytes(c) bytes
- * of expert e's mapped host record, at host_ptr[e,layer] with its codec tag c = host_ptr[e,layer]
- * & 1 cleared, to the slot address fill_ptr[e,layer]. Writes only those slot bytes; the tables
- * are read only. The copy is exact.
+ * of the source record at source_ptr[e,layer] with its codec tag c = source_ptr[e,layer] & 1
+ * cleared, to the destination address fill_ptr[e,layer]. A source record is device-mapped pinned
+ * host memory or device memory, read the same way: a host table, or the source column of
+ * moe_expert_cache_stage, which names staged VRAM copies of host records. Writes only those
+ * destination bytes; the tables are read only. The copy is exact.
  *
- * Shapes: host_ptr and fill_ptr are disjoint I64 [512,L] as for moe_expert_cache_admit,
- * 0 <= layer < L. Column layer of fill_ptr comes from moe_expert_cache_admit (fixed or flex
- * slots of the codec's pool) or moe_expert_cache_window (window placements, passed with host_ptr's
- * column as single-layer tables): every nonzero entry is a 256-byte aligned destination holding at
- * least moe_expert_record_bytes(c) bytes, disjoint from every other entry's destination and from
- * every record and table, and no enqueued work reads or writes those destinations until this call
- * completes. The schedule guarantees this: admit assigns only slots whose owners this layer does
- * not route, commit and a moe_experts deferral wait for this call, and a window is refilled only
- * after its previous readers are done.
+ * Shapes: source_ptr and fill_ptr are disjoint I64 [512,L] as for moe_expert_cache_admit's tables,
+ * 0 <= layer < L. Column layer of fill_ptr comes from moe_expert_cache_admit (fixed or flex slots
+ * of the codec's pool), moe_expert_cache_window (window placements) or moe_expert_cache_stage
+ * (staging placements), the last two passed with a source column as single-layer tables: every
+ * nonzero entry is a 256-byte aligned destination holding at least moe_expert_record_bytes(c)
+ * bytes, disjoint from every other entry's destination, from every source record read and from
+ * every table, and no enqueued work reads or writes those destinations until this call completes;
+ * every source record read stays unchanged until then. The schedule guarantees this: admit assigns
+ * only slots whose owners this layer does not route, commit and a moe_experts deferral wait for
+ * this call, a window or staging span is refilled only after its previous readers are done, and a
+ * staged source is rewritten only by a later staging fill.
  *
- * Grid: moe_expert_cache_fill_blocks(SM count) CTAs of 256 threads, independent of how many
- * fills are pending, so the launch is graph-capturable and an empty column costs one table scan
- * per CTA. Each CTA reads the column's 512 fill entries and forms in shared memory the exclusive
- * prefix of the pending records' 16-byte words, the records concatenated in ascending e. The grid
- * strides over that word range with four independent 16-byte loads in flight per thread
- * (consecutive threads take consecutive words, so a warp reads 512 contiguous host bytes per load
- * except where its words straddle two records), finds each word's record by binary search of the
- * prefix, and stores the word at the same offset of its slot. Pending fills of the whole layer
- * therefore share every SM, and mapped reads keep enough bytes in flight to run at PCIe rate.
+ * Grid: `blocks` CTAs of 256 threads (moe_expert_cache_fill_blocks(SM count) when not given, a
+ * value in [1, 1024] otherwise), independent of how many fills are pending, so the launch is
+ * graph-capturable and an empty column costs one table scan per CTA. Each CTA reads the column's
+ * 512 fill entries and forms in shared memory the exclusive prefix of the pending records' 16-byte
+ * words, the records concatenated in ascending e. The grid strides over that word range with four
+ * independent 16-byte loads in flight per thread (consecutive threads take consecutive words, so a
+ * warp reads 512 contiguous source bytes per load except where its words straddle two records),
+ * finds each word's record by binary search of the prefix, and stores the word at the same offset
+ * of its destination. Pending fills of the whole layer therefore share every CTA, and mapped reads
+ * keep enough bytes in flight to run at PCIe rate.
  *
- * No workspace; asynchronous on stream, deterministic, and graph-capturable for fixed views and
- * layer. Invalid arguments throw std::invalid_argument.
+ * No workspace; asynchronous on stream, deterministic, and graph-capturable for fixed views, layer
+ * and grid. Invalid arguments throw std::invalid_argument.
  */
-void moe_expert_cache_fill(const Tensor& host_ptr, const Tensor& fill_ptr, std::int32_t layer,
-                           cudaStream_t stream);
+void moe_expert_cache_fill(const Tensor& source_ptr, const Tensor& fill_ptr, std::int32_t layer,
+                           cudaStream_t stream, std::optional<std::int32_t> blocks = std::nullopt);
 
 /**
  * Op: moe_expert_cache_window
@@ -311,6 +327,87 @@ void moe_expert_cache_fill(const Tensor& host_ptr, const Tensor& fill_ptr, std::
 void moe_expert_cache_window(const Tensor& expert_ptr, const Tensor& host_ptr, std::int32_t layer,
                              DeviceSpan window, Tensor& window_ptr, cudaStream_t stream);
 
+// Candidates per token moe_expert_cache_stage accepts: a prefix of moe_route's ten ranked ids.
+inline constexpr std::int32_t kMoeStageMaxCandidates = kMoeTopK;
+
+/**
+ * Op: moe_expert_cache_stage
+ *
+ * Chooses which non-resident records of layer l = layer a staging fill copies into VRAM before the
+ * layer routes, from a prediction of its routes. With k = candidates and the exact integer weights
+ * W_j = 360360 / (4 + j), j in [0,10) (that is, 1 / (4 + j) scaled by lcm(4..13) = 360360):
+ *
+ *   score[e]   = sum of W_j over every (j, t) with j < k, t < T and predicted[j,t] = e (ids outside
+ *                [0,512) contribute nothing);
+ *   resident e : expert_ptr[e,l] != host_ptr[e,l];
+ *   candidates : every non-resident e with score[e] > 0, in descending score, ties to the lower e;
+ *   placement  : with used = 0, each candidate e in that order, of n_e = moe_expert_record_bytes(
+ *                tag(host_ptr[e,l])) bytes, is placed at offset used when used + n_e <=
+ *                budget_bytes (then used += n_e) and is skipped otherwise;
+ *   stage_ptr[e] = staging.data + the offset of a placed e, else 0;
+ *   source[e]    = stage_ptr[e] | tag(host_ptr[e,l]) for a placed e, else host_ptr[e,l].
+ *
+ * The weights rank an expert by summed reciprocal ranks, so an expert several tokens predict, or
+ * one predicted first, comes before one predicted once at a late rank; integer weights make the
+ * order exact. Placed records are 256-byte aligned (record sizes are multiples of 256).
+ *
+ * Consumers:
+ *   1. moe_expert_cache_fill with host_ptr's column l and stage_ptr as single-layer tables copies
+ *      the placed records into the staging span (the staging fill);
+ *   2. after the staging fill, source is the source column of moe_expert_cache_fill for the
+ *      layer's admitted misses (fill_ptr's column l from moe_expert_cache_admit), which copies a
+ *      staged record from VRAM and any other from its host record;
+ *   3. moe_expert_cache_defer merges stage_ptr into the layer's deferral, through which
+ *      moe_experts reads the staged records that admit did not admit.
+ *   Placement uses the residency on entry. Every source entry names bytes equal to the host
+ *   record, so the admitted fill is exact for any admission; when the schedule changes no
+ *   residency of layer l between this call and the layer's admit, every staged record moe_experts
+ *   reads through the deferral is a miss, since admit never evicts a routed expert. This Op reads
+ *   the tables and writes neither, so admit, commit and the replacement state evolve exactly as
+ *   without staging. stage_ptr, source and the staging bytes stay unchanged until those consumers
+ *   complete.
+ *
+ * Logical shapes: predicted I32 [10,T], 1 <= T <= 8192 (kMoeMaxTokens), contiguous;
+ * 1 <= candidates <= kMoeStageMaxCandidates; expert_ptr and host_ptr I64 [512,L] as for
+ * moe_expert_cache_admit, 0 <= layer < L; stage_ptr and source contiguous I64 [512], 8-byte
+ * aligned; staging.data 256-byte aligned with budget_bytes <= staging.bytes, or null with
+ * staging.bytes == budget_bytes == 0 (nothing is placed). Every tensor and the staging span are
+ * pairwise disjoint; the tables and predicted are read only.
+ *
+ * Grid: one CTA of 512 threads. Integer shared-memory atomics accumulate the scores (exact and
+ * independent of order); thread e then ranks its candidate by counting the candidates ahead of it,
+ * one thread walks the ranked candidates while a record still fits, and thread e writes entry e of
+ * both outputs. Deterministic; no workspace; asynchronous on stream and graph-capturable for fixed
+ * views, layer, candidates, staging and budget. Invalid arguments throw std::invalid_argument.
+ */
+void moe_expert_cache_stage(const Tensor& predicted, std::int32_t candidates,
+                            const Tensor& expert_ptr, const Tensor& host_ptr, std::int32_t layer,
+                            DeviceSpan staging, std::size_t budget_bytes, Tensor& stage_ptr,
+                            Tensor& source, cudaStream_t stream);
+
+/**
+ * Op: moe_expert_cache_defer
+ *
+ * The deferral slots of a staged layer's moe_experts (MoeExpertsDeferral::slots): for every e in
+ * [0,512), deferred[e] = fill_ptr[e,layer] when it is nonzero (an admitted miss, read from the slot
+ * its fill writes), else stage_ptr[e] (a staged record, or 0 for an expert read through the expert
+ * table). moe_experts with expert_ptr's column layer as its table then reads every routed expert
+ * from bytes equal to its host record: hits from their slots, admitted misses from their slots,
+ * staged misses from the staging span, and the rest from their mapped host records, so its output
+ * equals the unstaged call's bit for bit (the deferral contract). The deferral's ready event
+ * follows both the admitted fill and the staging fill.
+ *
+ * Shapes: fill_ptr I64 [512,L] as for moe_expert_cache_admit, 0 <= layer < L, its column final
+ * (after the layer's admit); stage_ptr from moe_expert_cache_stage of the same layer, which
+ * completes before this call (stream order or an event); stage_ptr and deferred stay unchanged
+ * until the layer's moe_experts completes; deferred contiguous I64 [512]; the three pairwise
+ * disjoint and 8-byte aligned. One CTA of 512 threads, thread e writing entry e. Exact; no
+ * workspace; asynchronous and graph-capturable for fixed views and layer; invalid arguments throw
+ * std::invalid_argument.
+ */
+void moe_expert_cache_defer(const Tensor& fill_ptr, std::int32_t layer, const Tensor& stage_ptr,
+                            Tensor& deferred, cudaStream_t stream);
+
 /**
  * Op: moe_expert_cache_commit
  *
@@ -319,8 +416,8 @@ void moe_expert_cache_window(const Tensor& expert_ptr, const Tensor& host_ptr, s
  * fill_ptr[e,layer] = 0. Nothing else changes. expert_ptr and fill_ptr are disjoint I64 [512,L]
  * as for moe_expert_cache_admit, 0 <= layer < L. Runs after the moe_expert_cache_fill that wrote
  * the slots completes (same stream, or ordered after it by an event), and after every read of
- * the fill column (a moe_experts deferral). No workspace; asynchronous and graph-capturable;
- * invalid arguments throw std::invalid_argument.
+ * the fill column (a moe_experts deferral or moe_expert_cache_defer). No workspace; asynchronous
+ * and graph-capturable; invalid arguments throw std::invalid_argument.
  */
 void moe_expert_cache_commit(Tensor& expert_ptr, Tensor& fill_ptr, std::int32_t layer,
                              cudaStream_t stream);

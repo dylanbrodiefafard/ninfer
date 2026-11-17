@@ -498,6 +498,7 @@ set(ninfer_op_tests
   moe_route
   moe_expert_cache
   moe_expert_cache_fill
+  moe_expert_cache_stage
   moe_expert_cache_window
   moe_experts
   ple)
@@ -514,6 +515,7 @@ ninfer_add_op_test(ninfer_gqa_attention_test
   LIBRARIES ninfer_ops)
 ninfer_add_sanitizer_cases(ninfer_a4_activation_test)
 ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_fill_test)
+ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_stage_test)
 ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_window_test)
 ninfer_add_op_test(ninfer_gqa_xattn_sort_test
   SOURCES ops/test_gqa_xattn_sort.cu

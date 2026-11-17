@@ -172,6 +172,42 @@ MoeScratch allocate_moe(Allocator& a, std::int32_t t) {
     };
 }
 
+// The staging budget (the Forward class comment): the bytes a staging fill copies while layer l's
+// dense work runs, from layer l - 1's MoE merge to layer l's routing. Those windows, measured on
+// the RTX 5090 at Gen5 x16 (fixed K3, 4096-token prompts, nsys, 2026-11-16), grow with the round's
+// T tokens: GDN layers 82 / 102 / 116 us and QSA layers 100 / 121 / 140 us at T = 4 / 16 / 20. The
+// lines through the T = 4 and 16 points bound them from below (6-9% under at T = 20). The fill
+// copies at kStagingBytesPerNs (12 CTAs reach 44-52 GB/s) after kStagingSetupNs of stage kernel
+// and stream wakeup.
+constexpr std::int64_t kGdnWindowBaseNs     = 75'300;
+constexpr std::int64_t kGdnWindowPerTokenNs = 1'670;
+constexpr std::int64_t kQsaWindowBaseNs     = 93'000;
+constexpr std::int64_t kQsaWindowPerTokenNs = 1'750;
+constexpr std::int64_t kStagingSetupNs      = 5'000;
+constexpr std::int64_t kStagingBytesPerNs   = 46;
+
+std::size_t staging_budget_bytes(std::int32_t layer, std::int32_t tokens) {
+    const std::int64_t window_ns = is_qsa_layer(layer)
+                                       ? kQsaWindowBaseNs + kQsaWindowPerTokenNs * tokens
+                                       : kGdnWindowBaseNs + kGdnWindowPerTokenNs * tokens;
+    return static_cast<std::size_t>(std::max<std::int64_t>(window_ns - kStagingSetupNs, 0) *
+                                    kStagingBytesPerNs);
+}
+
+// Columns of the widest decode or verification round.
+std::int32_t round_columns(const ForwardOptions& options, std::int32_t lanes) {
+    return lanes * std::max(1, options.max_verify_width);
+}
+
+// The staging span: the largest budget of any layer at the widest round (the budget grows with T).
+std::size_t staging_span_bytes(std::int32_t tokens) {
+    std::size_t bytes = 0;
+    for (std::int32_t layer = kFirstStagedLayer; layer < kLayers; ++layer) {
+        bytes = std::max(bytes, staging_budget_bytes(layer, tokens));
+    }
+    return bytes;
+}
+
 std::int32_t selected_slots(ops::QsaSelectBudget budget) {
     return ops::qsa_selected_capacity(budget);
 }
@@ -376,6 +412,35 @@ Forward::ChunkStorage Forward::allocate_chunk(Allocator& allocator, const Forwar
     return storage;
 }
 
+template <class Allocator>
+Forward::StagingStorage
+Forward::allocate_staging(Allocator& allocator, const ForwardOptions& options, std::int32_t lanes) {
+    if (options.expert_staging == ExpertStaging::Disabled) { return {}; }
+    const std::int32_t tokens = round_columns(options, lanes);
+    return StagingStorage{
+        .control  = allocator.alloc(DType::FP32, {ops::kMoeControlRows, tokens}),
+        .ids      = allocator.alloc(DType::I32, {ops::kMoeTopK, tokens}),
+        .weights  = allocator.alloc(DType::FP32, {ops::kMoeTopK, tokens}),
+        .shared   = allocator.alloc(DType::FP32, {tokens}),
+        .stage    = allocator.alloc(DType::I64, {ops::kMoeExperts, 2}),
+        .source   = allocator.alloc(DType::I64, {ops::kMoeExperts}),
+        .deferred = allocator.alloc(DType::I64, {ops::kMoeExperts}),
+        .span     = allocator.alloc_bytes(staging_span_bytes(tokens),
+                                          static_cast<std::size_t>(ops::kMoeRecordAlignment)),
+    };
+}
+
+std::size_t Forward::plan_staging_bytes(const ForwardOptions& options, std::int32_t lanes) {
+    WorkspaceLayoutBuilder builder;
+    static_cast<void>(allocate_staging(builder, options, lanes));
+    return builder.peak_bytes(kAlignment);
+}
+
+bool Forward::stages(std::int32_t layer, const SubChunk& chunk, bool streamed) const {
+    return options_.expert_staging == ExpertStaging::Enabled && !streamed && chunk.lane < 0 &&
+           layer >= kFirstStagedLayer && layer < kLayers;
+}
+
 std::size_t Forward::plan_input_bytes(const ForwardOptions& options) {
     WorkspaceLayoutBuilder builder;
     static_cast<void>(allocate_inputs(builder, options));
@@ -394,7 +459,7 @@ std::size_t Forward::device_bytes(const ModelView& model, const ForwardOptions& 
                                   const State& state) {
     const ForwardOptions checked = validated(options);
     return plan_activation_bytes(checked) + plan_verify_bytes(checked, state.lanes()) +
-           plan_work_bytes(model, checked, state);
+           plan_staging_bytes(checked, state.lanes()) + plan_work_bytes(model, checked, state);
 }
 
 Forward::Forward(const ModelView& model, State& state, PleRowFeeder& feeder,
@@ -404,10 +469,12 @@ Forward::Forward(const ModelView& model, State& state, PleRowFeeder& feeder,
       expert_table_(experts.expert_table()), host_table_(experts.host_table()),
       fill_table_(experts.fill_table()), cache_(experts.cache()), options_(validated(options)),
       stream_(stream),
-      activations_(plan_activation_bytes(options_) + plan_verify_bytes(options_, state.lanes())),
+      activations_(plan_activation_bytes(options_) + plan_verify_bytes(options_, state.lanes()) +
+                   plan_staging_bytes(options_, state.lanes())),
       work_(plan_work_bytes(model, options_, state)),
       chunk_(allocate_chunk(activations_, options_)),
       verify_(allocate_verify(activations_, options_, state.lanes())),
+      staging_(allocate_staging(activations_, options_, state.lanes())),
       input_staging_(plan_input_bytes(options_)),
       inputs_uploaded_(cudaEventDisableTiming | cudaEventBlockingSync),
       decode_rows_(static_cast<std::size_t>(kMaxLanes) *
@@ -416,7 +483,8 @@ Forward::Forward(const ModelView& model, State& state, PleRowFeeder& feeder,
       ingress_staging_(sizeof(DecodeIngress)), egress_(sizeof(SamplingEgress)),
       replay_start_(cudaEventBlockingSync), replay_stop_(cudaEventBlockingSync),
       admitted_(cudaEventDisableTiming), filled_(cudaEventDisableTiming),
-      window_slots_(window_slots(options_, cache_)),
+      input_ready_(cudaEventDisableTiming), stage_planned_(cudaEventDisableTiming),
+      experts_done_(cudaEventDisableTiming), window_slots_(window_slots(options_, cache_)),
       window_planned_{CudaEvent(cudaEventDisableTiming), CudaEvent(cudaEventDisableTiming)},
       window_ready_{CudaEvent(cudaEventDisableTiming), CudaEvent(cudaEventDisableTiming)},
       window_free_{CudaEvent(cudaEventDisableTiming), CudaEvent(cudaEventDisableTiming)},
@@ -789,6 +857,11 @@ void Forward::enqueue_layer_loop(std::span<const SubChunk> chunks, bool streamed
                                  std::span<const std::int32_t> next_tokens,
                                  const ForwardObserver* observer, std::int32_t first_layer,
                                  std::int32_t past_layer) {
+    // Staging keeps one span and one stage column per layer parity, so a staged round is one batch.
+    if (options_.expert_staging == ExpertStaging::Enabled && chunks.size() > 1 &&
+        chunks.front().lane < 0) {
+        throw std::logic_error("qwen3_8_flash_next Forward: a round runs as one batch");
+    }
     for (std::int32_t layer = first_layer; layer < past_layer; ++layer) {
         const LayerWeights& weights = model_.layers.at(static_cast<std::size_t>(layer));
         for (const SubChunk& chunk : chunks) {
@@ -1226,6 +1299,24 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
     Tensor x                    = columns(chunk_.block_input, kHidden, tokens);
     Tensor write_scale          = columns(chunk_.write_scale, ops::kHyperConnectionStreams, tokens);
     ops::hyper_connection_read(residual, weights.moe_connection, x, write_scale, work_, stream_);
+    // Staging (the class comment): whether this layer was staged, and whether the round stages the
+    // next one, whose prediction from x runs on the fill stream beside this layer's routing.
+    const bool staged            = stages(layer, chunk, streamed);
+    const bool next              = stages(layer + 1, chunk, streamed);
+    const std::int32_t following = layer + 1;
+    cudaStream_t fs              = fill_stream_.get();
+    const auto parity            = [](std::int32_t l) { return l % 2; };
+    if (next) {
+        CUDA_CHECK(cudaEventRecord(input_ready_.get(), stream_));
+        CUDA_CHECK(cudaStreamWaitEvent(fs, input_ready_.get(), 0));
+        Tensor control       = columns(staging_.control, ops::kMoeControlRows, tokens);
+        Tensor ids           = columns(staging_.ids, ops::kMoeTopK, tokens);
+        Tensor route_weights = columns(staging_.weights, ops::kMoeTopK, tokens);
+        Tensor shared        = Tensor(staging_.shared.data, DType::FP32, {tokens});
+        ops::bf16_projection(x, model_.layers.at(static_cast<std::size_t>(following)).moe_control,
+                             control, fs);
+        ops::moe_route(control, ids, route_weights, shared, fs);
+    }
 
     auto scope   = work_.scope();
     MoeScratch s = allocate_moe(work_, tokens);
@@ -1264,29 +1355,63 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
     }
 
     // The cache schedule of moe_expert_cache.h with the fill on fill_stream_: admit marks hits and
-    // assigns victim slots to misses; the fill copies the admitted misses' host records into their
+    // assigns victim slots to misses; the fill copies the admitted misses' records into their
     // slots while moe_experts computes the shared and resident experts, then reads the admitted
     // misses from their slots (the layer's fill column) after filled_; commit then publishes the
     // slots. A miss admit could not place, or did not admit, is read through mapped memory with
     // the resident ones. Decode rounds of two or more lanes filter admissions by frequency, which
     // keeps the lanes' competing working sets from thrashing the pools; one lane and narrow
-    // prefill chunks admit every miss (expert_residency.h, kExpertReferenceLimit).
+    // prefill chunks admit every miss (expert_residency.h, kExpertReferenceLimit). A staged layer
+    // (the class comment) admits once its stage has read the tables, fills its admitted misses from
+    // the stage's source column, and reads its staged records through the deferral; the round
+    // stages the next layer around this one's MoE.
+    if (staged) { CUDA_CHECK(cudaStreamWaitEvent(stream_, stage_planned_.get(), 0)); }
     const ops::MoeCacheAdmission admission = chunk.rows >= 2
                                                  ? ops::MoeCacheAdmission::FrequencyFilter
                                                  : ops::MoeCacheAdmission::EveryMiss;
     ops::moe_expert_cache_admit(s.expert_ids, expert_table_, host_table_, fill_table_, cache_,
                                 layer, admission, stream_, &chunk_.expert_cache_counters);
     CUDA_CHECK(cudaEventRecord(admitted_.get(), stream_));
-    CUDA_CHECK(cudaStreamWaitEvent(fill_stream_.get(), admitted_.get(), 0));
-    ops::moe_expert_cache_fill(host_table_, fill_table_, layer, fill_stream_.get());
-    CUDA_CHECK(cudaEventRecord(filled_.get(), fill_stream_.get()));
+    CUDA_CHECK(cudaStreamWaitEvent(fs, admitted_.get(), 0));
+    if (staged) {
+        ops::moe_expert_cache_fill(staging_.source.view({ops::kMoeExperts, 1}),
+                                   fill_table_.slice(1, layer, 1), 0, fs);
+    } else {
+        ops::moe_expert_cache_fill(host_table_, fill_table_, layer, fs);
+    }
+    CUDA_CHECK(cudaEventRecord(filled_.get(), fs));
+    if (next) {
+        const DeviceSpan span = staging_.span;
+        Tensor stage = staging_.stage.slice(1, parity(following), 1).view({ops::kMoeExperts});
+        ops::moe_expert_cache_stage(columns(staging_.ids, ops::kMoeTopK, tokens),
+                                    kStagingCandidates, expert_table_, host_table_, following, span,
+                                    staging_budget_bytes(following, tokens), stage, staging_.source,
+                                    fs);
+        CUDA_CHECK(cudaEventRecord(stage_planned_.get(), fs));
+    }
     ops::MoeExpertBank bank = weights.experts;
     bank.expert_table       = expert_table_.slice(1, layer, 1).view({ops::kMoeExperts});
-    const ops::MoeExpertsDeferral deferral{
-        .slots = fill_table_.slice(1, layer, 1).view({ops::kMoeExperts}), .ready = filled_.get()};
+    Tensor slots            = fill_table_.slice(1, layer, 1).view({ops::kMoeExperts});
+    if (staged) {
+        ops::moe_expert_cache_defer(
+            fill_table_, layer, staging_.stage.slice(1, parity(layer), 1).view({ops::kMoeExperts}),
+            staging_.deferred, stream_);
+        slots = staging_.deferred;
+    }
+    // filled_ follows the layer's staging copy on the fill stream, so it covers the staged records.
+    const ops::MoeExpertsDeferral deferral{.slots = slots, .ready = filled_.get()};
     Tensor y = columns(chunk_.block_output, kHidden, tokens);
     ops::moe_experts(x, s.expert_ids, s.route_weights, s.shared_scale, bank, y, work_, stream_,
                      &deferral);
+    if (next) {
+        // The span's last readers (this moe_experts and, earlier on the fill stream, the admitted
+        // fill) precede the copy, which the next layer's admitted fill and deferral follow.
+        CUDA_CHECK(cudaEventRecord(experts_done_.get(), stream_));
+        CUDA_CHECK(cudaStreamWaitEvent(fs, experts_done_.get(), 0));
+        ops::moe_expert_cache_fill(host_table_.slice(1, following, 1),
+                                   staging_.stage.slice(1, parity(following), 1), 0, fs,
+                                   ops::kMoeStagingFillBlocks);
+    }
     ops::moe_expert_cache_commit(expert_table_, fill_table_, layer, stream_);
     ops::hyper_connection_inject(residual, y, write_scale, residual, stream_);
 }

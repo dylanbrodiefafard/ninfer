@@ -53,13 +53,26 @@ void moe_expert_cache_lend_launch(MoeExpertSlotPoolArgs pool, std::uint64_t* exp
                                   std::int32_t first, std::int32_t count, MoeCacheLend lend,
                                   cudaStream_t stream);
 
-void moe_expert_cache_fill_launch(const std::uint64_t* host_ptr, const std::uint64_t* fill_ptr,
+// source_ptr names mapped host or device records (codec in bit 0); blocks is in [1, 1024].
+void moe_expert_cache_fill_launch(const std::uint64_t* source_ptr, const std::uint64_t* fill_ptr,
                                   std::int32_t layer, std::int32_t blocks, cudaStream_t stream);
 
 // expert_ptr and host_ptr are the layer's columns; window_base is 0 when window_bytes is 0.
 void moe_expert_cache_window_launch(const std::uint64_t* expert_ptr, const std::uint64_t* host_ptr,
                                     std::uint64_t window_base, std::uint64_t window_bytes,
                                     std::uint64_t* window_ptr, cudaStream_t stream);
+
+// expert_ptr and host_ptr are the layer's columns; predicted is I32 [10,tokens]; staging_base is 0
+// when budget_bytes is 0 and nothing can be placed.
+void moe_expert_cache_stage_launch(const std::int32_t* predicted, std::int32_t tokens,
+                                   std::int32_t candidates, const std::uint64_t* expert_ptr,
+                                   const std::uint64_t* host_ptr, std::uint64_t staging_base,
+                                   std::uint64_t budget_bytes, std::uint64_t* stage_ptr,
+                                   std::uint64_t* source, cudaStream_t stream);
+
+// fill_ptr is the layer's column.
+void moe_expert_cache_defer_launch(const std::uint64_t* fill_ptr, const std::uint64_t* stage_ptr,
+                                   std::uint64_t* deferred, cudaStream_t stream);
 
 void moe_expert_cache_commit_launch(std::uint64_t* expert_ptr, std::uint64_t* fill_ptr,
                                     std::int32_t layer, cudaStream_t stream);

@@ -2,10 +2,11 @@
 int run_lanes_bench(const Options& options, std::span<const std::int32_t> stream_tokens) {
     if (!options.calib_counts.empty() || options.expert_cache_mib != -1 || options.window != 1.0 ||
         options.window_min_tokens != 512 || options.profile_decode ||
+        options.expert_staging != fn::ExpertStaging::Enabled ||
         (options.super_chunk != 0 && options.super_chunk != 16384)) {
         throw std::invalid_argument(
             "lanes-bench uses production Engine planning, not private cache, "
-            "streaming-window, super-chunk or profiler controls");
+            "streaming-window, staging, super-chunk or profiler controls");
     }
     const auto prompt_tokens = options.prompt_lengths.front();
     if (prompt_tokens < 1 || options.prompt_offset < 0) {

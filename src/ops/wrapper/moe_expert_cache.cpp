@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -54,14 +55,12 @@ bool table_of(const Tensor& t, DType dtype, std::int32_t layers) {
 
 bool table(const Tensor& t, std::int32_t layers) { return table_of(t, DType::I64, layers); }
 
-// Validates two tables of equal L (named `first` and `second`) and the layer index; returns L.
-std::int32_t validate_tables(const Tensor& first_table, const Tensor& second_table,
-                             std::int32_t layer, const std::string& op, const char* first,
-                             const char* second) {
-    const std::int32_t layers = first_table.ne[1];
-    if (!table(first_table, layers) || !table(second_table, layers)) {
-        throw std::invalid_argument(op + ": " + first + " and " + second +
-                                    " must be contiguous I64 [512,L]");
+// Validates an I64 [512,L] table and 0 <= layer < L, and returns L.
+std::int32_t validate_table(const Tensor& table_view, std::int32_t layer, const std::string& op,
+                            const std::string& name) {
+    const std::int32_t layers = table_view.ne[1];
+    if (!table(table_view, layers)) {
+        throw std::invalid_argument(op + ": " + name + " must be contiguous I64 [512,L]");
     }
     if (layers > std::numeric_limits<std::int32_t>::max() / kMoeExperts) {
         throw std::invalid_argument(op + ": 512 L must fit int32");
@@ -70,6 +69,26 @@ std::int32_t validate_tables(const Tensor& first_table, const Tensor& second_tab
         throw std::invalid_argument(op + ": layer must lie in [0,L)");
     }
     return layers;
+}
+
+// Validates two tables of equal L (named `first` and `second`) and the layer index; returns L.
+std::int32_t validate_tables(const Tensor& first_table, const Tensor& second_table,
+                             std::int32_t layer, const std::string& op, const char* first,
+                             const char* second) {
+    const std::int32_t layers = validate_table(first_table, layer, op, first);
+    if (!table(second_table, layers)) {
+        throw std::invalid_argument(op + ": " + first + " and " + second +
+                                    " must be contiguous I64 [512,L]");
+    }
+    return layers;
+}
+
+// Validates a contiguous I64 [512] column.
+void validate_column(const Tensor& column, const std::string& op, const char* name) {
+    if (!contiguous_2d(column, DType::I64, sizeof(std::uint64_t)) || column.ne[0] != kMoeExperts ||
+        column.ne[1] != 1) {
+        throw std::invalid_argument(op + ": " + name + " must be contiguous I64 [512]");
+    }
 }
 
 // Validates a pool's geometry and metadata views (MoeExpertSlotPool); the flex addresses are
@@ -295,18 +314,29 @@ void moe_expert_cache_return(const MoeExpertCache& cache, MoeExpertCodec codec,
          stream);
 }
 
-void moe_expert_cache_fill(const Tensor& host_ptr, const Tensor& fill_ptr, std::int32_t layer,
-                           cudaStream_t stream) {
-    validate_tables(host_ptr, fill_ptr, layer, "moe_expert_cache_fill", "host_ptr", "fill_ptr");
-    require_disjoint({range_of(host_ptr), range_of(fill_ptr)},
-                     "moe_expert_cache_fill: host_ptr and fill_ptr must be disjoint");
-    int device_id = 0;
-    CUDA_CHECK(cudaGetDevice(&device_id));
-    int multiprocessors = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device_id));
-    detail::moe_expert_cache_fill_launch(static_cast<const std::uint64_t*>(host_ptr.data),
+void moe_expert_cache_fill(const Tensor& source_ptr, const Tensor& fill_ptr, std::int32_t layer,
+                           cudaStream_t stream, std::optional<std::int32_t> blocks) {
+    validate_tables(source_ptr, fill_ptr, layer, "moe_expert_cache_fill", "source_ptr", "fill_ptr");
+    require_disjoint({range_of(source_ptr), range_of(fill_ptr)},
+                     "moe_expert_cache_fill: source_ptr and fill_ptr must be disjoint");
+    constexpr std::int32_t kMaxFillBlocks = 1024;
+    if (blocks.has_value() && (*blocks < 1 || *blocks > kMaxFillBlocks)) {
+        throw std::invalid_argument("moe_expert_cache_fill: blocks must lie in [1, 1024]");
+    }
+    std::int32_t grid = 0;
+    if (blocks.has_value()) {
+        grid = *blocks;
+    } else {
+        int device_id = 0;
+        CUDA_CHECK(cudaGetDevice(&device_id));
+        int multiprocessors = 0;
+        CUDA_CHECK(
+            cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device_id));
+        grid = moe_expert_cache_fill_blocks(multiprocessors);
+    }
+    detail::moe_expert_cache_fill_launch(static_cast<const std::uint64_t*>(source_ptr.data),
                                          static_cast<const std::uint64_t*>(fill_ptr.data), layer,
-                                         moe_expert_cache_fill_blocks(multiprocessors), stream);
+                                         grid, stream);
 }
 
 void moe_expert_cache_window(const Tensor& expert_ptr, const Tensor& host_ptr, std::int32_t layer,
@@ -333,6 +363,59 @@ void moe_expert_cache_window(const Tensor& expert_ptr, const Tensor& host_ptr, s
         static_cast<const std::uint64_t*>(host_ptr.data) + column,
         reinterpret_cast<std::uint64_t>(window.data), window.bytes,
         static_cast<std::uint64_t*>(window_ptr.data), stream);
+}
+
+void moe_expert_cache_stage(const Tensor& predicted, std::int32_t candidates,
+                            const Tensor& expert_ptr, const Tensor& host_ptr, std::int32_t layer,
+                            DeviceSpan staging, std::size_t budget_bytes, Tensor& stage_ptr,
+                            Tensor& source, cudaStream_t stream) {
+    const std::string op("moe_expert_cache_stage");
+    validate_tables(expert_ptr, host_ptr, layer, op, "expert_ptr", "host_ptr");
+    if (!contiguous_2d(predicted, DType::I32, sizeof(std::int32_t)) ||
+        predicted.ne[0] != kMoeTopK || predicted.ne[1] > kMoeMaxTokens) {
+        throw std::invalid_argument(op + ": predicted must be contiguous I32 [10,T], 1 <= T <= " +
+                                    std::to_string(kMoeMaxTokens));
+    }
+    if (candidates < 1 || candidates > kMoeStageMaxCandidates) {
+        throw std::invalid_argument(op + ": candidates must lie in [1,10]");
+    }
+    validate_column(stage_ptr, op, "stage_ptr");
+    validate_column(source, op, "source");
+    const bool empty = staging.data == nullptr;
+    if (empty ? staging.bytes != 0 || budget_bytes != 0
+              : reinterpret_cast<std::uintptr_t>(staging.data) % kMoeRecordAlignment != 0 ||
+                    budget_bytes > staging.bytes) {
+        throw std::invalid_argument(op + ": the staging span must be 256-byte aligned and hold "
+                                         "the budget, or be null with a zero budget");
+    }
+    std::vector<ByteRange> ranges{range_of(predicted), range_of(expert_ptr), range_of(host_ptr),
+                                  range_of(stage_ptr), range_of(source)};
+    if (!empty) {
+        ranges.push_back({reinterpret_cast<std::uintptr_t>(staging.data), staging.bytes});
+    }
+    require_disjoint(ranges, (op + ": tensors and the staging span must be disjoint").c_str());
+    const std::size_t column = static_cast<std::size_t>(layer) * kMoeExperts;
+    detail::moe_expert_cache_stage_launch(
+        static_cast<const std::int32_t*>(predicted.data), predicted.ne[1], candidates,
+        static_cast<const std::uint64_t*>(expert_ptr.data) + column,
+        static_cast<const std::uint64_t*>(host_ptr.data) + column,
+        reinterpret_cast<std::uint64_t>(staging.data), budget_bytes,
+        static_cast<std::uint64_t*>(stage_ptr.data), static_cast<std::uint64_t*>(source.data),
+        stream);
+}
+
+void moe_expert_cache_defer(const Tensor& fill_ptr, std::int32_t layer, const Tensor& stage_ptr,
+                            Tensor& deferred, cudaStream_t stream) {
+    const std::string op("moe_expert_cache_defer");
+    validate_table(fill_ptr, layer, op, "fill_ptr");
+    validate_column(stage_ptr, op, "stage_ptr");
+    validate_column(deferred, op, "deferred");
+    require_disjoint({range_of(fill_ptr), range_of(stage_ptr), range_of(deferred)},
+                     (op + ": fill_ptr, stage_ptr and deferred must be disjoint").c_str());
+    detail::moe_expert_cache_defer_launch(static_cast<const std::uint64_t*>(fill_ptr.data) +
+                                              static_cast<std::size_t>(layer) * kMoeExperts,
+                                          static_cast<const std::uint64_t*>(stage_ptr.data),
+                                          static_cast<std::uint64_t*>(deferred.data), stream);
 }
 
 void moe_expert_cache_commit(Tensor& expert_ptr, Tensor& fill_ptr, std::int32_t layer,
