@@ -2,6 +2,7 @@
 
 // Host-side supply of the n-gram (PLE) table rows each forward chunk consumes.
 
+#include "config.h"
 #include "ngram_table.h"
 #include "runtime/cuda_event.h"
 
@@ -12,10 +13,15 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <future>
+#include <mutex>
 #include <span>
+#include <stop_token>
+#include <thread>
 #include <vector>
 
 namespace ninfer::targets::qwen3_8_flash_next {
@@ -42,12 +48,15 @@ namespace ninfer::targets::qwen3_8_flash_next {
  * time), then reads on the calling thread. cancel(), reset() of the pending gather's lane and
  * destruction wait for the worker. The table must outlive the feeder. A failed
  * gather rethrows from upload(); its lane's history is then unspecified and the lane must restart
- * with reset(). Not thread-safe; one owner thread.
+ * with reset(). Anchor fetches use a persistent worker and immutable history snapshots; every table
+ * reader joins any earlier worker before reading, so the shared row cache has one reader at a
+ * time. Gathers reuse matching anchor records without committing their speculative histories.
+ * Not thread-safe; one owner thread.
  */
 class PleRowFeeder {
 public:
     // max_tokens: the widest chunk, at least 1; lanes: the requests, at least 1. Allocates
-    // 2 * max_tokens * 2592 pinned bytes.
+    // 2 * max_tokens * 2592 pinned bytes and starts one persistent CPU worker for anchor reads.
     PleRowFeeder(NgramTable& table, std::int32_t max_tokens, std::int32_t lanes);
     ~PleRowFeeder();
 
@@ -86,8 +95,9 @@ public:
 
     // One decode round: gathers the records of tokens[i] after the history of lanes[i] (distinct
     // lanes, none of them the pending gather's) into `out` (exactly 2592 bytes per token) on the
-    // calling thread and advances those histories. Throws std::invalid_argument for repeated
-    // lanes or a size mismatch, std::out_of_range for a lane outside [0, lanes), and
+    // calling thread (reusing matching prefetched anchors) and advances those histories.
+    // Throws std::invalid_argument for repeated lanes or a size mismatch,
+    // std::out_of_range for a lane outside [0, lanes), and
     // std::logic_error for the pending gather's lane.
     void gather_now(std::span<const std::int32_t> lanes, std::span<const std::int32_t> tokens,
                     std::span<std::uint8_t> out);
@@ -97,6 +107,15 @@ public:
     // lanes and no pending gather of a named lane are required, as for gather_now().
     void gather_proposals(std::span<const std::int32_t> lanes, std::span<const std::int32_t> tokens,
                           std::int32_t width, std::span<std::uint8_t> out);
+
+    // Fetches the next input token of each distinct lane asynchronously from a snapshot of its
+    // committed raw history. Does not advance histories. Later gathers reuse an entry only when
+    // lane, token and both predecessors match; reset/restore joins the worker and drops the
+    // lane's entry. Serializes with prefill reads and any earlier anchor fetch. I/O failures
+    // belong to the fetched entries and rethrow only when a gather consumes a matching entry;
+    // discarding an entry on reset/restore cannot prevent lane release.
+    void prefetch_anchors(std::span<const std::int32_t> lanes,
+                          std::span<const std::int32_t> tokens);
 
     // Advances only the committed prefix of each gathered proposal row, without table I/O.
     // Uses the same packed geometry and distinct-lane preconditions as gather_proposals().
@@ -118,8 +137,18 @@ private:
         std::vector<std::future<void>> ready;
     };
 
+    struct AnchorRows {
+        std::int32_t lane  = -1;
+        std::int32_t token = -1;
+        NgramHistory history;
+        std::array<std::uint8_t, kNgramTokenBytes> bytes{};
+        std::exception_ptr failure{};
+    };
+
     [[nodiscard]] NgramHistory& history(std::int32_t lane);
     void wait_pending() noexcept;
+    void finish_anchors();
+    void anchor_worker(const std::stop_token& stop);
 
     NgramTable& table_;
     std::int32_t max_tokens_;
@@ -134,6 +163,17 @@ private:
     // Set by cancel(); the worker checks it before each part and stops early.
     std::atomic<bool> cancel_requested_{false};
     std::future<void> pending_;
+    std::vector<AnchorRows> anchors_;
+    // Compact table output for the uncached columns, scattered into the pinned proposal frame.
+    std::vector<std::uint8_t> proposal_rows_;
+    enum class AnchorPhase : std::uint8_t { Idle, Reading, Ready };
+    std::mutex anchor_mutex_;
+    std::condition_variable_any anchor_changed_;
+    std::array<AnchorRows, kMaxLanes> anchor_batch_;
+    std::size_t anchor_count_ = 0;
+    AnchorPhase anchor_phase_ = AnchorPhase::Idle;
+    // Last member: joined before the synchronization objects and staging it uses are destroyed.
+    std::jthread anchor_worker_;
 };
 
 } // namespace ninfer::targets::qwen3_8_flash_next

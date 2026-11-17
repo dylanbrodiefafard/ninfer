@@ -391,6 +391,8 @@ PrefillStep Program::finish_prompt(Lane lane) {
     control.phase          = LanePhase::Decoding;
     step.next_token        = rows.tokens[0];
     step.next_logprob      = rows.logprobs[0];
+    const std::array fetch_lanes{lane};
+    feeder_.prefetch_anchors(fetch_lanes, rows.tokens);
     if (control.sampling.top_logprobs) {
         std::copy_n(rows.top_ids.begin(), kTopLogprobs, step.top_ids.begin());
         std::copy_n(rows.top_logprobs.begin(), kTopLogprobs, step.top_logprobs.begin());

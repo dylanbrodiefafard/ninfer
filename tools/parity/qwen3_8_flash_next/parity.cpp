@@ -568,7 +568,8 @@ struct DecodeWindow {
     }
 
     // One summary line to `log` and one JSON object to `json`; per-round values are per token at
-    // one lane.
+    // one lane. Replay time spans the round's graphs including any exposed n-gram wait, and the
+    // host gather overlaps it, so the host gap is the round time outside the replay interval.
     void report(std::ostream& log, std::ostream& json) const {
         // PCIe time of the misses at the measured mapped-read rate of the plan (26.8 GB/s).
         constexpr double kMappedReadBytesPerSecond = 26.8e9;
@@ -594,15 +595,15 @@ struct DecodeWindow {
         };
         log << steps << " rounds of " << rows << ": aggregate " << aggregate << " tok/s, per lane "
             << steps / seconds << " tok/s (per round " << per_round_ms << " ms: replay "
-            << replay_ms << ", n-gram gather " << gather_ms << ", host "
-            << per_round_ms - replay_ms - gather_ms << "); expert-cache hit rate " << hit_rate
-            << ", PCIe " << miss_bytes_per_round / 1e6 << " MB/round\n";
+            << replay_ms << ", n-gram gather " << gather_ms << " overlapping replay, host "
+            << per_round_ms - replay_ms << "); expert-cache hit rate " << hit_rate << ", PCIe "
+            << miss_bytes_per_round / 1e6 << " MB/round\n";
         json << "{\"rounds\": " << steps << ", \"lanes\": " << rows
              << ", \"aggregate_tokens_per_second\": " << aggregate
              << ", \"lane_tokens_per_second\": " << steps / seconds
              << ", \"round_ms\": " << per_round_ms << ", \"replay_ms_per_round\": " << replay_ms
              << ", \"ngram_gather_ms_per_round\": " << gather_ms
-             << ", \"host_gap_ms_per_round\": " << per_round_ms - replay_ms - gather_ms
+             << ", \"host_gap_ms_per_round\": " << per_round_ms - replay_ms
              << ", \"expert_cache_hit_rate\": " << hit_rate << ", \"nvfp4_misses_per_round\": "
              << misses_per_round(ninfer::ops::MoeExpertCodec::Nvfp4G16)
              << ", \"f3_misses_per_round\": "

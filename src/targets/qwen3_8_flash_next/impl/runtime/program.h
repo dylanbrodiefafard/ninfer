@@ -114,7 +114,8 @@ struct PrefillStep {
 struct RoundTiming {
     // Host n-gram row gather of the round's input tokens, in seconds.
     double gather_seconds = 0.0;
-    // GPU time of the graph replay, in milliseconds (events around the launch).
+    // Elapsed stream time across the graph pair in milliseconds, including exposed gather waits.
+    // The host gather overlaps this interval; the two fields are not additive.
     float replay_ms = 0.0F;
 };
 
@@ -228,8 +229,8 @@ public:
     // and top_logprobs are not empty (each lanes.size() * kTopLogprobs), row i's kTopLogprobs
     // entries [i * kTopLogprobs, (i + 1) * kTopLogprobs) receive the ranked alternatives as in
     // PrefillStep, for every row. A round with both empty skips the log-probability pass.
-    // 1 <= lanes.size() <= lanes(); one graph replay of batch size lanes.size(), then the stream is
-    // synchronized.
+    // 1 <= lanes.size() <= lanes(); two graph replays of batch size lanes.size(), then the stream
+    // is synchronized.
     void decode(std::span<const Lane> lanes, std::span<const std::int32_t> tokens,
                 std::span<std::int32_t> next, std::span<float> next_logprob = {},
                 std::span<std::int32_t> top_ids = {}, std::span<float> top_logprobs = {});

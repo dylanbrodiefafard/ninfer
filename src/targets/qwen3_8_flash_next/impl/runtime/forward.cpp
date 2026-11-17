@@ -956,32 +956,49 @@ SampledRows Forward::sample_last(const ops::SamplingConfig& config, std::int32_t
     return sampled_rows(1);
 }
 
-void Forward::enqueue_decode(std::int32_t rows, const ForwardObserver* observer) {
+void Forward::enqueue_decode_a(std::int32_t rows, const ForwardObserver* observer) {
     feature_offset_  = 0;
     feature_columns_ = rows;
     CUDA_CHECK(cudaMemcpyAsync(chunk_.ingress.data, ingress_staging_.data(), sizeof(DecodeIngress),
                                cudaMemcpyHostToDevice, stream_));
+    const std::array batch{decode_batch(rows)};
+    const SubChunk& chunk = batch.front();
+    Tensor embedded       = columns(chunk_.block_input, kHidden, rows);
+    ops::embedding(chunk.token_ids, model_.embedding, embedded, stream_);
+    Tensor residual = residual_columns(chunk);
+    ops::hyper_connection_broadcast(embedded, residual, stream_);
+    enqueue_layer_loop(batch, false, RowSource::Resident, {}, observer, 0, kPleLayer);
+}
+
+void Forward::enqueue_decode_b(std::int32_t rows, const ForwardObserver* observer) {
     CUDA_CHECK(cudaMemcpyAsync(chunk_.ple_rows.data, decode_rows_.data(),
                                static_cast<std::size_t>(rows) * ops::kPleRowsPerToken *
                                    ops::kPleInt8RowBytes,
                                cudaMemcpyHostToDevice, stream_));
     const std::array<SubChunk, 1> batch{decode_batch(rows)};
-    enqueue_layers(batch, /*streamed=*/false, RowSource::Resident, {}, observer);
+    enqueue_layer_loop(batch, false, RowSource::Resident, {}, observer, kPleLayer, kLayers);
     head(0, rows);
     enqueue_sampling(rows, ops::kSamplePurposeDecode);
 }
 
 void Forward::capture_decode_graphs() {
     // Every address (staging, frames, arenas, tables) is fixed for the Forward's lifetime, and the
-    // workspace scopes allocate the same offsets on every replay; one graph per batch size.
+    // workspace scopes allocate the same offsets on every replay; one graph pair per batch size.
     const auto batches = static_cast<std::size_t>(state_.lanes());
-    decode_definitions_.resize(batches);
-    decode_graphs_.resize(batches);
+    decode_a_definitions_.resize(batches);
+    decode_b_definitions_.resize(batches);
+    decode_a_graphs_.resize(batches);
+    decode_b_graphs_.resize(batches);
     for (std::size_t b = 0; b < batches; ++b) {
         const auto rows = static_cast<std::int32_t>(b + 1);
-        decode_definitions_[b].capture(stream_, [this, rows] { enqueue_decode(rows, nullptr); });
-        decode_graphs_[b].instantiate(decode_definitions_[b]);
-        decode_graphs_[b].upload(stream_);
+        decode_a_definitions_[b].capture(stream_,
+                                         [this, rows] { enqueue_decode_a(rows, nullptr); });
+        decode_b_definitions_[b].capture(stream_,
+                                         [this, rows] { enqueue_decode_b(rows, nullptr); });
+        decode_a_graphs_[b].instantiate(decode_a_definitions_[b]);
+        decode_b_graphs_[b].instantiate(decode_b_definitions_[b]);
+        decode_a_graphs_[b].upload(stream_);
+        decode_b_graphs_[b].upload(stream_);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
@@ -1003,7 +1020,7 @@ SampledRows Forward::decode(std::span<const std::int32_t> lanes,
         throw std::invalid_argument("qwen3_8_flash_next Forward: a graph replay takes no "
                                     "observer");
     }
-    if (execution == DecodeExecution::Graph && decode_graphs_.empty()) {
+    if (execution == DecodeExecution::Graph && decode_a_graphs_.empty()) {
         throw std::logic_error("qwen3_8_flash_next Forward: decode graphs need "
                                "LogitColumns::Last");
     }
@@ -1011,19 +1028,18 @@ SampledRows Forward::decode(std::span<const std::int32_t> lanes,
     DecodeIngress& ingress = ingress_host();
     for (std::size_t i = 0; i < rows; ++i) {
         const std::int32_t lane = lanes[i];
+        const auto earlier      = lanes.first(i);
+        if (std::find(earlier.begin(), earlier.end(), lane) != earlier.end()) {
+            throw std::invalid_argument("Flash-Next decode: duplicate lane");
+        }
+        if (lane == feeder_.pending_lane()) {
+            throw std::logic_error("Flash-Next decode: lane has a pending n-gram gather");
+        }
         if (state_.committed(lane) >= state_.reserved_tokens(lane)) {
             throw std::out_of_range("qwen3_8_flash_next Forward: lane " + std::to_string(lane) +
                                     " has no reserved slot left");
         }
     }
-    // Validates distinct lanes and waits for a pending prefetch's reads; every earlier reader of
-    // the pinned row frame and ingress synchronized before returning.
-    const auto gather_start = std::chrono::steady_clock::now();
-    feeder_.gather_now(lanes, tokens,
-                       std::span<std::uint8_t>(static_cast<std::uint8_t*>(decode_rows_.data()),
-                                               rows * static_cast<std::size_t>(kNgramTokenBytes)));
-    last_gather_seconds_ =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - gather_start).count();
     for (std::size_t i = 0; i < rows; ++i) {
         const std::int32_t position = state_.committed(lanes[i]);
         ingress.tokens[i]           = tokens[i];
@@ -1040,21 +1056,42 @@ SampledRows Forward::decode(std::span<const std::int32_t> lanes,
     const auto batch = static_cast<std::int32_t>(rows);
     feature_offset_  = 0;
     feature_columns_ = batch;
-    CUDA_CHECK(cudaEventRecord(replay_start_.get(), stream_));
-    if (execution == DecodeExecution::Graph) {
-        decode_graphs_[rows - 1].launch(stream_);
-    } else {
-        enqueue_decode(batch, observer);
+    try {
+        CUDA_CHECK(cudaEventRecord(replay_start_.get(), stream_));
+        if (execution == DecodeExecution::Graph) {
+            decode_a_graphs_[rows - 1].launch(stream_);
+        } else {
+            enqueue_decode_a(batch, observer);
+        }
+        const auto gather_start = std::chrono::steady_clock::now();
+        feeder_.gather_now(
+            lanes, tokens,
+            std::span<std::uint8_t>(static_cast<std::uint8_t*>(decode_rows_.data()),
+                                    rows * static_cast<std::size_t>(kNgramTokenBytes)));
+        last_gather_seconds_ =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - gather_start).count();
+        if (execution == DecodeExecution::Graph) {
+            decode_b_graphs_[rows - 1].launch(stream_);
+        } else {
+            enqueue_decode_b(batch, observer);
+        }
+        for (std::size_t row = 0; row < rows; ++row) {
+            const Tensor tail = state_.tail_logits(lanes[row]);
+            const auto* source =
+                static_cast<const std::byte*>(chunk_.logits.data) + row * tail.bytes();
+            CUDA_CHECK(cudaMemcpyAsync(tail.data, source, tail.bytes(), cudaMemcpyDeviceToDevice,
+                                       stream_));
+        }
+        CUDA_CHECK(cudaEventRecord(replay_stop_.get(), stream_));
+        CUDA_CHECK(cudaEventSynchronize(replay_stop_.get()));
+        CUDA_CHECK(cudaEventElapsedTime(&last_replay_ms_, replay_start_.get(), replay_stop_.get()));
+    } catch (...) {
+        // A failed row read can follow layer zero's launch; drain its ingress and workspace
+        // readers before a caller closes or reuses the lane and pinned frames.
+        CUDA_CHECK(cudaStreamSynchronize(stream_));
+        CUDA_CHECK(cudaStreamSynchronize(fill_stream_.get()));
+        throw;
     }
-    for (std::size_t row = 0; row < rows; ++row) {
-        const Tensor tail  = state_.tail_logits(lanes[row]);
-        const auto* source = static_cast<const std::byte*>(chunk_.logits.data) + row * tail.bytes();
-        CUDA_CHECK(
-            cudaMemcpyAsync(tail.data, source, tail.bytes(), cudaMemcpyDeviceToDevice, stream_));
-    }
-    CUDA_CHECK(cudaEventRecord(replay_stop_.get(), stream_));
-    CUDA_CHECK(cudaEventSynchronize(replay_stop_.get()));
-    CUDA_CHECK(cudaEventElapsedTime(&last_replay_ms_, replay_start_.get(), replay_stop_.get()));
     for (const std::int32_t lane : lanes) { state_.advance(lane, 1); }
     return sampled_rows(batch);
 }

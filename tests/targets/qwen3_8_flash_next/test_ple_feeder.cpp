@@ -204,6 +204,8 @@ int run() {
             }
             const std::array<std::int32_t, 8> proposals{43, fn::kNgramEosToken, 47, 53, 59, 61, 67,
                                                         71};
+            const std::array<std::int32_t, 2> anchors{proposals[0], proposals[4]};
+            feeder.prefetch_anchors(lanes, anchors);
             std::vector<std::uint8_t> proposed(proposals.size() * fn::kNgramTokenBytes);
             for (std::int32_t repeat = 0; repeat < 2; ++repeat) {
                 feeder.gather_proposals(lanes, proposals, 4, proposed);
@@ -226,13 +228,16 @@ int run() {
                                           committed[row], constants,
                                           "proposal preserved committed history");
             }
+            // One history changes after the fetch, while the rejected lane's history does not.
+            // Equal anchor IDs alone must not license stale records for the committed lane.
+            const std::array<std::int32_t, 2> after_commit{83, 89};
+            feeder.prefetch_anchors(lanes, after_commit);
             const std::array<std::int32_t, 2> counts{2, 0};
             feeder.commit_proposals(lanes, proposals, 4, counts);
             for (std::int32_t column = 0; column < counts[0]; ++column) {
                 static_cast<void>(fn::ngram_row_ids(proposals[static_cast<std::size_t>(column)],
                                                     committed[0], constants));
             }
-            const std::array<std::int32_t, 2> after_commit{83, 89};
             feeder.gather_now(lanes, after_commit, ordinary);
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 failures += check_records(
@@ -241,6 +246,44 @@ int run() {
                     std::span<const std::int32_t>(after_commit).subspan(row, 1), committed[row],
                     constants, "accepted prefix and rejected row histories");
             }
+        }
+
+        // A pending anchor batch may be compacted or have a lane replaced by an exact-prefix
+        // restore. Rows for the surviving lane keep their own history; a replacement with the
+        // same anchor ID uses its restored predecessors, not the suspended request's rows.
+        {
+            const std::array<std::int32_t, 2> lanes{0, 1};
+            const std::array<std::int32_t, 2> anchors{101, 103};
+            const std::array<std::int32_t, 2> prefix0{17, 19}, prefix1{23, fn::kNgramEosToken};
+            feeder.restore_history(0, prefix0);
+            feeder.restore_history(1, prefix1);
+            feeder.prefetch_anchors(lanes, anchors);
+            const std::array<std::int32_t, 2> restored{29, 31};
+            feeder.restore_history(0, restored);
+            const std::array<std::int32_t, 2> reordered{1, 0};
+            const std::array<std::int32_t, 4> proposals{103, 107, 101, 109};
+            std::vector<std::uint8_t> proposed(proposals.size() * fn::kNgramTokenBytes);
+            feeder.gather_proposals(reordered, proposals, 2, proposed);
+            std::array<fn::NgramHistory, 2> expected{};
+            expected[0].tokens = prefix1;
+            expected[1].tokens = restored;
+            for (std::size_t row = 0; row < reordered.size(); ++row) {
+                failures += check_records(
+                    std::span<const std::uint8_t>(proposed).subspan(row * 2 * fn::kNgramTokenBytes,
+                                                                    2 * fn::kNgramTokenBytes),
+                    std::span<const std::int32_t>(proposals).subspan(row * 2, 2), expected[row],
+                    constants, "prefetched anchor after lane compaction and restore");
+            }
+            // Prefill and anchor workers share a non-thread-safe row cache. Starting prefill
+            // joins the anchor fetch before reading the table, without advancing its history.
+            feeder.prefetch_anchors(lanes, anchors);
+            feeder.begin(0, chunks[2], 2);
+            fn::NgramHistory expected_prefill;
+            expected_prefill.tokens = restored;
+            failures += check_records(upload_all(feeder, rows, device.stream,
+                                                 static_cast<std::int32_t>(chunks[2].size()), 2),
+                                      chunks[2], expected_prefill, constants,
+                                      "prefill after pending anchor fetch");
         }
 
         // Two lanes: lane 0 prefetches its second chunk while lane 1 gathers a decode round; the
@@ -306,6 +349,39 @@ int run() {
             ++failures;
         }
         feeder.reset(0);
+
+        // A failed asynchronous read must not make lane cleanup fallible, nor suppress the
+        // surviving lane's error. Reopening after cancellation starts from empty raw history.
+        {
+            fn::NgramTable failing_table({.path = path, .cache_rows = 64, .io_threads = 3});
+            fn::PleRowFeeder failing(failing_table, 1, 2);
+            std::filesystem::resize_file(path, fn::kNgramPageBytes);
+            const std::array<std::int32_t, 2> lanes{0, 1}, anchors{101, 103};
+            failing.prefetch_anchors(lanes, anchors);
+            failing.reset(0);
+            std::vector<std::uint8_t> one(fn::kNgramTokenBytes);
+            bool read_failed = false;
+            try {
+                failing.gather_now(std::span<const std::int32_t>(lanes).subspan(1),
+                                   std::span<const std::int32_t>(anchors).subspan(1), one);
+            } catch (const std::runtime_error&) { read_failed = true; }
+            if (!read_failed) {
+                std::cerr << "cancelling one lane suppressed another lane's anchor read error\n";
+                ++failures;
+            }
+            failing.reset(1);
+            static_cast<void>(write_table(path));
+            std::vector<std::uint8_t> ordinary(2 * fn::kNgramTokenBytes);
+            failing.gather_now(lanes, anchors, ordinary);
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                fn::NgramHistory expected;
+                failures +=
+                    check_records(std::span<const std::uint8_t>(ordinary).subspan(
+                                      row * fn::kNgramTokenBytes, fn::kNgramTokenBytes),
+                                  std::span<const std::int32_t>(anchors).subspan(row, 1), expected,
+                                  constants, "reopened lane after anchor read failure");
+            }
+        }
     }
     std::filesystem::remove(path);
     return failures;

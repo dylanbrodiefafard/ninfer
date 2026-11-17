@@ -345,6 +345,23 @@ void Forward::resolve_speculative(std::span<const std::int32_t> counts) {
                                   rows);
         state_.set_dflash_pending_count(ingress.lanes[row], ingress.append_counts[row]);
     }
+    const auto width     = pending_verify_width_;
     speculative_pending_ = false;
     commit_verify(counts);
+    // Only the publication prefix determines the next input. The last published output is not
+    // among the inputs just committed, so fetch it after the authoritative raw history advances.
+    // Snapshots keep this read independent of subsequent compaction, suspension or rejection.
+    std::array<std::int32_t, kMaxLanes> next_lanes{}, next_tokens{};
+    std::size_t next_rows = 0;
+    for (std::size_t row = 0; row < counts.size(); ++row) {
+        if (counts[row] == 0) { continue; }
+        next_lanes[next_rows]  = ingress.lanes[row];
+        next_tokens[next_rows] = output.tokens[row * static_cast<std::size_t>(width) +
+                                               static_cast<std::size_t>(counts[row] - 1)];
+        ++next_rows;
+    }
+    if (next_rows != 0) {
+        feeder_.prefetch_anchors(std::span<const std::int32_t>(next_lanes).first(next_rows),
+                                 std::span<const std::int32_t>(next_tokens).first(next_rows));
+    }
 }

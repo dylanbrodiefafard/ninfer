@@ -134,10 +134,11 @@ Per round: embedding, `hyper_connection_broadcast`, then per layer HC read, mixe
 HC inject, HC read, routing and `moe_experts`, HC inject; layer 1 runs `ple_inject` before its
 mixer read; the head is a read-only HC read and the FP8 vocabulary head.
 
-- Decode n-gram rows depend only on tokens the host holds at the round boundary, so
-  `PleRowFeeder` gathers them between rounds for every lane of the round into a pinned row frame
-  (one graph replay per round). Prefill gathers super-chunk k+1 on a host thread while super-chunk
-  k computes. Each lane's n-gram history is its last two tokens, so rollback needs no state.
+- Decode uploads ingress and runs embedding plus layer zero in one graph, while `PleRowFeeder`
+  gathers n-gram rows into a pinned frame; a second graph uploads the rows and runs layers 1..47,
+  head and sampling. Prefill gathers super-chunk k+1 on a host thread while super-chunk k computes.
+  Each lane's n-gram history is its last two raw tokens. Host gather duration overlaps elapsed
+  stream time across the graph pair; those timing intervals are not an additive phase breakdown.
 - Prefill runs layer-major over super-chunks (`ForwardOptions::super_chunk_tokens`): each layer
   runs over every sub-chunk (`max_chunk_tokens`, the Ops' width) of the super-chunk before the
   next layer, holding the super-chunk's four-stream residual (20 KiB per token) and n-gram rows
@@ -190,7 +191,8 @@ transport and target-owned window/suspension semantics are described below.
 
 - Batching: one forward over all lanes per round (concurrency contract §2.1); GDN through the
   lane-batched snapshot Ops (B up to 12), so Flash-Next admits C <= 12; per-lane PLE history;
-  one multi-lane n-gram gather per round.
+  lane-batched n-gram gathers. DFlash2 fetches anchors after publication on one persistent CPU
+  worker and draft columns after proposal, overlapping the latter with target layer zero.
 - QSA state lives in the paged pool (`PagedKVPool`, 64-token pages = 16 QSA blocks, 7 planes per
   QSA layer); the QSA Ops take block tables and B lanes. Shared capacity is the existing
   `--kv-capacity N`: NVFP4 QSA state is about 11.4 KiB per token, so 500K tokens is about 5.8 GB
@@ -349,7 +351,13 @@ after each target layer's MoE inject (not an HC read).
   no rollback (rejected slots lie beyond the frontier and are overwritten; a block sealed through
   a rejected slot is resealed when its last slot is re-appended). Drafted tokens need n-gram rows
   before layer 1, so a round is graph A (context append, propose, drafts to host, verify
-  embedding + layer 0), a host row fetch, then graph B (layers 1..47, head, accept, commits).
+  embedding + layer 0), a host draft-column row fetch, then graph B (layers 1..47, head, accept).
+  Authoritative publication commits the input prefix and starts an asynchronous fetch for the next
+  anchor, using the last published output and a snapshot of the committed raw history. The next
+  round consumes it only if lane, token and both predecessors match. Fetches do not advance raw
+  histories; zero publication starts no fetch. Lane reset/restore joins the worker and invalidates
+  that lane's entry, so retained/RAM/SSD/live restoration needs no pending I/O in its image.
+  Prefill and anchor reads serialize through the same table and bounded row cache.
 - Expert cost: replaying the split-LRU cache simulation with verify windows, expert pairs per
   step grow 1.64x at W=2, 2.69x at W=4, 4.37x at W=8; PCIe per committed token is 1.9-2.8 ms at
   W=4 (3 committed) and 1.6-3.2 ms at W=8 (4 committed) against 2.2 ms for plain decode, because
@@ -378,8 +386,9 @@ matrices, 34 BF16 tensors), preserving base payloads. See the
 [artifact contract](qwen3.8-flash-next-artifact.md#10-optional-dflash2-companion). CLI/server startup
 enables adaptive K0..3 when that companion is present. The native drafter uses its five layers,
 independent committed-context projections and full shared FP8 head. Graph A appends pending
-context, proposes, exports IDs and starts target layer zero; host n-gram reads overlap that layer.
-Graph B finishes verification and acceptance. After Engine output preview, authoritative prefix
+context, proposes, exports IDs and starts target layer zero; host draft-column n-gram reads
+overlap that layer. Anchor rows are fetched after the preceding publication (or prompt sampling),
+independently of the next proposal. Graph B finishes verification and acceptance. After Engine output preview, authoritative prefix
 counts fold the 36 GDN layers and commit only published PLE/history/features/head state. This
 avoids copying a full speculative target state before each round. A K0 root is a width-one chain
 record: `gdn_input_proj_conv_record` and `gated_delta_net_replay_record` read the canonical GDN
@@ -1123,8 +1132,8 @@ all 12 QSA layers' planes, NVFP4G16 by default (BF16 selectable), with a block-t
 `open_lane` reserves and maps ceil(reserve / 64) pages, and `close_lane` unmaps the row and
 returns them. `prefill_step` appends one super-chunk to one lane and synchronizes. The feeder
 prefetches that lane's next super-chunk rows; another lane's prefill cancels the prefetch and
-restores that lane's n-gram history. A decode round of B lanes is one graph replay of batch size
-B, with graphs for 1..lanes captured at construction:
+restores that lane's n-gram history. A decode round of B lanes replays two graphs of batch size
+B, captured for 1..lanes at construction, with the host row gather overlapping layer zero:
 - GDN runs through `gdn_input_proj_conv_snapshot` and `gated_delta_net_snapshot` in place on
   each lane's slot.
 - QSA runs over the lanes' block-table rows, and `ple_inject` over their history slots.

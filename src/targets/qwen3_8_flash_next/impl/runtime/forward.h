@@ -1,7 +1,7 @@
 #pragma once
 
 // The Qwen3.8-Flash-Next forward pass of 1..12 lanes: eager prefill super-chunks of one lane and
-// lane-batched decode rounds (one CUDA Graph per batch size) over paged QSA state, with optional
+// lane-batched decode rounds (two CUDA Graphs per batch size) over paged QSA state, with optional
 // noncommitting chain recording for speculative qualification.
 // The target package owns this Program; see docs/maintainer/qwen3.8-flash-next-plan.md, "Execution
 // design".
@@ -188,10 +188,11 @@ struct SampledRows {
  * lanes' block-table rows, ple_inject over the lanes' history slots, and one routed-expert call
  * over all B tokens, whose admit sees the union of their experts. Sampling (ops::sample with each
  * row's configuration) and ops::token_logprobs follow the head. With LogitColumns::Last, one graph
- * per batch size 1 .. state.lanes() is captured at construction; each uploads the round's ingress
- * frame (ids, positions, lanes, sampling configurations) and n-gram rows from fixed pinned buffers
- * and copies the egress back. QSA selection is captured for the lane capacity: the uploaded slot
- * sets each replay's visible prefix.
+ * pair per batch size 1 .. state.lanes() is captured at construction. The first uploads the ingress
+ * frame (ids, positions, lanes, sampling configurations) and runs embedding and layer zero while
+ * the host gathers n-gram rows. The second uploads those rows from a fixed pinned buffer, runs
+ * layers 1..47 and copies the egress back. QSA selection is captured for the lane capacity: the
+ * uploaded slot sets each replay's visible prefix.
  *
  * With ExpertStaging::Enabled, decode and verification rounds stage the records predicted for each
  * layer l in [kFirstStagedLayer, 48) into VRAM while layer l's mixer runs, a policy-neutral overlay
@@ -293,9 +294,10 @@ public:
      * with configs[i] (kSamplePurposeDecode, keyed by that position) and advances the lane by one.
      * With RoundLogprobs::Skip, token_logprobs skips every row and the result's log
      * probabilities and alternatives are unspecified.
-     * The host gathers the rows' n-gram records into the pinned row frame, writes the ingress
-     * frame, and replays the graph of batch size B = lanes.size() (DecodeExecution::Graph,
-     * LogitColumns::Last only) or enqueues the same work eagerly; the call then synchronizes. The
+     * The host writes the ingress frame and launches embedding and layer zero, gathers n-gram
+     * records into the pinned row frame while that work runs, then launches the remaining layers
+     * and head. DecodeExecution::Graph (LogitColumns::Last only) replays two graphs for batch
+     * size B = lanes.size(); eager execution enqueues the same work. The call synchronizes. The
      * round's logits stay in logits() until the next call. An observer (DecodeExecution::Eager
      * only; a graph replay cannot call the host) sees each layer's routes I32 [10,B] and residual
      * with the ForwardObserver rules. Requires 1 <= B <= state.lanes() and no
@@ -340,7 +342,8 @@ public:
     [[nodiscard]] Tensor verify_routes(std::int32_t layer) const;
 
     // Host seconds of the last decode round's n-gram gather (including the wait for a pending
-    // prefetch's reads) and the GPU milliseconds of its graph replay or eager work.
+    // prefetch's reads) and elapsed stream milliseconds across its split graph/eager work.
+    // The intervals overlap; stream time includes any exposed gather wait.
     [[nodiscard]] double last_gather_seconds() const noexcept { return last_gather_seconds_; }
 
     [[nodiscard]] float last_replay_ms() const noexcept { return last_replay_ms_; }
@@ -638,9 +641,10 @@ private:
     // ops::sample of logits columns [0, rows) with the ingress configurations and slots, then
     // ops::token_logprobs and the egress copy.
     void enqueue_sampling(std::int32_t rows, std::int32_t purpose);
-    // Uploads the ingress frame, the round's n-gram rows, then the layers, head and sampling.
+    // A uploads the ingress and runs through layer zero; B uploads n-gram rows and finishes.
     // `observer` (eager rounds only) sees the round's routes and residuals as a prefill does.
-    void enqueue_decode(std::int32_t rows, const ForwardObserver* observer);
+    void enqueue_decode_a(std::int32_t rows, const ForwardObserver* observer);
+    void enqueue_decode_b(std::int32_t rows, const ForwardObserver* observer);
     void capture_decode_graphs();
     [[nodiscard]] SampledRows sampled_rows(std::int32_t rows) const;
     [[nodiscard]] DecodeIngress& ingress_host() const noexcept;
@@ -683,9 +687,9 @@ private:
     PinnedHostBuffer decode_rows_;
     PinnedHostBuffer ingress_staging_;
     PinnedHostBuffer egress_;
-    // decode_graphs_[B - 1] is the round of batch size B (empty with LogitColumns::All).
-    std::vector<DecodeGraphDefinition> decode_definitions_;
-    std::vector<DecodeGraphExecutable> decode_graphs_;
+    // Index B - 1 is the graph pair of batch size B (empty with LogitColumns::All).
+    std::vector<DecodeGraphDefinition> decode_a_definitions_, decode_b_definitions_;
+    std::vector<DecodeGraphExecutable> decode_a_graphs_, decode_b_graphs_;
     CudaEvent replay_start_;
     CudaEvent replay_stop_;
     double last_gather_seconds_ = 0.0;

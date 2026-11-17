@@ -34,13 +34,19 @@ std::size_t lane_count(std::int32_t lanes) {
 
 PleRowFeeder::PleRowFeeder(NgramTable& table, std::int32_t max_tokens, std::int32_t lanes)
     : table_(table), max_tokens_(max_tokens), histories_(lane_count(lanes)),
-      staging_{Staging(staging_bytes(max_tokens)), Staging(staging_bytes(max_tokens))} {
+      staging_{Staging(staging_bytes(max_tokens)), Staging(staging_bytes(max_tokens))},
+      anchors_(lane_count(lanes)),
+      anchor_worker_([this](const std::stop_token& stop) { anchor_worker(stop); }) {
     for (Staging& staging : staging_) {
         staging.tokens.reserve(static_cast<std::size_t>(max_tokens));
     }
 }
 
-PleRowFeeder::~PleRowFeeder() { wait_pending(); }
+PleRowFeeder::~PleRowFeeder() {
+    wait_pending();
+    anchor_worker_.request_stop();
+    anchor_changed_.notify_all();
+}
 
 void PleRowFeeder::wait_pending() noexcept {
     if (pending_.valid()) { pending_.wait(); }
@@ -56,7 +62,9 @@ NgramHistory& PleRowFeeder::history(std::int32_t lane) {
 void PleRowFeeder::reset(std::int32_t lane) {
     NgramHistory& lane_history = history(lane);
     if (pending_lane_ == lane) { cancel(); }
-    lane_history = NgramHistory{};
+    finish_anchors();
+    anchors_.at(static_cast<std::size_t>(lane)) = AnchorRows{};
+    lane_history                                = NgramHistory{};
 }
 
 void PleRowFeeder::restore_history(std::int32_t lane, std::span<const std::int32_t> prefix) {
@@ -96,6 +104,7 @@ void PleRowFeeder::begin(std::int32_t lane, std::span<const std::int32_t> tokens
                                     " tokens is outside [1, " + std::to_string(max_tokens_) +
                                     "], its parts are empty, or its lane is invalid");
     }
+    finish_anchors();
     Staging& staging = staging_.at(next_);
     staging.tokens.assign(tokens.begin(), tokens.end());
     staging.part_tokens     = part_tokens;
@@ -184,23 +193,13 @@ void PleRowFeeder::gather_now(std::span<const std::int32_t> lanes,
     if (lanes.size() != tokens.size() || lanes.empty()) {
         throw std::invalid_argument("PleRowFeeder: one lane per token is required");
     }
-    std::array<NgramHistory*, kMaxLanes> histories{};
-    if (lanes.size() > histories.size()) {
+    std::array<std::int32_t, kMaxLanes> counts{};
+    if (lanes.size() > counts.size()) {
         throw std::invalid_argument("PleRowFeeder: a round holds at most 12 lanes");
     }
-    for (std::size_t i = 0; i < lanes.size(); ++i) {
-        if (std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(i), lanes[i]) !=
-            lanes.begin() + static_cast<std::ptrdiff_t>(i)) {
-            throw std::invalid_argument("PleRowFeeder: a round names a lane twice");
-        }
-        if (lanes[i] == pending_lane_) {
-            throw std::logic_error("PleRowFeeder: the lane has a pending gather");
-        }
-        histories.at(i) = &history(lanes[i]);
-    }
-    // The table serves one thread at a time: let a pending prefetch finish its reads first.
-    wait_pending();
-    table_.gather(tokens, std::span<NgramHistory* const>(histories.data(), lanes.size()), out);
+    gather_proposals(lanes, tokens, 1, out);
+    std::fill_n(counts.begin(), lanes.size(), 1);
+    commit_proposals(lanes, tokens, 1, std::span<const std::int32_t>(counts).first(lanes.size()));
 }
 
 void PleRowFeeder::gather_proposals(std::span<const std::int32_t> lanes,
@@ -210,8 +209,10 @@ void PleRowFeeder::gather_proposals(std::span<const std::int32_t> lanes,
         tokens.size() != lanes.size() * static_cast<std::size_t>(width)) {
         throw std::invalid_argument("PleRowFeeder: proposals require 1..12 chains of width 1..8");
     }
+    if (out.size() != tokens.size() * static_cast<std::size_t>(kNgramTokenBytes)) {
+        throw std::invalid_argument("PleRowFeeder: proposals need 2592 bytes per token");
+    }
     std::array<NgramHistory, kMaxLanes> copies{};
-    std::array<NgramHistory*, 8 * kMaxLanes> histories{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const auto earlier = lanes.first(row);
         if (std::find(earlier.begin(), earlier.end(), lanes[row]) != earlier.end()) {
@@ -221,13 +222,125 @@ void PleRowFeeder::gather_proposals(std::span<const std::int32_t> lanes,
             throw std::logic_error("PleRowFeeder: the proposal lane has a pending gather");
         }
         copies[row] = history(lanes[row]);
-        for (std::int32_t column = 0; column < width; ++column) {
-            histories[row * static_cast<std::size_t>(width) + static_cast<std::size_t>(column)] =
-                &copies[row];
-        }
     }
     wait_pending();
-    table_.gather(tokens, std::span<NgramHistory* const>(histories.data(), tokens.size()), out);
+    finish_anchors();
+    std::array<std::int32_t, 8 * kMaxLanes> missing_tokens{};
+    std::array<NgramHistory*, 8 * kMaxLanes> histories{};
+    std::array<std::size_t, 8 * kMaxLanes> destinations{};
+    std::size_t missing = 0;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const auto first   = row * static_cast<std::size_t>(width);
+        const auto& anchor = anchors_.at(static_cast<std::size_t>(lanes[row]));
+        const bool cached  = anchor.lane == lanes[row] && anchor.token == tokens[first] &&
+                             anchor.history.tokens == copies[row].tokens;
+        if (cached) {
+            if (anchor.failure) { std::rethrow_exception(anchor.failure); }
+            std::ranges::copy(anchor.bytes,
+                              out.begin() + static_cast<std::ptrdiff_t>(first * kNgramTokenBytes));
+            copies[row].tokens = {copies[row].tokens[1], tokens[first]};
+        }
+        // Hashing all columns on the calling thread preserves each chain's predecessor order;
+        // NgramTable advances the pointed-to copies while processing its compact token list.
+        for (std::int32_t column = cached ? 1 : 0; column < width; ++column) {
+            const auto index        = first + static_cast<std::size_t>(column);
+            missing_tokens[missing] = tokens[index];
+            histories[missing]      = &copies[row];
+            destinations[missing]   = index;
+            ++missing;
+        }
+    }
+    if (missing == 0) { return; }
+    proposal_rows_.resize(missing * static_cast<std::size_t>(kNgramTokenBytes));
+    table_.gather(std::span<const std::int32_t>(missing_tokens).first(missing),
+                  std::span<NgramHistory* const>(histories).first(missing), proposal_rows_);
+    for (std::size_t i = 0; i < missing; ++i) {
+        std::copy_n(proposal_rows_.data() + i * kNgramTokenBytes, kNgramTokenBytes,
+                    out.data() + destinations[i] * kNgramTokenBytes);
+    }
+}
+
+void PleRowFeeder::finish_anchors() {
+    std::unique_lock lock(anchor_mutex_);
+    if (anchor_phase_ == AnchorPhase::Idle) { return; }
+    anchor_changed_.wait(lock, [this] { return anchor_phase_ == AnchorPhase::Ready; });
+    for (std::size_t row = 0; row < anchor_count_; ++row) {
+        const auto& anchor                                 = anchor_batch_[row];
+        anchors_.at(static_cast<std::size_t>(anchor.lane)) = anchor;
+    }
+    anchor_phase_ = AnchorPhase::Idle;
+}
+
+void PleRowFeeder::prefetch_anchors(std::span<const std::int32_t> lanes,
+                                    std::span<const std::int32_t> tokens) {
+    if (lanes.empty() || lanes.size() > kMaxLanes || tokens.size() != lanes.size()) {
+        throw std::invalid_argument("PleRowFeeder: an anchor fetch needs one token per lane");
+    }
+
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const auto earlier = lanes.first(row);
+        if (lanes[row] == pending_lane_ || tokens[row] < 0 || tokens[row] >= kTokenDomain ||
+            std::find(earlier.begin(), earlier.end(), lanes[row]) != earlier.end()) {
+            throw std::invalid_argument("PleRowFeeder: invalid anchor fetch membership or token");
+        }
+        static_cast<void>(history(lanes[row]));
+    }
+    wait_pending();
+    finish_anchors();
+    {
+        std::lock_guard lock(anchor_mutex_);
+        anchor_count_ = lanes.size();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            auto& anchor   = anchor_batch_[row];
+            anchor.lane    = lanes[row];
+            anchor.token   = tokens[row];
+            anchor.history = history(lanes[row]);
+            anchor.failure = {};
+        }
+        anchor_phase_ = AnchorPhase::Reading;
+    }
+    anchor_changed_.notify_all();
+}
+
+void PleRowFeeder::anchor_worker(const std::stop_token& stop) {
+    while (!stop.stop_requested()) {
+        std::unique_lock lock(anchor_mutex_);
+        if (!anchor_changed_.wait(lock, stop,
+                                  [this] { return anchor_phase_ == AnchorPhase::Reading; })) {
+            return;
+        }
+        lock.unlock();
+        // The owner cannot replace the batch until Ready is published under the mutex. All
+        // canonical histories remain owner-thread-only; the worker advances local copies.
+        std::array<std::int32_t, kMaxLanes> ids{};
+        std::array<NgramHistory, kMaxLanes> copies{};
+        std::array<NgramHistory*, kMaxLanes> histories{};
+        std::array<std::uint8_t, kMaxLanes * kNgramTokenBytes> bytes{};
+        for (std::size_t row = 0; row < anchor_count_; ++row) {
+            ids[row]       = anchor_batch_[row].token;
+            copies[row]    = anchor_batch_[row].history;
+            histories[row] = &copies[row];
+        }
+        try {
+            table_.gather(std::span<const std::int32_t>(ids).first(anchor_count_),
+                          std::span<NgramHistory* const>(histories).first(anchor_count_),
+                          std::span<std::uint8_t>(bytes).first(anchor_count_ * kNgramTokenBytes));
+            for (std::size_t row = 0; row < anchor_count_; ++row) {
+                std::copy_n(bytes.data() + row * kNgramTokenBytes, kNgramTokenBytes,
+                            anchor_batch_[row].bytes.data());
+            }
+        } catch (...) {
+            // Cancellation discards only that lane's entry. Surviving entries retain the read
+            // failure, but joining the worker during lane cleanup never throws an I/O error.
+            for (std::size_t row = 0; row < anchor_count_; ++row) {
+                anchor_batch_[row].failure = std::current_exception();
+            }
+        }
+        lock.lock();
+        anchor_phase_ = AnchorPhase::Ready;
+        lock.unlock();
+        anchor_changed_.notify_all();
+    }
 }
 
 void PleRowFeeder::commit_proposals(std::span<const std::int32_t> lanes,
