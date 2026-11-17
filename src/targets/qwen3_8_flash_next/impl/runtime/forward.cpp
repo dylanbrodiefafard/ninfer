@@ -1336,6 +1336,11 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
     Tensor x                    = columns(chunk_.block_input, kHidden, tokens);
     Tensor write_scale          = columns(chunk_.write_scale, ops::kHyperConnectionStreams, tokens);
     ops::hyper_connection_read(residual, weights.moe_connection, x, write_scale, work_, stream_);
+    // Verify packs t = row * width + column, with at least the root valid in every row.
+    // Route padding from the last valid logits so it adds no experts to admit or staging.
+    const Tensor valid_columns =
+        chunk.state_mode == StateMode::Record ? chunk.valid_columns : Tensor{};
+    const std::int32_t route_width = chunk.state_mode == StateMode::Record ? chunk.width : 1;
     // Staging (the class comment): whether this layer was staged, and whether the round stages the
     // next one, whose prediction from x runs on the fill stream beside this layer's routing.
     const bool staged            = stages(layer, chunk, streamed);
@@ -1352,13 +1357,14 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
         Tensor shared        = Tensor(staging_.shared.data, DType::FP32, {tokens});
         ops::bf16_projection(x, model_.layers.at(static_cast<std::size_t>(following)).moe_control,
                              control, fs);
-        ops::moe_route(control, ids, route_weights, shared, fs);
+        ops::moe_route(control, ids, route_weights, shared, valid_columns, route_width, fs);
     }
 
     auto scope   = work_.scope();
     MoeScratch s = allocate_moe(work_, tokens);
     ops::bf16_projection(x, weights.moe_control, s.control, stream_);
-    ops::moe_route(s.control, s.expert_ids, s.route_weights, s.shared_scale, stream_);
+    ops::moe_route(s.control, s.expert_ids, s.route_weights, s.shared_scale, valid_columns,
+                   route_width, stream_);
     if (options_.trace_verify_routes && chunk.state_mode == StateMode::Record) {
         auto* destination = static_cast<std::byte*>(verify_.expert_routes.data) +
                             static_cast<std::size_t>(layer) * verify_.expert_routes.nb[2];

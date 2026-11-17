@@ -26,16 +26,28 @@ __device__ __forceinline__ bool ranks_before(float value, int id, float best_val
 // logit, reduces (value, id) across the warp with the xor butterfly so every lane learns the
 // winner, and the owning lane removes it (its id has lane id % 32 and slot id / 32). Lane k < 10
 // then records round k's winner. The weights are exp(v_k - v_0) over their sum, v_0 being the
-// maximum; lane 0 publishes the shared-expert scale. No shared memory or block barriers.
+// maximum; lane 0 publishes the shared-expert scale. Packed columns read their own logits
+// when valid, otherwise the row's last valid logits. Each warp recomputes its source route,
+// avoiding inter-warp communication or a second launch; output tokens remain disjoint.
+// No shared memory or block barriers. All lanes in a warp share the source and active status.
+// Token offsets use I64; the ceil(T/4) grid and its token indices fit I32 for positive I32 T.
+template <bool Packed>
 __global__ void __launch_bounds__(kWarpsPerCta* kWarpSize)
     moe_route_kernel(const float* __restrict__ logits, std::int32_t* __restrict__ expert_ids,
                      float* __restrict__ route_weights, float* __restrict__ shared_scale,
-                     int tokens) {
+                     int tokens, const std::int32_t* __restrict__ valid_columns, int packed_width) {
     const int lane = static_cast<int>(threadIdx.x) % kWarpSize;
     const int token =
         static_cast<int>(blockIdx.x) * kWarpsPerCta + static_cast<int>(threadIdx.x) / kWarpSize;
     if (token >= tokens) { return; }
-    const float* row = logits + static_cast<std::int64_t>(token) * kMoeControlRows;
+    int source = token;
+    if constexpr (Packed) {
+        const int row    = token / packed_width;
+        const int column = token % packed_width;
+        const int valid  = valid_columns[row];
+        source           = row * packed_width + min(column, valid - 1);
+    }
+    const float* row = logits + static_cast<std::int64_t>(source) * kMoeControlRows;
 
     float values[kLogitsPerLane];
 #pragma unroll
@@ -91,10 +103,16 @@ __global__ void __launch_bounds__(kWarpsPerCta* kWarpSize)
 } // namespace
 
 void moe_route_launch(const float* logits, std::int32_t* expert_ids, float* route_weights,
-                      float* shared_scale, std::int32_t tokens, cudaStream_t stream) {
-    const int blocks = (tokens + kWarpsPerCta - 1) / kWarpsPerCta;
-    moe_route_kernel<<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-        logits, expert_ids, route_weights, shared_scale, tokens);
+                      float* shared_scale, std::int32_t tokens, const std::int32_t* valid_columns,
+                      std::int32_t packed_width, cudaStream_t stream) {
+    const int blocks = (tokens - 1) / kWarpsPerCta + 1;
+    if (valid_columns != nullptr) {
+        moe_route_kernel<true><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+            logits, expert_ids, route_weights, shared_scale, tokens, valid_columns, packed_width);
+    } else {
+        moe_route_kernel<false><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+            logits, expert_ids, route_weights, shared_scale, tokens, nullptr, 1);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

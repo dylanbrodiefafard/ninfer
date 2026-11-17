@@ -1579,6 +1579,14 @@ those of the unstaged round, and a wrong prediction costs only its copy.
   `moe_control`, then `moe_route`), on the fill stream as soon as that input exists. Candidates
   are the first four ranks of every token, scored by integer reciprocal-rank weights
   W_j = 360360 / (4 + j), resident experts skipped, ties to the lower id.
+- **Verify padding.** `moe_route` consumes the verify round's device valid-column counts for
+  both actual and predictive routing. Packed token `b * W + c` with `c >= valid_columns[b]`
+  routes from row b's last valid logits, including weights and shared scale; every row has at
+  least its root column valid. Padding therefore introduces no distinct experts into admission
+  or staging. Admission's routed-set mask also keeps duplicate routes from incrementing lookup,
+  miss, reference or eviction-frequency counters more than once per expert per layer. Staging
+  still ranks by summed route-rank votes, including replicated votes. Padding expert compute
+  remains active, but its outputs are discarded. Prefill and ordinary decode route unchanged.
 - **Ops.** `moe_expert_cache_stage` (one CTA) places the ranked candidates greedily in the
   layer's byte budget and writes the stage column (span address or 0) and the source column
   (span address with the codec tag for a placed record, the host record otherwise).

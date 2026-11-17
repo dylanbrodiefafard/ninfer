@@ -25,7 +25,8 @@ bool overlaps(const Tensor& a, const Tensor& b) {
 } // namespace
 
 void moe_route(const Tensor& logits, Tensor& expert_ids, Tensor& route_weights,
-               Tensor& shared_scale, cudaStream_t stream) {
+               Tensor& shared_scale, const Tensor& valid_columns, std::int32_t packed_width,
+               cudaStream_t stream) {
     const std::int32_t tokens = logits.ne[1];
     if (tokens < 1 || !valid(logits, DType::FP32, kMoeControlRows, tokens)) {
         throw std::invalid_argument(
@@ -42,10 +43,22 @@ void moe_route(const Tensor& logits, Tensor& expert_ids, Tensor& route_weights,
         overlaps(expert_ids, shared_scale) || overlaps(route_weights, shared_scale)) {
         throw std::invalid_argument("moe_route: tensors must be pairwise disjoint");
     }
-    detail::moe_route_launch(static_cast<const float*>(logits.data),
-                             static_cast<std::int32_t*>(expert_ids.data),
-                             static_cast<float*>(route_weights.data),
-                             static_cast<float*>(shared_scale.data), tokens, stream);
+    const bool packed = valid_columns.data != nullptr;
+    if (packed_width < 1 || tokens % packed_width != 0 || (!packed && packed_width != 1) ||
+        (packed && !valid(valid_columns, DType::I32, tokens / packed_width, 1))) {
+        throw std::invalid_argument(
+            "moe_route: valid_columns must be aligned contiguous I32 [T/packed_width], "
+            "or empty with packed_width=1; packed_width must divide T");
+    }
+    if (packed &&
+        (overlaps(valid_columns, logits) || overlaps(valid_columns, expert_ids) ||
+         overlaps(valid_columns, route_weights) || overlaps(valid_columns, shared_scale))) {
+        throw std::invalid_argument("moe_route: valid_columns must be disjoint from other tensors");
+    }
+    detail::moe_route_launch(
+        static_cast<const float*>(logits.data), static_cast<std::int32_t*>(expert_ids.data),
+        static_cast<float*>(route_weights.data), static_cast<float*>(shared_scale.data), tokens,
+        static_cast<const std::int32_t*>(valid_columns.data), packed_width, stream);
 }
 
 } // namespace ninfer::ops

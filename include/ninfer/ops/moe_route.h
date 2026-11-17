@@ -33,10 +33,20 @@ inline constexpr std::int32_t kMoeControlRows   = 544;
  * disjoint; T >= 1; logits are finite. The oracle evaluates p in FP64 from the represented FP32
  * logits. Ids are exact. The implementation evaluates the weights as exp(r_i - r_max) normalized
  * over the selected ten in FP32, which equals the renormalized full softmax mathematically. No
- * workspace. Invalid arguments throw std::invalid_argument. Asynchronous on stream and
- * graph-capturable for a fixed T.
+ * workspace.
+ *
+ * With nonempty valid_columns, tokens are packed as t = b * packed_width + c, T = B *
+ * packed_width. valid_columns is device I32 [B], contiguous, 16-byte aligned, disjoint from
+ * every other tensor; the caller guarantees 1 <= valid_columns[b] <= packed_width. For each
+ * padding column c >= valid_columns[b], evaluate the formula from logits at
+ * b * packed_width + valid_columns[b] - 1 instead. Valid columns are unchanged, including
+ * their implementation's output bits. Empty valid_columns means all T columns are valid
+ * and requires packed_width == 1. All inputs and outputs live until stream completes.
+ * Invalid host-visible arguments throw std::invalid_argument. Asynchronous on stream and
+ * graph-capturable for fixed T and packed_width, with device counts allowed to vary on replay.
  */
 void moe_route(const Tensor& logits, Tensor& expert_ids, Tensor& route_weights,
-               Tensor& shared_scale, cudaStream_t stream);
+               Tensor& shared_scale, const Tensor& valid_columns, std::int32_t packed_width,
+               cudaStream_t stream);
 
 } // namespace ninfer::ops
