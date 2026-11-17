@@ -54,6 +54,11 @@ void fill(fn::State& state, std::int32_t lane, ninfer::PinnedHostBuffer& image, 
         calibration.draft_temperature = 0.6F;
         calibration.calibration_sum.fill(static_cast<double>(seed) / 16.0);
         calibration.calibration_count.fill(16);
+        calibration.policy.reached     = {seed % 32, (seed + 1) % 32, (seed + 2) % 32};
+        calibration.policy.accepted    = {seed % 8, 0, 0};
+        calibration.policy.low_windows = {1, 0, 1};
+        calibration.policy.width       = 3;
+        calibration.policy.ceiling     = 2;
     }
     state.pack_continuation(lane, image.data(), stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));

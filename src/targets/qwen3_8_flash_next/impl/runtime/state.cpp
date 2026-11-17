@@ -324,6 +324,14 @@ void State::pack_continuation(std::int32_t lane, void* destination, cudaStream_t
         std::memcpy(bytes + 8, metadata.calibration_sum.data(), sizeof(metadata.calibration_sum));
         std::memcpy(bytes + 72, metadata.calibration_count.data(),
                     sizeof(metadata.calibration_count));
+        // The fixed 256-byte metadata block includes the request-local policy, independently
+        // of host struct padding. Its windows survive RAM/SSD transport and lane relocation.
+        std::memcpy(bytes + 136, metadata.policy.reached.data(), sizeof(metadata.policy.reached));
+        std::memcpy(bytes + 148, metadata.policy.accepted.data(), sizeof(metadata.policy.accepted));
+        std::memcpy(bytes + 160, metadata.policy.low_windows.data(),
+                    sizeof(metadata.policy.low_windows));
+        std::memcpy(bytes + 172, &metadata.policy.width, sizeof(metadata.policy.width));
+        std::memcpy(bytes + 176, &metadata.policy.ceiling, sizeof(metadata.policy.ceiling));
     }
 }
 
@@ -338,8 +346,16 @@ void State::unpack_continuation(std::int32_t lane, const void* source, cudaStrea
         std::memcpy(restored.calibration_sum.data(), header + 8, sizeof(restored.calibration_sum));
         std::memcpy(restored.calibration_count.data(), header + 72,
                     sizeof(restored.calibration_count));
-        if (restored.pending < 0 || restored.pending > kDflashWidth ||
-            !std::isfinite(restored.draft_temperature) ||
+        std::memcpy(restored.policy.reached.data(), header + 136, sizeof(restored.policy.reached));
+        std::memcpy(restored.policy.accepted.data(), header + 148,
+                    sizeof(restored.policy.accepted));
+        std::memcpy(restored.policy.low_windows.data(), header + 160,
+                    sizeof(restored.policy.low_windows));
+        std::memcpy(&restored.policy.width, header + 172, sizeof(restored.policy.width));
+        std::memcpy(&restored.policy.ceiling, header + 176, sizeof(restored.policy.ceiling));
+        if (restored.pending < 0 || restored.pending > kDflashWidth || restored.policy.width < 0 ||
+            restored.policy.width > kDflashMaxK || restored.policy.ceiling < 0 ||
+            restored.policy.ceiling > kDflashMaxK || !std::isfinite(restored.draft_temperature) ||
             !std::all_of(restored.calibration_sum.begin(), restored.calibration_sum.end(),
                          [](double value) { return std::isfinite(value) && value >= 0.0; })) {
             throw std::invalid_argument(

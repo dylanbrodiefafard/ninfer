@@ -117,8 +117,8 @@ For Qwen3.8-27B, CLI startup inspects the artifact directory and enables adaptiv
 tokens and the optimized proposal head when its companion is present. Otherwise speculation stays
 off. `--spec none` explicitly disables it; explicit `--spec dflash` settings override the defaults.
 Qwen3.8-27B NVFP4 DFlash2 supports chain windows from one to seven. Flash-Next supports K=0..3,
-including root-only K0, automatic chain width K+1, and measured-time adaptive selection per batch
-size. Its full shared FP8 head is used; `--lm-head-draft` and `--dflash-verify-width` are rejected.
+including root-only K0, automatic chain width K+1, and a measured per-batch-size default with
+request-local acceptance step-down. Its full shared FP8 head is used; `--lm-head-draft` and `--dflash-verify-width` are rejected.
 MTP execution is disabled in the Engine,
 CLI, and server. Stored MTP tensors do not enable execution or affect the cache fingerprint.
 The companion is text-only internally, but a `--vision` Engine supplies it target hidden
@@ -318,8 +318,15 @@ what requests actually reserve. Serve prints both parts on its KV capacity line 
 steps; the super-chunk is the unit between which other requests decode and a short prompt may
 start. A complete DFlash2 companion enables adaptive K0..3 automatically, with a full shared
 proposal head. `--spec none` disables it; `--spec dflash --draft-tokens K` fixes K in [0,3], and
-`--adaptive-draft` turns that value into the ceiling. The picker uses observed seconds per
-published token with bounded exploration. All graphs, features and draft context are funded
+`--adaptive-draft` turns that value into the ceiling. The default table selects K3 at batch sizes
+1–2, K2 at 3–5, and K1 at 6–12 (7 and 9–12 use the measured C8 policy). Only a request's own
+conditional per-hop acceptance drives additional step-down: two consecutive 32-observation windows
+below 55% of that width's calibration trigger a step-down, including K0 when even perfect later
+hops cannot repay the measured drafting cost. There is no cross-request timed exploration or
+upward probing: a published table choice also caps that request, so batch drain cannot raise K.
+The shared width is the largest request policy window among rows eligible to draft; output
+clipping alone does not change the symmetric proposal width. Request-local policy state
+survives live RAM suspension and resets for a new request. All graphs, features and draft context are funded
 before sizing the expert cache. The target rejects `--lm-head-draft`, `--dflash-verify-width`, `--context-checkpoints`,
 `--vision`, `--kv-dtype int8`, `--sage`, `--keep-frac`, `--xattn-tau` and `--no-cuda-graph`;
 Engine scoring supports only the prefill schedule. Idle lanes retain exact continuation state:
@@ -331,7 +338,7 @@ reuse. `cache_write: false` forks into independent allocations without consuming
 without a spare lane or secured RAM that can preserve the original, admission reports overload.
 Disposable retained state is evicted before ordinary state. `--kv-ram-capacity` and the inclusive
 `--kv-disk-capacity` tier retain complete QSA/GDN/PLE/tail-logit state, including active DFlash2
-cyclic KV, pending features and calibration, under the shared FIFO,
+cyclic KV, pending features, calibration and request-local speculation policy, under the shared FIFO,
 claim, exact-checkpoint and source-preservation contracts. RAM-on execution funds output windows
 of at most 8192 tokens and can suspend settled continuations to secured RAM under KV pressure.
 `--kv-ram-system-prompts` keeps RAM-only system anchors. Flash-Next checkpoint images use a

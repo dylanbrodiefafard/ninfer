@@ -86,7 +86,7 @@ Options:
   --kv-capacity N      lanes-bench: shared QSA pool tokens (default: every lane's context)
   --spec none|dflash   lanes-bench/lanes-trace: disabled (default) or native DFlash2
   --draft-tokens K     fixed K in [0,3]; lanes-bench also uses it as the adaptive ceiling
-  --adaptive-draft     lanes-bench: measured-time K picker
+  --adaptive-draft     lanes-bench: batch-size K table with request-local step-down
   --interleave N       lanes-check: interleave an N-token prefill with the B=2 decode rounds
   --interleave-tokens PATH  raw I32 tokens of the interleaved prompt (N + 1024 tokens)
   --prompt-offset K    lanes-bench: lane i takes prompt i + K (default 0)

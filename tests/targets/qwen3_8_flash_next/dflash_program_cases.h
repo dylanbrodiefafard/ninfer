@@ -73,6 +73,68 @@ void dflash_program_cases(const Inputs& inputs) {
         for (const auto lane : lanes) { program.close_lane(lane); }
     }
 
+    {
+        fn::ProgramOptions options;
+        options.ngram_table                = inputs.ngram_table;
+        options.lanes                      = 3;
+        options.context_tokens             = 128;
+        options.kv_capacity_tokens         = 384;
+        options.speculative.backend        = ninfer::SpeculativeBackend::DFlash;
+        options.speculative.draft_tokens   = 3;
+        options.speculative.adaptive_draft = true;
+        fn::Program program(model, options, device);
+        std::array<fn::Lane, 3> lanes{};
+        std::array<std::int32_t, 3> anchors{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            lanes[row]        = program.open_lane(32, {}).value();
+            const auto prompt = prompt_tokens(1, 73U + static_cast<std::uint32_t>(row));
+            anchors[row]      = program.prefill_step(lanes[row], prompt).next_token;
+        }
+        program.state().dflash_lane(lanes[0]).policy.ceiling = 0;
+        program.state().dflash_lane(lanes[2]).policy.ceiling = 0;
+        const std::array<std::uint32_t, 3> limits{4, 4, 4};
+        ninfer::PinnedHostBuffer before(program.state().continuation_bytes());
+        ninfer::PinnedHostBuffer after(before.size());
+        program.state().pack_continuation(lanes[1], before.data(), device.stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        static_cast<void>(program.decode_round(lanes, anchors, limits, fn::RoundLogprobs::Skip));
+        const std::array<std::int32_t, 3> reject{0, 0, 0};
+        program.resolve_round(reject);
+        program.state().pack_continuation(lanes[1], after.data(), device.stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        require(std::memcmp(before.data(), after.data(), before.size()) == 0,
+                "rejected default round changed the request's table ceiling");
+        for (const auto ceiling : {2, 1, 0}) {
+            if (ceiling != 2) { program.state().dflash_lane(lanes[1]).policy.ceiling = ceiling; }
+            const auto round =
+                program.decode_round(lanes, anchors, limits, fn::RoundLogprobs::Skip);
+            require(round.width == ceiling + 1 && round.counts[0] == 1,
+                    "request step-down did not bound the shared width and root-only row");
+            std::array<std::int32_t, 3> counts{round.counts[0], round.counts[1], round.counts[2]};
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                anchors[row] = round.tokens[row * static_cast<std::size_t>(round.width) +
+                                            static_cast<std::size_t>(counts[row] - 1)];
+            }
+            program.resolve_round(counts);
+            if (ceiling == 2) {
+                const auto drain = program.decode_round(
+                    std::span(lanes).subspan(1, 1), std::span(anchors).subspan(1, 1),
+                    std::span(limits).subspan(1, 1), fn::RoundLogprobs::Skip);
+                require(drain.width == 3, "batch drain raised an existing request's ceiling");
+                const std::array committed{drain.counts[0]};
+                anchors[1] = drain.tokens[static_cast<std::size_t>(committed[0] - 1)];
+                program.resolve_round(committed);
+            }
+        }
+        const auto root     = program.speculative_stats(lanes[0]);
+        const auto drafting = program.speculative_stats(lanes[1]);
+        require(root.drafted_tokens == 0 && root.fallback_steps == 3 &&
+                    drafting.rounds_per_draft[2] == 2 && drafting.rounds_per_draft[1] == 1 &&
+                    drafting.rounds_per_draft[0] == 1,
+                "request-local step-down changed the other row's arm history");
+        for (const auto lane : lanes) { program.close_lane(lane); }
+    }
+
     struct Case {
         std::int32_t lanes, k;
         float temperature;
@@ -82,7 +144,7 @@ void dflash_program_cases(const Inputs& inputs) {
     for (const auto test :
          {Case{1, 1, 0.0F, false}, Case{1, 3, 0.0F, false}, Case{1, 3, 0.6F, true},
           Case{2, 2, 0.7F, false}, Case{1, 0, 0.6F, true}}) {
-        const auto execute = [&](bool adaptive) {
+        const auto execute = [&](bool adaptive, bool force = true) {
             fn::ProgramOptions options;
             options.ngram_table                = inputs.ngram_table;
             options.lanes                      = test.lanes;
@@ -91,7 +153,9 @@ void dflash_program_cases(const Inputs& inputs) {
             options.speculative.backend        = ninfer::SpeculativeBackend::DFlash;
             options.speculative.draft_tokens   = adaptive ? 3U : static_cast<std::uint32_t>(test.k);
             options.speculative.adaptive_draft = adaptive;
-            if (adaptive) { options.forced_adaptive_k = static_cast<std::uint32_t>(test.k); }
+            if (adaptive && force) {
+                options.forced_adaptive_k = static_cast<std::uint32_t>(test.k);
+            }
             fn::Program program(model, options, device);
             std::vector<fn::Lane> owners;
             std::vector<Tokens> output(static_cast<std::size_t>(test.lanes));
@@ -209,5 +273,8 @@ void dflash_program_cases(const Inputs& inputs) {
         const auto fixed  = execute(false);
         const auto forced = execute(true);
         require(fixed == forced, "picker-forced K differs from fixed K output");
+        if (test.lanes == 1 && test.k == 3 && test.temperature == 0.0F) {
+            static_cast<void>(execute(true, false));
+        }
     }
 }

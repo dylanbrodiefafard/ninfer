@@ -354,8 +354,8 @@ after each target layer's MoE inject (not an HC read).
   step grow 1.64x at W=2, 2.69x at W=4, 4.37x at W=8; PCIe per committed token is 1.9-2.8 ms at
   W=4 (3 committed) and 1.6-3.2 ms at W=8 (4 committed) against 2.2 ms for plain decode, because
   rejected drafts route to their own experts. Expected gain about 1.0-1.5x at C=1, mainly from
-  amortizing dense reads; an adaptive arm picker on measured round time is required, with smaller
-  K at higher concurrency.
+  amortizing dense reads. Native measurements, rather than this replay model, select the
+  [per-batch K table](#per-batch-speculation-table-2026-11-16), with smaller K at higher concurrency.
 - Measured acceptance (study harness, `study/results/dflash/REPORT.md`, 837 teacher-forced
   rounds per arm on the mixed raw-document panel): conditional per-hop acceptance is 69-74% at
   every hop; mean committed length (greedy / sampled) on the recipe target with the NVFP4 drafter
@@ -366,10 +366,10 @@ after each target layer's MoE inject (not an HC read).
   expected above this panel. Replaying every verify column through the corrected split-pool
   simulator (strict capacity, fill on miss, 26.8 GB/s) and modeling dense time at the roof gives
   C=1 160 tok/s at K=2 against 147 autoregressive at 19.95 GB (190 against 165 at 23.4 GB),
-  9-15%; at C=4 every speculative arm loses to autoregressive decode. Decision: DFlash2 is built
-  after the decode kernel time and batched lanes, with an adaptive picker on measured round
-  time over K in {0, 1, 2, 3} and K=0 as the C>=4 default; serving acceptance is measured in the
-  engine before K is tuned further.
+  9-15%; this model predicts every speculative arm loses at C=4. That is a study projection,
+  not the native result. Native DFlash2 runs K in {0, 1, 2, 3}; its measured per-batch defaults
+  are K3 at C1–2, K2 at C3–5 and K1 above C5, with request-local acceptance step-down rather
+  than timed arm exploration.
 
 ### Native DFlash2 qualification status
 
@@ -429,7 +429,8 @@ rows from physical `[128,2048,8,lanes]` storage, never a fictitious contiguous 1
 
 The complete continuation is 116,139,008 bytes without speculation and 158,184,704 bytes with
 DFlash2: cyclic KV, four pending feature columns and 256 bytes of explicit calibration metadata
-extend the base image. RAM and reopened raw/Zstd SSD transport current/rewrite/rollback images
+extend the base image. The metadata includes the request-local speculation ceiling and
+conditional-acceptance hysteresis windows. RAM and reopened raw/Zstd SSD transport current/rewrite/rollback images
 and QSA pages byte-for-byte. Engine tests cover fixed/adaptive streamed logprobs, caller stops,
 cancellation, retained lanes, RAM/SSD reuse and source-preserving disposable turns. Live RAM
 suspension preserves standard and p-less sampled IDs, calibration, counts and cumulative request
@@ -535,6 +536,61 @@ verify result matches the independently executed same-width prefill at every rep
 Builds are `-Werror`; focused clang-tidy reports zero diagnostics. Python 3.11 compilation, Ruff,
 formatting and spelling checks pass. Failed runtime candidates were screened at C5/C1 rather than
 expanded into full per-candidate grids; no new sanitizer or universal speedup claim is made.
+
+### Per-batch speculation table (2026-11-16)
+
+The default policy uses a measured K table, capped by `--draft-tokens`, rather than timed
+cross-request arm exploration. On RTX 5090 Gen5 x16, CUDA 13.1, Release `sm_120a`, baseline
+`a1a5580c`, build `/build/sol-picker` in `ninfer-builder-flashnext`, the public Engine
+`lanes-bench` fixed-arm grid uses the DFlash companion, external int8 n-gram table,
+`out/flashnext/long_tokens.i32`, NVFP4 KV, 4096-token prompts, 512 greedy outputs, chunk 4096
+and context 8192. Each arm runs C in ascending order in one process. The second C5 prompt set
+uses `--prompt-offset 5`, in a fresh process per arm. Rates exclude prefill and include drain.
+
+| C | K0 tok/s | K1 tok/s | K2 tok/s | K3 tok/s | Default K |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 125.95 | 157.33 | 160.09 | **181.22** | 3 |
+| 2 | 188.41 | 231.40 | 236.53 | **245.45** | 3 |
+| 3 | 234.18 | 268.45 | **279.02** | 249.77 | 2 |
+| 4 | 242.76 | 269.71 | **279.69** | 277.97 | 2 |
+| **5** | **228.02** | **178.79** | **252.69** | **212.89** | **2** |
+| 6 | 232.37 | **240.97** | 238.33 | 232.13 | 1 |
+| 8 | 214.59 | **232.12** | 228.42 | 200.78 | 1 |
+| **5, offset 5** | **229.97** | **212.73** | **255.78** | **235.72** | **2** |
+
+C7 and C9–12 use the C8 policy; they are supported but not measured optima. Request-local
+step-down uses conditional acceptance, never counting an unreached hop as a rejection. Two
+consecutive disjoint windows of 32 reached observations below 55% of that width's fixed-grid
+calibration lower the request's ceiling to omit the failing hop. A failing first hop limits K to
+one, or to zero when even perfect later hops cannot repay the grid's measured round cost relative
+to K0. Width changes reset observation windows, not the ceiling: a symmetric K3 proposal prefix
+is not a K2 counterfactual. Rejected and partially published packets do not train the policy.
+The compact batch width is the maximum request policy window among rows eligible to draft,
+so a poor request does not lower another request's ceiling; a root-only row still participates
+in the shared verifier width. Output clipping alone preserves proposal width. A published table
+choice caps the request for its remaining lifetime, so batch drain cannot raise its K. There are
+no upward probes. Fresh requests reset this policy; complete continuation transport
+preserves it for live suspension. The 256-byte metadata block and total continuation size are
+unchanged. Fixed K and forced-adaptive K bypass request-local step-down and retain exact
+same-width output equality; different K values already produce different greedy streams in the
+baseline's width-dependent arithmetic profile.
+
+Final matched lanes pairs produce identical generated bytes to the selected fixed arm at every
+measured C. Priority C5 is **243.12 versus 245.42 tok/s (-0.94%)** on offset 0 and
+**267.42 versus 262.99 (+1.68%)** on offset 5. C1/C6 two-repeat means are **-1.49%/-1.09%**,
+so a strict all-C within-1% result is not established. The controlled HTTP panel, with fixed
+per-task payloads and sampling seeds, measures default/best-fixed **255.40/250.85** at C1 and
+**321.60/318.24** at C5. The original random-nonce/random-seed HTTP panel misses the target
+(-7.51%/-12.39%); it does not isolate policy cost, and no random-workload guarantee is claimed.
+
+Fast CTest reports zero failures (144 registered, one unrelated weights-dependent skip). Final
+DFlash Program, DFlash Engine, real Engine default and live-tier tests pass, including exact
+forced/fixed output equality, rejected continuation bytes and cross-lane sampled suspension.
+Both fresh read-only Sol reviews have no findings; `-Werror`, focused clang-tidy (zero
+diagnostics) and changed-file quality checks pass. No kernel or Forward path changed.
+
+Raw fixed grids: `out/sol/picker-table-fixed-offset{0,5}-k{0,1,2,3}/lanes_bench.json`.
+Complete A/B tables, qualification and limitations: `out/sol/picker-table-report.md`.
 
 ### K0 width-one record (2026-11-16)
 

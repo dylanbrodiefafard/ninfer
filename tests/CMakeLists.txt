@@ -88,6 +88,9 @@ ninfer_add_test(ninfer_flash_next_ngram_table_test
 ninfer_add_test(ninfer_flash_next_ple_feeder_test
   SOURCES targets/qwen3_8_flash_next/test_ple_feeder.cpp
   LIBRARIES ninfer_qwen3_8_flash_next)
+ninfer_add_test(ninfer_flash_next_speculative_policy_test
+  SOURCES targets/qwen3_8_flash_next/test_speculative_policy.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next)
 ninfer_add_test(ninfer_flash_next_state_test
   SOURCES targets/qwen3_8_flash_next/test_state.cpp
   LIBRARIES ninfer_qwen3_8_flash_next)

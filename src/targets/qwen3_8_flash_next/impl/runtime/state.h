@@ -7,6 +7,7 @@
 // them.
 
 #include "config.h"
+#include "runtime/speculative_policy.h"
 
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
@@ -66,6 +67,7 @@ struct DflashLaneState {
     float draft_temperature = 0.4F;
     std::array<double, ops::kPLessProposalCalibrationTemperatureCount> calibration_sum{};
     std::array<std::uint64_t, ops::kPLessProposalCalibrationTemperatureCount> calibration_count{};
+    SpeculativeRequestPolicy policy;
 };
 
 class State {

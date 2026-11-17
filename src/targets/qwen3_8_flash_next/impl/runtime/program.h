@@ -20,7 +20,6 @@
 #include <cuda_runtime.h> // cudaStream_t
 
 #include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -303,13 +302,6 @@ private:
     SpeculativeOptions speculative_options_;
     std::optional<std::uint32_t> forced_adaptive_k_;
 
-    struct Picker {
-        std::array<double, kDflashWidth> seconds{}, published{};
-        std::array<std::uint64_t, kDflashWidth> samples{}, last_seen{};
-        std::uint64_t rounds = 0;
-    };
-
-    std::array<Picker, kMaxLanes> pickers_{};
     std::array<Lane, kMaxLanes> pending_lanes_{};
     std::array<std::int32_t, kMaxLanes> pending_extents_{};
     std::array<ops::SamplingConfig, kMaxLanes> round_sampling_{};
@@ -322,7 +314,6 @@ private:
     std::int32_t pending_k_   = 0;
     bool pending_batch_       = false;
     bool pending_speculative_ = false;
-    std::chrono::steady_clock::time_point round_started_;
     [[nodiscard]] std::int32_t choose_k(std::int32_t batch);
     void initialize_speculative(Lane lane, RestorePhase phase = RestorePhase::Prompt);
 };
