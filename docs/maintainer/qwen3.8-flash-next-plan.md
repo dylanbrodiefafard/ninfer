@@ -601,6 +601,59 @@ diagnostics) and changed-file quality checks pass. No kernel or Forward path cha
 Raw fixed grids: `out/sol/picker-table-fixed-offset{0,5}-k{0,1,2,3}/lanes_bench.json`.
 Complete A/B tables, qualification and limitations: `out/sol/picker-table-report.md`.
 
+### Rejected confidence gate and cost refit (2026-11-17)
+
+At `75d0405e`, after predictive expert staging and padding-free routing, 36 fresh-process
+fixed-K arms refit `round_ms = a + c_d × drafted_columns`. Hardware and toolchain: RTX 5090,
+PCIe Gen5 x16, CUDA 13.1, Release `sm_120a`, `-Werror`; private build
+`/build/sol-confidence-gate` in `ninfer-builder-flashnext`. Workload: DFlash companion,
+`out/flashnext/long_tokens.i32`, 4096-token prompts, 512 outputs, offsets 0 and 5, context 8192,
+chunk 4096, NVFP4 KV. Sampled arms use T=1, top-p .95, top-k 20, p-less disabled,
+seed `73 + row`; greedy arms use temperature zero. K0 and table K anchor each fit; C5 also
+includes K3. Only full-membership, full-extent rounds after the first replay enter the fit.
+
+| C | Sampler | Root round a, ms | c_d, ms/draft column | c_d/a | RMSE, ms | R² |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | greedy | 7.4993 | 1.7605 | .23475 | 2.794 | .403 |
+| 1 | sampled | 7.3838 | 1.5579 | .21099 | 2.700 | .382 |
+| 3 | greedy | 11.5281 | 1.7079 | .14815 | 4.296 | .533 |
+| 3 | sampled | 11.7825 | 1.3412 | .11383 | 4.373 | .414 |
+| 5 | greedy | 19.5559 | 2.1425 | .10956 | 5.990 | .827 |
+| 5 | sampled | 19.6939 | 1.9141 | .09719 | 8.372 | .665 |
+| 6 | greedy | 23.6255 | 2.8431 | .12034 | 5.684 | .668 |
+| 6 | sampled | 23.7744 | 2.9047 | .12218 | 5.948 | .660 |
+
+Confidence is an FP64 temperature-one softmax top-1 over the 16 represented raw Markov scores,
+not `selector_q[0]` or the actual proposal law (one-hot for greedy). Per-C, per-width,
+per-sampler conditional maps pool both offsets, use eight equal-population bins with Jeffreys
+smoothing and isotonic regression, and interpolate linearly. Their product predicts prefix
+survival. The marginal threshold solves the training trace's expected reward/cost fixed point;
+this is a fitted policy, not measured ragged-width savings. C5 K2 thresholds are .71883 greedy
+and .60500 sampled; K3 thresholds are .73213 and .62289. The stateless candidate used no
+request-local correction bytes and changed no continuation or transport size.
+
+**Not adopted.** Two alternating fresh-process pairs per C5 sampler/offset compare the gated K2
+default with the ungated table policy. Rates below pool each arm's two decode intervals; prefill
+and GPU-lock waiting are excluded.
+
+| Sampler | Offset | Ungated tok/s | Gated K2 tok/s | Gain |
+|---|---:|---:|---:|---:|
+| greedy | 0 | 279.65 | 286.33 | +2.39% |
+| greedy | 5 | 285.33 | 294.16 | +3.09% |
+| sampled | 0 | 249.46 | 261.63 | +4.88% |
+| sampled | 5 | 286.77 | 274.19 | -4.39% |
+
+The candidate does not achieve the required +3% on all four C5 sets. A separate gated-K3/gated-K2
+pair per set measures -6.78%/-3.47% at offset 0 (greedy/sampled), and +2.59%/+12.11% at offset 5; K3 therefore
+also fails the both-set adoption condition. Qualification stopped at this priority failure:
+C1/C3/C6 A/Bs, the controlled HTTP panel and extended Engine/tier qualification were not run.
+All candidate runtime, Op, test and CLI changes were removed; the ungated table policy remains.
+These observations do not establish an irreducible limit or a specific cause for the losses.
+
+Data and full map knots: `out/sol/confidence-gate-data/analysis.json`; reproduction:
+`out/sol/confidence-gate-refit.sh` and `out/sol/confidence-gate-analyze.py`. The acceptance
+decision and direct, fresh-process A/B measurements are in `out/sol/confidence-gate-report.md`.
+
 ### K0 width-one record (2026-11-16)
 
 A K0 root used to emulate a read-only width-one record: per GDN layer it copied the whole
