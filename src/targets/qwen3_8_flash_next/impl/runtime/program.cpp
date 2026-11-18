@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -224,7 +225,30 @@ Program::Program(const LoadedModel& model, const ProgramOptions& options, Device
                device.stream, dflash_.get()),
       stream_(device.stream), mask_staging_(static_cast<std::size_t>(options.lanes) *
                                             State::kAllowedTokenWordStride * sizeof(std::uint32_t)),
-      speculative_options_(options.speculative), forced_adaptive_k_(options.forced_adaptive_k) {
+      speculative_options_(options.speculative), forced_adaptive_k_(options.forced_adaptive_k),
+      expert_route_profile_path_(options.expert_route_profile_path) {
+    write_route_profile(true);
+}
+
+Program::~Program() {
+    try {
+        write_route_profile(true);
+    } catch (const std::exception& error) {
+        // Destruction cannot propagate; a failed final diagnostic write is visible to the user.
+        std::cerr << "expert route profile final write failed: " << error.what() << '\n';
+    }
+}
+
+void Program::write_route_profile(bool force) {
+    if (expert_route_profile_path_.empty()) { return; }
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - profile_written_ < std::chrono::minutes(5)) { return; }
+    if (pending_batch_ || pending_speculative_) {
+        throw std::logic_error("expert route profile requires a settled round");
+    }
+    write_expert_route_profile(expert_route_profile_path_, forward_.expert_route_profile(),
+                               std::chrono::duration<double>(now - profile_started_).count());
+    profile_written_ = now;
 }
 
 std::int32_t Program::lanes() const noexcept { return state_.lanes(); }
@@ -475,6 +499,7 @@ void Program::decode(std::span<const Lane> lanes, std::span<const std::int32_t> 
     }
     last_round_ = RoundTiming{.gather_seconds = forward_.last_gather_seconds(),
                               .replay_ms      = forward_.last_replay_ms()};
+    write_route_profile();
 }
 
 std::vector<float> Program::score(std::span<const std::int32_t> tokens) {

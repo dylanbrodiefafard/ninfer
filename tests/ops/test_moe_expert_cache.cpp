@@ -2,9 +2,10 @@
 // independent host model of the contract's sequential policy (CLOCK bits or GCLOCK counters, with
 // or without the frequency state and its admission filter, lent slots protected): exact equality
 // of the expert, fill and host tables, the slot index (derived independently from the model's
-// owners), slot owners, reference counters, hands and frequency state after every admit, commit,
-// borrow and return, over many random steps with skewed routing (hits, repeated experts across
-// and within tokens), both codec pools, multi-layer interleaving, pools small enough that every
+// owners), slot owners, reference counters, hands, frequency state and full-set route counts after
+// every admit, commit, borrow and return, over many random steps with skewed routing (hits,
+// repeated experts across and within tokens), both codec pools, multi-layer interleaving, pools
+// small enough that every
 // slot is protected (exhaustion), pools wider than one 1024-slot scan window, an empty pool, pools
 // with flex slots at scattered addresses (with and without fixed slots, lent in extents while a
 // fixed run is lent as well), and a captured multi-layer graph with a flex lend replayed with
@@ -64,7 +65,7 @@ struct PoolModel {
 // The complete cache state as the contract defines it (tables are layer-major [512,L]).
 struct CacheModel {
     std::int32_t layers = 0;
-    std::vector<std::uint64_t> expert, host, fill;
+    std::vector<std::uint64_t> expert, host, fill, route_counts;
     std::array<PoolModel, kPools> pools;
     std::array<std::int32_t, kPools> hands{};
     // counters[kind + 2 codec], as the admit contract lays them out.
@@ -87,14 +88,17 @@ std::size_t counter_index(ops::MoeCacheCounter kind, std::size_t tag) {
 // at its period; misses in ascending id run CLOCK one slot at a time after checking that an
 // unprotected slot exists, and with the filter a miss whose count does not exceed its victim
 // owner's is not admitted. With count_events, every distinct routed expert adds one lookup of its
-// codec and, when its entry names the host record on entry, one miss. With an eligibility set,
-// the routed set holds only eligible experts, for every step.
+// codec and, when its entry names the host record on entry, one miss. Route counts include the
+// full routed set; eligibility restricts only cache events, frequency and admission.
 void model_admit(CacheModel& m, const std::vector<std::int32_t>& ids, std::int32_t layer,
                  bool count_events, bool filter, const std::vector<bool>* eligible = nullptr) {
     std::vector<bool> routed(kExperts, false);
-    for (const std::int32_t id : ids) {
-        const auto e = static_cast<std::size_t>(id);
-        routed[e]    = eligible == nullptr || (*eligible)[e];
+    for (const std::int32_t id : ids) { routed[static_cast<std::size_t>(id)] = true; }
+    for (std::int32_t e = 0; e < kExperts; ++e) {
+        if (count_events && routed[e]) {
+            ++m.route_counts[static_cast<std::size_t>(layer) * kExperts + e];
+        }
+        if (eligible != nullptr && !(*eligible)[e]) { routed[e] = false; }
     }
     if (count_events) {
         for (std::int32_t e = 0; e < kExperts; ++e) {
@@ -238,7 +242,8 @@ public:
         : expert_(table_bytes(model)), host_(table_bytes(model)), fill_(table_bytes(model)),
           slot_index_(table_bytes(model) / 2), hands_(kPools * sizeof(std::int32_t)),
           counters_(kCounters * sizeof(std::int64_t)), counts_(table_bytes(model) / 2),
-          lookups_(sizeof(std::int32_t)) {
+          lookups_(sizeof(std::int32_t)), route_counts_(table_bytes(model)) {
+        model.route_counts.resize(static_cast<std::size_t>(model.layers) * kExperts);
         for (std::int32_t p = 0; p < kPools; ++p) {
             const auto fixed  = static_cast<std::size_t>(config[p].slots);
             const auto flex   = static_cast<std::size_t>(config[p].flex);
@@ -288,6 +293,7 @@ public:
                 .halving_lookups = model.halving_lookups,
             };
         }
+        route_counts_view_ = Tensor(route_counts_.data(), DType::I64, {kExperts, model.layers});
         counters_view_ = Tensor(counters_.data(), DType::I64, {ops::kMoeCacheCounterKinds, kPools});
         expert_view_   = Tensor(expert_.data(), DType::I64, {kExperts, model.layers});
         host_view_     = Tensor(host_.data(), DType::I64, {kExperts, model.layers});
@@ -302,6 +308,7 @@ public:
         slot_index_.copy_from_host(slot_index.data(), slot_index_.bytes());
         hands_.copy_from_host(m.hands.data(), hands_.bytes());
         counters_.copy_from_host(m.counters.data(), counters_.bytes());
+        route_counts_.copy_from_host(m.route_counts.data(), route_counts_.bytes());
         if (!m.counts.empty()) {
             counts_.copy_from_host(m.counts.data(), counts_.bytes());
             lookups_.copy_from_host(&m.lookups, lookups_.bytes());
@@ -337,6 +344,10 @@ public:
                                  from_device<std::int64_t>(counters_.data(), kCounters),
                                  std::vector<std::int64_t>(m.counters.begin(), m.counters.end()));
         failures += counters_.verify_guards(label + " counters");
+        failures +=
+            verify_exact((label + " route counts").c_str(),
+                         from_device<std::uint64_t>(route_counts_.data(), entries), m.route_counts);
+        failures += route_counts_.verify_guards(label + " route counts");
         if (!m.counts.empty()) {
             failures +=
                 verify_exact((label + " frequency counts").c_str(),
@@ -377,7 +388,8 @@ public:
         ops::moe_expert_cache_admit(ids, expert_view_, host_view_, fill_view_, cache_, layer,
                                     filter ? ops::MoeCacheAdmission::FrequencyFilter
                                            : ops::MoeCacheAdmission::EveryMiss,
-                                    stream, count_events ? &counters_view_ : nullptr, eligible);
+                                    stream, count_events ? &counters_view_ : nullptr, eligible,
+                                    count_events ? &route_counts_view_ : nullptr);
     }
 
     void lend(std::int32_t pool, ops::MoeCacheSlotRegion region, std::int32_t first,
@@ -400,10 +412,11 @@ private:
         return static_cast<std::size_t>(m.layers) * kExperts * sizeof(std::uint64_t);
     }
 
-    GuardedDeviceBuffer expert_, host_, fill_, slot_index_, hands_, counters_, counts_, lookups_;
+    GuardedDeviceBuffer expert_, host_, fill_, slot_index_, hands_, counters_, counts_, lookups_,
+        route_counts_;
     std::array<std::unique_ptr<DevicePool>, kPools> pools_;
     ops::MoeExpertCache cache_;
-    Tensor expert_view_, host_view_, fill_view_, counters_view_;
+    Tensor expert_view_, host_view_, fill_view_, counters_view_, route_counts_view_;
 };
 
 // Consistent random initial state: host addresses with random codecs (a fraction nvfp4_share of
@@ -616,7 +629,12 @@ int run_eager(const Scenario& scenario, std::uint32_t seed, cudaStream_t stream)
             }
             const std::int32_t tokens =
                 kTokens[std::uniform_int_distribution<std::size_t>(0, kTokens.size() - 1)(rng)];
-            const auto ids = random_ids(tokens, layer, rng);
+            auto ids = random_ids(tokens, layer, rng);
+            if (scenario.eligibility) {
+                // Every restricted round routes both an eligible and an ineligible expert.
+                ids[0] = 0;
+                ids[1] = 1;
+            }
             GuardedDeviceBuffer ids_storage(ids.size() * sizeof(std::int32_t));
             ids_storage.copy_from_host(ids.data(), ids_storage.bytes());
             const Tensor ids_view(ids_storage.data(), DType::I32, {kTopK, tokens});
@@ -635,6 +653,9 @@ int run_eager(const Scenario& scenario, std::uint32_t seed, cudaStream_t stream)
                     eligible[e] = unit(rng) < 0.7;
                     if (eligible[e]) { words[e / 32] |= 1U << (e % 32); }
                 }
+                eligible[0] = true;
+                eligible[1] = false;
+                words[0]    = (words[0] | 1U) & ~2U;
                 eligible_storage =
                     std::make_unique<GuardedDeviceBuffer>(words.size() * sizeof(std::uint32_t));
                 eligible_storage->copy_from_host(words.data(), eligible_storage->bytes());

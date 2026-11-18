@@ -198,4 +198,5 @@ void Program::resolve_round(std::span<const std::int32_t> counts) {
     }
     pending_batch_       = false;
     pending_speculative_ = false;
+    write_route_profile();
 }

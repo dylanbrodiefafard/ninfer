@@ -433,11 +433,12 @@ int main(int argc, char** argv) {
         engine_options.xattn_tau                = cli.xattn_tau;
         engine_options.speculative              = ninfer::product::resolve_speculative_startup(
             cli.artifact_path, cli.speculative_selection, cli.speculative);
-        engine_options.enable_vision     = cli.enable_vision;
-        engine_options.use_cuda_graph    = cli.use_cuda_graph;
-        engine_options.ngram_table_path  = cli.ngram_table_path;
-        engine_options.qsa_select_budget = cli.qsa_select_budget;
-        engine_options.load_progress     = load_progress.callback();
+        engine_options.enable_vision             = cli.enable_vision;
+        engine_options.use_cuda_graph            = cli.use_cuda_graph;
+        engine_options.ngram_table_path          = cli.ngram_table_path;
+        engine_options.expert_route_profile_path = cli.expert_route_profile_path;
+        engine_options.qsa_select_budget         = cli.qsa_select_budget;
+        engine_options.load_progress             = load_progress.callback();
 
         const auto load_started = Clock::now();
         ninfer::Engine engine(std::move(engine_options));

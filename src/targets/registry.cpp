@@ -107,6 +107,11 @@ decltype(auto) with_automatic_headroom_hint(const KvCapacityPolicy& policy, Fn&&
 
 // Engine options only qwen3.8-flash-next implements.
 void reject_flash_next_options(const EngineOptions& options, std::string_view target_key) {
+    if (!options.expert_route_profile_path.empty()) {
+        throw std::invalid_argument("--expert-route-profile applies only to qwen3.8-flash-next, "
+                                    "not to target '" +
+                                    std::string(target_key) + "'");
+    }
     if (!options.ngram_table_path.empty() || options.qsa_select_budget.has_value()) {
         throw std::invalid_argument("--ngram-table and --qsa-select-budget apply only to "
                                     "qwen3.8-flash-next, not to target '" +

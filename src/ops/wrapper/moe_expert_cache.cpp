@@ -221,7 +221,7 @@ detail::MoeAdmitPolicyArgs validate_policy(const MoeExpertCache& cache, std::int
 void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor& host_ptr,
                             Tensor& fill_ptr, const MoeExpertCache& cache, std::int32_t layer,
                             MoeCacheAdmission admission, cudaStream_t stream, Tensor* counters,
-                            const Tensor* eligible) {
+                            const Tensor* eligible, Tensor* route_counts) {
     const std::int32_t layers = validate_tables(expert_ptr, fill_ptr, layer,
                                                 "moe_expert_cache_admit", "expert_ptr", "fill_ptr");
     if (!contiguous_2d(ids, DType::I32, sizeof(std::int32_t)) || ids.ne[0] != kMoeTopK) {
@@ -265,11 +265,18 @@ void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor&
     }
     const std::uint32_t* const eligible_bits =
         validate_eligible(eligible, "moe_expert_cache_admit", ranges);
+    if (route_counts != nullptr) {
+        if (!table(*route_counts, layers)) {
+            throw std::invalid_argument(
+                "moe_expert_cache_admit: route_counts must be contiguous I64 [512,L]");
+        }
+        ranges.push_back(range_of(*route_counts));
+    }
     for (const MoeExpertSlotPool& pool : cache.pools) { append_pool_ranges(pool, ranges); }
     require_disjoint(
         ranges,
-        "moe_expert_cache_admit: tables, slots, pool metadata, counters and the eligibility "
-        "bitset must be disjoint");
+        "moe_expert_cache_admit: tables, slots, pool metadata, counters, route counts and the "
+        "eligibility bitset must be disjoint");
 
     detail::moe_expert_cache_admit_launch(
         static_cast<const std::int32_t*>(ids.data), static_cast<std::int32_t>(id_count),
@@ -278,6 +285,7 @@ void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor&
         static_cast<std::uint64_t*>(fill_ptr.data), slot_index, pool0, pool1,
         static_cast<std::int32_t*>(hands.data), layer, policy,
         counters == nullptr ? nullptr : static_cast<std::uint64_t*>(counters->data), eligible_bits,
+        route_counts == nullptr ? nullptr : static_cast<std::uint64_t*>(route_counts->data),
         stream);
 }
 

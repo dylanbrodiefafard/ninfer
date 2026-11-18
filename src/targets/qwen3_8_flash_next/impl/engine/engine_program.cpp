@@ -121,9 +121,10 @@ void validate_sampling(const ResolvedSamplingParameters& sampling) {
 
 [[nodiscard]] ProgramOptions make_program_options(const EngineOptions& options) {
     ProgramOptions out;
-    out.ngram_table    = options.ngram_table_path;
-    out.context_tokens = static_cast<std::int32_t>(options.max_context);
-    out.lanes          = static_cast<std::int32_t>(options.max_concurrency);
+    out.ngram_table               = options.ngram_table_path;
+    out.expert_route_profile_path = options.expert_route_profile_path;
+    out.context_tokens            = static_cast<std::int32_t>(options.max_context);
+    out.lanes                     = static_cast<std::int32_t>(options.max_concurrency);
     if (options.kv_capacity.mode == KvCapacityMode::Explicit) {
         out.kv_capacity_tokens = options.kv_capacity.explicit_tokens;
     }

@@ -223,11 +223,20 @@ int main() {
     failures +=
         check(custom_marks.context_checkpoint_marks == std::vector<std::uint32_t>{8192u, 16384u},
               "--context-checkpoints custom list was not parsed");
-    const ServeOptions flash_next = parse({"ninfer-serve", "model.ninfer", "--ngram-table",
-                                           "table.bin", "--qsa-select-budget", "1024"});
+    const ServeOptions flash_next =
+        parse({"ninfer-serve", "model.ninfer", "--ngram-table", "table.bin", "--qsa-select-budget",
+               "1024", "--expert-route-profile", "routes.json"});
     failures += check(flash_next.ngram_table_path == "table.bin" &&
                           flash_next.qsa_select_budget == ninfer::QsaSelectBudget::Blocks1024,
                       "--ngram-table / --qsa-select-budget were not parsed");
+    failures += check(flash_next.expert_route_profile_path == "routes.json" &&
+                          configured.expert_route_profile_path.empty(),
+                      "--expert-route-profile parsing/default failed");
+    bool empty_profile = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--expert-route-profile", ""});
+    } catch (const std::invalid_argument&) { empty_profile = true; }
+    failures += check(empty_profile, "an empty --expert-route-profile was accepted");
     bool bad_marks = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "16384,8192"});

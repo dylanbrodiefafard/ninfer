@@ -172,8 +172,10 @@ __device__ void admit_pool(AdmitShared& shared, int tag, const MoeExpertSlotPool
 }
 
 // Grid 1, block 1024. Phase 1 marks the routed set in a shared 512-bit mask (shared atomics, so
-// repeated ids need no ordering) and, with an eligibility bitset, threads 0..15 intersect it word
-// by word after a barrier; every later phase, CLOCK protection included, reads only that mask.
+// repeated ids need no ordering). Thread e < 512 increments route_counts[e,layer], when given,
+// from that full set. With an eligibility bitset, threads 0..15 intersect the mask word by word
+// after its route-count readers finish; every later phase, CLOCK protection included, reads
+// only that filtered mask.
 // Phase 2: thread e < 512 classifies a routed expert as a hit
 // (increments the reference counter of its slot, slot_index[e], up to the limit; distinct hits
 // own distinct slots) or a miss of its pool; warp ballots and per-warp offsets give the
@@ -189,7 +191,7 @@ __global__ void __launch_bounds__(kAdmitThreads) moe_expert_cache_admit_kernel(
     const std::uint64_t* __restrict__ host_ptr, std::uint64_t* __restrict__ fill_ptr,
     std::int32_t* __restrict__ slot_index, MoeExpertSlotPoolArgs pool0, MoeExpertSlotPoolArgs pool1,
     std::int32_t* clock_hands, int layer, MoeAdmitPolicyArgs policy, std::uint64_t* counters,
-    const std::uint32_t* __restrict__ eligible) {
+    const std::uint32_t* __restrict__ eligible, std::uint64_t* route_counts) {
     __shared__ AdmitShared shared;
     const int thread = static_cast<int>(threadIdx.x);
     const int lane   = thread % kWarpSize;
@@ -202,8 +204,14 @@ __global__ void __launch_bounds__(kAdmitThreads) moe_expert_cache_admit_kernel(
         atomicOr(&shared.routed[expert / kWarpSize], 1U << (expert % kWarpSize));
     }
     __syncthreads();
+    if (route_counts != nullptr && thread < kMoeExperts && is_routed(shared, thread)) {
+        // Thread e owns this layer's entry; calls sharing route_counts are stream ordered.
+        ++route_counts[layer * kMoeExperts + thread];
+    }
     if (eligible != nullptr) {
-        // U is the routed set intersected with the eligible experts before every later step.
+        // All full-set readers must finish before these threads overwrite the shared mask.
+        // Both optional pointers are uniform across the CTA.
+        if (route_counts != nullptr) { __syncthreads(); }
         if (thread < kRoutedMaskWords) { shared.routed[thread] &= eligible[thread]; }
         __syncthreads();
     }
@@ -600,10 +608,11 @@ void moe_expert_cache_admit_launch(const std::int32_t* ids, std::int32_t id_coun
                                    MoeExpertSlotPoolArgs pool0, MoeExpertSlotPoolArgs pool1,
                                    std::int32_t* clock_hands, std::int32_t layer,
                                    MoeAdmitPolicyArgs policy, std::uint64_t* counters,
-                                   const std::uint32_t* eligible, cudaStream_t stream) {
+                                   const std::uint32_t* eligible, std::uint64_t* route_counts,
+                                   cudaStream_t stream) {
     moe_expert_cache_admit_kernel<<<1, kAdmitThreads, 0, stream>>>(
         ids, id_count, expert_ptr, host_ptr, fill_ptr, slot_index, pool0, pool1, clock_hands, layer,
-        policy, counters, eligible);
+        policy, counters, eligible, route_counts);
     CUDA_CHECK(cudaGetLastError());
 }
 

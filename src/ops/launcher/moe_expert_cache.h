@@ -35,14 +35,16 @@ struct MoeAdmitPolicyArgs {
 // The launchers trust the wrapper's validation (shapes, alignment, disjointness, layer range).
 // The tables are [512,L] layer-major (slot_index I32, the others U64); id_count is 10 * T;
 // counters is null or the I64 [2,2] (kind, codec) counters, summed as U64; eligible is null or
-// the layer's U32 [16] eligibility bitset.
+// the layer's U32 [16] eligibility bitset. route_counts is null or I64 [512,L], incremented once
+// per routed-set entry before eligibility filtering.
 void moe_expert_cache_admit_launch(const std::int32_t* ids, std::int32_t id_count,
                                    std::uint64_t* expert_ptr, const std::uint64_t* host_ptr,
                                    std::uint64_t* fill_ptr, std::int32_t* slot_index,
                                    MoeExpertSlotPoolArgs pool0, MoeExpertSlotPoolArgs pool1,
                                    std::int32_t* clock_hands, std::int32_t layer,
                                    MoeAdmitPolicyArgs policy, std::uint64_t* counters,
-                                   const std::uint32_t* eligible, cudaStream_t stream);
+                                   const std::uint32_t* eligible, std::uint64_t* route_counts,
+                                   cudaStream_t stream);
 
 // Whether moe_expert_cache_lend_launch borrows (owner -2, evicting) or returns (owner -1).
 enum class MoeCacheLend : std::uint8_t { Borrow, Return };

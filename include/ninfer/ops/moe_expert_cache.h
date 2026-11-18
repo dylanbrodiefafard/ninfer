@@ -132,8 +132,8 @@ enum class MoeCacheAdmission : std::uint8_t {
  *                         only;
  *     fill_ptr   [512,L]  the untagged slot address moe_expert_cache_fill copies the record to,
  *                         or 0 for no fill.
- *   With U the set of ids in ids [10,T], intersected with the eligible experts when eligible is
- *   given, and l = layer, a slot of a pool is "protected" when it is
+ *   With R the set of ids in ids [10,T], U = R intersected with the eligible experts when
+ *   eligible is given (otherwise U = R), and l = layer, a slot of a pool is "protected" when it is
  *   borrowed (owner -2) or its owner is l * 512 + u for some u in U (slots taken below become
  *   protected), and K = cache.reference_limit. Then:
  *   1. Hit: each u in U with expert_ptr[u,l] != host_ptr[u,l] sets referenced[s] =
@@ -160,19 +160,22 @@ enum class MoeCacheAdmission : std::uint8_t {
  *      admitted or not. U is a set: an expert routed by several (token, k) pairs of the call
  *      counts once, matching the one record read per miss that the fill or moe_experts makes.
  *      The sums wrap modulo 2^64; the caller zeroes the counters when it starts a measurement.
+ *   5. Route counts (when route_counts is given): route_counts[r,l] += 1 for every r in R,
+ *      independent of eligibility, residency and admission, wrapping modulo 2^64.
  *   Eligibility (the expert-helper split, docs/maintainer/qwen3.8-flash-next-expert-helper.md):
  *   eligible is layer l's bitset, bit e % 32 of word e / 32 set when expert e may be cached (a
- *   local expert). An ineligible routed expert is outside U for every step above: no hit, lookup,
- *   frequency count, miss or protection. Without eligible every expert is eligible, which is the
- *   unrestricted Op.
+ *   local expert). An ineligible routed expert is outside U for steps 1-4: no hit, lookup,
+ *   frequency count, miss or protection. Route counts in step 5 still include it. Without
+ *   eligible every expert is eligible, which is the unrestricted Op.
  *
  * Logical shapes:
  *   ids I32 [10,T], T >= 1 with 10 T < 2^31, every id in [0,512); expert_ptr, host_ptr and
  *   fill_ptr I64 [512,L], L >= 1 with 512 L < 2^31; 0 <= layer < L; counters, when not null,
  *   contiguous I64 [2,2] (kind, codec); frequency counts, when present, contiguous I32 [512,L]
  *   with lookups contiguous I32 [1]; cache.slot_index contiguous I32 [512,L]; eligible, when not
- *   null, contiguous I32 [16] holding U32 bit patterns (kMoeExpertMaskWords), read only and
- *   disjoint from every other operand.
+ *   null, contiguous I32 [16] holding U32 bit patterns (kMoeExpertMaskWords), read only;
+ *   route_counts, when not null, contiguous I64 [512,L]. Both optional tensors are disjoint from
+ *   every other operand.
  *
  * Supported domain:
  *   Exact integer and address arithmetic. On entry the state is consistent: every fill_ptr entry
@@ -185,9 +188,9 @@ enum class MoeCacheAdmission : std::uint8_t {
  * Effects:
  *   Writes expert_ptr only for evicted owners (any layer), slot_index only for evicted owners and
  *   admitted misses, fill_ptr only in column layer, owner, referenced and clock_hands of the
- *   pools, the frequency state when present, and the counters when given; nothing else. Between
- *   admit and commit an admitted miss already has its slot_index entry while its expert_ptr entry
- *   still names the host record.
+ *   pools, the frequency state when present, and counters and route_counts when given; nothing
+ *   else. Between admit and commit an admitted miss already has its slot_index entry while its
+ *   expert_ptr entry still names the host record.
  *   ids and host_ptr are read only. The state is consistent again after the commit. Invariants
  *   the schedule relies on:
  *   - a slot evicted by this call is never read by this layer's moe_experts: its owner is not
@@ -203,9 +206,9 @@ enum class MoeCacheAdmission : std::uint8_t {
  *   moe_experts with a MoeExpertsDeferral of this layer's fill_ptr column (or of its
  *   moe_expert_cache_defer merge with a staging column, which reads the fill column before commit)
  *   and an event recorded after the fill, and then commit. Commit always follows the fill. All
- *   tensors and pool metadata are pairwise disjoint device memory. Calls sharing counters run in
- *   stream order (one stream): the single CTA adds each counter with one plain read-modify-write,
- *   no atomics.
+ *   tensors and pool metadata are pairwise disjoint device memory. Calls sharing counters or
+ *   route_counts run in stream order (one stream): the single CTA adds each counter, and thread
+ *   e increments route_counts[e,layer], with plain read-modify-writes; no atomics are needed.
  *
  * Workspace: none.
  *
@@ -216,7 +219,8 @@ enum class MoeCacheAdmission : std::uint8_t {
 void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor& host_ptr,
                             Tensor& fill_ptr, const MoeExpertCache& cache, std::int32_t layer,
                             MoeCacheAdmission admission, cudaStream_t stream,
-                            Tensor* counters = nullptr, const Tensor* eligible = nullptr);
+                            Tensor* counters = nullptr, const Tensor* eligible = nullptr,
+                            Tensor* route_counts = nullptr);
 
 /**
  * Op: moe_expert_cache_borrow / moe_expert_cache_return

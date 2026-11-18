@@ -108,11 +108,19 @@ int main() {
 
     const ninfer::cli::Options flash_next =
         parse({"ninfer", "model.ninfer", "--prompt", "hi", "--ngram-table", "table.bin",
-               "--qsa-select-budget", "2048"});
+               "--qsa-select-budget", "2048", "--expert-route-profile", "routes.json"});
     failures += check(flash_next.ngram_table_path == "table.bin" &&
                           flash_next.qsa_select_budget == ninfer::QsaSelectBudget::Blocks2048,
                       "--ngram-table / --qsa-select-budget were not parsed");
-    failures += check(!on.qsa_select_budget.has_value() && on.ngram_table_path.empty(),
+    failures += check(flash_next.expert_route_profile_path == "routes.json",
+                      "--expert-route-profile was not parsed");
+    bool empty_profile = false;
+    try {
+        (void)parse({"ninfer", "model.ninfer", "--prompt", "hi", "--expert-route-profile", ""});
+    } catch (const std::invalid_argument&) { empty_profile = true; }
+    failures += check(empty_profile, "an empty --expert-route-profile was accepted");
+    failures += check(!on.qsa_select_budget.has_value() && on.ngram_table_path.empty() &&
+                          on.expert_route_profile_path.empty(),
                       "omitted Flash-Next options were not left unset");
     bool bad_budget = false;
     try {

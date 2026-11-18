@@ -405,7 +405,10 @@ Forward::ChunkStorage Forward::allocate_chunk(Allocator& allocator, const Forwar
     storage.score_top_logprobs = allocator.alloc(DType::FP32, {logit_width});
     storage.expert_cache_counters =
         allocator.alloc(DType::I64, {ops::kMoeCacheCounterKinds, ops::kMoeCacheCodecTags});
-    storage.window_columns = allocator.alloc(DType::I64, {ops::kMoeExperts, 2});
+    storage.decode_cache_counters =
+        allocator.alloc(DType::I64, {ops::kMoeCacheCounterKinds, ops::kMoeCacheCodecTags});
+    storage.decode_route_counts = allocator.alloc(DType::I64, {ops::kMoeExperts, kLayers});
+    storage.window_columns      = allocator.alloc(DType::I64, {ops::kMoeExperts, 2});
     if (options.dflash_features == DflashExecution::Enabled) {
         storage.dflash_features = allocator.alloc(DType::BF16, {kDflashFeatures, kDflashWindow});
     }
@@ -526,6 +529,10 @@ Forward::Forward(const ModelView& model, State& state, PleRowFeeder& feeder,
     constexpr std::int32_t kOne = 1;
     CUDA_CHECK(cudaMemcpyAsync(chunk_.row_enabled.data, &kOne, sizeof(kOne), cudaMemcpyHostToDevice,
                                stream_));
+    CUDA_CHECK(cudaMemsetAsync(chunk_.decode_cache_counters.data, 0,
+                               chunk_.decode_cache_counters.bytes(), stream_));
+    CUDA_CHECK(cudaMemsetAsync(chunk_.decode_route_counts.data, 0,
+                               chunk_.decode_route_counts.bytes(), stream_));
     clear_expert_cache_counts();
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     // Capture reads no staging contents and needs no idle feeder (thread-local capture mode), so
@@ -544,6 +551,32 @@ Forward::~Forward() {
 void Forward::clear_expert_cache_counts() {
     CUDA_CHECK(cudaMemsetAsync(chunk_.expert_cache_counters.data, 0,
                                chunk_.expert_cache_counters.bytes(), stream_));
+    CUDA_CHECK(
+        cudaMemcpyAsync(diagnostic_decode_baseline_.data(), chunk_.decode_cache_counters.data,
+                        sizeof(diagnostic_decode_baseline_), cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+ExpertRouteProfile Forward::expert_route_profile() {
+    require_resolved();
+    ExpertRouteProfile out;
+    out.decode_lookups.resize(static_cast<std::size_t>(kLayers) * ops::kMoeExperts);
+    std::array<std::uint64_t, 4> counters{};
+    CUDA_CHECK(cudaMemcpyAsync(out.decode_lookups.data(), chunk_.decode_route_counts.data,
+                               chunk_.decode_route_counts.bytes(), cudaMemcpyDeviceToHost,
+                               stream_));
+    CUDA_CHECK(cudaMemcpyAsync(counters.data(), chunk_.decode_cache_counters.data, sizeof(counters),
+                               cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    for (std::size_t codec = 0; codec < out.lookups.size(); ++codec) {
+        out.lookups[codec] = counters[2 * codec];
+        out.misses[codec]  = counters[2 * codec + 1];
+        out.miss_bytes +=
+            out.misses[codec] * static_cast<std::uint64_t>(ops::moe_expert_record_bytes(
+                                    static_cast<ops::MoeExpertCodec>(codec)));
+    }
+    out.rounds = decode_profile_rounds_;
+    return out;
 }
 
 ExpertCacheCounts Forward::expert_cache_counts() {
@@ -552,7 +585,13 @@ ExpertCacheCounts Forward::expert_cache_counts() {
         values{};
     CUDA_CHECK(cudaMemcpyAsync(values.data(), chunk_.expert_cache_counters.data, sizeof(values),
                                cudaMemcpyDeviceToHost, stream_));
+    std::array<std::uint64_t, 4> decode{};
+    CUDA_CHECK(cudaMemcpyAsync(decode.data(), chunk_.decode_cache_counters.data, sizeof(decode),
+                               cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
+    for (std::size_t i = 0; i < decode.size(); ++i) {
+        values[i] += static_cast<std::int64_t>(decode[i] - diagnostic_decode_baseline_[i]);
+    }
     ExpertCacheCounts counts;
     for (std::size_t codec = 0; codec < counts.lookups.size(); ++codec) {
         const std::size_t base = static_cast<std::size_t>(ops::kMoeCacheCounterKinds) * codec;
@@ -1096,6 +1135,7 @@ SampledRows Forward::decode(std::span<const std::int32_t> lanes,
         CUDA_CHECK(cudaStreamSynchronize(fill_stream_.get()));
         throw;
     }
+    ++decode_profile_rounds_;
     for (const std::int32_t lane : lanes) { state_.advance(lane, 1); }
     return sampled_rows(batch);
 }
@@ -1416,8 +1456,10 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
     const ops::MoeCacheAdmission admission = chunk.rows >= 2
                                                  ? ops::MoeCacheAdmission::FrequencyFilter
                                                  : ops::MoeCacheAdmission::EveryMiss;
-    ops::moe_expert_cache_admit(s.expert_ids, expert_table_, host_table_, fill_table_, cache_,
-                                layer, admission, stream_, &chunk_.expert_cache_counters);
+    ops::moe_expert_cache_admit(
+        s.expert_ids, expert_table_, host_table_, fill_table_, cache_, layer, admission, stream_,
+        chunk.lane < 0 ? &chunk_.decode_cache_counters : &chunk_.expert_cache_counters, nullptr,
+        chunk.lane < 0 ? &chunk_.decode_route_counts : nullptr);
     CUDA_CHECK(cudaEventRecord(admitted_.get(), stream_));
     CUDA_CHECK(cudaStreamWaitEvent(fs, admitted_.get(), 0));
     if (staged) {
