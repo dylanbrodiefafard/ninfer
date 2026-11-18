@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/moe_helper_contract.h"
 #include "ninfer/ops/moe_experts.h"
 #include "ninfer/ops/moe_route.h"
 
@@ -131,7 +132,8 @@ enum class MoeCacheAdmission : std::uint8_t {
  *                         only;
  *     fill_ptr   [512,L]  the untagged slot address moe_expert_cache_fill copies the record to,
  *                         or 0 for no fill.
- *   With U the set of ids in ids [10,T] and l = layer, a slot of a pool is "protected" when it is
+ *   With U the set of ids in ids [10,T], intersected with the eligible experts when eligible is
+ *   given, and l = layer, a slot of a pool is "protected" when it is
  *   borrowed (owner -2) or its owner is l * 512 + u for some u in U (slots taken below become
  *   protected), and K = cache.reference_limit. Then:
  *   1. Hit: each u in U with expert_ptr[u,l] != host_ptr[u,l] sets referenced[s] =
@@ -158,12 +160,19 @@ enum class MoeCacheAdmission : std::uint8_t {
  *      admitted or not. U is a set: an expert routed by several (token, k) pairs of the call
  *      counts once, matching the one record read per miss that the fill or moe_experts makes.
  *      The sums wrap modulo 2^64; the caller zeroes the counters when it starts a measurement.
+ *   Eligibility (the expert-helper split, docs/maintainer/qwen3.8-flash-next-expert-helper.md):
+ *   eligible is layer l's bitset, bit e % 32 of word e / 32 set when expert e may be cached (a
+ *   local expert). An ineligible routed expert is outside U for every step above: no hit, lookup,
+ *   frequency count, miss or protection. Without eligible every expert is eligible, which is the
+ *   unrestricted Op.
  *
  * Logical shapes:
  *   ids I32 [10,T], T >= 1 with 10 T < 2^31, every id in [0,512); expert_ptr, host_ptr and
  *   fill_ptr I64 [512,L], L >= 1 with 512 L < 2^31; 0 <= layer < L; counters, when not null,
  *   contiguous I64 [2,2] (kind, codec); frequency counts, when present, contiguous I32 [512,L]
- *   with lookups contiguous I32 [1]; cache.slot_index contiguous I32 [512,L].
+ *   with lookups contiguous I32 [1]; cache.slot_index contiguous I32 [512,L]; eligible, when not
+ *   null, contiguous I32 [16] holding U32 bit patterns (kMoeExpertMaskWords), read only and
+ *   disjoint from every other operand.
  *
  * Supported domain:
  *   Exact integer and address arithmetic. On entry the state is consistent: every fill_ptr entry
@@ -207,7 +216,7 @@ enum class MoeCacheAdmission : std::uint8_t {
 void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor& host_ptr,
                             Tensor& fill_ptr, const MoeExpertCache& cache, std::int32_t layer,
                             MoeCacheAdmission admission, cudaStream_t stream,
-                            Tensor* counters = nullptr);
+                            Tensor* counters = nullptr, const Tensor* eligible = nullptr);
 
 /**
  * Op: moe_expert_cache_borrow / moe_expert_cache_return
@@ -340,7 +349,9 @@ inline constexpr std::int32_t kMoeStageMaxCandidates = kMoeTopK;
  *   score[e]   = sum of W_j over every (j, t) with j < k, t < T and predicted[j,t] = e (ids outside
  *                [0,512) contribute nothing);
  *   resident e : expert_ptr[e,l] != host_ptr[e,l];
- *   candidates : every non-resident e with score[e] > 0, in descending score, ties to the lower e;
+ *   eligible e : the bit of e in eligible (bit e % 32 of word e / 32), or every e without it;
+ *   candidates : every non-resident eligible e with score[e] > 0, in descending score, ties to the
+ *                lower e;
  *   placement  : with used = 0, each candidate e in that order, of n_e = moe_expert_record_bytes(
  *                tag(host_ptr[e,l])) bytes, is placed at offset used when used + n_e <=
  *                budget_bytes (then used += n_e) and is skipped otherwise;
@@ -371,8 +382,9 @@ inline constexpr std::int32_t kMoeStageMaxCandidates = kMoeTopK;
  * 1 <= candidates <= kMoeStageMaxCandidates; expert_ptr and host_ptr I64 [512,L] as for
  * moe_expert_cache_admit, 0 <= layer < L; stage_ptr and source contiguous I64 [512], 8-byte
  * aligned; staging.data 256-byte aligned with budget_bytes <= staging.bytes, or null with
- * staging.bytes == budget_bytes == 0 (nothing is placed). Every tensor and the staging span are
- * pairwise disjoint; the tables and predicted are read only.
+ * staging.bytes == budget_bytes == 0 (nothing is placed); eligible, when not null, contiguous I32
+ * [16] holding layer l's U32 bitset as for moe_expert_cache_admit. Every tensor and the staging
+ * span are pairwise disjoint; the tables, predicted and eligible are read only.
  *
  * Grid: one CTA of 512 threads. Integer shared-memory atomics accumulate the scores (exact and
  * independent of order); thread e then ranks its candidate by counting the candidates ahead of it,
@@ -383,7 +395,7 @@ inline constexpr std::int32_t kMoeStageMaxCandidates = kMoeTopK;
 void moe_expert_cache_stage(const Tensor& predicted, std::int32_t candidates,
                             const Tensor& expert_ptr, const Tensor& host_ptr, std::int32_t layer,
                             DeviceSpan staging, std::size_t budget_bytes, Tensor& stage_ptr,
-                            Tensor& source, cudaStream_t stream);
+                            Tensor& source, cudaStream_t stream, const Tensor* eligible = nullptr);
 
 /**
  * Op: moe_expert_cache_defer

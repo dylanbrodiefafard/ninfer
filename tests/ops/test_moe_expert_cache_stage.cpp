@@ -56,10 +56,12 @@ struct Staged {
 };
 
 // The contract's outputs for column `layer`, written independently of the kernel's phases: exact
-// integer scores, a full sort of the candidates, and the greedy walk over every candidate.
+// integer scores, a full sort of the candidates, and the greedy walk over every candidate. With an
+// eligibility set, only eligible experts are candidates.
 Staged oracle(const std::vector<std::int32_t>& predicted, std::int32_t tokens, std::int32_t k,
               const std::vector<std::uint64_t>& expert, const std::vector<std::uint64_t>& host,
-              std::int32_t layer, std::uint64_t base, std::uint64_t budget) {
+              std::int32_t layer, std::uint64_t base, std::uint64_t budget,
+              const std::vector<bool>* eligible = nullptr) {
     std::vector<std::uint64_t> score(kExperts, 0);
     for (std::int32_t t = 0; t < tokens; ++t) {
         for (std::int32_t j = 0; j < k; ++j) {
@@ -74,7 +76,8 @@ Staged oracle(const std::vector<std::int32_t>& predicted, std::int32_t tokens, s
     };
     std::vector<std::int32_t> candidates;
     for (std::int32_t e = 0; e < kExperts; ++e) {
-        if (score[static_cast<std::size_t>(e)] > 0 && expert[entry(e)] == host[entry(e)]) {
+        if (score[static_cast<std::size_t>(e)] > 0 && expert[entry(e)] == host[entry(e)] &&
+            (eligible == nullptr || (*eligible)[static_cast<std::size_t>(e)])) {
             candidates.push_back(e);
         }
     }
@@ -181,6 +184,18 @@ int placement_cases(cudaStream_t stream) {
             GuardedDeviceBuffer predicted(ids.size() * sizeof(std::int32_t));
             predicted.copy_from_host(ids.data(), predicted.bytes());
             const Tensor predicted_view(predicted.data(), DType::I32, {kTopK, tokens});
+            // A random eligibility bitset (about 60% eligible), used on half of the calls.
+            std::vector<bool> eligible(kExperts);
+            std::vector<std::uint32_t> words(ops::kMoeExpertMaskWords, 0);
+            std::uniform_real_distribution<double> unit(0.0, 1.0);
+            for (std::size_t e = 0; e < eligible.size(); ++e) {
+                eligible[e] = unit(rng) < 0.6;
+                if (eligible[e]) { words[e / 32] |= 1U << (e % 32); }
+            }
+            GuardedDeviceBuffer eligible_storage(words.size() * sizeof(std::uint32_t));
+            eligible_storage.copy_from_host(words.data(), eligible_storage.bytes());
+            const Tensor eligible_view(eligible_storage.data(), DType::I32,
+                                       {ops::kMoeExpertMaskWords});
             constexpr std::uint64_t kF3   = ops::kMoeF3RecordBytes;
             constexpr std::uint64_t kNv   = ops::kMoeNvfp4RecordBytes;
             const std::uint64_t budgets[] = {
@@ -188,9 +203,11 @@ int placement_cases(cudaStream_t stream) {
                 kF3 + kNv, 2 * kF3, 6'000'000, 15'000'000, std::uint64_t{1} << 31};
             for (const std::int32_t k : ks) {
                 for (const std::uint64_t budget : budgets) {
+                    const bool restricted   = unit(rng) < 0.5;
                     const std::string label = std::string("stage ") + mix.name + " T " +
                                               std::to_string(tokens) + " k " + std::to_string(k) +
-                                              " budget " + std::to_string(budget);
+                                              " budget " + std::to_string(budget) +
+                                              (restricted ? " eligible" : "");
                     stage.fill(0x3c);
                     source.fill(0x3c);
                     // cudaMemset runs on the legacy stream, which does not order the Op's stream.
@@ -203,10 +220,12 @@ int placement_cases(cudaStream_t stream) {
                                           kStagingBase),
                         budget};
                     ops::moe_expert_cache_stage(predicted_view, k, expert_view, host_view, kLayer,
-                                                span, budget, stage_view, source_view, stream);
+                                                span, budget, stage_view, source_view, stream,
+                                                restricted ? &eligible_view : nullptr);
                     cuda_synchronize(stream);
                     const Staged want = oracle(ids, tokens, k, t.expert, t.host, kLayer,
-                                               budget == 0 ? 0 : kStagingBase, budget);
+                                               budget == 0 ? 0 : kStagingBase, budget,
+                                               restricted ? &eligible : nullptr);
                     failures += verify_exact((label + " stage_ptr").c_str(),
                                              from_device<std::uint64_t>(stage.data(), kExperts),
                                              want.stage);

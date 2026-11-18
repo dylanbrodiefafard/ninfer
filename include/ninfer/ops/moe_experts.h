@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/moe_expert_record.h"
 #include "ninfer/ops/moe_route.h"
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -12,38 +13,9 @@
 
 namespace ninfer::ops {
 
-// Qwen3.8-Flash-Next expert geometry: hidden width H, intermediate width I, and the token extent
-// one moe_experts call admits.
-inline constexpr std::int32_t kMoeHidden       = 2560;
-inline constexpr std::int32_t kMoeIntermediate = 640;
-inline constexpr std::int32_t kMoeMaxTokens    = 8192;
-
-/** Storage codec of a routed-expert record; bit 0 of the record's expert-table entry. */
-enum class MoeExpertCodec : std::uint8_t {
-    Nvfp4G16 = 0,
-    F3G32    = 1,
-};
-
-// Record geometry (see "Routed-expert record" below). A record is a sequence of fixed-size chunk
-// records, each covering 32 matrix rows and 128 consecutive K.
-inline constexpr std::int64_t kMoeGateUpChunks    = 800; // 40 row tiles x 20 K chunks
-inline constexpr std::int64_t kMoeDownChunks      = 400; // 80 row tiles x 5 K chunks
-inline constexpr std::int64_t kMoeF3ChunkBytes    = 1664;
-inline constexpr std::int64_t kMoeNvfp4ChunkBytes = 2304;
-inline constexpr std::int64_t kMoeRecordAlignment = 256;
-inline constexpr std::int64_t kMoeF3RecordBytes =
-    (kMoeGateUpChunks + kMoeDownChunks) * kMoeF3ChunkBytes;
-inline constexpr std::int64_t kMoeNvfp4RecordBytes =
-    (kMoeGateUpChunks + kMoeDownChunks) * kMoeNvfp4ChunkBytes;
-static_assert(kMoeF3RecordBytes == 1996800 && kMoeNvfp4RecordBytes == 2764800);
-
-[[nodiscard]] constexpr std::int64_t moe_expert_chunk_bytes(MoeExpertCodec codec) {
-    return codec == MoeExpertCodec::F3G32 ? kMoeF3ChunkBytes : kMoeNvfp4ChunkBytes;
-}
-
-[[nodiscard]] constexpr std::int64_t moe_expert_record_bytes(MoeExpertCodec codec) {
-    return codec == MoeExpertCodec::F3G32 ? kMoeF3RecordBytes : kMoeNvfp4RecordBytes;
-}
+// The token extent one moe_experts call admits (the expert geometry and record sizes are in
+// ninfer/ops/moe_expert_record.h).
+inline constexpr std::int32_t kMoeMaxTokens = 8192;
 
 /**
  * Routed-expert record
@@ -184,5 +156,38 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& route_
                  const Tensor& shared_scale, const MoeExpertBank& bank, Tensor& y,
                  WorkspaceArena& workspace, cudaStream_t stream,
                  const MoeExpertsDeferral* deferral = nullptr);
+
+/**
+ * Op: moe_experts_local_partial
+ *
+ * The RTX 5090 side of the expert-helper split
+ * (docs/maintainer/qwen3.8-flash-next-expert-helper.md): moe_experts restricted to the local
+ * experts, without output rounding. With L the experts whose bit is set in local_experts (I32 [16]
+ * holding U32 bit patterns, bit e % 32 of word e / 32; see ninfer/ops/moe_helper_contract.h):
+ *
+ *   partial[:,t] = sum_{j<10, expert_ids[j,t] in L} route_weights[j,t] E_{expert_ids[j,t]}(x_t)
+ *                  + shared_scale[t] E_shared(x_t)
+ *
+ * Every other routed assignment is excluded: it is not computed and its record is not read, so
+ * the table entries of non-local experts may name any value. The shared expert is always
+ * included, also when no routed expert of a token is local. Adding moe_helper_experts' output for
+ * the remaining assignments gives moe_experts' sum (moe_expert_partial_join); only the reduction
+ * association differs.
+ *
+ * Shapes, operands, deferral, workspace (moe_experts_workspace_capacity_bytes) and execution are
+ * as for moe_experts, with partial FP32 [2560,T] in place of y: contiguous, 16-byte aligned and
+ * disjoint from every input. local_experts is contiguous I32 [16], 16-byte aligned, read on the
+ * device when the call executes (a captured graph stays valid while it changes between calls); it
+ * must not change while the call runs, since the grouping and the final sum each read it.
+ *
+ * Numeric: moe_experts' implementation profile, except that each token's sum over its included
+ * slots in slot order (local routed j ascending, then the shared expert) is stored as FP32, not
+ * rounded to BF16. Deterministic for identical inputs and T.
+ */
+void moe_experts_local_partial(const Tensor& x, const Tensor& expert_ids,
+                               const Tensor& route_weights, const Tensor& shared_scale,
+                               const MoeExpertBank& bank, const Tensor& local_experts,
+                               Tensor& partial, WorkspaceArena& workspace, cudaStream_t stream,
+                               const MoeExpertsDeferral* deferral = nullptr);
 
 } // namespace ninfer::ops

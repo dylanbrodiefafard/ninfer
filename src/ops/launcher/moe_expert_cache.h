@@ -34,14 +34,15 @@ struct MoeAdmitPolicyArgs {
 
 // The launchers trust the wrapper's validation (shapes, alignment, disjointness, layer range).
 // The tables are [512,L] layer-major (slot_index I32, the others U64); id_count is 10 * T;
-// counters is null or the I64 [2,2] (kind, codec) counters, summed as U64.
+// counters is null or the I64 [2,2] (kind, codec) counters, summed as U64; eligible is null or
+// the layer's U32 [16] eligibility bitset.
 void moe_expert_cache_admit_launch(const std::int32_t* ids, std::int32_t id_count,
                                    std::uint64_t* expert_ptr, const std::uint64_t* host_ptr,
                                    std::uint64_t* fill_ptr, std::int32_t* slot_index,
                                    MoeExpertSlotPoolArgs pool0, MoeExpertSlotPoolArgs pool1,
                                    std::int32_t* clock_hands, std::int32_t layer,
                                    MoeAdmitPolicyArgs policy, std::uint64_t* counters,
-                                   cudaStream_t stream);
+                                   const std::uint32_t* eligible, cudaStream_t stream);
 
 // Whether moe_expert_cache_lend_launch borrows (owner -2, evicting) or returns (owner -1).
 enum class MoeCacheLend : std::uint8_t { Borrow, Return };
@@ -63,12 +64,14 @@ void moe_expert_cache_window_launch(const std::uint64_t* expert_ptr, const std::
                                     std::uint64_t* window_ptr, cudaStream_t stream);
 
 // expert_ptr and host_ptr are the layer's columns; predicted is I32 [10,tokens]; staging_base is 0
-// when budget_bytes is 0 and nothing can be placed.
+// when budget_bytes is 0 and nothing can be placed; eligible is null or the layer's U32 [16]
+// eligibility bitset.
 void moe_expert_cache_stage_launch(const std::int32_t* predicted, std::int32_t tokens,
                                    std::int32_t candidates, const std::uint64_t* expert_ptr,
                                    const std::uint64_t* host_ptr, std::uint64_t staging_base,
                                    std::uint64_t budget_bytes, std::uint64_t* stage_ptr,
-                                   std::uint64_t* source, cudaStream_t stream);
+                                   std::uint64_t* source, const std::uint32_t* eligible,
+                                   cudaStream_t stream);
 
 // fill_ptr is the layer's column.
 void moe_expert_cache_defer_launch(const std::uint64_t* fill_ptr, const std::uint64_t* stage_ptr,

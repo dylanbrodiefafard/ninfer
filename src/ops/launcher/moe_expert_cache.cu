@@ -172,7 +172,9 @@ __device__ void admit_pool(AdmitShared& shared, int tag, const MoeExpertSlotPool
 }
 
 // Grid 1, block 1024. Phase 1 marks the routed set in a shared 512-bit mask (shared atomics, so
-// repeated ids need no ordering). Phase 2: thread e < 512 classifies a routed expert as a hit
+// repeated ids need no ordering) and, with an eligibility bitset, threads 0..15 intersect it word
+// by word after a barrier; every later phase, CLOCK protection included, reads only that mask.
+// Phase 2: thread e < 512 classifies a routed expert as a hit
 // (increments the reference counter of its slot, slot_index[e], up to the limit; distinct hits
 // own distinct slots) or a miss of its pool; warp ballots and per-warp offsets give the
 // ascending miss lists, and thread c < 2 sums pool c's per-warp
@@ -186,7 +188,8 @@ __global__ void __launch_bounds__(kAdmitThreads) moe_expert_cache_admit_kernel(
     const std::int32_t* __restrict__ ids, int id_count, std::uint64_t* __restrict__ expert_ptr,
     const std::uint64_t* __restrict__ host_ptr, std::uint64_t* __restrict__ fill_ptr,
     std::int32_t* __restrict__ slot_index, MoeExpertSlotPoolArgs pool0, MoeExpertSlotPoolArgs pool1,
-    std::int32_t* clock_hands, int layer, MoeAdmitPolicyArgs policy, std::uint64_t* counters) {
+    std::int32_t* clock_hands, int layer, MoeAdmitPolicyArgs policy, std::uint64_t* counters,
+    const std::uint32_t* __restrict__ eligible) {
     __shared__ AdmitShared shared;
     const int thread = static_cast<int>(threadIdx.x);
     const int lane   = thread % kWarpSize;
@@ -199,6 +202,11 @@ __global__ void __launch_bounds__(kAdmitThreads) moe_expert_cache_admit_kernel(
         atomicOr(&shared.routed[expert / kWarpSize], 1U << (expert % kWarpSize));
     }
     __syncthreads();
+    if (eligible != nullptr) {
+        // U is the routed set intersected with the eligible experts before every later step.
+        if (thread < kRoutedMaskWords) { shared.routed[thread] &= eligible[thread]; }
+        __syncthreads();
+    }
 
     bool miss[kMoeCacheCodecTags]   = {false, false};
     bool lookup[kMoeCacheCodecTags] = {false, false};
@@ -447,7 +455,8 @@ constexpr std::uint64_t kNotPlaced = ~std::uint64_t{0};
 //   1. score[e] = 0;
 //   2. the block strides over the k T (token, rank) pairs, adding W_j to score[id] with shared
 //      U32 atomics (integer, so the sums are exact in any order);
-//   3. thread e reads its table entries; a candidate keeps its score as its key, any other expert
+//   3. thread e reads its table entries; a candidate (non-resident and, with an eligibility bitset,
+//      eligible) keeps its score as its key, any other expert
 //      writes key 0 (a candidate's score is positive). It sets offset[e] = kNotPlaced and, as a
 //      candidate, counts the keys ahead of it (larger, or equal at a lower expert): its rank r,
 //      where it writes order[r] = e and bytes[r] = n_e. Every thread reads all 512 keys in the same
@@ -457,13 +466,11 @@ constexpr std::uint64_t kNotPlaced = ~std::uint64_t{0};
 //   5. thread e writes stage_ptr[e] and source[e].
 // key aliases score: thread e reads score[e] and writes key[e] = score[e] or 0 at the same index,
 // and the other threads read keys only after the next barrier.
-__global__ void __launch_bounds__(kStageThreads)
-    moe_expert_cache_stage_kernel(const std::int32_t* __restrict__ predicted, int tokens,
-                                  int candidates, const std::uint64_t* __restrict__ expert_ptr,
-                                  const std::uint64_t* __restrict__ host_ptr,
-                                  std::uint64_t staging_base, std::uint64_t budget_bytes,
-                                  std::uint64_t* __restrict__ stage_ptr,
-                                  std::uint64_t* __restrict__ source) {
+__global__ void __launch_bounds__(kStageThreads) moe_expert_cache_stage_kernel(
+    const std::int32_t* __restrict__ predicted, int tokens, int candidates,
+    const std::uint64_t* __restrict__ expert_ptr, const std::uint64_t* __restrict__ host_ptr,
+    std::uint64_t staging_base, std::uint64_t budget_bytes, std::uint64_t* __restrict__ stage_ptr,
+    std::uint64_t* __restrict__ source, const std::uint32_t* __restrict__ eligible) {
     __shared__ unsigned key[kMoeExperts];
     __shared__ int order[kMoeExperts];
     __shared__ unsigned bytes[kMoeExperts];
@@ -486,10 +493,12 @@ __global__ void __launch_bounds__(kStageThreads)
     const std::uint64_t host     = host_ptr[expert];
     const std::uint64_t resident = expert_ptr[expert];
     const bool streamed          = resident == host;
-    const unsigned score         = streamed ? key[expert] : 0U;
-    key[expert]                  = score;
-    offset[expert]               = kNotPlaced;
-    const int count              = __syncthreads_count(score != 0U ? 1 : 0);
+    const bool admissible =
+        eligible == nullptr || ((eligible[expert / 32] >> (expert % 32)) & 1U) != 0;
+    const unsigned score = streamed && admissible ? key[expert] : 0U;
+    key[expert]          = score;
+    offset[expert]       = kNotPlaced;
+    const int count      = __syncthreads_count(score != 0U ? 1 : 0);
     if (score != 0U) {
         int rank = 0;
         for (int other = 0; other < kMoeExperts; ++other) {
@@ -571,10 +580,11 @@ void moe_expert_cache_stage_launch(const std::int32_t* predicted, std::int32_t t
                                    std::int32_t candidates, const std::uint64_t* expert_ptr,
                                    const std::uint64_t* host_ptr, std::uint64_t staging_base,
                                    std::uint64_t budget_bytes, std::uint64_t* stage_ptr,
-                                   std::uint64_t* source, cudaStream_t stream) {
+                                   std::uint64_t* source, const std::uint32_t* eligible,
+                                   cudaStream_t stream) {
     moe_expert_cache_stage_kernel<<<1, kStageThreads, 0, stream>>>(
         predicted, tokens, candidates, expert_ptr, host_ptr, staging_base, budget_bytes, stage_ptr,
-        source);
+        source, eligible);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -590,10 +600,10 @@ void moe_expert_cache_admit_launch(const std::int32_t* ids, std::int32_t id_coun
                                    MoeExpertSlotPoolArgs pool0, MoeExpertSlotPoolArgs pool1,
                                    std::int32_t* clock_hands, std::int32_t layer,
                                    MoeAdmitPolicyArgs policy, std::uint64_t* counters,
-                                   cudaStream_t stream) {
+                                   const std::uint32_t* eligible, cudaStream_t stream) {
     moe_expert_cache_admit_kernel<<<1, kAdmitThreads, 0, stream>>>(
         ids, id_count, expert_ptr, host_ptr, fill_ptr, slot_index, pool0, pool1, clock_hands, layer,
-        policy, counters);
+        policy, counters, eligible);
     CUDA_CHECK(cudaGetLastError());
 }
 

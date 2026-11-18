@@ -54,8 +54,8 @@ struct Canonical {
 
 // Block-scale distributions. Wide: E4M3 0.5..448 with occasional zero, subnormal and negative
 // scales. Subnormal: only subnormal scales (2^-9 .. 7 * 2^-9), so a wrong subnormal decode changes
-// every value.
-enum class ScaleMode : std::uint8_t { Wide, Subnormal };
+// every value. Narrow: 2..4, a single binade step.
+enum class ScaleMode : std::uint8_t { Wide, Subnormal, Narrow };
 
 inline Canonical make_canonical(MoeExpertCodec codec, ScaleMode mode, std::uint32_t seed) {
     std::mt19937 rng(seed);
@@ -63,6 +63,7 @@ inline Canonical make_canonical(MoeExpertCodec codec, ScaleMode mode, std::uint3
     std::uniform_int_distribution<int> code(0, codec == MoeExpertCodec::F3G32 ? 7 : 15);
     std::uniform_int_distribution<int> normal_scale(0x30, 0x7E); // 0.5 .. 448
     std::uniform_int_distribution<int> subnormal_scale(0x01, 0x07);
+    std::uniform_int_distribution<int> narrow_scale(0x40, 0x48); // 2 .. 4
     std::uniform_int_distribution<int> roll(0, 255);
     for (int m = 0; m < 3; ++m) {
         const auto elements = static_cast<std::size_t>(kDims[m].rows) * kDims[m].k;
@@ -73,6 +74,8 @@ inline Canonical make_canonical(MoeExpertCodec codec, ScaleMode mode, std::uint3
             int bits = 0;
             if (mode == ScaleMode::Subnormal) {
                 bits = subnormal_scale(rng);
+            } else if (mode == ScaleMode::Narrow) {
+                bits = narrow_scale(rng);
             } else {
                 const int r = roll(rng);
                 bits        = r == 0   ? 0

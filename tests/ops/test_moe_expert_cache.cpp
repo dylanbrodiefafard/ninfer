@@ -26,6 +26,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -86,11 +87,15 @@ std::size_t counter_index(ops::MoeCacheCounter kind, std::size_t tag) {
 // at its period; misses in ascending id run CLOCK one slot at a time after checking that an
 // unprotected slot exists, and with the filter a miss whose count does not exceed its victim
 // owner's is not admitted. With count_events, every distinct routed expert adds one lookup of its
-// codec and, when its entry names the host record on entry, one miss.
+// codec and, when its entry names the host record on entry, one miss. With an eligibility set,
+// the routed set holds only eligible experts, for every step.
 void model_admit(CacheModel& m, const std::vector<std::int32_t>& ids, std::int32_t layer,
-                 bool count_events, bool filter) {
+                 bool count_events, bool filter, const std::vector<bool>* eligible = nullptr) {
     std::vector<bool> routed(kExperts, false);
-    for (const std::int32_t id : ids) { routed[static_cast<std::size_t>(id)] = true; }
+    for (const std::int32_t id : ids) {
+        const auto e = static_cast<std::size_t>(id);
+        routed[e]    = eligible == nullptr || (*eligible)[e];
+    }
     if (count_events) {
         for (std::int32_t e = 0; e < kExperts; ++e) {
             const auto entry = static_cast<std::size_t>(layer) * kExperts + e;
@@ -368,11 +373,11 @@ public:
     }
 
     void admit(const Tensor& ids, std::int32_t layer, bool count_events, bool filter,
-               cudaStream_t stream) {
+               cudaStream_t stream, const Tensor* eligible = nullptr) {
         ops::moe_expert_cache_admit(ids, expert_view_, host_view_, fill_view_, cache_, layer,
                                     filter ? ops::MoeCacheAdmission::FrequencyFilter
                                            : ops::MoeCacheAdmission::EveryMiss,
-                                    stream, count_events ? &counters_view_ : nullptr);
+                                    stream, count_events ? &counters_view_ : nullptr, eligible);
     }
 
     void lend(std::int32_t pool, ops::MoeCacheSlotRegion region, std::int32_t first,
@@ -520,6 +525,8 @@ struct Scenario {
     std::int32_t reference_limit = 1;
     std::int32_t halving_lookups = 0;
     bool lend                    = false;
+    // Admits take a random eligibility bitset (about 70% eligible) on two of every three steps.
+    bool eligibility = false;
 };
 
 // The lending state of one eager run: a fixed run of pool 1 (the window's region) and which flex
@@ -618,9 +625,26 @@ int run_eager(const Scenario& scenario, std::uint32_t seed, cudaStream_t stream)
                                       " T=" + std::to_string(tokens);
             const bool count_events = step++ % 3 != 2;
             const bool filter       = !model.counts.empty() && unit(rng) < 0.5;
-            device.admit(ids_view, layer, count_events, filter, stream);
+            const bool restricted   = scenario.eligibility && step % 3 != 0;
+            std::vector<bool> eligible(kExperts, true);
+            std::vector<std::uint32_t> words(ops::kMoeExpertMaskWords, 0);
+            std::unique_ptr<GuardedDeviceBuffer> eligible_storage;
+            std::optional<Tensor> eligible_view;
+            if (restricted) {
+                for (std::size_t e = 0; e < eligible.size(); ++e) {
+                    eligible[e] = unit(rng) < 0.7;
+                    if (eligible[e]) { words[e / 32] |= 1U << (e % 32); }
+                }
+                eligible_storage =
+                    std::make_unique<GuardedDeviceBuffer>(words.size() * sizeof(std::uint32_t));
+                eligible_storage->copy_from_host(words.data(), eligible_storage->bytes());
+                eligible_view =
+                    Tensor(eligible_storage->data(), DType::I32, {ops::kMoeExpertMaskWords});
+            }
+            device.admit(ids_view, layer, count_events, filter, stream,
+                         eligible_view ? &*eligible_view : nullptr);
             cuda_synchronize(stream);
-            model_admit(model, ids, layer, count_events, filter);
+            model_admit(model, ids, layer, count_events, filter, restricted ? &eligible : nullptr);
             failures += device.compare(model, label + " admit");
             device.commit(layer, stream);
             cuda_synchronize(stream);
@@ -762,7 +786,7 @@ int main() {
         // A saturated pool (every slot owned and referenced) makes its first miss sweep a whole
         // lap: more than one window, clearing every unprotected bit across the wrap. Flex pools
         // use the target's F3 extent widths (36 and 84 slots) and an NVFP4 pool of flex slots.
-        const std::array<Scenario, 14> scenarios{{
+        const std::array<Scenario, 15> scenarios{{
             {"tiny", 3, {{{3, 512}, {7, 256}}}, 0.25, 0.8, 0.5, 30},
             {"medium", 6, {{{40, 2764800}, {300, 1996800}}}, 0.1, 0.5, 0.5, 40},
             {"wide", 3, {{{1100, 256}, {2500, 512}}}, 0.15, 0.7, 0.5, 25},
@@ -776,6 +800,18 @@ int main() {
             {"gclock filter lend", 4, {{{60, 512}, {1300, 256}}}, 0.2, 0.8, 0.7, 30, 8, 500, true},
             {"saturated lend", 8, {{{200, 256}, {1100, 256}}}, 0.3, 1.0, 1.0, 12, 255, 4000, true},
             {"flex", 6, {{{40, 512, 12, 4}, {300, 256, 108, 36}}}, 0.1, 0.6, 0.5, 40, 8, 0, true},
+            // The expert-helper split's eligibility bitset with the full policy and lending.
+            {"eligible",
+             4,
+             {{{60, 512, 24, 12}, {700, 256, 252, 36}}},
+             0.2,
+             0.8,
+             0.6,
+             30,
+             8,
+             900,
+             true,
+             true},
             {"flex only", 3, {{{0, 256}, {0, 256, 1260, 36}}}, 0.0, 0.7, 0.5, 25, 8, 3000, true},
             {"flex wide filter",
              4,

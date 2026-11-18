@@ -642,6 +642,11 @@ __device__ int block_exclusive_sum(int value, int* scratch, int& total) {
     return exclusive;
 }
 
+// Expert e is local (or every expert is, with no bitset); bit e % 32 of word e / 32.
+__device__ __forceinline__ bool is_local(const std::uint32_t* local_experts, int expert) {
+    return local_experts == nullptr || ((local_experts[expert / 32] >> (expert % 32)) & 1U) != 0;
+}
+
 // Grid: one CTA of 512 threads. Builds the stable expert grouping and the job table.
 //
 // Warp w walks the routed assignments r = 10 t + j of tokens [w * ceil(T/16), (w+1) * ceil(T/16))
@@ -654,10 +659,12 @@ __device__ int block_exclusive_sum(int value, int* scratch, int& total) {
 // first, then each routed expert's ceil(n_e/C) in ascending expert order, those of deferred
 // experts (deferred non-null and deferred[e] != 0) after all others; job_count[0] counts the jobs
 // before the deferred ones and job_count[1] all jobs. The matmul launches' next_item counters are
-// zeroed.
+// zeroed. With a local-expert bitset, routed assignments of non-local experts are not walked:
+// they get no sorted position, job or contribution.
 __global__ void __launch_bounds__(kGroupThreads)
     moe_group_kernel(const std::int32_t* __restrict__ expert_ids,
-                     const std::uint64_t* __restrict__ deferred, int tokens, int token_tile,
+                     const std::uint64_t* __restrict__ deferred,
+                     const std::uint32_t* __restrict__ local_experts, int tokens, int token_tile,
                      std::int32_t* __restrict__ sorted, MoeJob* __restrict__ jobs,
                      MoeJobSchedule* __restrict__ schedule) {
     __shared__ int counts[kGroupWarps][kMoeExperts];
@@ -676,10 +683,11 @@ __global__ void __launch_bounds__(kGroupThreads)
     const unsigned lower  = (1U << lane) - 1U;
     const auto walk       = [&](bool scatter) {
         for (int base = first; base < last; base += kWarpSize) {
-            const int r      = base + lane;
-            const bool valid = r < last;
+            const int r = base + lane;
             // Ids are promised in [0,512); the clamp only keeps a violation inside the tables.
-            const int expert     = valid ? min(max(expert_ids[r], 0), kMoeExperts - 1) : -1;
+            const int id         = r < last ? min(max(expert_ids[r], 0), kMoeExperts - 1) : -1;
+            const bool valid     = id >= 0 && is_local(local_experts, id);
+            const int expert     = valid ? id : -1;
             const unsigned peers = __match_any_sync(kFullWarpMask, expert);
             if (valid && scatter) {
                 const int rank = counts[warp][expert] + __popc(peers & lower);
@@ -737,23 +745,48 @@ constexpr int kMergeThreads      = 128;
 constexpr int kMergeRowsPerBlock = kMergeThreads * 4;
 
 // Grid: (2560 / 512, T); block 128. Thread i of block (b, t) sums rows 512 b + 4 i .. +3 of the
-// eleven contributions of token t in slot order (float4 loads; rows 16-byte aligned) and rounds
-// each sum once to BF16.
+// contributions of token t in slot order (float4 loads; rows 16-byte aligned): every routed slot,
+// or with a local-expert bitset only the slots of local experts, then the shared slot. An
+// ordinary call rounds each sum once to BF16 into y; a local-partial call stores it as FP32.
 __global__ void __launch_bounds__(kMergeThreads)
-    moe_merge_kernel(const float* __restrict__ contributions, std::uint16_t* __restrict__ y) {
+    moe_merge_kernel(const float* __restrict__ contributions,
+                     const std::int32_t* __restrict__ expert_ids,
+                     const std::uint32_t* __restrict__ local_experts, std::uint16_t* __restrict__ y,
+                     float* __restrict__ partial) {
     const int token = static_cast<int>(blockIdx.y);
     const int row =
         static_cast<int>(blockIdx.x) * kMergeRowsPerBlock + static_cast<int>(threadIdx.x) * 4;
     const float* source =
         contributions + static_cast<std::int64_t>(token) * kMoeSlots * kMoeHidden + row;
-    float4 sum = load_vec<float4>(source);
-#pragma unroll
-    for (int slot = 1; slot < kMoeSlots; ++slot) {
+    // The sum starts as the first added contribution (not 0 + it, which would turn a -0 sum +0).
+    float4 sum     = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+    bool started   = false;
+    const auto add = [&](int slot) {
         const float4 value = load_vec<float4>(source + slot * kMoeHidden);
+        if (!started) {
+            sum     = value;
+            started = true;
+            return;
+        }
         sum.x += value.x;
         sum.y += value.y;
         sum.z += value.z;
         sum.w += value.w;
+    };
+#pragma unroll
+    for (int slot = 0; slot < kMoeTopK; ++slot) {
+        if (local_experts == nullptr) {
+            add(slot);
+        } else {
+            // The same clamp as moe_group_kernel, so a slot is added exactly when it was computed.
+            const int id = min(max(expert_ids[token * kMoeTopK + slot], 0), kMoeExperts - 1);
+            if (is_local(local_experts, id)) { add(slot); }
+        }
+    }
+    add(kMoeTopK);
+    if (partial != nullptr) {
+        store_vec(partial + static_cast<std::int64_t>(token) * kMoeHidden + row, sum);
+        return;
     }
     const __nv_bfloat162 low  = __floats2bfloat162_rn(sum.x, sum.y);
     const __nv_bfloat162 high = __floats2bfloat162_rn(sum.z, sum.w);
@@ -846,9 +879,9 @@ void moe_experts_launch(const MoeExpertsOperands& operands, const MoeExpertsWork
     const std::int32_t token_tile = moe_experts_token_tile(tokens);
     const std::int32_t max_jobs   = moe_experts_max_jobs(tokens);
 
-    moe_group_kernel<<<1, kGroupThreads, 0, stream>>>(operands.expert_ids, operands.deferred_slots,
-                                                      tokens, token_tile, workspace.sorted,
-                                                      workspace.jobs, workspace.schedule);
+    moe_group_kernel<<<1, kGroupThreads, 0, stream>>>(
+        operands.expert_ids, operands.deferred_slots, operands.local_experts, tokens, token_tile,
+        workspace.sorted, workspace.jobs, workspace.schedule);
     CUDA_CHECK(cudaGetLastError());
 
     MatmulParams params;
@@ -896,7 +929,9 @@ void moe_experts_launch(const MoeExpertsOperands& operands, const MoeExpertsWork
     }
 
     moe_merge_kernel<<<dim3(kMoeHidden / kMergeRowsPerBlock, static_cast<unsigned>(tokens)),
-                       kMergeThreads, 0, stream>>>(workspace.contributions, operands.y);
+                       kMergeThreads, 0, stream>>>(workspace.contributions, operands.expert_ids,
+                                                   operands.local_experts, operands.y,
+                                                   operands.partial);
     CUDA_CHECK(cudaGetLastError());
 }
 

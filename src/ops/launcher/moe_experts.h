@@ -86,8 +86,12 @@ struct MoeExpertsOperands {
     std::array<std::uint32_t, 3> f3_books = {};
     const std::uint8_t* shared_record     = nullptr;
     const float* shared_matrix_scales     = nullptr;
-    std::uint16_t* y                      = nullptr;
-    std::int32_t tokens                   = 0;
+    // Local-partial call: the U32 [16] local-expert bitset (assignments of other experts are
+    // excluded) and the FP32 [2560,T] output; both null for an ordinary call, which writes y.
+    const std::uint32_t* local_experts = nullptr;
+    float* partial                     = nullptr;
+    std::uint16_t* y                   = nullptr;
+    std::int32_t tokens                = 0;
 };
 
 void moe_experts_launch(const MoeExpertsOperands& operands, const MoeExpertsWorkspace& workspace,

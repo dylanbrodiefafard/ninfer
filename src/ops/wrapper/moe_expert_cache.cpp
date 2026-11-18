@@ -4,6 +4,7 @@
 
 #include "core/device.h"
 #include "core/dtype.h"
+#include "ninfer/ops/moe_helper_contract.h"
 #include "ops/launcher/moe_expert_cache.h"
 
 #include <cstdint>
@@ -46,6 +47,21 @@ void require_disjoint(const std::vector<ByteRange>& ranges, const char* message)
             }
         }
     }
+}
+
+static_assert(kMoeExpertMaskWords * 32 == kMoeExperts);
+
+// Validates an optional eligibility bitset (contiguous I32 [16], 4-byte aligned), appends its
+// range for the disjointness check, and returns its words, or null when absent.
+const std::uint32_t* validate_eligible(const Tensor* eligible, const char* op,
+                                       std::vector<ByteRange>& ranges) {
+    if (eligible == nullptr) { return nullptr; }
+    if (!contiguous_2d(*eligible, DType::I32, sizeof(std::int32_t)) ||
+        eligible->ne[0] != kMoeExpertMaskWords || eligible->ne[1] != 1) {
+        throw std::invalid_argument(std::string(op) + ": eligible must be contiguous I32 [16]");
+    }
+    ranges.push_back(range_of(*eligible));
+    return static_cast<const std::uint32_t*>(eligible->data);
 }
 
 bool table_of(const Tensor& t, DType dtype, std::int32_t layers) {
@@ -204,7 +220,8 @@ detail::MoeAdmitPolicyArgs validate_policy(const MoeExpertCache& cache, std::int
 
 void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor& host_ptr,
                             Tensor& fill_ptr, const MoeExpertCache& cache, std::int32_t layer,
-                            MoeCacheAdmission admission, cudaStream_t stream, Tensor* counters) {
+                            MoeCacheAdmission admission, cudaStream_t stream, Tensor* counters,
+                            const Tensor* eligible) {
     const std::int32_t layers = validate_tables(expert_ptr, fill_ptr, layer,
                                                 "moe_expert_cache_admit", "expert_ptr", "fill_ptr");
     if (!contiguous_2d(ids, DType::I32, sizeof(std::int32_t)) || ids.ne[0] != kMoeTopK) {
@@ -246,10 +263,13 @@ void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor&
         }
         ranges.push_back(range_of(*counters));
     }
+    const std::uint32_t* const eligible_bits =
+        validate_eligible(eligible, "moe_expert_cache_admit", ranges);
     for (const MoeExpertSlotPool& pool : cache.pools) { append_pool_ranges(pool, ranges); }
     require_disjoint(
         ranges,
-        "moe_expert_cache_admit: tables, slots, pool metadata and counters must be disjoint");
+        "moe_expert_cache_admit: tables, slots, pool metadata, counters and the eligibility "
+        "bitset must be disjoint");
 
     detail::moe_expert_cache_admit_launch(
         static_cast<const std::int32_t*>(ids.data), static_cast<std::int32_t>(id_count),
@@ -257,7 +277,8 @@ void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor&
         static_cast<const std::uint64_t*>(host_ptr.data),
         static_cast<std::uint64_t*>(fill_ptr.data), slot_index, pool0, pool1,
         static_cast<std::int32_t*>(hands.data), layer, policy,
-        counters == nullptr ? nullptr : static_cast<std::uint64_t*>(counters->data), stream);
+        counters == nullptr ? nullptr : static_cast<std::uint64_t*>(counters->data), eligible_bits,
+        stream);
 }
 
 namespace {
@@ -368,7 +389,7 @@ void moe_expert_cache_window(const Tensor& expert_ptr, const Tensor& host_ptr, s
 void moe_expert_cache_stage(const Tensor& predicted, std::int32_t candidates,
                             const Tensor& expert_ptr, const Tensor& host_ptr, std::int32_t layer,
                             DeviceSpan staging, std::size_t budget_bytes, Tensor& stage_ptr,
-                            Tensor& source, cudaStream_t stream) {
+                            Tensor& source, cudaStream_t stream, const Tensor* eligible) {
     const std::string op("moe_expert_cache_stage");
     validate_tables(expert_ptr, host_ptr, layer, op, "expert_ptr", "host_ptr");
     if (!contiguous_2d(predicted, DType::I32, sizeof(std::int32_t)) ||
@@ -393,6 +414,7 @@ void moe_expert_cache_stage(const Tensor& predicted, std::int32_t candidates,
     if (!empty) {
         ranges.push_back({reinterpret_cast<std::uintptr_t>(staging.data), staging.bytes});
     }
+    const std::uint32_t* const eligible_bits = validate_eligible(eligible, op.c_str(), ranges);
     require_disjoint(ranges, (op + ": tensors and the staging span must be disjoint").c_str());
     const std::size_t column = static_cast<std::size_t>(layer) * kMoeExperts;
     detail::moe_expert_cache_stage_launch(
@@ -401,7 +423,7 @@ void moe_expert_cache_stage(const Tensor& predicted, std::int32_t candidates,
         static_cast<const std::uint64_t*>(host_ptr.data) + column,
         reinterpret_cast<std::uint64_t>(staging.data), budget_bytes,
         static_cast<std::uint64_t*>(stage_ptr.data), static_cast<std::uint64_t*>(source.data),
-        stream);
+        eligible_bits, stream);
 }
 
 void moe_expert_cache_defer(const Tensor& fill_ptr, std::int32_t layer, const Tensor& stage_ptr,

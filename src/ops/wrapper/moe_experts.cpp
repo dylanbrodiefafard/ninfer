@@ -2,6 +2,8 @@
 // workspace, and dispatches to the launcher. Host-compiled; never includes the kernel code.
 #include "ninfer/ops/moe_experts.h"
 
+#include "ninfer/ops/moe_helper_contract.h"
+
 #include "ops/launcher/moe_experts.h"
 
 #include <algorithm>
@@ -12,6 +14,10 @@
 #include <string>
 
 namespace ninfer::ops {
+
+// The local-expert bitset covers every routed expert of the moe_experts geometry.
+static_assert(kMoeHelperExperts == kMoeExperts && kMoeExpertMaskWords * 32 == kMoeExperts);
+
 namespace {
 
 constexpr const char* kOp             = "moe_experts";
@@ -78,10 +84,14 @@ std::size_t moe_experts_workspace_capacity_bytes(std::int32_t max_tokens) {
     return capacity;
 }
 
-void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& route_weights,
-                 const Tensor& shared_scale, const MoeExpertBank& bank, Tensor& y,
-                 WorkspaceArena& workspace, cudaStream_t stream,
-                 const MoeExpertsDeferral* deferral) {
+namespace {
+
+// One call of either Op: an ordinary call writes BF16 y; a local-partial call (local_experts not
+// null) writes FP32 y.
+void run(const Tensor& x, const Tensor& expert_ids, const Tensor& route_weights,
+         const Tensor& shared_scale, const MoeExpertBank& bank, const Tensor* local_experts,
+         Tensor& y, WorkspaceArena& workspace, cudaStream_t stream,
+         const MoeExpertsDeferral* deferral) {
     const std::int32_t tokens = x.ne[1];
     require(tokens >= 1 && tokens <= kMoeMaxTokens, "T must be in [1,8192]");
     require_tensor(x, DType::BF16, kMoeHidden, tokens,
@@ -92,8 +102,16 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& route_
                    "route_weights must be aligned contiguous FP32 [10,T]");
     require_tensor(shared_scale, DType::FP32, tokens, 1,
                    "shared_scale must be aligned contiguous FP32 [T]");
-    require_tensor(y, DType::BF16, kMoeHidden, tokens,
-                   "y must be aligned contiguous BF16 [2560,T]");
+    if (local_experts == nullptr) {
+        require_tensor(y, DType::BF16, kMoeHidden, tokens,
+                       "y must be aligned contiguous BF16 [2560,T]");
+    } else {
+        require_tensor(y, DType::FP32, kMoeHidden, tokens,
+                       "partial must be aligned contiguous FP32 [2560,T]");
+        require_tensor(*local_experts, DType::I32, kMoeExpertMaskWords, 1,
+                       "local_experts must be aligned contiguous I32 [16]");
+        require(!overlaps(y, *local_experts), "partial must be disjoint from local_experts");
+    }
     require_tensor(bank.expert_table, DType::I64, kMoeExperts, 1,
                    "expert_table must be aligned contiguous I64 [512]");
     require_tensor(bank.matrix_scales, DType::FP32, 3, kMoeExperts,
@@ -106,16 +124,20 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& route_
             "shared_record must be 256-byte aligned");
     require_tensor(bank.shared_matrix_scales, DType::FP32, 3, 1,
                    "shared_matrix_scales must be aligned contiguous FP32 [3]");
+    const bool partial = local_experts != nullptr;
     for (const Tensor* input :
          {&x, &expert_ids, &route_weights, &shared_scale, &bank.expert_table, &bank.matrix_scales,
           &bank.shared_record, &bank.shared_matrix_scales}) {
-        require(!overlaps(y, *input), "y must be disjoint from every input");
+        require(!overlaps(y, *input), partial ? "partial must be disjoint from every input"
+                                              : "y must be disjoint from every input");
     }
     if (deferral != nullptr) {
         require_tensor(deferral->slots, DType::I64, kMoeExperts, 1,
                        "deferral slots must be aligned contiguous I64 [512]");
         require(deferral->ready != nullptr, "deferral needs a ready event");
-        require(!overlaps(y, deferral->slots), "y must be disjoint from the deferral slots");
+        require(!overlaps(y, deferral->slots),
+                partial ? "partial must be disjoint from the deferral slots"
+                        : "y must be disjoint from the deferral slots");
     }
 
     auto scope                 = workspace.scope();
@@ -144,9 +166,32 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& route_
     operands.f3_books             = bank.f3_books;
     operands.shared_record        = static_cast<const std::uint8_t*>(bank.shared_record.data);
     operands.shared_matrix_scales = static_cast<const float*>(bank.shared_matrix_scales.data);
-    operands.y                    = static_cast<std::uint16_t*>(y.data);
-    operands.tokens               = tokens;
+    if (local_experts == nullptr) {
+        operands.y = static_cast<std::uint16_t*>(y.data);
+    } else {
+        operands.local_experts = static_cast<const std::uint32_t*>(local_experts->data);
+        operands.partial       = static_cast<float*>(y.data);
+    }
+    operands.tokens = tokens;
     detail::moe_experts_launch(operands, scratch, stream);
+}
+
+} // namespace
+
+void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& route_weights,
+                 const Tensor& shared_scale, const MoeExpertBank& bank, Tensor& y,
+                 WorkspaceArena& workspace, cudaStream_t stream,
+                 const MoeExpertsDeferral* deferral) {
+    run(x, expert_ids, route_weights, shared_scale, bank, nullptr, y, workspace, stream, deferral);
+}
+
+void moe_experts_local_partial(const Tensor& x, const Tensor& expert_ids,
+                               const Tensor& route_weights, const Tensor& shared_scale,
+                               const MoeExpertBank& bank, const Tensor& local_experts,
+                               Tensor& partial, WorkspaceArena& workspace, cudaStream_t stream,
+                               const MoeExpertsDeferral* deferral) {
+    run(x, expert_ids, route_weights, shared_scale, bank, &local_experts, partial, workspace,
+        stream, deferral);
 }
 
 } // namespace ninfer::ops

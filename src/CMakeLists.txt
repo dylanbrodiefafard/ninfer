@@ -108,6 +108,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/moe_route.cu
   ops/launcher/moe_expert_cache.cu
   ops/launcher/moe_experts.cu
+  ops/launcher/moe_expert_partition.cu
   ops/launcher/ple.cu
   ops/launcher/dflash2_path_select.cu
   ops/launcher/scalar.cu
@@ -249,6 +250,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/moe_route.cpp
   ops/wrapper/moe_expert_cache.cpp
   ops/wrapper/moe_experts.cpp
+  ops/wrapper/moe_expert_partition.cpp
   ops/wrapper/ple.cpp
   ops/wrapper/dflash2_path_select.cpp
   ops/wrapper/scalar.cpp

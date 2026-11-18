@@ -6,7 +6,9 @@
 // decodes the canonical codes (through the matrix's F3 codebook or as E2M1) times the exact E4M3
 // scale, applies the FP32 matrix scales and evaluates the complete routed + shared SwiGLU sum in
 // FP64 from the represented BF16 x.
+#include "ninfer/ops/moe_expert_partition.h"
 #include "ninfer/ops/moe_experts.h"
+#include "ops/moe_expert_record_reference.h"
 #include "ops/op_tester.h"
 #include "ops/sanitizer_scope.h"
 
@@ -19,6 +21,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -56,232 +59,23 @@ constexpr ReductionCriterion output_criterion() {
             /*gross_relative_to_max_reference*/ 8.0e-3};
 }
 
-double e4m3_value(std::uint8_t bits) {
-    const int exponent     = (bits >> 3) & 0xF;
-    const int mantissa     = bits & 0x7;
-    const double magnitude = exponent == 0 ? std::ldexp(mantissa / 8.0, -6)
-                                           : std::ldexp(1.0 + mantissa / 8.0, exponent - 7);
-    return (bits & 0x80) != 0 ? -magnitude : magnitude;
+// moe_experts_local_partial keeps the FP32 sum, so only the gate/up product's BF16 rounding (1)
+// of the output criterion remains: about 1.5e-3 relative RMS, bounded at 3e-3 relative L2, and
+// pointwise under 2.5e-3 max|y| beyond six deviations, capped at 4e-3 of the largest reference
+// magnitude.
+constexpr ReductionCriterion partial_criterion() {
+    return {/*relative_l2*/ 3.0e-3, /*gross_absolute*/ 0.0,
+            /*gross_relative_to_max_reference*/ 4.0e-3};
 }
 
-double e2m1_value(std::uint8_t nibble) {
-    constexpr double kMagnitudes[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
-    const double magnitude          = kMagnitudes[nibble & 7];
-    return (nibble & 8) != 0 ? -magnitude : magnitude;
-}
+using moe_record::Expert;
+using moe_record::ScaleMode;
 
-struct MatrixDims {
-    int rows;
-    int k;
-};
-
-constexpr MatrixDims kDims[3] = {{kInter, kHidden}, {kInter, kHidden}, {kHidden, kInter}};
-
-void write_u32(std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint32_t value) {
-    for (int b = 0; b < 4; ++b) { bytes[offset + b] = static_cast<std::uint8_t>(value >> (8 * b)); }
-}
-
-std::uint32_t read_u32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (int b = 0; b < 4; ++b) {
-        value |= static_cast<std::uint32_t>(bytes[offset + b]) << (8 * b);
-    }
-    return value;
-}
-
-// Canonical expert: per matrix m, codes [rows][K] (F3: 3-bit book index; NVFP4: E2M1 nibble) and
-// scales [rows][K/group].
-struct Canonical {
-    MoeExpertCodec codec;
-    std::array<std::vector<std::uint8_t>, 3> codes;
-    std::array<std::vector<std::uint8_t>, 3> scales;
-
-    int group() const { return codec == MoeExpertCodec::F3G32 ? 32 : 16; }
-};
-
-// Block-scale distributions. Wide: E4M3 0.5..448 with occasional subnormal and zero scales.
-// Subnormal: only subnormal scales (2^-9 .. 7 * 2^-9), so a wrong subnormal decode changes every
-// value. Narrow: 2..4, a single binade step.
-enum class ScaleMode : std::uint8_t { Wide, Subnormal, Narrow };
-
-Canonical make_canonical(MoeExpertCodec codec, ScaleMode mode, std::uint32_t seed) {
-    std::mt19937 rng(seed);
-    Canonical expert{codec, {}, {}};
-    std::uniform_int_distribution<int> code(0, codec == MoeExpertCodec::F3G32 ? 7 : 15);
-    std::uniform_int_distribution<int> normal_scale(0x30, 0x7E); // 0.5 .. 448
-    std::uniform_int_distribution<int> subnormal_scale(0x01, 0x07);
-    std::uniform_int_distribution<int> narrow_scale(0x40, 0x48); // 2 .. 4
-    std::uniform_int_distribution<int> roll(0, 255);
-    for (int m = 0; m < 3; ++m) {
-        const auto elements = static_cast<std::size_t>(kDims[m].rows) * kDims[m].k;
-        expert.codes[m].resize(elements);
-        for (auto& value : expert.codes[m]) { value = static_cast<std::uint8_t>(code(rng)); }
-        expert.scales[m].resize(elements / static_cast<std::size_t>(expert.group()));
-        for (auto& value : expert.scales[m]) {
-            int bits = 0;
-            if (mode == ScaleMode::Subnormal) {
-                bits = subnormal_scale(rng);
-            } else if (mode == ScaleMode::Narrow) {
-                bits = narrow_scale(rng);
-            } else {
-                const int r = roll(rng);
-                bits        = r == 0 ? 0 : (r < 4 ? subnormal_scale(rng) : normal_scale(rng));
-            }
-            value = static_cast<std::uint8_t>(bits);
-        }
-    }
-    return expert;
-}
-
-// Logical location of local row rho of plane tile r.
-struct RowRef {
-    int matrix;
-    int row;
-};
-
-RowRef plane_row(bool down_plane, int tile, int rho) {
-    if (down_plane) { return {2, 32 * tile + rho}; }
-    return rho < 16 ? RowRef{0, 16 * tile + rho} : RowRef{1, 16 * tile + rho - 16};
-}
-
-// Packer: walks the physical layout (plane, tile, chunk, lane, unit) and writes every byte.
-std::vector<std::uint8_t> pack_record(const Canonical& expert) {
-    const bool f3          = expert.codec == MoeExpertCodec::F3G32;
-    const std::size_t unit = static_cast<std::size_t>(ops::moe_expert_chunk_bytes(expert.codec));
-    std::vector<std::uint8_t> record(
-        static_cast<std::size_t>(ops::moe_expert_record_bytes(expert.codec)), 0);
-    for (int plane = 0; plane < 2; ++plane) {
-        const bool down  = plane == 1;
-        const int tiles  = down ? 80 : 40;
-        const int chunks = down ? 5 : 20;
-        const int first  = down ? 800 : 0;
-        for (int tile = 0; tile < tiles; ++tile) {
-            for (int q = 0; q < chunks; ++q) {
-                const std::size_t base = static_cast<std::size_t>(first + tile * chunks + q) * unit;
-                for (int lane = 0; lane < 32; ++lane) {
-                    const int g = lane / 4, c = lane % 4;
-                    for (int k = 0; k < 4; ++k) {
-                        const RowRef ref   = plane_row(down, tile, g + 8 * k);
-                        const int width    = kDims[ref.matrix].k;
-                        const int k_base   = 128 * q + 32 * c;
-                        const auto& codes  = expert.codes[ref.matrix];
-                        const auto& scales = expert.scales[ref.matrix];
-                        const auto code_at = [&](int kk) {
-                            return codes[static_cast<std::size_t>(ref.row) * width + kk];
-                        };
-                        if (f3) {
-                            record[base + static_cast<std::size_t>(4 * lane + k)] =
-                                scales[static_cast<std::size_t>(ref.row) * (width / 32) +
-                                       k_base / 32];
-                            std::uint32_t words[3] = {0, 0, 0};
-                            for (int i = 0; i < 32; ++i) {
-                                const std::uint32_t code = code_at(k_base + i);
-                                if (i < 24) {
-                                    words[i / 8] |= code << (4 * (i % 8));
-                                } else {
-                                    for (int j = 0; j < 3; ++j) {
-                                        words[j] |= ((code >> j) & 1U) << (4 * (i - 24) + 3);
-                                    }
-                                }
-                            }
-                            for (int j = 0; j < 3; ++j) {
-                                write_u32(record,
-                                          base + static_cast<std::size_t>(
-                                                     128 + 16 * (32 * j + lane) + 4 * k),
-                                          words[j]);
-                            }
-                        } else {
-                            for (int h = 0; h < 2; ++h) {
-                                record[base + static_cast<std::size_t>(8 * lane + 2 * k + h)] =
-                                    scales[static_cast<std::size_t>(ref.row) * (width / 16) +
-                                           (k_base + 16 * h) / 16];
-                            }
-                            for (int j = 0; j < 4; ++j) {
-                                for (int b = 0; b < 4; ++b) {
-                                    const int kk = k_base + 8 * j + 2 * b;
-                                    record[base + static_cast<std::size_t>(
-                                                      256 + 16 * (32 * j + lane) + 4 * k + b)] =
-                                        static_cast<std::uint8_t>(code_at(kk) |
-                                                                  (code_at(kk + 1) << 4));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return record;
-}
-
-// Independent reader: locates the code and scale of (matrix, row, K) from the header formulas.
-struct CodeAndScale {
-    std::uint8_t code;
-    std::uint8_t scale;
-};
-
-CodeAndScale read_record(const std::vector<std::uint8_t>& record, MoeExpertCodec codec, int matrix,
-                         int row, int k) {
-    const bool down  = matrix == 2;
-    const int tile   = down ? row / 32 : row / 16;
-    const int rho    = down ? row % 32 : row % 16 + (matrix == 1 ? 16 : 0);
-    const int chunks = down ? 5 : 20;
-    const int q = k / 128, kappa = k % 128, c = kappa / 32, i = kappa % 32;
-    const int lane = 4 * (rho % 8) + c, unit = rho / 8;
-    const std::size_t base = static_cast<std::size_t>((down ? 800 : 0) + tile * chunks + q) *
-                             static_cast<std::size_t>(ops::moe_expert_chunk_bytes(codec));
-    if (codec == MoeExpertCodec::F3G32) {
-        const std::uint8_t scale = record[base + static_cast<std::size_t>(4 * lane + unit)];
-        const auto word          = [&](int j) {
-            return read_u32(record,
-                            base + static_cast<std::size_t>(128 + 16 * (32 * j + lane) + 4 * unit));
-        };
-        if (i < 24) {
-            return {static_cast<std::uint8_t>((word(i / 8) >> (4 * (i % 8))) & 7U), scale};
-        }
-        std::uint32_t code = 0;
-        for (int j = 0; j < 3; ++j) { code |= ((word(j) >> (4 * (i - 24) + 3)) & 1U) << j; }
-        return {static_cast<std::uint8_t>(code), scale};
-    }
-    const std::uint8_t scale =
-        record[base + static_cast<std::size_t>(8 * lane + 2 * unit + i / 16)];
-    const std::uint8_t byte =
-        record[base +
-               static_cast<std::size_t>(256 + 16 * (32 * (i / 8) + lane) + 4 * unit + (i % 8) / 2)];
-    return {static_cast<std::uint8_t>((i % 2) != 0 ? byte >> 4 : byte & 0xF), scale};
-}
-
-// One distinct test expert: its record and its decoded values code * E4M3 scale (exact in FP32).
-struct Expert {
-    MoeExpertCodec codec;
-    std::vector<std::uint8_t> record;
-    std::array<std::vector<float>, 3> values;
-};
-
+// moe_record::make_expert, counting a failed record-layout round trip.
 Expert make_expert(MoeExpertCodec codec, ScaleMode mode, std::uint32_t seed,
                    const std::array<std::uint32_t, 3>& books, int& failures) {
-    const Canonical canonical = make_canonical(codec, mode, seed);
-    Expert expert{codec, pack_record(canonical), {}};
     bool round_trip = true;
-    for (int m = 0; m < 3; ++m) {
-        const int rows = kDims[m].rows, width = kDims[m].k;
-        expert.values[m].resize(static_cast<std::size_t>(rows) * width);
-        for (int row = 0; row < rows; ++row) {
-            for (int k = 0; k < width; ++k) {
-                const std::size_t index = static_cast<std::size_t>(row) * width + k;
-                const std::uint8_t code = canonical.codes[m][index];
-                const std::uint8_t scale =
-                    canonical.scales[m][index / static_cast<std::size_t>(canonical.group())];
-                const CodeAndScale read = read_record(expert.record, codec, m, row, k);
-                round_trip &= read.code == code && read.scale == scale;
-                const double element =
-                    codec == MoeExpertCodec::F3G32
-                        ? e2m1_value(static_cast<std::uint8_t>((books[m] >> (4 * code)) & 0xFU))
-                        : e2m1_value(code);
-                expert.values[m][index] = static_cast<float>(element * e4m3_value(scale));
-            }
-        }
-    }
+    Expert expert   = moe_record::make_expert(codec, mode, seed, books, round_trip);
     if (!round_trip) {
         std::cerr << "moe_experts: record layout round trip failed (seed " << seed << ")\n";
         ++failures;
@@ -485,9 +279,15 @@ Inputs make_inputs(const Fixture& fixture, const BankState& state, int tokens, R
     return inputs;
 }
 
-// FP64 oracle of one token.
+// Which assignments of a token the oracle sums: all of them (moe_experts), the routed ones of
+// local experts plus the shared expert (moe_experts_local_partial), or the routed ones of the
+// other experts (the helper's share).
+enum class Part : std::uint8_t { All, Local, Helper };
+
+// FP64 oracle of one token; `local` (one flag per expert id) selects Local and Helper.
 std::vector<double> oracle_token(const Fixture& fixture, const BankState& state,
-                                 const Inputs& inputs, int t) {
+                                 const Inputs& inputs, int t, Part part = Part::All,
+                                 const std::vector<bool>* local = nullptr) {
     const float* x = inputs.x.data() + static_cast<std::size_t>(t) * kHidden;
     std::vector<double> y(kHidden, 0.0);
     std::vector<double> gated(kInter);
@@ -518,12 +318,14 @@ std::vector<double> oracle_token(const Fixture& fixture, const BankState& state,
     for (int j = 0; j < kTopK; ++j) {
         const std::size_t slot = static_cast<std::size_t>(t) * kTopK + j;
         const auto id          = static_cast<std::size_t>(inputs.ids[slot]);
-        const Expert& expert   = fixture.experts[static_cast<std::size_t>(state.record[id])];
-        const double scale[3]  = {state.matrix_scales[id * 3], state.matrix_scales[id * 3 + 1],
-                                  state.matrix_scales[id * 3 + 2]};
+        if (part != Part::All && (*local)[id] != (part == Part::Local)) { continue; }
+        const Expert& expert  = fixture.experts[static_cast<std::size_t>(state.record[id])];
+        const double scale[3] = {state.matrix_scales[id * 3], state.matrix_scales[id * 3 + 1],
+                                 state.matrix_scales[id * 3 + 2]};
         expert_output(expert.values[0].data(), expert.values[1].data(), expert.values[2].data(),
                       scale, inputs.weights[slot]);
     }
+    if (part == Part::Helper) { return y; }
     const double shared[3] = {state.shared_matrix_scales[0], state.shared_matrix_scales[1],
                               state.shared_matrix_scales[2]};
     expert_output(fixture.shared.values[0].data(), fixture.shared.values[1].data(),
@@ -549,22 +351,31 @@ std::vector<int> sample_tokens(int tokens, int samples, std::uint32_t seed) {
     return {chosen.begin(), chosen.end()};
 }
 
+// The oracle of each token in `tokens`, computed on kOracleThreads threads.
+std::vector<std::vector<double>> oracle_tokens(const Fixture& fixture, const BankState& state,
+                                               const Inputs& inputs, const std::vector<int>& tokens,
+                                               Part part                      = Part::All,
+                                               const std::vector<bool>* local = nullptr) {
+    std::vector<std::vector<double>> expected(tokens.size());
+    std::vector<std::jthread> workers;
+    workers.reserve(kOracleThreads);
+    for (std::size_t w = 0; w < kOracleThreads; ++w) {
+        workers.emplace_back([&, w] {
+            for (std::size_t i = w; i < tokens.size(); i += kOracleThreads) {
+                expected[i] = oracle_token(fixture, state, inputs, tokens[i], part, local);
+            }
+        });
+    }
+    workers.clear();
+    return expected;
+}
+
 // Compares the sampled tokens of y (BF16 bits [T][2560]) against the oracle.
 int verify_output(const std::string& label, const Fixture& fixture, const BankState& state,
                   const Inputs& inputs, const std::vector<std::uint16_t>& bits,
                   const std::vector<int>& sampled) {
-    std::vector<std::vector<double>> expected(sampled.size());
-    {
-        std::vector<std::jthread> workers;
-        workers.reserve(kOracleThreads);
-        for (std::size_t w = 0; w < kOracleThreads; ++w) {
-            workers.emplace_back([&, w] {
-                for (std::size_t i = w; i < sampled.size(); i += kOracleThreads) {
-                    expected[i] = oracle_token(fixture, state, inputs, sampled[i]);
-                }
-            });
-        }
-    }
+    const std::vector<std::vector<double>> expected =
+        oracle_tokens(fixture, state, inputs, sampled);
     std::vector<double> got;
     std::vector<double> reference;
     for (std::size_t i = 0; i < sampled.size(); ++i) {
@@ -646,6 +457,7 @@ public:
           scales_(static_cast<std::size_t>(kExperts) * 3 * sizeof(float)),
           shared_scales_(3 * sizeof(float)),
           y_(static_cast<std::size_t>(inputs.tokens) * kHidden * sizeof(std::uint16_t)),
+          partial_(static_cast<std::size_t>(inputs.tokens) * kHidden * sizeof(float)),
           workspace_(ops::moe_experts_workspace_capacity_bytes(inputs.tokens)) {}
 
     void upload(const BankState& state) {
@@ -692,10 +504,32 @@ public:
         ops::moe_experts(x, ids, weights, scale, bank(), y, workspace_, stream, deferral);
     }
 
-    // Poisons y and orders the poison before work on any stream.
+    // moe_experts_local_partial into the FP32 partial, local_experts I32 [16].
+    void invoke_local(cudaStream_t stream, const DeviceBuffer& local_experts,
+                      const ops::MoeExpertsDeferral* deferral = nullptr) {
+        Tensor x(x_.p, DType::BF16, {kHidden, tokens_});
+        Tensor ids(ids_.p, DType::I32, {kTopK, tokens_});
+        Tensor weights(weights_.p, DType::FP32, {kTopK, tokens_});
+        Tensor scale(shared_scale_.p, DType::FP32, {tokens_});
+        Tensor mask(local_experts.p, DType::I32, {ops::kMoeExpertMaskWords});
+        Tensor partial(partial_.data(), DType::FP32, {kHidden, tokens_});
+        ops::moe_experts_local_partial(x, ids, weights, scale, bank(), mask, partial, workspace_,
+                                       stream, deferral);
+    }
+
+    // Poisons y and the partial and orders the poison before work on any stream.
     void poison_output() {
         y_.fill(0xff);
+        partial_.fill(0xff);
         cuda_synchronize();
+    }
+
+    [[nodiscard]] std::vector<float> partial_output() const {
+        return from_device<float>(partial_.data(), static_cast<std::size_t>(tokens_) * kHidden);
+    }
+
+    [[nodiscard]] int verify_partial_guards(const std::string& label) const {
+        return partial_.verify_guards(label);
     }
 
     [[nodiscard]] std::vector<std::uint16_t> output() const {
@@ -722,6 +556,7 @@ private:
     int tokens_;
     DeviceBuffer x_, ids_, weights_, shared_scale_, table_, scales_, shared_scales_;
     GuardedDeviceBuffer y_;
+    GuardedDeviceBuffer partial_;
     WorkspaceArena workspace_;
 };
 
@@ -926,6 +761,211 @@ int run_case(const Fixture& fixture, const Case& c) {
     return failures;
 }
 
+// Expert-helper split: which experts are local.
+enum class Locality : std::uint8_t { All, None, Random };
+
+std::vector<bool> make_locality(Locality locality, std::uint32_t seed) {
+    std::vector<bool> local(kExperts, locality == Locality::All);
+    if (locality == Locality::Random) {
+        std::mt19937 rng(seed);
+        for (std::size_t id = 0; id < local.size(); ++id) { local[id] = (rng() & 1U) != 0; }
+    }
+    return local;
+}
+
+// The I32 [16] bitset of moe_experts_local_partial and moe_expert_partition.
+std::vector<std::int32_t> locality_words(const std::vector<bool>& local) {
+    std::vector<std::uint32_t> words(ops::kMoeExpertMaskWords, 0);
+    for (std::size_t id = 0; id < local.size(); ++id) {
+        if (local[id]) { words[id / 32] |= 1U << (id % 32); }
+    }
+    std::vector<std::int32_t> bits(words.size());
+    std::memcpy(bits.data(), words.data(), words.size() * sizeof(std::uint32_t));
+    return bits;
+}
+
+// An address no allocation ever occupies (below Linux's mmap_min_addr on the host side of the
+// unified address space, and outside every device allocation), 256-byte aligned like a record.
+constexpr std::uint64_t kUnmappedRecord = 0x100;
+
+// Points every non-local expert's table entry at kUnmappedRecord, keeping its codec bit: any read
+// of a non-local record, summed or not, faults and fails the test.
+void unmap_remote(Run& run, const Fixture& fixture, const BankState& state,
+                  const std::vector<bool>& local) {
+    for (int id = 0; id < kExperts; ++id) {
+        const auto index = static_cast<std::size_t>(id);
+        if (local[index]) { continue; }
+        const auto codec = fixture.experts[static_cast<std::size_t>(state.record[index])].codec;
+        run.set_entry(id, kUnmappedRecord | static_cast<std::uint64_t>(codec));
+    }
+}
+
+// Compares the FP32 partial [T][2560] of every token against the Local restriction of the oracle.
+int verify_partial(const std::string& label, const Fixture& fixture, const BankState& state,
+                   const Inputs& inputs, const std::vector<bool>& local,
+                   const std::vector<float>& partial) {
+    std::vector<int> tokens(static_cast<std::size_t>(inputs.tokens));
+    std::iota(tokens.begin(), tokens.end(), 0);
+    const std::vector<std::vector<double>> expected =
+        oracle_tokens(fixture, state, inputs, tokens, Part::Local, &local);
+    std::vector<double> got(partial.begin(), partial.end());
+    std::vector<double> reference;
+    reference.reserve(got.size());
+    for (const auto& row : expected) { reference.insert(reference.end(), row.begin(), row.end()); }
+    return verify_reduction(label, got, reference, partial_criterion());
+}
+
+struct SplitCase {
+    int tokens;
+    Routing routing;
+    Locality locality;
+    bool graph;
+    int deferred; // routed experts (local or not) read through a deferral; -1: no deferral
+    std::uint32_t seed;
+};
+
+std::string describe(const SplitCase& c) {
+    const char* routing  = c.routing == Routing::Skewed     ? "skewed"
+                           : c.routing == Routing::Distinct ? "distinct"
+                                                            : "concentrated";
+    const char* locality = c.locality == Locality::All    ? "all-local"
+                           : c.locality == Locality::None ? "none-local"
+                                                          : "random-local";
+    return "moe_experts split T=" + std::to_string(c.tokens) + " " + routing + " " + locality +
+           (c.graph ? " graph" : "") +
+           (c.deferred < 0 ? "" : " deferred=" + std::to_string(c.deferred));
+}
+
+// moe_experts_local_partial against the Local oracle (with every non-local record unmapped), then
+// moe_expert_partition and moe_expert_partial_join with the helper's share given as the FP32
+// rounding of its oracle: the joined y against the full oracle. All-local partials round to
+// moe_experts' output bit for bit (the same slot-order sum). With graph, a captured local partial
+// is replayed after the bitset and the table change.
+int run_split_case(const Fixture& fixture, const SplitCase& c) {
+    const std::string label       = describe(c);
+    const BankState state         = make_bank_state(RecordSet::Standard, 0, true, c.seed + 5);
+    const Inputs inputs           = make_inputs(fixture, state, c.tokens, c.routing, true, c.seed);
+    const std::vector<bool> local = make_locality(c.locality, c.seed + 7);
+    const auto tokens             = static_cast<std::size_t>(c.tokens);
+    Run run(fixture, inputs);
+    run.upload(state);
+    run.poison_output();
+    run.invoke(nullptr);
+    cuda_synchronize();
+    const std::vector<std::uint16_t> ordinary = run.output();
+
+    unmap_remote(run, fixture, state, local);
+    DeviceBuffer mask = to_device(locality_words(local));
+    run.poison_output();
+    run.invoke_local(nullptr, mask);
+    cuda_synchronize();
+    const std::vector<float> partial = run.partial_output();
+    int failures = verify_partial(label + " partial", fixture, state, inputs, local, partial);
+    failures += run.verify_partial_guards(label + " partial");
+    if (c.locality == Locality::All) {
+        std::vector<std::uint16_t> rounded(partial.size());
+        std::transform(partial.begin(), partial.end(), rounded.begin(), f32_to_bf16);
+        failures += verify_exact((label + " all-local rounding").c_str(), rounded, ordinary);
+    }
+
+    DeviceBuffer compact_map(tokens * sizeof(std::int32_t));
+    DeviceBuffer compact_count(16);
+    DeviceBuffer compact_x(tokens * kHidden * sizeof(std::uint16_t));
+    DeviceBuffer compact_ids(tokens * kTopK * sizeof(std::int32_t));
+    DeviceBuffer compact_weights(tokens * kTopK * sizeof(float));
+    {
+        Tensor x(run.x_data(), DType::BF16, {kHidden, c.tokens});
+        Tensor ids(run.ids_data(), DType::I32, {kTopK, c.tokens});
+        Tensor weights(run.weights_data(), DType::FP32, {kTopK, c.tokens});
+        Tensor bits(mask.p, DType::I32, {ops::kMoeExpertMaskWords});
+        Tensor map(compact_map.p, DType::I32, {c.tokens});
+        Tensor count(compact_count.p, DType::I32, {1});
+        Tensor cx(compact_x.p, DType::BF16, {kHidden, c.tokens});
+        Tensor cids(compact_ids.p, DType::I32, {kTopK, c.tokens});
+        Tensor cweights(compact_weights.p, DType::FP32, {kTopK, c.tokens});
+        ops::moe_expert_partition(x, ids, weights, bits, map, count, cx, cids, cweights, nullptr);
+    }
+    cuda_synchronize();
+    const std::vector<std::int32_t> map = from_device<std::int32_t>(compact_map.p, tokens);
+    // Compact columns the join must not read hold NaN.
+    std::vector<float> helper(tokens * kHidden, std::numeric_limits<float>::quiet_NaN());
+    std::vector<int> participants;
+    for (int t = 0; t < c.tokens; ++t) {
+        if (map[static_cast<std::size_t>(t)] >= 0) { participants.push_back(t); }
+    }
+    const std::vector<std::vector<double>> remote =
+        oracle_tokens(fixture, state, inputs, participants, Part::Helper, &local);
+    for (std::size_t i = 0; i < participants.size(); ++i) {
+        const auto column =
+            static_cast<std::size_t>(map[static_cast<std::size_t>(participants[i])]) * kHidden;
+        for (std::size_t n = 0; n < kHidden; ++n) {
+            helper[column + n] = static_cast<float>(remote[i][n]);
+        }
+    }
+    const DeviceBuffer helper_device = to_device(helper);
+    GuardedDeviceBuffer y(tokens * kHidden * sizeof(std::uint16_t));
+    y.fill(0xff);
+    {
+        const DeviceBuffer partial_device = to_device(partial);
+        Tensor partial_view(partial_device.p, DType::FP32, {kHidden, c.tokens});
+        Tensor map_view(compact_map.p, DType::I32, {c.tokens});
+        Tensor helper_view(helper_device.p, DType::FP32, {kHidden, c.tokens});
+        Tensor y_view(y.data(), DType::BF16, {kHidden, c.tokens});
+        ops::moe_expert_partial_join(partial_view, map_view, helper_view, y_view, nullptr);
+        cuda_synchronize();
+    }
+    std::vector<int> all(tokens);
+    std::iota(all.begin(), all.end(), 0);
+    failures += verify_output(label + " joined", fixture, state, inputs,
+                              from_device<std::uint16_t>(y.data(), tokens * kHidden), all);
+    failures += y.verify_guards(label + " joined y");
+
+    if (c.deferred >= 0) {
+        // The deferral of run_case on the local partial: deferred table entries name the poisoned
+        // record and their slots receive the true records only after a host sleep on a second
+        // stream; non-local deferred experts must stay unread.
+        DeferredRecords deferred(fixture, state, inputs, static_cast<std::size_t>(c.deferred));
+        deferred.poison_table(run);
+        const Stream main;
+        const Stream copies;
+        const ops::MoeExpertsDeferral deferral = deferred.deferral();
+        deferred.poison_slots();
+        run.poison_output();
+        deferred.enqueue_copies(copies.get());
+        run.invoke_local(main.get(), mask, &deferral);
+        cuda_synchronize();
+        failures += verify_exact((label + " deferred").c_str(), run.partial_output(), partial);
+        failures += deferred.verify_guards(label);
+        run.upload(state);
+        unmap_remote(run, fixture, state, local);
+    }
+
+    if (c.graph) {
+        const Stream stream;
+        const Graph graph(stream.get(), [&](cudaStream_t s) { run.invoke_local(s, mask); });
+        run.poison_output();
+        graph.replay(stream.get());
+        failures += verify_exact((label + " graph replay").c_str(), run.partial_output(), partial);
+
+        const std::vector<bool> changed = make_locality(Locality::Random, c.seed + 8);
+        run.upload(state);
+        unmap_remote(run, fixture, state, changed);
+        const std::vector<std::int32_t> words = locality_words(changed);
+        mask.copy_from_host(words.data(), mask.bytes);
+        run.poison_output();
+        graph.replay(stream.get());
+        const std::vector<float> replayed = run.partial_output();
+        failures += verify_partial(label + " replay after bitset change", fixture, state, inputs,
+                                   changed, replayed);
+        run.poison_output();
+        run.invoke_local(nullptr, mask);
+        cuda_synchronize();
+        failures += verify_exact((label + " eager after bitset change").c_str(),
+                                 run.partial_output(), replayed);
+    }
+    return failures;
+}
+
 int invalid_argument_cases(const Fixture& fixture) {
     const BankState state = make_bank_state(RecordSet::Standard, 0, false, 3U);
     const Inputs inputs   = make_inputs(fixture, state, 2, Routing::Skewed, true, 3U);
@@ -951,6 +991,21 @@ int invalid_argument_cases(const Fixture& fixture) {
         "moe_experts_workspace_capacity_bytes accepted T=8193");
     failures += expect_invalid_argument([] { (void)ops::moe_experts_workspace_capacity_bytes(0); },
                                         "moe_experts_workspace_capacity_bytes accepted T=0");
+    const DeviceBuffer mask = to_device(locality_words(make_locality(Locality::All, 0U)));
+    const auto call_local   = [&](DType partial_dtype, std::int32_t mask_words) {
+        Tensor x(run.x_data(), DType::BF16, {kHidden, 2});
+        Tensor ids(run.ids_data(), DType::I32, {kTopK, 2});
+        Tensor weights(run.weights_data(), DType::FP32, {kTopK, 2});
+        Tensor scale(run.shared_scale_data(), DType::FP32, {2});
+        Tensor bits(mask.p, DType::I32, {mask_words});
+        Tensor partial(run.y_data(), partial_dtype, {kHidden, 2});
+        ops::moe_experts_local_partial(x, ids, weights, scale, run.bank(), bits, partial, workspace,
+                                       nullptr);
+    };
+    failures += expect_invalid_argument([&] { call_local(DType::BF16, ops::kMoeExpertMaskWords); },
+                                        "moe_experts_local_partial accepted a BF16 partial");
+    failures += expect_invalid_argument([&] { call_local(DType::FP32, 8); },
+                                        "moe_experts_local_partial accepted an I32 [8] bitset");
     return failures;
 }
 
@@ -989,12 +1044,22 @@ int run_full(const Fixture& fixture) {
         {8192, Routing::Skewed, true, RecordSet::Standard, 48, false, -1, 71U},
     };
     for (const Case& c : cases) { failures += run_case(fixture, c); }
+    // The helper round's extents: one decode token, a 4-column verify lane, and twelve lanes.
+    const std::vector<SplitCase> split_cases = {
+        {1, Routing::Skewed, Locality::Random, false, 6, 201U},
+        {4, Routing::Skewed, Locality::Random, true, -1, 203U},
+        {12, Routing::Concentrated, Locality::Random, false, 6, 205U},
+        {20, Routing::Distinct, Locality::None, false, -1, 207U},
+        {48, Routing::Skewed, Locality::Random, true, 40, 209U},
+        {48, Routing::Distinct, Locality::All, false, -1, 211U},
+    };
+    for (const SplitCase& c : split_cases) { failures += run_split_case(fixture, c); }
     return failures;
 }
 
-// Reduced cases running every token tile, codec and placement once, and the deferral at a single
+// Reduced cases running every token tile, codec and placement once, the deferral at a single
 // job, at split jobs, with nothing deferred, and with more deferred work items than one wave of
-// CTAs, for compute-sanitizer.
+// CTAs, and the expert-helper split at a verify lane and at twelve lanes, for compute-sanitizer.
 int run_sanitizer(const Fixture& fixture) {
     const std::vector<Case> cases = {
         {1, Routing::Skewed, true, RecordSet::Standard, 1, false, 6, 101U},
@@ -1006,6 +1071,11 @@ int run_sanitizer(const Fixture& fixture) {
     };
     int failures = 0;
     for (const Case& c : cases) { failures += run_case(fixture, c); }
+    const std::vector<SplitCase> split_cases = {
+        {4, Routing::Skewed, Locality::Random, false, 6, 221U},
+        {48, Routing::Distinct, Locality::Random, false, -1, 223U},
+    };
+    for (const SplitCase& c : split_cases) { failures += run_split_case(fixture, c); }
     return failures;
 }
 
