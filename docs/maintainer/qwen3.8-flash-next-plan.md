@@ -454,7 +454,7 @@ mean L **2.52449**. The study's integrated case-c values are **70.7%, 67.5%, 71.
 These are descriptive comparisons, not equal draws or confidence bounds: the study integrates
 accept uniforms and uses BF16 target KV/its own arithmetic profile. Native default NVFP4 KV and
 represented artifact weights are used here. The study's speed estimates are not native results;
-[native Engine/HTTP measurements](../performance.md#flash-next-native-dflash2-gen5-2026-11-15)
+[native Engine/HTTP measurements](../performance.md#flash-next-native-dflash2-gen5-2026-11-17)
 cover every fixed arm and adaptive selection at C=1,2,3,4,6,8, with Strata reference values and
 separate RAM conversation TTFT. The base artifact is faster in the measured C6/C8 HTTP cases.
 
@@ -545,6 +545,28 @@ verify result matches the independently executed same-width prefill at every rep
 Builds are `-Werror`; focused clang-tidy reports zero diagnostics. Python 3.11 compilation, Ruff,
 formatting and spelling checks pass. Failed runtime candidates were screened at C5/C1 rather than
 expanded into full per-candidate grids; no new sanitizer or universal speedup claim is made.
+
+Final quality re-check (2026-11-17, `8c891bb3` Release build, after the FP8 GDN convolution
+epilogue, FP8 mixer-output double buffering, the drafter K-warp split and exact top-16).
+Teacher-forced parity against the study reference on `parity_4x512.npy` (2044 positions) is
+unchanged: BF16 KV KL mean **0.00452** (p50 0.00021, p90 0.01021, p99 0.06716, max 0.23343),
+top-1 **98.24%**; NVFP4 KV KL mean **0.01683** (p50 0.00081, p99 0.23015, max 1.61407), top-1
+**96.04%**. The product server (DFlash companion, NVFP4 KV, C=1, 262144 context, thinking and
+prefix reuse off) passed the standard needle battery **100/100**: standard and multi-key at
+8K-128K greedy 20/20 each, multi-key p-less T=1.5 seeds 1-2 40/40, standard and multi-key at
+240K/260K 10/10 each. The variable-tracking ladder (greedy, 192 output tokens; exact-set
+scoring; distinct layouts, Wilson 95% intervals):
+
+| Level | Cases (32K / 128K / 260K) | Passed | Rate, 95% interval | Calibration NVFP4 / BF16 / 27B (of 15) |
+|---|---|---|---|---|
+| 1x3 | 5 / 5 / 5 | 15/15 | 100% [80, 100] | 15 / 15 / 14 |
+| 1x6 | 15 / 15 / 15 | 34/45 (14 / 6 / 14) | 76% [61, 86] | 11 / 10 / 11 |
+| 2x6 | 15 / 15 / 15 | 13/45 (8 / 1 / 4) | 29% [18, 43] | 5 / 6 / 3 |
+| 4x6 | 5 / 5 / 5 | 1/15 (0 / 0 / 1) | 7% [1, 30] | 1 / 0 / 0 |
+
+Every level lies inside its calibration interval and at or above the 27B control, so the
+kernel changes caused no measurable retrieval regression. 128K is the weakest length at 1x6
+and 2x6 on this fixture set. Reports are in `out/sol/final-sweep/needle-results/`.
 
 ### Per-batch speculation table (2026-11-16)
 
@@ -892,6 +914,13 @@ Rows depend only on token ids, so the reader fetches chunk k+1's rows while chun
 only the first chunk's reads (about 40 ms for 512 tokens) are exposed. Decode reads 16 rows per
 token (well under 1 ms at queue depth 16) before layer 1 of the step.
 
+The reader uses 48 I/O threads (2026-11-17, PCIe Gen5 host, same table). Random reads scale
+256K / 466K / 794K pages/s at 16 / 32 / 64 threads. Paired fresh-process cold 64K prefills
+measured 6,308 / 6,592 / 6,724 / 6,780 tok/s at 16 / 32 / 48 / 64 threads; lanes-bench C1
+fixed K3 and C5 adaptive decode at offsets 0 and 5 stayed within spread (48 against 32:
+within ±0.1%, identical tokens), because decode gathers overlap the previous round. 64 was
+not taken: one of its C5 repetitions dropped 5%.
+
 ## Expert residency design (step 9)
 
 - **Always resident.** Everything every token uses stays in VRAM for the life of the model and
@@ -1173,6 +1202,14 @@ overlap it. 16K is the default: within 7% of 32K at half the stall.
   The windows and super-chunk activations cost about 3 GB of cache, about one hit point, 0.35
   ms per token; on one stream the experts the admitting prefill left were partly useful to the
   following decode. The isolation matters with several lanes.
+- **Segment boundaries.** Every `Program::prefill_step` call is one complete layer-major sweep
+  that re-borrows and refills the windows, so the Engine adapter splits a super-chunk only where
+  it captures state: the request's rewrite checkpoint and its system-prompt frontier. Splitting
+  at every historical assistant-turn closure as well (the family runtime does so for exact
+  equality with earlier-turn checkpoints, which super-chunk boundaries already break here) ran a
+  190-message, 109K-token agent history at 2.4K tok/s, with 7-8 sweeps per super-chunk at about
+  300 W; without those splits it runs at 7.0-7.2K tok/s, as fast as plain text of the same
+  length (2026-11-17, fresh server, NVFP4 KV, cache 0).
 - **Transient window.** The 2.1 GB of dedicated windows cost that hit point all the time,
   prefill or not. The windows now borrow cache slots per windowed super-chunk; see "Transient
   streaming window (2026-11-15)".

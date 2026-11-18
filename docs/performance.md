@@ -5390,15 +5390,17 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.
 
-## Flash-Next native DFlash2, Gen5 (2026-11-15)
+## Flash-Next native DFlash2, Gen5 (2026-11-17)
 
 Target `qwen3.8-flash-next/f3-fp8-nvfp4`, RTX 5090, PCIe Gen5 x16, 600 W power limit,
-CUDA 13.1, Release `sm_120a`, NVFP4 KV. The base artifact is
-`qwen3.8-flash-next-f3-fp8-nvfp4.ninfer`; native arms use its append-only
-`qwen3.8-flash-next-f3-fp8-nvfp4-dflash.ninfer` companion. The external table is
-`/ai/qwen3.8-flash-next-ngram/ngram_table.int8.bin`. No CUDA kernels were changed.
-These are single measured runs per configuration, not confidence intervals or a universal
-speculation-speed claim.
+NVIDIA driver 580.178.04, CUDA 13.1.115, fresh Release `sm_120a` build of `8c891bb3` in
+`/build/sol-final`, container `ninfer-builder-flashnext`, with `-Werror`. The base artifact is
+`qwen3.8-flash-next-f3-fp8-nvfp4.ninfer`; the product default uses its
+`qwen3.8-flash-next-f3-fp8-nvfp4-dflash.ninfer` companion and NVFP4 KV. The external table is
+`/ai/qwen3.8-flash-next-ngram/ngram_table.int8.bin`. Each GPU step holds the blocking queue lock
+through shutdown and a five-second idle check; host RAM admission requires at least 70 GiB.
+These are single measured runs per configuration, without tuning or repeats, not confidence
+intervals or a universal speculation-speed claim.
 
 ### Public Engine lane workload
 
@@ -5409,76 +5411,80 @@ lane (4672 page-rounded tokens). The timed interval begins after all initial pre
 monotonic committed-decode counters through natural request drain. It measures 511×C tokens;
 it is not a fixed-width synthetic round loop. Startup/model load and initial prefill are excluded.
 
-| C | Base, no speculation | Native K0 | K1 | K2 | K3 | Adaptive K0..3 |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 137.57 | 122.51 | 125.69 | 139.24 | 143.87 | 134.60 |
-| 2 | 154.44 | 143.16 | 191.22 | 210.57 | 214.74 | 210.96 |
-| 3 | 197.82 | 183.70 | 230.63 | 245.76 | 268.49 | 251.47 |
-| 4 | 225.03 | 207.11 | 249.02 | 295.58 | 315.76 | 280.54 |
-| 6 | 223.43 | 191.96 | 254.33 | 238.04 | 225.51 | 219.17 |
-| 8 | 238.39 | 210.00 | 267.34 | 219.10 | 233.74 | 222.90 |
+| C | Product default, aggregate tok/s |
+|---:|---:|
+| 1 | 195.25 |
+| 2 | 273.42 |
+| 3 | 298.45 |
+| 4 | 323.53 |
+| 5 | 285.87 |
+| 6 | 273.76 |
+| 7 | 261.72 |
+| 8 | 265.29 |
 
-All rates are aggregate tokens/s. The adaptive policy compares separate time/token EWMAs
-(E[T]/E[Y], not EWMA(T/Y)), warms each arm with four interleaved observations, discards its
-first cold observation and periodically probes the least recently observed arm. A short changing
-trace need not equal the best fixed arm; its generated trajectory and cache history also differ.
-The table reports the ratio-based policy, not the superseded reciprocal-average experiment.
+The default uses the [per-batch K table](maintainer/qwen3.8-flash-next-plan.md#per-batch-speculation-table-2026-11-16)
+with request-local acceptance step-down, not timed arm exploration. Initial K is 3 at C1–2,
+2 at C3–5 and 1 at C6–8; draining a batch cannot raise a request's ceiling. This pass does
+not measure fixed-arm alternatives or establish an optimal-K guarantee.
 
 Example, in the builder container under the GPU queue lock:
 
 ```bash
-out/sol-lanes/src/targets/qwen3_8_flash_next/ninfer_qwen3_8_flash_next_parity \
+/build/sol-final/src/targets/qwen3_8_flash_next/ninfer_qwen3_8_flash_next_parity \
   --artifact models/qwen3.8-flash-next-f3-fp8-nvfp4-dflash.ninfer \
   --ngram-table /ai/qwen3.8-flash-next-ngram/ngram_table.int8.bin \
   --tokens out/flashnext/long_tokens.i32 --mode lanes-bench \
   --prompt-lengths 4096 --decode 512 --chunk 4096 --super-chunk 16384 \
-  --lanes 1,2,3,4,6,8 --spec dflash --draft-tokens 3 --adaptive-draft \
-  --out out/sol/native-lanes-adaptive-ratio
+  --lanes 1,2,3,4,5,6,7,8 --spec dflash --draft-tokens 3 --adaptive-draft \
+  --kv-format nvfp4 --out out/sol/final-sweep/lanes
 ```
 
-Fixed arms omit `--adaptive-draft`; the no-speculation control uses the base artifact and
-`--spec none`. Reports are `lanes_bench.json`; token dumps are request-major I32. Private cache,
-window and profiler knobs are not accepted by this production benchmark.
+The report is `out/sol/final-sweep/lanes/lanes_bench.json`; token dumps are request-major I32.
+Private cache, window and profiler knobs are not accepted by this production benchmark.
 
 ### HTTP workload and Strata reference
 
 The existing `/home/battlefront/ai/bench/serve_bench.py` harness drives one resident server with
 startup concurrency **8**, automatic 8×65,536-token KV capacity, and client concurrency
-C=1,2,3,4,6,8. It generates 1024 tokens per request using the harness's technical/story tasks,
+C=1,2,3,4,5,6,8. It generates 1024 tokens per request using the harness's technical/story tasks,
 unique nonces, T=1, top-p .95 and top-k 20. NInfer retains its default **p-less** sampler, so the
 latter two controls do not affect its target distribution. Each mode has one untimed warmup.
 These aggregate rates include prefill, queueing and natural drain; no long-prefill sweep is
 included in this decode comparison.
 
-| Client C | Base, no speculation | Native K0 | K1 | K2 | K3 | Automatic adaptive | Strata IQ3S Gen5 |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 134.16 | 112.18 | 135.66 | 157.12 | 160.21 | 147.02 | 211.83 |
-| 2 | 152.53 | 134.17 | 182.46 | 196.20 | 195.69 | 189.90 | 210.95 |
-| 3 | 171.26 | 158.81 | 193.58 | 185.34 | 178.96 | 187.49 | 182.76 |
-| 4 | 191.17 | 177.97 | 195.09 | 190.34 | 182.52 | 193.93 | 198.88 |
-| 6 | 199.39 | 182.50 | 184.71 | 184.00 | 181.30 | 194.17 | — |
-| 8 | 227.65 | 191.61 | 193.23 | 184.07 | 178.80 | 189.22 | — |
+| Client C | Product default | Base, no speculation | Strata IQ3S Gen5 | Default / Strata |
+|---:|---:|---:|---:|---:|
+| 1 | 244.72 | 144.86 | 202.47 | 1.209× |
+| 2 | 306.29 | 229.65 | 209.93 | 1.459× |
+| 3 | 294.08 | 270.20 | 180.96 | 1.625× |
+| 4 | 310.51 | 306.80 | 193.83 | 1.602× |
+| 5 | 328.19 | 343.21 | 198.50 | 1.653× |
+| 6 | 332.65 | 346.52 | 192.92 | 1.724× |
+| 8 | 327.89 | 354.28 | 189.33 | 1.732× |
 
-Strata values come from `/home/battlefront/ai/bench/results/strata-iq3s-gen5.json`. That file has
-no C6/C8 results. This is a deployment-level reference, **not** numerical identity or a controlled
-same-sampler/quantization A/B: Strata uses its recorded ordinary sampler and IQ3S representation,
-and its resident-lane configuration is not specified by that JSON. Native model weights, KV and
-sampling profiles differ. On this measured HTTP workload, the fastest native arm improves over
-its base control by about 19% at C1 and 29% at C2; the base control wins at C6/C8. C3 is measured
-explicitly. Small differences between adjacent arms are not statistical claims.
+All rates are aggregate tokens/s. Strata was re-run using image
+`ghcr.io/niko1221/strata:0.2.13-cuda13`, engine 0.1.59, IQ3_S GSQ-RCO, `--ple-io direct`,
+60 GiB container limit, context 65536 and tuner skipped, matching the
+[baseline configuration](maintainer/qwen3.8-flash-next-plan.md#baseline-to-beat). Its resolved
+command uses INT8 KV, Q4_0 DFlash2, `--spec 6 --draft-conf 0.35`. Strata explicitly selects
+one active request with DFlash2: C2–8 are queued aggregate measurements, not concurrent GPU
+decode. Its container was stopped before NInfer loaded. All 87 timed requests across the
+three arms completed with 1024 tokens and a length finish; each arm had one untimed warmup.
 
-Native K0 is not the base control: it keeps companion weights, draft context/features and deferred
-width-one GDN snapshot/fold publication. Its overhead remains when no proposal is selected.
-`--spec none` disables that execution state, but a stored companion is still materialized;
-the base-artifact control also avoids those stored weights. The full shared head is used, not the
-27B optimized-head route. These K0 measurements copied every GDN state pool into private
-snapshot scratch each round; the width-one GDN record route that replaced those copies is
-measured in the [Flash-Next plan](maintainer/qwen3.8-flash-next-plan.md#k0-width-one-record-2026-11-16).
+This is a deployment-level reference, **not** numerical identity or a controlled
+same-sampler/quantization A/B. Native weights, KV, sampling draws and generated trajectories
+differ. The default exceeds Strata at every measured C; the base control exceeds the default
+at C5/C6/C8. Small differences are not statistical claims. The base artifact avoids both
+speculative execution state and stored companion weights; merely using native K0 or loading
+the companion with `--spec none` is not that control. Native DFlash uses the full shared head,
+not the 27B optimized-head route.
 
-The harness command uses `--prefill-tokens '' --decode-repeats 0 --decode-tokens 1024
---concurrency 1,2,3,4,6,8`. Per-mode reports are `out/sol/native-serve-<mode>.json`; the automatic
-case omits `--spec`, exercising companion discovery. OpenAI/Responses reject unsupported context
-capture before streaming; an Anthropic streaming request completes through native DFlash2.
+NInfer server flags are `--max-context 65536 --max-concurrency 8 --kv-dtype nvfp4`, with
+`--kv-capacity` left automatic; the default companion case omits `--spec` and draft-policy
+flags, exercising automatic discovery. The control uses the base artifact and `--spec none`.
+The harness uses `--prefill-tokens '' --decode-repeats 0 --decode-tokens 1024
+--concurrency 1,2,3,4,5,6,8`. Reports are `out/sol/final-sweep/http-{default,base,strata}.json`;
+server summaries, resolved Strata invocation and request telemetry are alongside them.
 
 ### Expert cache over idle KV pages (2026-11-16)
 
