@@ -17,9 +17,15 @@ __device__ inline std::uint64_t now_ns() {
 
 __device__ inline void fail(ExpertMailboxView view, std::uint32_t layer, ExpertWireError code) {
     // One CUDA stream, one leader per serialized kernel: this line has a single writer.
-    // Peer errors license only drain, never a second write into the peer's error record.
-    if (Error(view.failure->code).load(cuda::memory_order_acquire) == ExpertWireError::None &&
-        Error(view.peer_failure->code).load(cuda::memory_order_acquire) == ExpertWireError::None) {
+    // Cancellation is drain control, not a fatal diagnosis. A later fatal cause may replace
+    // cancellation on this side; peer records are never written and fatal records stay sticky.
+    const auto own    = Error(view.failure->code).load(cuda::memory_order_acquire);
+    const auto peer   = Error(view.peer_failure->code).load(cuda::memory_order_acquire);
+    const auto benign = [](ExpertWireError value) {
+        return value == ExpertWireError::None || value == ExpertWireError::Cancelled;
+    };
+    if ((own == ExpertWireError::None && peer == ExpertWireError::None) ||
+        (code != ExpertWireError::Cancelled && benign(own) && benign(peer))) {
         view.failure->side     = ExpertWireSide::Cuda;
         view.failure->sequence = view.control->sequence;
         view.failure->layer    = layer;

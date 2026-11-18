@@ -17,6 +17,7 @@ void mailbox_test_nonce(const void*, const void*, const void*, const void*, void
 void mailbox_test_delay(const HipStream&);
 void mailbox_test_fail(ExpertMailboxView, const HipStream&);
 cudaError_t mailbox_test_cuda_error(cudaStream_t);
+cudaError_t mailbox_test_claim_writer(ExpertMailboxView, cudaStream_t);
 
 namespace {
 void cuda_check(cudaError_t status) {
@@ -185,6 +186,11 @@ void failure_case(const std::string& mode, std::uint32_t t = 1) {
     static_cast<void>(box.begin(t, cuda.value, hip));
     if (mode == "failed") { mailbox_test_fail(box.hip_view(), hip); }
     if (mode == "delayed") { mailbox_test_delay(hip); }
+    if (mode == "seal-timeout") {
+        cuda_check(mailbox_test_claim_writer(box.cuda_view(), cuda.value));
+        cuda_check(cudaStreamSynchronize(cuda.value));
+        box.cancel();
+    }
     if (mode != "cuda-deadline") { panels.helper(box, 0, t, hip); }
     if (mode == "late-cancel") {
         expert_mailbox_cuda_publish(box.cuda_view(), 0, panels.x.data, panels.ids.data,
@@ -196,7 +202,7 @@ void failure_case(const std::string& mode, std::uint32_t t = 1) {
         expert_mailbox_cuda_acquire(box.cuda_view(), 0,
                                     static_cast<std::uint32_t*>(panels.count.data), panels.out.data,
                                     cuda.value);
-    } else if (mode != "cancel" && mode != "hip-deadline") {
+    } else if (mode != "cancel" && mode != "hip-deadline" && mode != "seal-timeout") {
         panels.primary(box, 0, cuda.value);
     }
     if (mode == "cancel") { box.cancel(); }
@@ -214,6 +220,13 @@ void failure_case(const std::string& mode, std::uint32_t t = 1) {
         panels.output(1, 0xabcdef01U, hip);
     } else {
         require(box.failure().code != ExpertWireError::None, "failure was not latched");
+        if (mode == "seal-timeout") {
+            require(box.failure().code == ExpertWireError::Deadline,
+                    "seal deadline was hidden by benign cancellation");
+            box.cancel_and_drain();
+            require(box.failure().code == ExpertWireError::Deadline,
+                    "host abort erased a fatal seal deadline");
+        }
         bool sticky = false;
         try {
             box.finish();
@@ -258,6 +271,47 @@ void teardown() {
     }
     require(hip.ready(), "active teardown left HIP work running");
     std::puts("mailbox missing-graph-B and active cancellation teardown=ok");
+}
+
+void host_exception_reuse() {
+    CudaStream cuda;
+    HipStream hip;
+    Panels panels;
+    panels.initialize(hip);
+    for (const auto tokens : {1U, 48U}) {
+        ExpertMailbox box(tokens);
+        HipGraph helper(hip);
+        for (std::uint32_t layer = 0; layer < 48; ++layer) {
+            panels.helper(box, layer, tokens, hip);
+        }
+        helper.instantiate();
+        panels.input(1, 0x10203040U);
+        bool original = false;
+        try {
+            try {
+                static_cast<void>(box.begin(tokens, cuda.value, hip));
+                helper.launch(hip);
+                panels.primary(box, 0, cuda.value); // Graph A exists; graph B will not submit.
+                throw std::runtime_error("injected host n-gram read failure");
+            } catch (...) {
+                box.cancel_and_drain();
+                throw;
+            }
+        } catch (const std::runtime_error& error) {
+            original = std::string(error.what()) == "injected host n-gram read failure";
+        }
+        require(original && box.drained() && box.failure().code == ExpertWireError::None,
+                "host abort lost its cause or poisoned joined mailbox state");
+        panels.input(1, 0x55667788U);
+        static_cast<void>(box.begin(tokens, cuda.value, hip));
+        helper.launch(hip);
+        for (std::uint32_t layer = 0; layer < 48; ++layer) {
+            panels.primary(box, layer, cuda.value);
+        }
+        box.finish();
+        panels.output(1, 0x55667788U, hip, 48);
+        std::printf("mailbox host exception/cancel/reuse T=%u nonce=ok\n", tokens);
+    }
 }
 
 void late_finish() {
@@ -341,6 +395,8 @@ int main(int argc, char** argv) {
             round_deadline();
         } else if (argc == 2 && std::string(argv[1]) == "late-finish") {
             late_finish();
+        } else if (argc == 2 && std::string(argv[1]) == "host-exception-reuse") {
+            host_exception_reuse();
         } else if (argc == 2 && std::string(argv[1]) == "async-error") {
             asynchronous_error();
         } else if (argc == 2) {
@@ -348,11 +404,12 @@ int main(int argc, char** argv) {
         } else {
             replay();
             for (const auto* mode : {"delayed", "failed", "cancel", "late-cancel", "invalid",
-                                     "cuda-deadline", "hip-deadline"}) {
+                                     "cuda-deadline", "hip-deadline", "seal-timeout"}) {
                 failure_case(mode);
                 failure_case(mode, 48);
             }
             teardown();
+            host_exception_reuse();
             round_deadline();
             { ExpertMailbox idle(1); }
             std::puts("mailbox idle teardown=ok");

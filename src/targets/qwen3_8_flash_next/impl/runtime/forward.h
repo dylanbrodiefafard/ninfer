@@ -670,7 +670,8 @@ private:
     [[nodiscard]] SampledRows sampled_rows(std::int32_t rows) const;
     [[nodiscard]] DecodeIngress& ingress_host() const noexcept;
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
-    // Exception path with a live helper: attempt all drains before reporting its sticky error.
+    // Called from a catch handler with a live helper. Attempt all drains; preserve the original
+    // exception, nesting it with helper context only when cleanup itself fails.
     void drain_helper_round();
 #endif
 

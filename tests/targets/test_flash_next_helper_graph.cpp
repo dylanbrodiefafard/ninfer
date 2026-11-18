@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <set>
 #include <stdexcept>
+#include <string>
 
 using namespace ninfer;
 using namespace ninfer::targets::qwen3_8_flash_next;
@@ -107,8 +108,41 @@ int main() {
             mailbox.cancel_and_drain();
             throw;
         }
+        mailbox.cancel_and_drain(); // Recover the explicit cancelled finish at its idle boundary.
+        execution.retire_joined_round();
+        for (const auto tokens : {1U, 48U}) {
+            bool original = false;
+            try {
+                try {
+                    static_cast<void>(mailbox.begin(tokens, primary.stream, hip));
+                    execution.launch(tokens);
+                    expert_mailbox_cuda_publish(mailbox.cuda_view(), 0, nullptr, nullptr, nullptr,
+                                                primary.count, primary.stream);
+                    throw std::runtime_error("injected host gather failure");
+                } catch (...) {
+                    mailbox.cancel_and_drain();
+                    if (mailbox.drained()) { execution.retire_joined_round(); }
+                    throw;
+                }
+            } catch (const std::runtime_error& error) {
+                original = std::string(error.what()) == "injected host gather failure";
+            }
+            if (!original || !mailbox.drained() ||
+                mailbox.failure().code != ExpertWireError::None) {
+                throw std::runtime_error(
+                    "helper host-abort drain lost its cause or stayed poisoned");
+            }
+            static_cast<void>(mailbox.begin(tokens, primary.stream, hip));
+            execution.launch(tokens);
+            for (std::uint32_t layer = 0; layer < 48; ++layer) {
+                expert_mailbox_cuda_publish(mailbox.cuda_view(), layer, nullptr, nullptr, nullptr,
+                                            primary.count, primary.stream);
+            }
+            mailbox.finish();
+            execution.retire_joined_round();
+        }
         std::printf("production helper graph shapes=%zu replays=2 layers=48 all-SKIP drain=ok "
-                    "cancellation=ok\n",
+                    "cancellation/host-exception reuse=ok\n",
                     shapes.size());
         return 0;
     } catch (const std::exception& e) {

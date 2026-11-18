@@ -941,8 +941,14 @@ verification round, not token assignments; prefill is excluded and rejected prop
 Its version-1 JSON contains `identity: {model_id, weights_id}`, `uptime_s`, `rounds`,
 `codecs: {nvfp4: {decode_lookups, decode_misses}, f3g32: {decode_lookups, decode_misses}}`,
 `hit_rate`, `miss_bytes`, and integer `decode_lookups[48][512]` in layer-major order.
-`hit_rate` is hits divided by lookups (zero before any lookup); miss MB/round logs use decimal
-MB. The Program writes on its execution thread, replacing a same-directory `.tmp` file by
+`hit_rate` is the **global routed-set residency rate**: `(lookups - misses) / lookups` (zero
+before any lookup). With the expert helper enabled, lookups include every distinct helper-owned
+expert routed in that layer/round, and those immutable helper-resident records count as hits.
+Misses count only non-resident local records demanded on the NVIDIA primary; `miss_bytes` is
+that logical demand times each codec's record size. It excludes helper activation/partial
+exchange bytes and speculative staging of unused records, so it is not measured PCIe traffic.
+This is **not** the 5090-domain cache hit rate, whose denominator excludes helper-owned experts.
+JSON v1 fields and global count invariants are unchanged. Miss MB/round logs use decimal MB. The Program writes on its execution thread, replacing a same-directory `.tmp` file by
 rename. The directory must exist and one process must own the path. Idle time does not force
 a write until the next round; SIGKILL cannot save the final partial interval. Existing files
 are overwritten, not merged. The CLI accepts the same flag and format.

@@ -54,6 +54,8 @@ public:
     // Idle-boundary check used by every Forward entry point; poisoned state cannot be reused.
     void check_failure() const;
     void cancel_round() noexcept;
+    // Host abort: joins both runtimes and retires execution tracking. Benign cancellation
+    // leaves reusable idle storage; real failures remain visible through check_failure().
     void cancel_and_drain() noexcept;
 private:
     struct Impl;

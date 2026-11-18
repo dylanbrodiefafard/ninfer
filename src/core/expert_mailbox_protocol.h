@@ -20,6 +20,9 @@ enum class ExpertWireSide : std::uint32_t { Cuda = 1, Hip = 2, Host = 3 };
 
 // Each sequence has exactly one writer. Payload/status fields are protected by release/acquire
 // of sequence; host never changes them while a round is active. Cancellation has its own line.
+// After successful joins the host may clear benign cancellation codes and copy guards, never
+// sequence flags. Each GPU owns its failure record while active; fatal causes supersede only
+// cancellation, and are retained across rounds.
 struct alignas(128) ExpertWireHeader {
     std::uint64_t sequence;
     std::uint32_t version, layer, tokens, compact_tokens;

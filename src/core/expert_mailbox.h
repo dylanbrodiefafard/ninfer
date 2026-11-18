@@ -24,12 +24,15 @@ public:
     [[nodiscard]] std::uint64_t begin(std::uint32_t tokens, void* cuda_stream,
                                       const HipStream& hip_stream);
     void cancel() noexcept;
-    // Exception/teardown path: cancel and join, consuming only an already-latched protocol error.
-    // Failed runtime joins retain the backing until process exit, never free reachable memory.
+    // Exception/teardown path: request cancellation and join. If both joins succeed and only
+    // cancellation was latched, clear its device codes/seals at idle for reuse. Fatal errors
+    // remain sticky; failed runtime joins retain backing until process exit. No output from
+    // the discarded round is licensed.
     void cancel_and_drain() noexcept;
     // Coarse watchdog: 30 s until host cancellation, then drain bounded GPU polls. Throws HipError
     // with the latched sequence/layer/side after both join attempts, never licenses failed output.
-    // Failure is sticky: later finish calls also fail, including after cancel_and_drain.
+    // A cancelled finish throws to prevent output licensing; cancel_and_drain may then recover
+    // benign host cancellation. Protocol, deadline, helper and runtime failures stay sticky.
     void finish();
     [[nodiscard]] ExpertWireFailure failure() const;
     // True at idle/joined boundaries. After a failed drain, enclosing owners must also be retained.

@@ -20,7 +20,18 @@ __device__ bool failed(ExpertMailboxView view) {
 
 __device__ void fail(ExpertMailboxView view, std::uint32_t layer, ExpertWireError code) {
     // One HIP stream, one leader per serialized kernel; never RMW a CUDA/CPU-owned line.
-    if (!failed(view)) {
+    // Fatal causes, including a seal timeout, supersede only benign cancellation records.
+    const auto own = static_cast<ExpertWireError>(
+        __hip_atomic_load(reinterpret_cast<std::uint32_t*>(&view.failure->code), __ATOMIC_ACQUIRE,
+                          __HIP_MEMORY_SCOPE_SYSTEM));
+    const auto peer = static_cast<ExpertWireError>(
+        __hip_atomic_load(reinterpret_cast<std::uint32_t*>(&view.peer_failure->code),
+                          __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM));
+    const auto benign = [](ExpertWireError value) {
+        return value == ExpertWireError::None || value == ExpertWireError::Cancelled;
+    };
+    if ((own == ExpertWireError::None && peer == ExpertWireError::None) ||
+        (code != ExpertWireError::Cancelled && benign(own) && benign(peer))) {
         view.failure->side     = ExpertWireSide::Hip;
         view.failure->sequence = view.control->sequence;
         view.failure->layer    = layer;

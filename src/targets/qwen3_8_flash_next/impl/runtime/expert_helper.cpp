@@ -230,7 +230,7 @@ std::uint64_t ExpertHelper::begin_round(std::uint32_t tokens) {
     try {
         impl_->execution->launch(tokens);
     } catch (...) {
-        impl_->mailbox.cancel_and_drain();
+        cancel_and_drain();
         throw;
     }
     return sequence;
@@ -243,7 +243,7 @@ void ExpertHelper::finish_round() {
         // The stream is already joined; retire the execution's pending event for the next round.
         impl_->execution->join();
     } catch (...) {
-        impl_->mailbox.cancel_and_drain();
+        cancel_and_drain();
         throw;
     }
 }
@@ -260,5 +260,8 @@ void ExpertHelper::check_failure() const {
 
 void ExpertHelper::cancel_round() noexcept { impl_->mailbox.cancel(); }
 
-void ExpertHelper::cancel_and_drain() noexcept { impl_->mailbox.cancel_and_drain(); }
+void ExpertHelper::cancel_and_drain() noexcept {
+    impl_->mailbox.cancel_and_drain();
+    if (impl_->mailbox.drained()) { impl_->execution->retire_joined_round(); }
+}
 } // namespace ninfer::targets::qwen3_8_flash_next

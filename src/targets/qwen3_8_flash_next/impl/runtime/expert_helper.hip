@@ -91,6 +91,8 @@ void ExpertHelperExecution::launch(std::uint32_t tokens) {
     impl_->pending = true;
 }
 
+void ExpertHelperExecution::retire_joined_round() noexcept { impl_->pending = false; }
+
 void ExpertHelperExecution::join() {
     if (impl_->pending) {
         impl_->completion.synchronize();

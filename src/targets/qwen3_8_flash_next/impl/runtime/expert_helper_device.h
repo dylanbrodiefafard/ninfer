@@ -28,6 +28,9 @@ public:
     void launch(std::uint32_t tokens);
     // Joins the completion event on the constructor's fixed stream; no CPU polling tax.
     void join();
+    // The fixed stream must already have synchronized successfully. Retires pending-event
+    // bookkeeping after an external drain without another fallible runtime call.
+    void retire_joined_round() noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

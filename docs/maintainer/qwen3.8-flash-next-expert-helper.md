@@ -100,7 +100,10 @@ Package the existing CALIB `[48,512]` nonnegative integer counts as a target-pri
 profile in `expert_helper_profile.h`, generated offline from the explicit study input
 `/home/battlefront/ai/study/calib/routing_counts.npy`. A small target-private generation tool
 checks shape, nonnegativity and integer range. Record the source/recipe in the generated header;
-no installed Python dependency or absolute path is used at startup. The artifact remains the
+no installed Python dependency or absolute path is used at startup. The generator also accepts
+served decode-route JSON v1 as an explicit offline input for this same compiled header; selecting
+that profile requires generation and rebuild, never a runtime flag, sidecar or hot reload.
+The artifact remains the
 only product weight artifact, its directory and record bytes unchanged. Counts influence
 performance only: the binder's actual codec map, record bytes, books and scales always determine
 execution. Keep the profile out of OFF builds and do not change the flag-off cache warm start.
@@ -177,7 +180,12 @@ Transient prefill-window borrowing can evict some; after window return, admits r
 post-prefill startup/drain misses are not zero. No permanent pinning/refill sweep is added just
 to hide this warmup cost. Define domain hit rate as hits / unique eligible `(layer,expert)`
 lookups, and report helper assignments/unique jobs separately; counting helper routes as local
-misses recreates Strata's PCIe-share bug.
+misses recreates Strata's PCIe-share bug. `ExpertCacheCounts` uses that eligible local domain.
+The JSON-v1 route profile intentionally uses a different, global denominator: all unique routed
+experts, with immutable helper residents counted as hits and only demanded local misses in
+`miss_bytes`. It is placement/work telemetry, not a conditional primary-cache hit rate or a
+measurement of all PCIe traffic. Keep the global profile/schema intact; distinguish these two
+metrics in reports rather than treating its `hit_rate` as the 5090-domain rate.
 
 For context, the old Gen4 C1 measurements ranged 87.2–96.0% hits and 40–126 MB/token;
 C4 at 24.0/18.5 GB gave 82.4/73.1% and 662/1024 MB/round. Those are workload/policy-specific
@@ -306,8 +314,8 @@ status uses the same ordering. Use atomics with the measured supported system sc
 than wrap into a stale packet. Each round has at most one outstanding request per layer slot.
 
 All device polling is bounded: a **5-second layer wait deadline**, cancellation checks and a
-latched first-error record containing sequence/layer/side. One persistent host watchdog observes response completion
-and progress at coarse intervals while armed for a round, with a **30-second round deadline**;
+latched first-fatal-error record containing sequence/layer/side. One persistent host watchdog
+observes response completion and progress at coarse intervals while armed for a round, with a **30-second round deadline**;
 these are failure bounds, not performance targets. All 48 matching response sequences disarm
 it even if the host has not called finish; a host stall after completion is not a deadline error.
 Finish blocks on the HIP stream and then the CUDA stream without a polling sleep. Runtime errors
@@ -320,7 +328,14 @@ round and leaves N=0 instead of trapping the process; fixed DMA bytes never lice
 Driver wedges remain subject to the external whole-process deadline below.
 On I/O exception between graph A and B,
 request cancellation of unsubmitted work before draining; do not leave HIP waiting for layers
-that CUDA will never publish. Already-submitted normal request cancellation drains the round
+that CUDA will never publish. If both runtime joins succeed, no writer guard remains claimed,
+and the only recorded state is host-requested cancellation, reset cancellation codes and
+response seals at that idle boundary, retire the helper's pending execution and reuse its
+storage. Sequence flags are never reset. Rethrow the original host exception under the existing
+Program/request policy; no result from the discarded round is licensed. A fatal protocol,
+deadline, helper or runtime error prevents this recovery. Fatal device causes may supersede
+benign cancellation, including a bounded seal-wait deadline. If cleanup itself fails, retain
+helper context with the original exception nested rather than hiding the root cause. Already-submitted normal request cancellation drains the round
 and uses existing zero-publication semantics. On protocol timeout, the failed wait returns an
 error and suppresses its copy; later helper jobs see cancellation/zero counts and terminate.
 CUDA results must not be licensed/published or cached after any helper error, even if later

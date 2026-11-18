@@ -94,6 +94,7 @@ struct ExpertMailbox::Impl {
     const HipStream* hip_stream = nullptr;
     bool active                 = false;
     bool drained                = true;
+    bool host_cancel_requested  = false;
     ExpertWireFailure host_failure{.code = ExpertWireError::None, .side = ExpertWireSide::Host};
     std::mutex mutex;
     std::condition_variable_any wake;
@@ -159,6 +160,44 @@ struct ExpertMailbox::Impl {
         wake.notify_all();
     }
 
+    // Only the host owner calls this after both runtime joins and watchdog disarm. Sequence
+    // flags and payloads remain intact; only benign cancellation state can be reset for reuse.
+    [[nodiscard]] bool recover_host_cancel() noexcept {
+        if (active || !drained || !host_cancel_requested ||
+            (host_failure.code != ExpertWireError::None &&
+             host_failure.code != ExpertWireError::Cancelled)) {
+            return false;
+        }
+        const auto benign = [this](const ExpertWireFailure& error) {
+            return error.code == ExpertWireError::None ||
+                   (error.code == ExpertWireError::Cancelled && error.sequence == sequence);
+        };
+        if (!benign(*host.failure) || !benign(*host.peer_failure)) { return false; }
+        for (std::uint32_t layer = 0; layer < kExpertMailboxLayers; ++layer) {
+            if (std::atomic_ref<std::uint64_t>(host.slots[layer].request->copy_guard)
+                    .load(std::memory_order_acquire) != 0) {
+                host_failure = {.code     = ExpertWireError::Protocol,
+                                .side     = ExpertWireSide::Host,
+                                .sequence = sequence,
+                                .layer    = layer};
+                return false;
+            }
+        }
+        for (auto* error : {host.failure, host.peer_failure}) {
+            std::atomic_ref<ExpertWireError>(error->code)
+                .store(ExpertWireError::None, std::memory_order_release);
+        }
+        for (auto& slot : host.slots) {
+            std::atomic_ref<std::uint64_t>(slot.response->copy_guard)
+                .store(0, std::memory_order_release);
+        }
+        std::atomic_ref<std::uint64_t>(host.cancellation->sequence)
+            .store(0, std::memory_order_release);
+        host_failure.code     = ExpertWireError::None;
+        host_cancel_requested = false;
+        return true;
+    }
+
     void stop_watchdog() {
         watchdog.request_stop();
         wake.notify_all();
@@ -187,11 +226,15 @@ ExpertMailbox::~ExpertMailbox() {
 }
 
 void ExpertMailbox::cancel_and_drain() noexcept {
-    if (!impl_->active) { return; }
+    if (!impl_->active) {
+        static_cast<void>(impl_->recover_host_cancel());
+        return;
+    }
     cancel();
     try {
         finish();
     } catch (...) {
+        if (impl_->recover_host_cancel()) { return; }
         // Expected protocol/runtime failures are already sticky. An unexpected host exception
         // must also prevent reuse and retain backing whose quiescence cannot be established.
         if (impl_->active) {
@@ -234,10 +277,11 @@ std::uint64_t ExpertMailbox::begin(std::uint32_t tokens, void* cuda_stream,
     std::atomic_thread_fence(std::memory_order_release);
     {
         std::lock_guard lock(impl_->mutex);
-        impl_->active         = true;
-        impl_->drained        = false;
-        impl_->round_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        impl_->armed          = true;
+        impl_->active                = true;
+        impl_->drained               = false;
+        impl_->host_cancel_requested = false;
+        impl_->round_deadline        = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        impl_->armed                 = true;
     }
     impl_->wake.notify_all();
     return impl_->sequence;
@@ -245,6 +289,7 @@ std::uint64_t ExpertMailbox::begin(std::uint32_t tokens, void* cuda_stream,
 
 void ExpertMailbox::cancel() noexcept {
     if (impl_->active) {
+        impl_->host_cancel_requested = true;
         std::atomic_ref<std::uint64_t>(impl_->host.cancellation->sequence)
             .store(impl_->sequence, std::memory_order_release);
     }
@@ -260,6 +305,13 @@ ExpertWireFailure ExpertMailbox::failure() const {
     const auto& hip  = *impl_->host.peer_failure;
     if (cuda.code == ExpertWireError::None) { return hip; }
     if (hip.code == ExpertWireError::None) { return cuda; }
+    // A cascading cancellation must not hide a peer's fatal cause.
+    if (cuda.code == ExpertWireError::Cancelled && hip.code != ExpertWireError::Cancelled) {
+        return hip;
+    }
+    if (hip.code == ExpertWireError::Cancelled && cuda.code != ExpertWireError::Cancelled) {
+        return cuda;
+    }
     // Simultaneous independent faults have no cross-device happens-before order. Choose the
     // earliest layer, CUDA on a tie; neither record can be overwritten by a cascading error.
     return hip.layer < cuda.layer ? hip : cuda;

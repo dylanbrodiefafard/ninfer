@@ -724,6 +724,10 @@ if(NINFER_ENABLE_HIP_EXPERT_HELPER)
     LIBRARIES ninfer_core Threads::Threads)
   set_target_properties(ninfer_expert_mailbox_test PROPERTIES LINKER_LANGUAGE CXX)
   set_tests_properties(ninfer_expert_mailbox_test PROPERTIES LABELS "cuda;hip;slow" TIMEOUT 240)
+  add_test(NAME ninfer_expert_mailbox_host_exception_reuse_test
+    COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_expert_mailbox_test> host-exception-reuse)
+  set_tests_properties(ninfer_expert_mailbox_host_exception_reuse_test PROPERTIES
+    LABELS "cuda;hip" TIMEOUT 90)
   add_test(NAME ninfer_expert_mailbox_late_finish_test
     COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_expert_mailbox_test> late-finish)
   set_tests_properties(ninfer_expert_mailbox_late_finish_test PROPERTIES

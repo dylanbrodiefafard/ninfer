@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -1608,14 +1609,26 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
 
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
 void Forward::drain_helper_round() {
+    const auto original = std::current_exception();
     helper_->cancel_and_drain();
     const auto status = cudaStreamSynchronize(fill_stream_.get());
-    // Both runtime streams and the fill stream have now had a join attempt. Preserve the
-    // sticky, contextual helper error instead of replacing it with a secondary CUDA error.
-    helper_->check_failure();
-    if (status != cudaSuccess) {
-        throw HipError(std::string("expert helper fill-stream drain: ") +
-                       cudaGetErrorString(status));
+    // Successful host-abort cleanup leaves the helper reusable and lets the caller rethrow
+    // its original exception. A real cleanup failure keeps that root cause nested as well.
+    try {
+        helper_->check_failure();
+        if (status != cudaSuccess) {
+            throw HipError(std::string("expert helper fill-stream drain: ") +
+                           cudaGetErrorString(status));
+        }
+    } catch (const std::exception& cleanup) {
+        const std::string context = std::string("expert helper drain failed: ") + cleanup.what();
+        try {
+            std::rethrow_exception(original);
+        } catch (const std::exception& host) {
+            std::throw_with_nested(HipError(context + "; original exception: " + host.what()));
+        } catch (...) {
+            std::throw_with_nested(HipError(context + "; original non-standard exception"));
+        }
     }
 }
 #endif
