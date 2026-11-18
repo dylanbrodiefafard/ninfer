@@ -21,6 +21,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "runtime/expert_route_profile.h"
+#include "targets/qwen3_6/impl/frontend/token_masks.h"
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
 #    include "runtime/expert_helper.h"
 #endif
@@ -31,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -237,6 +239,8 @@ struct SpeculativeRows {
     std::span<const std::int32_t> tokens;
     std::span<const std::int32_t> counts;
     std::span<const std::int32_t> accepted;
+    // Root constraint failures only; hypothetical failures clip counts and retry at the root.
+    std::span<const std::exception_ptr> row_errors;
     std::span<const float> calibration;
     std::span<const float> logprobs;
     std::span<const std::int32_t> top_ids;
@@ -350,7 +354,8 @@ public:
                                             std::span<const std::int32_t> anchors,
                                             std::span<const ops::SamplingConfig> configs,
                                             std::int32_t k, std::span<const std::int32_t> extents,
-                                            RoundLogprobs logprobs);
+                                            RoundLogprobs logprobs,
+                                            std::span<const qwen3_6::OutputSession* const> outputs);
     void resolve_speculative(std::span<const std::int32_t> counts);
     // I32 [10,width*rows] routed ids for one layer of the latest unresolved verify frame.
     // Storage remains owned by Forward until the next forward. Throws std::logic_error unless
@@ -580,6 +585,7 @@ private:
         Tensor selected_logits;
         Tensor spec_ingress, spec_egress, targets, selector_ids, selector_q, lengths, anchors;
         Tensor count_snapshot;
+        Tensor token_masks, mask_sampling, mask_nodes;
         Tensor context_key_backup, context_value_backup;
         Tensor expert_routes;
     };
@@ -593,7 +599,7 @@ private:
     void prepare_verify(std::span<const std::int32_t> lanes, std::span<const std::int32_t> tokens,
                         std::int32_t width, std::span<const std::int32_t> valid_columns);
     void enqueue_spec_a(std::int32_t width, std::int32_t rows);
-    void enqueue_spec_b(std::int32_t width, std::int32_t rows);
+    void enqueue_spec_b(std::int32_t width, std::int32_t rows, bool exchange_masks);
     void capture_spec_graphs();
     void require_resolved() const;
 
@@ -701,8 +707,16 @@ private:
     std::optional<PinnedHostBuffer> verify_commit_staging_;
     std::optional<PinnedHostBuffer> spec_ingress_staging_, spec_egress_staging_;
     std::optional<CudaEvent> drafts_ready_;
+    // Shared output-policy transport; bindings change only between synchronized rounds.
+    std::unique_ptr<qwen3_6::TokenMaskExchange> token_masks_;
+    CudaStream mask_stream_;
+    // Graph B has an unmasked and a mask-exchange topology per (K, batch).
     std::vector<DecodeGraphDefinition> spec_a_definitions_, spec_b_definitions_;
     std::vector<DecodeGraphExecutable> spec_a_graphs_, spec_b_graphs_;
+    // Licensed views differ from the raw egress when a matcher rejects a hypothetical
+    // node. Keep raw sampled counts for exact token-count rollback during resolution.
+    std::array<std::int32_t, kMaxLanes> licensed_counts_{}, licensed_accepted_{};
+    std::array<std::exception_ptr, kMaxLanes> mask_row_errors_{};
     bool speculative_pending_            = false;
     std::int32_t pending_verify_width_   = 0;
     std::int32_t pending_verify_rows_    = 0;

@@ -47,7 +47,8 @@ namespace ninfer::targets::qwen3_8_flash_next {
  *   token_counts I32 [248320,lanes]: column l counts the tokens lane l sampled at positive
  *                temperature (ops::sample's penalty counts; rows below kTokenDomain are used).
  *   allowed      U32 [kAllowedTokenWordStride,lanes]: column l is lane l's token-eligibility
- *                bitset storage (ops::SamplingConfig::allowed_token_words).
+ *                root bitset storage (ops::SamplingConfig::allowed_token_words). Forward owns
+ *                the separate compact-row, per-hypothesis masks used during verification.
  *
  * Lanes are opened with a page reservation for their whole token bound: open() reserves and maps
  * ceil(reserve / 64) pages from the shared pool, publishes them in the lane's block-table row and

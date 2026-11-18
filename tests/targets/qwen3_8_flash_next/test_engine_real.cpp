@@ -25,8 +25,11 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_8_flash_next/package.h>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -1420,6 +1423,7 @@ void cancellation(ninfer::Engine& engine) {
 }
 
 #include "dflash_engine_cases.h"
+#include "dflash_mask_cases.h"
 
 void engine_suite(const Inputs& inputs) {
     EngineBatch observations;
@@ -1494,6 +1498,17 @@ int main(int argc, char** argv) {
             dflash_program_cases(inputs);
         } else if (mode == "--dflash-engine") {
             dflash_engine_cases(inputs);
+        } else if (mode == "--dflash-masks" || mode == "--dflash-mask-program") {
+            const ninfer::artifact::Reader reader(inputs.artifact);
+            if (reader.find("dflash/feature_projection") == nullptr) {
+                std::cout << "skip: masked speculation requires the Flash-Next DFlash2 companion\n";
+                return 77;
+            }
+            if (mode == "--dflash-masks") {
+                dflash_mask_cases(inputs);
+            } else {
+                dflash_mask_program_cases(inputs);
+            }
         } else if (mode == "--dflash-ram-tiers" || mode == "--dflash-disk-tiers" ||
                    mode == "--dflash-live-tiers" || mode == "--dflash-retained") {
             Inputs speculative                   = inputs;
@@ -1525,9 +1540,9 @@ int main(int argc, char** argv) {
         } else {
             std::cerr
                 << "usage: " << argv[0]
-                << " [--helper-smoke|--program-parity|--reuse-parity|--verify-parity|--dflash-"
-                   "program|"
-                   "--dflash-engine|--retained|--dflash-retained|--ram-tiers|--disk-tiers|"
+                << " [--helper-smoke|--program-parity|--reuse-parity|--verify-parity|"
+                   "--dflash-program|--dflash-engine|--dflash-masks|--dflash-mask-program|"
+                   "--retained|--dflash-retained|--ram-tiers|--disk-tiers|"
                    "--live-tiers|--dflash-ram-tiers|--dflash-disk-tiers|--dflash-live-tiers|"
                    "--conversation-bench|--conversation-ram-bench|--mixer-split-diagnostic]\n";
             return 2;

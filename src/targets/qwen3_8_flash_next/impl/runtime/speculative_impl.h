@@ -60,7 +60,7 @@ void Forward::enqueue_spec_a(std::int32_t width, std::int32_t rows) {
     enqueue_layer_loop(batch, false, RowSource::Resident, {}, nullptr, 0, kPleLayer);
 }
 
-void Forward::enqueue_spec_b(std::int32_t width, std::int32_t rows) {
+void Forward::enqueue_spec_b(std::int32_t width, std::int32_t rows, bool exchange_masks) {
     feature_offset_          = 0;
     feature_columns_         = width * rows;
     const auto columns_count = width * rows;
@@ -68,10 +68,21 @@ void Forward::enqueue_spec_b(std::int32_t width, std::int32_t rows) {
                                static_cast<std::size_t>(columns_count) * kNgramTokenBytes,
                                cudaMemcpyHostToDevice, stream_));
     const std::array batch{verify_batch(width, rows)};
+    // Graph A has constructed every chain input. The matcher reads fixed-pitch pinned
+    // staging while the target runs; only target sampling consumes its configurations.
+    std::optional<qwen3_6::TokenMaskExchange::Submission> masks;
+    if (exchange_masks) {
+        masks = token_masks_->enqueue(batch.front().token_ids.view({width, rows}), nullptr,
+                                      batch.front().valid_columns, stream_, mask_stream_.get());
+    }
     enqueue_layer_loop(batch, false, RowSource::Resident, {}, nullptr, kPleLayer, kLayers);
     head(0, columns_count);
     const auto* configs = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const std::byte*>(verify_.spec_ingress.data) + offsetof(SpecIngress, configs));
+    if (masks) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream_, masks->ready, 0));
+        configs = masks->sampling;
+    }
     const Tensor logits_flat   = logits(columns_count);
     const Tensor packed_logits = logits_flat.view({kVocabRows, width, rows});
     const Tensor counts_pool   = state_.sampling_counts_pool();
@@ -139,9 +150,9 @@ void Forward::enqueue_spec_b(std::int32_t width, std::int32_t rows) {
 void Forward::capture_spec_graphs() {
     const auto size = std::size_t{kDflashWidth} * static_cast<std::size_t>(state_.lanes());
     spec_a_definitions_.resize(size);
-    spec_b_definitions_.resize(size);
+    spec_b_definitions_.resize(2 * size);
     spec_a_graphs_.resize(size);
-    spec_b_graphs_.resize(size);
+    spec_b_graphs_.resize(2 * size);
     for (std::int32_t k = 0; k <= kDflashMaxK; ++k) {
         for (std::int32_t rows = 1; rows <= state_.lanes(); ++rows) {
             const auto index =
@@ -149,12 +160,15 @@ void Forward::capture_spec_graphs() {
                 static_cast<std::size_t>(rows - 1);
             spec_a_definitions_[index].capture(stream_,
                                                [this, k, rows] { enqueue_spec_a(k + 1, rows); });
-            spec_b_definitions_[index].capture(stream_,
-                                               [this, k, rows] { enqueue_spec_b(k + 1, rows); });
             spec_a_graphs_[index].instantiate(spec_a_definitions_[index]);
-            spec_b_graphs_[index].instantiate(spec_b_definitions_[index]);
             spec_a_graphs_[index].upload(stream_);
-            spec_b_graphs_[index].upload(stream_);
+            for (const bool exchange : {false, true}) {
+                const auto target_index = 2 * index + static_cast<std::size_t>(exchange);
+                spec_b_definitions_[target_index].capture(
+                    stream_, [this, k, rows, exchange] { enqueue_spec_b(k + 1, rows, exchange); });
+                spec_b_graphs_[target_index].instantiate(spec_b_definitions_[target_index]);
+                spec_b_graphs_[target_index].upload(stream_);
+            }
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -163,12 +177,18 @@ void Forward::capture_spec_graphs() {
 SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
                                    std::span<const std::int32_t> anchors,
                                    std::span<const ops::SamplingConfig> configs, std::int32_t k,
-                                   std::span<const std::int32_t> extents, RoundLogprobs logprobs) {
+                                   std::span<const std::int32_t> extents, RoundLogprobs logprobs,
+                                   std::span<const qwen3_6::OutputSession* const> outputs) {
     if (drafter_ == nullptr || speculative_pending_ || k < 0 || k > kDflashMaxK || lanes.empty() ||
         lanes.size() > static_cast<std::size_t>(state_.lanes()) || anchors.size() != lanes.size() ||
-        configs.size() != lanes.size() || extents.size() != lanes.size()) {
+        configs.size() != lanes.size() || extents.size() != lanes.size() ||
+        outputs.size() != lanes.size()) {
         throw std::invalid_argument("Flash-Next speculative round has invalid membership or state");
     }
+    const bool exchange_masks = std::any_of(outputs.begin(), outputs.end(), [](const auto* output) {
+        return output != nullptr && output->has_token_masks();
+    });
+    if (exchange_masks) { token_masks_->bind(outputs, configs); }
     const auto width = k + 1;
     const auto rows  = static_cast<std::int32_t>(lanes.size());
     std::array<std::int32_t, kMaxLanes> valid{};
@@ -221,6 +241,7 @@ SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
     const auto index = static_cast<std::size_t>(k) * static_cast<std::size_t>(state_.lanes()) +
                        static_cast<std::size_t>(rows - 1);
     auto& output     = *static_cast<SpecEgress*>(spec_egress_staging_.value().data());
+    std::span<const qwen3_6::TokenMaskResult> mask_results;
     try {
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
         if (helper_) {
@@ -250,9 +271,10 @@ SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
                                   count * static_cast<std::size_t>(kNgramTokenBytes)});
         last_gather_seconds_ =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - gather_start).count();
-        spec_b_graphs_.at(index).launch(stream_);
+        spec_b_graphs_.at(2 * index + static_cast<std::size_t>(exchange_masks)).launch(stream_);
         CUDA_CHECK(cudaEventRecord(replay_stop_.get(), stream_));
         CUDA_CHECK(cudaEventSynchronize(replay_stop_.get()));
+        if (exchange_masks) { mask_results = token_masks_->results(); }
         CUDA_CHECK(cudaEventElapsedTime(&last_replay_ms_, replay_start_.get(), replay_stop_.get()));
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
         if (helper_) { helper_->finish_round(); }
@@ -266,6 +288,7 @@ SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
 #endif
         CUDA_CHECK(cudaStreamSynchronize(stream_));
         CUDA_CHECK(cudaStreamSynchronize(fill_stream_.get()));
+        CUDA_CHECK(cudaStreamSynchronize(mask_stream_.get()));
         throw;
     }
     const auto& packet = *static_cast<const VerifyIngress*>(verify_ingress_staging_.value().data());
@@ -283,14 +306,32 @@ SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
         if (output.counts[row] < 1 || output.counts[row] > valid[row]) {
             throw std::logic_error("Flash-Next accept produced an invalid licensed prefix");
         }
+        licensed_counts_[row] = output.counts[row];
+        mask_row_errors_[row] = {};
+        if (exchange_masks && mask_results[row].error) {
+            const auto safe       = static_cast<std::int32_t>(mask_results[row].safe_columns);
+            licensed_counts_[row] = std::min(licensed_counts_[row], safe);
+            if (safe == 0) { mask_row_errors_[row] = mask_results[row].error; }
+            // Invalid columns carry no calibration evidence, even if the fallback
+            // all-ones domain let device acceptance visit them before the CPU clamp.
+            for (std::int32_t hop = safe; hop < k; ++hop) {
+                const auto offset =
+                    (row * static_cast<std::size_t>(k) + static_cast<std::size_t>(hop)) *
+                    ops::kPLessProposalCalibrationTemperatureCount;
+                std::fill_n(output.calibration.data() + offset,
+                            ops::kPLessProposalCalibrationTemperatureCount, -1.0F);
+            }
+        }
+        licensed_accepted_[row] = std::min(output.accepted[row], licensed_counts_[row]);
     }
     const auto span = [](const auto& array, std::size_t size) {
         return std::span(array).first(size);
     };
-    return {.width    = width,
-            .tokens   = span(output.tokens, count),
-            .counts   = span(output.counts, lanes.size()),
-            .accepted = span(output.accepted, lanes.size()),
+    return {.width      = width,
+            .tokens     = span(output.tokens, count),
+            .counts     = span(licensed_counts_, lanes.size()),
+            .accepted   = span(licensed_accepted_, lanes.size()),
+            .row_errors = span(mask_row_errors_, lanes.size()),
             .calibration =
                 span(output.calibration, lanes.size() * static_cast<std::size_t>(k) *
                                              ops::kPLessProposalCalibrationTemperatureCount),

@@ -356,7 +356,8 @@ void Program::set_sampling(Lane lane, const LaneSampling& sampling) {
     control.sampling = sampling;
 }
 
-void Program::set_allowed_tokens(Lane lane, std::span<const std::uint32_t> words) {
+void Program::set_allowed_tokens(Lane lane, std::span<const std::uint32_t> words,
+                                 const qwen3_6::OutputSession* output) {
     LaneControl& control = open_control(lane);
     if (words.size() != static_cast<std::size_t>(kAllowedTokenWords)) {
         throw std::invalid_argument("qwen3_8_flash_next Program: an eligibility mask holds " +
@@ -378,8 +379,9 @@ void Program::set_allowed_tokens(Lane lane, std::span<const std::uint32_t> words
     // staging is marked again and re-copied later in stream order, before any sampler reads it.
     std::ranges::copy(words, static_cast<std::uint32_t*>(mask_staging_.data()) +
                                  static_cast<std::size_t>(lane) * State::kAllowedTokenWordStride);
-    control.mask_armed = true;
-    masks_staged_      = true;
+    control.mask_armed  = true;
+    control.mask_output = output;
+    masks_staged_       = true;
 }
 
 void Program::upload_masks() {
@@ -389,7 +391,11 @@ void Program::upload_masks() {
     masks_staged_ = false;
 }
 
-void Program::clear_allowed_tokens(Lane lane) { open_control(lane).mask_armed = false; }
+void Program::clear_allowed_tokens(Lane lane) {
+    auto& control       = open_control(lane);
+    control.mask_armed  = false;
+    control.mask_output = nullptr;
+}
 
 std::int32_t Program::committed(Lane lane) const { return state_.committed(lane); }
 
@@ -452,10 +458,10 @@ PrefillStep Program::finish_prompt(Lane lane) {
     step.complete = true;
     upload_masks();
     const SampledRows rows = forward_.sample_retained(lane, sampling_config(lane));
-    control.mask_armed     = false;
-    control.phase          = LanePhase::Decoding;
-    step.next_token        = rows.tokens[0];
-    step.next_logprob      = rows.logprobs[0];
+    clear_allowed_tokens(lane);
+    control.phase     = LanePhase::Decoding;
+    step.next_token   = rows.tokens[0];
+    step.next_logprob = rows.logprobs[0];
     const std::array fetch_lanes{lane};
     feeder_.prefetch_anchors(fetch_lanes, rows.tokens);
     if (control.sampling.top_logprobs) {
@@ -493,8 +499,8 @@ void Program::decode(std::span<const Lane> lanes, std::span<const std::int32_t> 
         lanes, tokens, std::span<const ops::SamplingConfig>(configs.data(), rows),
         next_logprob.empty() && top_ids.empty() ? RoundLogprobs::Skip : RoundLogprobs::Report);
     for (std::size_t i = 0; i < rows; ++i) {
-        lanes_.at(static_cast<std::size_t>(lanes[i])).mask_armed = false;
-        next[i]                                                  = sampled.tokens[i];
+        clear_allowed_tokens(lanes[i]);
+        next[i] = sampled.tokens[i];
         if (!next_logprob.empty()) { next_logprob[i] = sampled.logprobs[i]; }
     }
     if (dflash_) { dflash_->save_decode_features(lanes, forward_.dflash_features()); }

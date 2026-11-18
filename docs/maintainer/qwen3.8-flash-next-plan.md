@@ -228,8 +228,9 @@ transport and target-owned window/suspension semantics are described below.
   ownership table and the concurrency document are amended together when the target is
   registered. Status: done (2026-11-14). `EngineProgram`
   (`export/ninfer/targets/qwen3_8_flash_next/package.h`, mapping in its header) adapts the
-  executor to the lane Program: per-lane prompt and sampled-token bookkeeping, one-shot token
-  masks re-armed per sampled token, cycle-exit and suppressed tokens through `set_sampling`, top-20
+  executor to the lane Program: per-lane prompt and sampled-token bookkeeping, root masks
+  re-armed per round with their OutputSession bound for per-prefix chain masks, cycle-exit and
+  suppressed tokens through `set_sampling`, top-20
   logprobs and QSA pages as the executor's main KV pages. Retained-lane support is described
   below, together with its shared host tiers. `LoadedModel` loads from the registry's opened `Reader` with load progress and keeps the
   frontend resources. Real Engine test: `ninfer_qwen3_8_flash_next_engine_real_test` (C=4 against
@@ -406,7 +407,43 @@ enables adaptive K0..3 when that companion is present. The native drafter uses i
 independent committed-context projections and full shared FP8 head. Graph A appends pending
 context, proposes, exports IDs and starts target layer zero; host draft-column n-gram reads
 overlap that layer. Anchor rows are fetched after the preceding publication (or prompt sampling),
-independently of the next proposal. Graph B finishes verification and acceptance. After Engine output preview, authoritative prefix
+independently of the next proposal. Graph B finishes verification and acceptance. Its shared
+frontend `TokenMaskExchange` (`qwen3_6/impl/frontend/token_masks.{h,cpp}`) forks a CUDA host node
+onto a dedicated mask stream after Graph A has constructed the chain IDs. For each row it calls
+`OutputSession::fill_token_masks` with parents `[-1,0,1,2]` truncated to that row's valid extent.
+Column zero uses committed output state; column j uses exactly the proposed prefix through j.
+The host matcher overlaps target layers and joins before target argmax/acceptance; target
+SamplingConfigs select masks with `allowed_token_column_stride`. Proposal sampling remains
+unmasked. Each Graph B shape has masked and unmasked topologies, so batches without a
+session-backed mask incur no host callback or mask transfers. This transport belongs to the
+shared frontend/output semantics, not the family Program; Flash-Next owns its allocation, graph schedule, binding and acceptance.
+
+Masks and sampling/node staging have startup-fixed addresses at the maximum chain pitch.
+Bindings change only at synchronized round boundaries. Constraint errors are attributed to the
+first failing node of each row by retrying prefixes on the error path. Failed tails get all-ones
+device masks so the graph can finish; Forward licenses only preceding columns and retains the
+raw sampled count for exact token-count rollback. If publication reaches that hypothetical
+state, ordinary root validation fails only that request on the next round. A callback root error
+is returned through `row_errors` with zero publication, while healthy rows resolve independently.
+Unexpected transport/invariant errors still propagate before publication. Error paths and
+Forward teardown drain the mask stream. Grammar,
+replay and reasoning budgets therefore do not disable drafting. A bare one-shot bitset without
+an OutputSession remains root-only because it cannot describe hypothetical histories. Suppressed
+tokens still intersect every column's mask; the sampler's one-token typical exclusion remains
+root-local. Budget masks can force the native reasoning close at a hypothetical boundary, then
+exclude a repeated close in its descendants, without changing committed budget state.
+The per-column eligibility is exact relative to ordinary root mask filling; it does not change
+the cross-width model arithmetic qualification below. `--dflash-masks` on the real Engine test
+checks greedy K3 against `SpeculativeBackend::None` for tools, budgets 2–6, and their combination;
+it requires accepted tool drafts and budget-sweep acceptance, schema-valid calls and exact
+forced-close accounting. `--dflash-mask-program` runs mixed session/one-shot/unmasked rows in
+non-lane-order compact batches with different extents, greedy and positive-temperature p-less
+acceptance, committed non-root binding masks, non-root singleton close masks, exact published
+token counts, and zero-publication rollback beside a healthy row. CPU frontend tests compare
+every K3 hypothesis mask word with an independently committed-prefix root mask and reproduce
+first-node failures at columns 0–3 without advancing committed state.
+
+After Engine output preview, authoritative prefix
 counts fold the 36 GDN layers and commit only published PLE/history/features/head state. This
 avoids copying a full speculative target state before each round. A K0 root is a width-one chain
 record: `gdn_input_proj_conv_record` and `gated_delta_net_replay_record` read the canonical GDN
