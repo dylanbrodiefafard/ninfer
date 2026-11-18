@@ -258,7 +258,6 @@ public:
         std::uint64_t use_tick                = 0;
         std::optional<qwen3_6::RewriteCheckpointSpec> rewrite;
         std::optional<qwen3_6::RewriteCheckpointSpec> capture_rewrite;
-        std::vector<std::uint32_t> closure_frontiers;
         std::uint32_t rollback_frontier = 0;
         void* rewrite_image             = nullptr;
         void* rollback_image            = nullptr;
@@ -601,7 +600,6 @@ public:
             auto split_at        = [&](std::uint32_t frontier) {
                 if (frontier > entry.appended) { stop = std::min(stop, std::size_t{frontier}); }
             };
-            for (const auto frontier : entry.closure_frontiers) { split_at(frontier); }
             if (entry.capture_rewrite) { split_at(entry.capture_rewrite->frontier); }
             if (entry.system_capture) { split_at(*entry.system_capture); }
             const bool capture = entry.capture_rewrite && stop == entry.capture_rewrite->frontier;
@@ -1016,7 +1014,6 @@ EngineProgram::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt, R
     entry.window_output_tokens    = base.summary_.window_output_tokens;
     entry.effective_output_tokens = base.summary_.effective_output_tokens;
     entry.output                  = output;
-    entry.closure_frontiers       = std::move(data.turn_closure_frontiers);
     entry.identity.assign(data);
     entry.system_capture.reset();
     if (impl_->ram && impl_->system_prompt_limit != 0 && base.cache_write_ && base.allow_reuse_ &&
