@@ -636,7 +636,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                                           p_less_red_val, p_less_red_aux, p_less_warp_keys);
         if (tid == 0) {
             sampling_p_less_store_moments(workspace, col, partial_blocks + group, group_moments);
-            const int done = sampling_completion_add(&workspace.group_done[col], group_count);
+            const int done = sampling_completion_add(&workspace.group_done[col]);
             is_last_group  = done == group_count ? 1 : 0;
         }
         __syncthreads();
@@ -681,7 +681,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 sampling_partial_offset(workspace, col, partial_blocks + group, rank);
             sampling_publish_key(workspace, out_off, published_keys[rank]);
         }
-        const int done = sampling_completion_add(&workspace.group_done[col], group_count);
+        const int done = sampling_completion_add(&workspace.group_done[col]);
         is_last_group  = (done == group_count) ? 1 : 0;
     }
     __syncthreads();
@@ -723,8 +723,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         }
         workspace.group_done[col] = 0;
         const int need_cols       = tree ? valid : (extent + 1);
-        const int done_cols =
-            sampling_completion_add(workspace.speculative_finalize_count, need_cols);
+        const int done_cols       = sampling_completion_add(workspace.speculative_finalize_count);
         if (done_cols == need_cols) {
             const int L = lengths[row];
             if (tree) {
@@ -952,7 +951,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
             warp_sums);
         if (threadIdx.x == 0) {
             sampling_p_less_store_tile_mass(workspace, col, partial, tile_mass);
-            const int done = sampling_completion_add(&workspace.group_done[col], partial_blocks);
+            const int done = sampling_completion_add(&workspace.group_done[col]);
             is_last        = done == partial_blocks ? 1 : 0;
         }
         __syncthreads();
@@ -965,9 +964,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
             sampling_p_less_store_admitted(workspace, col, admitted);
             workspace.group_done[col] = 0;
             const int need_cols       = tree ? valid : (extent + 1);
-            const int done_cols =
-                sampling_completion_add(workspace.speculative_finalize_count, need_cols);
-            is_finalizer = done_cols == need_cols ? 1 : 0;
+            const int done_cols = sampling_completion_add(workspace.speculative_finalize_count);
+            is_finalizer        = done_cols == need_cols ? 1 : 0;
         }
         __syncthreads();
         if (!is_finalizer) { return; }
