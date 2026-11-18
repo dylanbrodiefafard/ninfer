@@ -314,7 +314,7 @@ speculative continuation. Context checkpoints, the optimized proposal-head flag,
 widths, Vision and INT8 KV are unsupported.
 Tools, constraints, reasoning budgets, logprobs and p-less sampling work as for the 27B.
 [Native Gen5 measurements](docs/performance.md#flash-next-native-dflash2-gen5-2026-11-17)
-compare fixed/adaptive arms, Strata, and RAM conversation TTFT. Speculation is workload-dependent;
+compare the product default, the base artifact, Strata, and RAM conversation TTFT. Speculation is workload-dependent;
 the base artifact wins the measured high-concurrency HTTP cases.
 
 ## Docker

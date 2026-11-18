@@ -455,8 +455,8 @@ These are descriptive comparisons, not equal draws or confidence bounds: the stu
 accept uniforms and uses BF16 target KV/its own arithmetic profile. Native default NVFP4 KV and
 represented artifact weights are used here. The study's speed estimates are not native results;
 [native Engine/HTTP measurements](../performance.md#flash-next-native-dflash2-gen5-2026-11-17)
-cover every fixed arm and adaptive selection at C=1,2,3,4,6,8, with Strata reference values and
-separate RAM conversation TTFT. The base artifact is faster in the measured C6/C8 HTTP cases.
+cover the product default, the base control and Strata at C=1-6 and 8, with separate RAM
+conversation TTFT. The base artifact is faster in the measured C5/C6/C8 HTTP cases.
 
 The drafter owns initialized proposal-residual and physical-head transfer panels (1,510,400
 bytes per configured lane), separate from reused context scratch. CUDA 13.1 initcheck can flag
