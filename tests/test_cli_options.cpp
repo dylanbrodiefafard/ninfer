@@ -26,6 +26,27 @@ ninfer::cli::Options parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    failures += check(!parse({"ninfer", "model.ninfer", "--prompt", "hi"}).expert_helper_pci,
+                      "CLI enabled an expert helper by default");
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--expert-helper-pci", "ABCD:EF:1F.7"})
+                .expert_helper_pci == "abcd:ef:1f.7",
+        "CLI did not normalize the complete helper PCI address");
+    for (const char* pci : {"", "13:00.0", "0000:13:20.0", "0000:13:00.8", "0000:gg:00.0",
+                            "0000:13:00.00", " 0000:13:00.0", "0000:13:00.0x"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer", "model.ninfer", "--prompt", "hi", "--expert-helper-pci", pci});
+        } catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()).find("--expert-helper-pci") != std::string::npos;
+        }
+        failures += check(rejected, "CLI accepted a malformed or empty helper PCI address");
+    }
+    bool missing_helper = false;
+    try {
+        (void)parse({"ninfer", "model.ninfer", "--prompt", "hi", "--expert-helper-pci"});
+    } catch (const std::invalid_argument&) { missing_helper = true; }
+    failures += check(missing_helper, "CLI accepted a missing helper PCI value");
     failures += check(!parse({"ninfer", "model.ninfer", "--prompt", "hi"}).thinking_token_budget,
                       "CLI enabled a reasoning budget by default");
     failures += check(

@@ -13,6 +13,8 @@
 #include "runtime/program.h"
 
 #include "core/device.h"
+#include "core/expert_helper_pci.h"
+#include "targets/startup_options.h"
 #include "ninfer/ops/moe_experts.h"
 
 #include <cuda_profiler_api.h>
@@ -52,6 +54,9 @@ constexpr std::string_view kUsage = R"(usage: ninfer_qwen3_8_flash_next_parity [
 Required:
   --artifact PATH      qwen3.8-flash-next .ninfer artifact
   --ngram-table PATH   int8_row n-gram table (ngram_table.int8.bin)
+  --expert-helper-pci DOMAIN:BUS:DEVICE.FUNCTION
+                      optional gfx1201 decode helper; requires HIP-enabled build
+                      experimental: helper inference qualification remains pending
   --tokens PATH        token ids: a C-order int32 .npy [S,T], or raw little-endian I32 with
                        --sequences S sequences of equal length T
   --out DIR            output directory (created)
@@ -82,7 +87,8 @@ Options:
   --window-min-tokens N  narrowest super-chunk that streams through the windows (default 512)
   --expert-staging on|off  predictive expert staging of decode and verification rounds (default
                        on); it changes when records cross PCIe, never a result
-  --calib-counts PATH  '<i8' .npy [48,512] routing counts for the cache's warm start
+  --calib-counts PATH  CUDA-only cache warm-start '<i8' .npy [48,512] counts
+                      helper mode uses its compiled profile; trace modes are CUDA-only
   --kv-format F        QSA state format: nvfp4 (default) or bf16
   --lanes L,..         lanes-check: batch sizes (default 2,4,12); lanes-bench: concurrencies
   --kv-capacity N      lanes-bench: shared QSA pool tokens (default: every lane's context)
@@ -139,6 +145,7 @@ transitions) on greedy tokens, or with --teacher on the tokens that follow the p
 struct Options {
     std::filesystem::path artifact;
     std::filesystem::path ngram_table;
+    std::optional<std::string> expert_helper_pci;
     std::filesystem::path tokens;
     std::filesystem::path out;
     std::int64_t sequences      = 1;
@@ -267,6 +274,8 @@ Options parse(std::span<char*> args) {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(parse_int(value(), flag));
         } else if (flag == "--adaptive-draft") {
             options.speculative.adaptive_draft = true;
+        } else if (flag == "--expert-helper-pci") {
+            options.expert_helper_pci = ninfer::normalize_helper_pci(value());
         } else if (flag == "--profile-decode") {
             options.profile_decode = true;
         } else if (flag == "--decode") {
@@ -321,6 +330,13 @@ Options parse(std::span<char*> args) {
     if (options.artifact.empty() || options.ngram_table.empty() || options.tokens.empty() ||
         options.out.empty()) {
         throw std::invalid_argument("--artifact, --ngram-table, --tokens and --out are required");
+    }
+    ninfer::targets::validate_expert_helper_option(options.expert_helper_pci, "qwen3.8-flash-next");
+    if (options.expert_helper_pci &&
+        (!options.calib_counts.empty() || options.trace_mode || options.lanes_trace_mode)) {
+        throw std::invalid_argument(
+            "--expert-helper-pci uses the compiled placement profile; --calib-counts and "
+            "cache trace modes are CUDA-only");
     }
     if (options.sequences < 1) { throw std::invalid_argument("--sequences must be positive"); }
     if (options.decode_tokens < 1) { throw std::invalid_argument("--decode must be positive"); }
@@ -526,6 +542,7 @@ fn::ProgramOptions program_options_for(const Options& options, std::int32_t cont
         .expert_window_layers = options.window,
         .expert_cache_bytes   = std::nullopt,
         .calib_counts         = calib_counts,
+        .expert_helper_pci    = options.expert_helper_pci,
     };
     if (options.expert_cache_mib >= 0) {
         program_options.expert_cache_bytes = static_cast<std::size_t>(options.expert_cache_mib)

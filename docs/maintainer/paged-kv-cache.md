@@ -4,9 +4,13 @@ Current product execution supports ordinary decoding and DFlash2 only. MTP execu
 rejected at Engine admission. MTP algorithms and layouts below describe dormant private
 machinery, not an available product backend.
 
-This document defines the growing KV storage architecture of NInfer for a single GPU, a single
-resident model, and a small number of concurrent requests. It is the KV substrate on which the
-[small-scale concurrent inference architecture](concurrent-inference-architecture.md) depends.
+This document defines the growing KV storage architecture of NInfer for one NVIDIA primary GPU, a single
+resident model, and a small number of concurrent requests. An optional startup-selected gfx1201
+expert helper for Flash-Next owns immutable decode weights only: all KV pools, capacity and page
+ownership remain on the NVIDIA primary. Helper VRAM is never KV capacity; helper scratch is not
+continuation state. Its completion joins the settled-round boundary without changing reservation,
+retention, interruption or suspension rules. This KV substrate underlies the
+[small-scale concurrent inference architecture](concurrent-inference-architecture.md).
 
 This document defines the KV pool layout, page ownership, capacity reservation, logical frontier,
 prefix retention, and lifecycle. It also defines the device block-table representation, the

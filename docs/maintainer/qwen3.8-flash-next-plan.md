@@ -12,13 +12,31 @@ baseline below (phase 6) remains open. Remove this plan when that comparison is 
   about 4B dense, 4B MTP; 48 layers, hidden 2560). Text only; MTP not executed.
 - Placement: the n-gram table on the ext4 boot SSD
   (`/home/battlefront/ai/qwen3.8-flash-next-ngram`); every routed expert in pinned host RAM
-  with a dynamic VRAM cache; all computation on the GPU.
+  with a dynamic VRAM cache; ordinary execution stays on the NVIDIA primary. The opt-in
+  gfx1201 helper below accelerates only its immutable decode-expert subset.
 - Budgets: at most 50 GB of host RAM for weights; one RTX 5090 (32 GB) at PCIe Gen4 x16
   (the riser is rated Gen5; Gen5 may be enabled later).
 - Quality bar: teacher-forced KL against BF16 no worse than the ISTA-DASLab GSQ-RCO IQ3_S
   GGUF on the same tokens, plus a short task check.
 - Drafter: DFlash2 `incoai/Qwen3.8-Flash-Next-DFlash2` with NVFP4 matrices and a BF16
   selector codebook, as in the 27B production recipe.
+
+## Experimental gfx1201 expert helper
+
+`--expert-helper-pci 0000:13:00.0` is an optional startup-only Engine/CLI/server setting for this
+identity. It requires `NINFER_ENABLE_HIP_EXPERT_HELPER=ON`, selects one R9700 by full PCI address,
+and leaves the RTX 5090 primary. OFF builds and other identities reject it; omission preserves
+the ordinary path. The [helper plan](qwen3.8-flash-next-expert-helper.md) specifies compiled-CALIB
+exclusive decode placement, immutable original record bytes, partial arithmetic, guarded
+mailboxes and failure drains. Prefill/shared experts/drafting remain local; Engine scheduling
+and continuation formats do not change. Helper memory is reported separately from CUDA KV/cache.
+
+Startup logs selected hardware/toolchain, memory and record inventory, CALIB share, upload
+checksums and the exchange nonce. Invalid selection or exchange fails before readiness, never
+falls back. Runtime JSON profile loading is not supported; the served `--expert-route-profile`
+file is output-only. Helper-enabled same-column numerical, graph/eager, Engine/tier and HTTP
+qualification remain pending, as do end-to-end speed results. The ordinary measurements below
+are not evidence for helper mode.
 
 ## Baseline to beat
 

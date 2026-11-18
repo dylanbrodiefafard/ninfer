@@ -35,6 +35,26 @@ ninfer::RequestOptions test_request_options(const GenerationRequest& request,
 int main() {
     int failures      = 0;
     bool mtp_rejected = false;
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).expert_helper_pci,
+                      "server enabled an expert helper by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-helper-pci", "ABCD:EF:1F.7"})
+                              .expert_helper_pci == "abcd:ef:1f.7",
+                      "server did not normalize the complete helper PCI address");
+    for (const char* pci : {"", "13:00.0", "0000:13:20.0", "0000:13:00.8", "0000:gg:00.0",
+                            "0000:13:00.00", " 0000:13:00.0", "0000:13:00.0x"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--expert-helper-pci", pci});
+        } catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()).find("--expert-helper-pci") != std::string::npos;
+        }
+        failures += check(rejected, "server accepted a malformed or empty helper PCI address");
+    }
+    bool missing_helper = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--expert-helper-pci"});
+    } catch (const std::invalid_argument&) { missing_helper = true; }
+    failures += check(missing_helper, "server accepted a missing helper PCI value");
     failures +=
         check(!ServeOptions{}.default_thinking_token_budget &&
                   !parse({"ninfer-serve", "model.ninfer"}).default_thinking_token_budget &&

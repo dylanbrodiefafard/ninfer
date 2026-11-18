@@ -3,6 +3,9 @@
 
 #include <exception>
 #include <iostream>
+#include <optional>
+#include <stdexcept>
+#include <string>
 
 int main() {
     using namespace ninfer;
@@ -69,6 +72,57 @@ int main() {
                                         {})
                 .backend != SpeculativeBackend::None) {
             throw std::runtime_error("base Flash-Next artifact enabled speculation");
+        }
+        const std::optional<std::string> helper = "0000:13:00.0";
+        for (const auto selection :
+             {SpeculativeSelection::ArtifactDefault, SpeculativeSelection::Explicit}) {
+            bool wrong_target = false;
+            try {
+                (void)resolve_speculative_startup(base.path, selection, {}, helper);
+            } catch (const std::invalid_argument& error) {
+                wrong_target =
+                    std::string(error.what())
+                        .find("--expert-helper-pci applies only to qwen3.8-flash-next") !=
+                    std::string::npos;
+            }
+            if (!wrong_target) { throw std::runtime_error("27B accepted an expert helper"); }
+            bool build_rejected = false;
+            try {
+                const auto resolved =
+                    resolve_speculative_startup(flash_next.path, selection, {}, helper);
+                if ((selection == SpeculativeSelection::Explicit &&
+                     resolved.backend != SpeculativeBackend::None) ||
+                    (selection == SpeculativeSelection::ArtifactDefault &&
+                     resolved.backend != SpeculativeBackend::DFlash)) {
+                    throw std::runtime_error("helper preflight changed speculation selection");
+                }
+            } catch (const std::invalid_argument& error) {
+                build_rejected =
+                    std::string(error.what())
+                        .find("requires a build with NINFER_ENABLE_HIP_EXPERT_HELPER=ON") !=
+                    std::string::npos;
+                if (!build_rejected) { throw; }
+            }
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+            if (build_rejected) {
+                throw std::runtime_error("enabled build rejected helper preflight");
+            }
+#else
+            if (!build_rejected) {
+                throw std::runtime_error("OFF build accepted an expert helper");
+            }
+#endif
+        }
+        for (const char* pci : {"", "13:00.0", "0000:13:00.8"}) {
+            bool malformed = false;
+            try {
+                (void)resolve_speculative_startup(flash_next.path, SpeculativeSelection::Explicit,
+                                                  {}, std::string(pci));
+            } catch (const std::invalid_argument& error) {
+                malformed =
+                    std::string(error.what()).find("--expert-helper-pci") != std::string::npos;
+            }
+            if (!malformed) { throw std::runtime_error("helper preflight accepted malformed PCI"); }
         }
         std::cout << "ok\n";
         return 0;

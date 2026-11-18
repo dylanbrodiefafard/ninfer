@@ -36,25 +36,6 @@ bool complete(hipError_t status) {
 }
 } // namespace
 
-std::string normalize_helper_pci(std::string_view pci) {
-    if (pci.size() != 12 || pci[4] != ':' || pci[7] != ':' || pci[10] != '.') {
-        throw std::invalid_argument("expert helper PCI must be domain:bus:device.function");
-    }
-    std::string result(pci);
-    for (std::size_t i = 0; i < result.size(); ++i) {
-        if (i == 4 || i == 7 || i == 10) { continue; }
-        char& c = result[i];
-        if (c >= 'A' && c <= 'F') { c = static_cast<char>(c - 'A' + 'a'); }
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
-            throw std::invalid_argument("expert helper PCI contains a non-hex digit");
-        }
-    }
-    if (result[8] > '1' || result[11] > '7') {
-        throw std::invalid_argument("expert helper PCI device/function is out of range");
-    }
-    return result;
-}
-
 HipDevice::HipDevice(std::string_view pci) : pci_(normalize_helper_pci(pci)) {
     check(hipDeviceGetByPCIBusId(&ordinal_, pci_.c_str()), "select PCI device");
     bind();

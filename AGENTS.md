@@ -71,8 +71,10 @@ or will be changed, proportionately and without performative apology or praise.
 
 ## Current product contract
 
-NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance,
-compiled for `sm_120a` and tuned on an NVIDIA GeForce RTX 5090. Two identities are supported. The
+NInfer is a from-scratch C++/CUDA inference engine for maximum inference performance on one
+NVIDIA primary GPU, compiled for `sm_120a` and tuned on an NVIDIA GeForce RTX 5090. Flash-Next
+alone may use one optional startup-selected gfx1201 expert-compute helper, as described below;
+this is not a general ROCm port or multi-GPU Engine. Two identities are supported. The
 recommended one is `qwen3.8-27b/nvfp4`; its recommended artifact is the DFlash2 variant (NVFP4
 matrices, BF16 selector codebook) over the base Ostfralla NVFP4 shell. CLI/server default to
 automatic KV capacity and enable adaptive DFlash2 K7 with the optimized proposal head when that
@@ -93,8 +95,14 @@ Its optional DFlash2 companion enables chain-only adaptive K0–3 speculation wi
 proposal head. Complete retained, RAM and SSD continuations include its cyclic draft context,
 pending features and calibration; live suspension also preserves request statistics. It rejects
 context checkpoints, the optimized proposal head, explicit verify widths, Vision, INT8 KV and
-sparse or Sage attention.
-The workload is one GPU, one resident model instance, and a startup-fixed one to twelve active
+sparse or Sage attention. Its experimental `--expert-helper-pci` option selects one gfx1201
+R9700 in an opt-in HIP-enabled build for immutable decode/verification expert placement only.
+The NVIDIA primary retains routing, shared experts, drafting, all prefill and all request/KV
+state. Helper completion joins settled rounds; failures poison execution without fallback.
+Compiled routing counts are placement policy, not artifact metadata or continuation state.
+Helper-enabled inference/performance qualification remains pending; default execution is unchanged.
+The workload is one NVIDIA primary, at most that one startup-selected helper, one resident model
+instance, and a startup-fixed one to twelve active
 requests. The Engine forms one compact decode batch per round boundary with bounded FIFO
 ingress. A short text prefill may interrupt a large prefill at a completed chunk boundary only on a genuinely
 available spare lane with its own feasible resources; the suspended owner retains its lane
@@ -158,12 +166,12 @@ them, updating the corresponding authorities and implementation together.
 | `.ninfer` | the only C++ product artifact | `.qus` fallback, extension detection, compatibility shims, a second product lane |
 | `include/ninfer/engine.h`, `include/ninfer/types.h` | the opaque Engine interface used by in-tree applications and owning host values; NInfer does not install or export a C++ SDK | |
 | `include/ninfer/ops/` | repository-internal semantic Op contracts | |
-| `src/core` | device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV-cache containers, raw transfer mechanisms | |
+| `src/core` | device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV-cache containers, raw transfer mechanisms, optional HIP resource RAII and runtime-neutral mapped-mailbox transport | expert placement or model mathematics |
 | `src/artifact` | generic `.ninfer` framing, descriptors, binding primitives, materialization | checkpoint execution semantics |
 | `src/ops` | every semantically closed Op implementation, including fused, fixed-shape, and device-specialized paths; ownership follows the mathematical or state-transition contract, not the first model caller or demonstrated cross-target reuse | |
 | `src/targets/qwen3_6` | shared Qwen3.6-family architecture code used by the Qwen3.8-27B target (Qwen3.8-Flash-Next uses only its frontend and output semantics): tokenizer/template and output semantics, media preprocessing and MRoPE prompt construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive Vision definitions, and the fixed planning/Program/Text/Vision/speculative/state/workspace/CUDA-Graph algorithms | target identity, registry entry, artifact binder, target leaf implementation, storage for a live Program instance |
 | `src/targets/<package>` | registered checkpoint identities, storage profiles, binder, `LoadedModel`, configuration, populated family model-view values and private leaf payloads, diagnostics, graph frontier values, and exactly three execution-leaf families (attention projection, GDN projection/control, post-mixer); aliases and instantiates the family runtime types | a copied Program, Text/Vision/speculative schedule, workspace composition, state transaction, or graph-capture algorithm; leaf Ops remain in `src/ops` |
-| `src/targets/qwen3_8_flash_next` | the Flash-Next identity, binder and `LoadedModel`, its own Program (Forward, State, expert residency, n-gram reader and PLE row feeder; the Qwen3.6 family runtime does not apply to its hyper-connected MoE layers), and `EngineProgram`, the adapter that maps the ConcurrentExecutor's Program surface onto that Program; it reuses the shared Qwen3.6 frontend | family Program types, the Engine scheduler, KV-tier or speculative machinery it does not run; Ops remain in `src/ops` |
+| `src/targets/qwen3_8_flash_next` | the Flash-Next identity, binder and `LoadedModel`, its own Program (Forward, State, expert residency, optional helper placement/round scheduling, n-gram reader and PLE row feeder; the Qwen3.6 family runtime does not apply to its hyper-connected MoE layers), and `EngineProgram`, the adapter that maps the ConcurrentExecutor's Program surface onto that Program; it reuses the shared Qwen3.6 frontend | family Program types, the Engine scheduler, KV-tier or speculative machinery it does not run; Ops remain in `src/ops` |
 | `src/runtime` | common contracts, generated-token transaction/publication policy, public Engine PIMPL | model mathematics or target state |
 | `src/media/decode` | consuming already-owned bytes | URL/path/data acquisition, which belongs to `src/product/media_acquire`, CLI, or serving and is not linked into a target |
 | `src/product/prompt_input` | the shared product-side JSON/message-to-owning-input adapter | |

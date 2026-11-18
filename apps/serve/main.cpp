@@ -48,7 +48,8 @@ int main(int argc, char** argv) {
         }
 
         options.speculative = ninfer::product::resolve_speculative_startup(
-            options.artifact_path, options.speculative_selection, options.speculative);
+            options.artifact_path, options.speculative_selection, options.speculative,
+            options.expert_helper_pci);
         using Clock = std::chrono::steady_clock;
         ninfer::serve::HttpServer server(options);
         if (!server.bind()) {
@@ -101,6 +102,15 @@ int main(int argc, char** argv) {
         if (memory.expert_cache_bytes != 0 || memory.expert_cache_flex_bytes != 0) {
             capacity << " expert-cache=" << format_bytes(memory.expert_cache_bytes)
                      << "+kv-lendable=" << format_bytes(memory.expert_cache_flex_bytes);
+        }
+        if (memory.expert_helper) {
+            const auto& helper = *memory.expert_helper;
+            capacity << " helper-records=" << format_bytes(helper.record_bytes)
+                     << " helper-aux=" << format_bytes(helper.nonrecord_device_bytes)
+                     << " helper-reserve=" << format_bytes(helper.reserve_bytes)
+                     << " helper-free-at-start=" << format_bytes(helper.free_at_start_bytes)
+                     << " helper-cuda-panels=" << format_bytes(helper.cuda_device_bytes)
+                     << " helper-mailbox-host=" << format_bytes(helper.mailbox_host_bytes);
         }
         capacity << " ckpt-pin=" << format_bytes(memory.checkpoint_image_host_bytes)
                  << " ckpt-heads=" << memory.checkpoint_image_pool_heads

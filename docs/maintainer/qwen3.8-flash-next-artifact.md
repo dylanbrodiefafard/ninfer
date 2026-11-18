@@ -262,6 +262,16 @@ most-routed experts (by calibration route count) in GPTQ NVFP4 (E4M3 scale per 1
 FP32 multiplier per matrix. The converter repacks every code, scale, multiplier, and book word
 without changing it; the BF16 checkpoint's routed-expert tensors are never read.
 
+The optional startup-selected gfx1201 expert helper changes placement, not this artifact.
+`--expert-helper-pci` copies selected records, matrix scales and books byte-for-byte into an
+immutable helper bank; the pinned host store remains the local-prefill backing. Its compiled
+CALIB routing profile is target-private performance policy, not weight metadata or an artifact
+object. There is no runtime placement JSON sidecar. Ownership is fixed for the Program lifetime,
+while primary cache residency may change. Helper PCI/placement does not enter the continuation
+fingerprint: same-mode transport remains exact, while cross-mode execution is checked
+numerically rather than requiring bitwise identity across reduction profiles. Helper inference
+qualification remains pending; see the [helper plan](qwen3.8-flash-next-expert-helper.md).
+
 ## 7. Inventory summary
 
 | Component | Objects |

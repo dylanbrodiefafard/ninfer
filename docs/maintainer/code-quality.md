@@ -77,6 +77,35 @@ own `ninfer-dual-gpu-build-cache` volume at `/build`, and mounts `NINFER_MODELS_
 and `NINFER_DATA_DIR` at `/data` read-only when they are set. The script header lists the other
 overrides. An existing container keeps its original image and mounts until it is recreated.
 
+Configure the optional feature explicitly in that container (the default remains OFF):
+
+```bash
+docker exec ninfer-builder-dual-gpu cmake -S /src -B /build/helper -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DNINFER_WARNINGS_AS_ERRORS=ON \
+  -DNINFER_ENABLE_HIP_EXPERT_HELPER=ON
+docker exec ninfer-builder-dual-gpu cmake --build /build/helper --parallel 8
+```
+
+`--expert-helper-pci` is recognized by both product parsers. Host-only startup admission rejects
+an OFF build and non-Flash-Next identity without loading weights or initializing the helper.
+ON binaries without the option retain the ordinary CUDA schedule and allocate no helper
+exchange/panels. The helper's startup diagnostics include selected PCI/name/gfx target,
+HIP/toolchain, actual memory use, record inventory, compiled-profile share and checksum/nonce
+validation. Enabled inference qualification and speed results remain pending.
+
+The ON-only `ninfer_qwen3_8_flash_next_helper_real_test` runs the public Engine's helper smoke
+with two repeated requests and consecutive decode rounds. Set
+`NINFER_QWEN3_8_FLASH_NEXT_WEIGHTS`, `NINFER_QWEN3_8_FLASH_NEXT_NGRAM_TABLE` and
+`NINFER_QWEN3_8_FLASH_NEXT_HELPER_PCI` explicitly; absent prerequisites skip with code 77. It
+requires both devices and is not a CPU or R9700-only test. The target parity driver also accepts
+`--expert-helper-pci`, including the public-Engine `lanes-bench` path; CUDA-only cache traces and
+`--calib-counts` cannot be combined with helper mode.
+
+CUDA memcheck/racecheck do not instrument HIP. Keep the independent HIP oracle, exact upload and
+wire-visibility tests distinct from CUDA sanitizer evidence. The pinned clang-tidy 22 cannot
+parse the ROCm-23 `__builtin_amdgcn_is_invocable` headers; matching ROCm clang-tidy analysis is
+supplementary, not a pinned-gate pass. Do not suppress or disable checks to hide this limitation.
+
 ### Running clang-tidy
 
 clang-tidy runs in the builder container against `/build/compile_commands.json`:

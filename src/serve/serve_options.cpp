@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "core/expert_helper_pci.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -124,7 +125,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--context-checkpoints off|on|a,b,c] "
            "[--ngram-table PATH] [--qsa-select-budget 512|1024|2048] "
-           "[--expert-route-profile PATH] "
+           "[--expert-route-profile PATH] [--expert-helper-pci DOMAIN:BUS:DEVICE.FUNCTION] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--system-prepend TEXT] "
            "[--default-thinking-token-budget N|off] "
            "[--cors] "
@@ -167,6 +168,9 @@ std::string serve_usage_text(const char* argv0) {
            "(both require DFlash). Marks at or above --max-context stay unused. "
            "Advertised freeze F is the committed chunk end at or past the mark. Turn-rollback "
            "checkpoints do not depend on the ladder.\n"
+           "       --expert-helper-pci selects one gfx1201 helper for Flash-Next decode only;\n"
+           "       requires NINFER_ENABLE_HIP_EXPERT_HELPER=ON. Experimental, no qualified "
+           "speedup.\n"
            "       --expert-route-profile PATH is Flash-Next only: overwrites decode route JSON\n"
            "       every five minutes at a settled round boundary and at clean shutdown.\n"
            "       qwen3.8-flash-next requires --ngram-table (its 8-bit n-gram table file) and "
@@ -346,6 +350,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--expert-helper-pci") {
+            options.expert_helper_pci = normalize_helper_pci(require_value("--expert-helper-pci"));
         } else if (arg == "--expert-route-profile") {
             options.expert_route_profile_path = require_value("--expert-route-profile");
             if (options.expert_route_profile_path.empty()) {

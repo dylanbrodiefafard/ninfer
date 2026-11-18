@@ -36,11 +36,12 @@ int run_lanes_bench(const Options& options, std::span<const std::int32_t> stream
             throw std::invalid_argument("lanes-bench context cannot hold the requested lifetime");
         }
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path    = options.artifact;
-        engine_options.ngram_table_path = options.ngram_table;
-        engine_options.max_concurrency  = static_cast<std::uint32_t>(lanes);
-        engine_options.max_context      = static_cast<std::uint32_t>(context);
-        engine_options.prefill_chunk    = static_cast<std::uint32_t>(options.chunk);
+        engine_options.artifact_path     = options.artifact;
+        engine_options.ngram_table_path  = options.ngram_table;
+        engine_options.expert_helper_pci = options.expert_helper_pci;
+        engine_options.max_concurrency   = static_cast<std::uint32_t>(lanes);
+        engine_options.max_context       = static_cast<std::uint32_t>(context);
+        engine_options.prefill_chunk     = static_cast<std::uint32_t>(options.chunk);
         engine_options.qsa_select_budget =
             ninfer::parse_qsa_select_budget_flag(std::to_string(options.budget));
         engine_options.kv_cache    = options.kv_format == ninfer::ops::QsaKvFormat::BF16
@@ -128,7 +129,14 @@ int run_lanes_bench(const Options& options, std::span<const std::int32_t> stream
         }
         if (!dump) { throw std::runtime_error("cannot write generated token dump"); }
         const double rate = static_cast<double>(measured_tokens) / decode_seconds;
-        report << "{\"lanes\":" << lanes << ",\"lane_context\":" << context
+        report << "{\"expert_helper_pci\":";
+        if (options.expert_helper_pci) {
+            // The parser limits this value to canonical hexadecimal PCI notation.
+            report << '"' << *options.expert_helper_pci << '"';
+        } else {
+            report << "null";
+        }
+        report << ",\"lanes\":" << lanes << ",\"lane_context\":" << context
                << ",\"kv_capacity_tokens\":" << engine.memory_summary().kv_capacity
                << ",\"decode_tokens\":" << measured_tokens
                << ",\"decode_seconds\":" << decode_seconds << ",\"decode_tok_s\":" << rate

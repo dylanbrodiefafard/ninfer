@@ -62,6 +62,7 @@ struct ServeOptions {
     // qwen3.8-flash-next only.
     std::filesystem::path ngram_table_path;
     std::filesystem::path expert_route_profile_path;
+    std::optional<std::string> expert_helper_pci;
     std::optional<QsaSelectBudget> qsa_select_budget;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)

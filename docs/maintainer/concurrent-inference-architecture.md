@@ -5,7 +5,7 @@ rejected at Engine admission. MTP algorithms and layouts below describe dormant 
 machinery, not an available product backend.
 
 This document defines the execution architecture by which NInfer supports a small number of
-concurrent requests on a single GPU with a single model instance. A typical `max_concurrency` is
+concurrent requests on one NVIDIA primary GPU with a single model instance. A typical `max_concurrency` is
 1-8.
 
 The design goal is not to let multiple requests execute in turn, but to let all requests in the
@@ -23,7 +23,8 @@ runtime, operator, and qualification documents.
 
 ### 1.1 Supported workload
 
-- Single GPU, single resident model instance;
+- One NVIDIA primary GPU, single resident model instance; Flash-Next alone may select one
+  gfx1201 expert-compute helper at startup (not a general ROCm port or multi-GPU Engine);
 - `max_concurrency=C` is fixed at startup, and `C=1..12` is supported;
 - `0..C` admitted requests at run time;
 - Text and image/video prompts (text only for qwen3.8-flash-next, §1.4);
@@ -31,6 +32,13 @@ runtime, operator, and qualification documents.
 - streaming and non-streaming output;
 - prefix reuse, plus an optional completed-bundle pinned-host RAM second tier;
 - Different prompt lengths, context lengths, generation limits, and sampling configurations.
+
+The optional Flash-Next helper owns immutable decode-resident expert weights and round-local
+scratch only. The target Program submits its HIP graph before CUDA graph A, retains the layer-zero /
+host PLE / graph-B split, and joins helper completion before licensing output or settling the
+round. Prefill stays on the primary. Helper errors poison the round/Engine; no CUDA-only retry
+is licensed. No helper state enters request lanes, KV pools, retained/RAM/SSD continuations or
+scheduler policy. Helper-enabled numerical/lifecycle qualification remains pending.
 
 ### Eight-lane execution geometry
 

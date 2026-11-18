@@ -6,6 +6,7 @@
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/qwen3_6/impl/frontend/encoded_history_cache.h"
 #include "targets/registry.h"
+#include "targets/startup_options.h"
 
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
@@ -37,6 +38,11 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.stop                     = std::move(options.stop);
     resolved.output                   = options.output;
     return resolved;
+}
+
+EngineOptions checked_startup_options(EngineOptions options) {
+    targets::validate_expert_helper_build(options.expert_helper_pci);
+    return options;
 }
 
 std::string context_capacity_error(std::uint32_t prompt_tokens, std::uint32_t max_context) {
@@ -157,7 +163,7 @@ public:
     static_assert(std::variant_size_v<ActiveRuntime> == 2);
 
     explicit Impl(EngineOptions engine_options)
-        : options(std::move(engine_options)), device(options.device),
+        : options(checked_startup_options(std::move(engine_options))), device(options.device),
           active(start(targets::construct_target(options, device))) {}
 
     ~Impl() noexcept {

@@ -67,8 +67,9 @@ struct ProgramOptions {
     // Optional calibration routing count per expert, layer-major [48,512], for the cache's warm
     // start (ExpertResidency).
     std::span<const std::uint64_t> calib_counts;
-    // Internal startup placement control; product/Engine plumbing is separate. OFF builds reject
-    // a supplied PCI address before allocating lane state; nullopt preserves the ordinary path.
+    // Startup-fixed helper placement, forwarded by Engine or the target parity driver. OFF
+    // builds reject a supplied PCI address before allocating lane state; nullopt preserves the
+    // ordinary path.
     std::optional<std::string> expert_helper_pci;
 };
 

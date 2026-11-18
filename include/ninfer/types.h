@@ -222,6 +222,9 @@ struct EngineOptions {
     // Flash-Next only: overwrite this JSON with decode routed-set statistics every five minutes
     // at a settled round boundary and at clean shutdown. Empty disables file output.
     std::filesystem::path expert_route_profile_path;
+    // Flash-Next only: optional startup-selected gfx1201 expert-compute helper. A full PCI
+    // domain:bus:device.function; unset leaves ordinary CUDA-only execution unchanged.
+    std::optional<std::string> expert_helper_pci;
     // qwen3.8-flash-next only; unset selects 512 blocks. Other targets reject a value.
     std::optional<QsaSelectBudget> qsa_select_budget;
     // Diagnostic baseline: disable repetition exclusions and internal regeneration,
@@ -791,6 +794,19 @@ struct ArenaMemorySummary {
     std::size_t peak_used_bytes = 0;
 };
 
+// Separate helper-device accounting; never added to primary CUDA free memory or KV capacity.
+// cuda_device_bytes is already included in workspace; mailbox_host_bytes is additional pinned RAM.
+struct ExpertHelperMemorySummary {
+    std::size_t free_at_start_bytes    = 0;
+    std::size_t reserve_bytes          = 0;
+    std::size_t record_bytes           = 0;
+    std::size_t nonrecord_device_bytes = 0;
+    std::size_t cuda_device_bytes      = 0;
+    std::size_t mailbox_host_bytes     = 0;
+    // NVFP4, F3G32, respectively.
+    std::array<std::int32_t, 2> record_counts{};
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -820,6 +836,8 @@ struct MemorySummary {
     // second lies inside kv_payload_bytes and is an upper bound, not the current holding.
     std::size_t expert_cache_bytes      = 0;
     std::size_t expert_cache_flex_bytes = 0;
+    // Absent when the helper is disabled, in either build configuration.
+    std::optional<ExpertHelperMemorySummary> expert_helper;
     // Pinned host memory for checkpoint images (per-lane rewrite images plus the
     // context-checkpoint head pool), allocated and prefaulted at startup, separate from
     // kv_ram_capacity_bytes.

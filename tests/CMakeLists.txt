@@ -710,6 +710,12 @@ add_test(NAME ninfer_qwen3_8_27b_eight_windows_real_test
 set_tests_properties(ninfer_qwen3_8_27b_eight_windows_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 
 if(NINFER_ENABLE_HIP_EXPERT_HELPER)
+  add_test(NAME ninfer_qwen3_8_flash_next_helper_real_test
+    COMMAND ${NINFER_TEST_LAUNCHER}
+      $<TARGET_FILE:ninfer_qwen3_8_flash_next_engine_real_test> --helper-smoke)
+  set_tests_properties(ninfer_qwen3_8_flash_next_helper_real_test PROPERTIES
+    SKIP_RETURN_CODE 77 LABELS "cuda;hip;slow" TIMEOUT 480)
+
   add_library(ninfer_expert_mailbox_test_hip OBJECT test_expert_mailbox_hip.hip)
   ninfer_hip_target(ninfer_expert_mailbox_test_hip)
   ninfer_add_test(ninfer_expert_mailbox_test

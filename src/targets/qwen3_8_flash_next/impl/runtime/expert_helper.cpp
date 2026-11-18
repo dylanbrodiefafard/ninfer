@@ -159,14 +159,14 @@ struct ExpertHelper::Impl {
                   .cuda_device_bytes      = cuda_storage.capacity(),
                   .mailbox_host_bytes     = mailbox.bytes(),
                   .record_counts          = placement.helper_counts};
-        std::fprintf(stderr,
-                     "expert-helper pci=%s name=%s arch=%s HIP=%d free=%zu reserve=%zu records=%zu "
-                     "nonrecord=%zu cuda=%zu mailbox=%zu transport=T1-47:mapped,T48:DMA "
-                     "upload=%.3fs checksum=ok nonce=ok\n",
-                     initial.pci.c_str(), initial.name.c_str(), initial.architecture.c_str(),
-                     initial.runtime_version, initial.free_bytes, kHelperReserveBytes,
-                     records.size(), nonrecords, memory.cuda_device_bytes, mailbox.bytes(),
-                     upload.seconds);
+        std::fprintf(
+            stderr,
+            "expert-helper pci=%s name=%s arch=%s HIP=%d free=%zu reserve=%zu used=%zu records=%zu "
+            "nonrecord=%zu cuda=%zu mailbox=%zu transport=T1-47:mapped,T48:DMA "
+            "upload=%.3fs checksum=ok nonce=ok\n",
+            initial.pci.c_str(), initial.name.c_str(), initial.architecture.c_str(),
+            initial.runtime_version, initial.free_bytes, kHelperReserveBytes, used, records.size(),
+            nonrecords, memory.cuda_device_bytes, mailbox.bytes(), upload.seconds);
         std::fprintf(
             stderr,
             "expert-helper fixed=%d/%d local=%d/%d helper=%d/%d codec-bytes=%zu/%zu "

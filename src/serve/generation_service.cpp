@@ -339,6 +339,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.speculative               = options_.speculative;
     engine_options.ngram_table_path          = options_.ngram_table_path;
     engine_options.expert_route_profile_path = options_.expert_route_profile_path;
+    engine_options.expert_helper_pci         = options_.expert_helper_pci;
     engine_options.qsa_select_budget         = options_.qsa_select_budget;
     engine_options.load_progress             = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));

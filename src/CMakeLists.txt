@@ -291,10 +291,17 @@ if(NINFER_BUILD_PROMPT_INPUT)
   target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire ninfer_text)
 endif()
 
+# Host-only target admission is shared by Engine and product preflight; it links neither runtime.
+add_library(ninfer_target_startup STATIC targets/startup_options.cpp)
+ninfer_internal_includes(ninfer_target_startup)
+if(NINFER_ENABLE_HIP_EXPERT_HELPER)
+  target_compile_definitions(ninfer_target_startup PUBLIC NINFER_ENABLE_HIP_EXPERT_HELPER)
+endif()
+
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
   add_library(ninfer_product_startup STATIC product/startup_options.cpp)
   ninfer_internal_includes(ninfer_product_startup)
-  target_link_libraries(ninfer_product_startup PRIVATE ninfer_artifact)
+  target_link_libraries(ninfer_product_startup PUBLIC ninfer_target_startup PRIVATE ninfer_artifact)
   add_library(ninfer_product_load_progress STATIC
     product/load_progress/load_progress.cpp)
   ninfer_internal_includes(ninfer_product_load_progress)
@@ -306,6 +313,7 @@ add_library(ninfer_engine STATIC
   targets/registry.cpp
   runtime/contract/sampling.cpp
   runtime/engine/engine.cpp)
+target_link_libraries(ninfer_engine PRIVATE ninfer_target_startup)
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 

@@ -17,6 +17,7 @@
 
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/expert_helper_pci.h"
 #include "load/binder.h"
 #include "runtime/program.h"
 #include "ninfer/ops/hyper_connection.h"
@@ -54,6 +55,7 @@ struct Inputs {
     const char* artifact    = nullptr;
     const char* ngram_table = nullptr;
     ninfer::SpeculativeOptions speculative;
+    std::optional<std::string> expert_helper_pci;
 };
 
 void require(bool condition, const std::string& message) {
@@ -83,12 +85,13 @@ ninfer::RequestOptions greedy(std::uint32_t outputs) {
 ninfer::EngineOptions engine_options(const Inputs& inputs, std::uint32_t lanes,
                                      std::uint32_t context, std::uint32_t kv_tokens) {
     ninfer::EngineOptions options;
-    options.artifact_path    = inputs.artifact;
-    options.ngram_table_path = inputs.ngram_table;
-    options.speculative      = inputs.speculative;
-    options.max_concurrency  = lanes;
-    options.max_context      = context;
-    options.kv_capacity      = ninfer::KvCapacityPolicy::explicit_capacity(kv_tokens);
+    options.artifact_path     = inputs.artifact;
+    options.ngram_table_path  = inputs.ngram_table;
+    options.speculative       = inputs.speculative;
+    options.expert_helper_pci = inputs.expert_helper_pci;
+    options.max_concurrency   = lanes;
+    options.max_context       = context;
+    options.kv_capacity       = ninfer::KvCapacityPolicy::explicit_capacity(kv_tokens);
     return options;
 }
 
@@ -1432,6 +1435,35 @@ void engine_suite(const Inputs& inputs) {
     cross_batch_teacher_forcing(inputs, observations);
 }
 
+// The public helper startup/teardown smoke uses one fixed placement and identical geometry
+// across both requests. It does not compare different arithmetic profiles or claim model parity.
+void helper_smoke(const Inputs& inputs, std::string_view pci) {
+    Inputs enabled            = inputs;
+    enabled.expert_helper_pci = ninfer::normalize_helper_pci(pci);
+    {
+        ninfer::Engine engine(engine_options(enabled, 1, 2048, 2048));
+        const auto memory = engine.memory_summary();
+        require(memory.expert_helper.has_value(), "enabled Engine omitted helper memory");
+        const auto& helper = memory.expert_helper.value();
+        require(helper.record_bytes > 0 && helper.mailbox_host_bytes > 0 &&
+                    helper.cuda_device_bytes > 0 &&
+                    memory.workspace.capacity_bytes >= helper.cuda_device_bytes,
+                "enabled helper memory is missing or CUDA panels are outside workspace");
+        auto request        = greedy(16);
+        request.output.raw  = true;
+        const auto prompt   = prompt_tokens(128, 6123);
+        const auto first    = engine.generate(engine.prepare_tokens(prompt, false), request);
+        const auto repeated = engine.generate(engine.prepare_tokens(prompt, false), request);
+        require(first.finish_reason == ninfer::FinishReason::OutputLimit &&
+                    repeated.finish_reason == ninfer::FinishReason::OutputLimit,
+                "helper smoke did not complete both requests");
+        require_equal(repeated.generated_token_ids, first.generated_token_ids,
+                      "helper repeated request at fixed geometry");
+        require(engine.runtime_stats().decode_rounds >= 2,
+                "helper smoke did not run consecutive rounds");
+    }
+    std::cout << "helper Engine startup, consecutive rounds, repeated request and teardown: ok\n";
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1445,7 +1477,14 @@ int main(int argc, char** argv) {
     }
     try {
         const std::string_view mode = argc == 2 ? std::string_view(argv[1]) : std::string_view{};
-        if (mode == "--program-parity") {
+        if (mode == "--helper-smoke") {
+            const char* pci = std::getenv("NINFER_QWEN3_8_FLASH_NEXT_HELPER_PCI");
+            if (pci == nullptr || *pci == '\0') {
+                std::cout << "skip: set NINFER_QWEN3_8_FLASH_NEXT_HELPER_PCI\n";
+                return 77;
+            }
+            helper_smoke(inputs, pci);
+        } else if (mode == "--program-parity") {
             program_parity(inputs);
         } else if (mode == "--reuse-parity") {
             reuse_parity(inputs);
@@ -1486,7 +1525,8 @@ int main(int argc, char** argv) {
         } else {
             std::cerr
                 << "usage: " << argv[0]
-                << " [--program-parity|--reuse-parity|--verify-parity|--dflash-program|"
+                << " [--helper-smoke|--program-parity|--reuse-parity|--verify-parity|--dflash-"
+                   "program|"
                    "--dflash-engine|--retained|--dflash-retained|--ram-tiers|--disk-tiers|"
                    "--live-tiers|--dflash-ram-tiers|--dflash-disk-tiers|--dflash-live-tiers|"
                    "--conversation-bench|--conversation-ram-bench|--mixer-split-diagnostic]\n";

@@ -180,6 +180,7 @@ The RTX 5090 tree investigation is in
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--context-checkpoints off\|on\|a,b,c` | automatic prefill ladder: `off` captures none, `on` uses the standard marks (24576, 36864, 53248, 77824, 102400, 151552), and a comma list sets custom marks. `on` and custom lists require DFlash, selected automatically or with `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark, not the raw named size. Turn-rollback and turn (rewrite) checkpoints do not depend on the ladder. | `off` |
 | `--ngram-table PATH` | qwen3.8-flash-next only, and required by it: the 8-bit n-gram (PLE) table file (`ngram_table.int8.bin`); other targets reject it | unset |
+| `--expert-helper-pci DOMAIN:BUS:DEVICE.FUNCTION` | Experimental Flash-Next decode expert helper: one startup-selected gfx1201 R9700; requires `NINFER_ENABLE_HIP_EXPERT_HELPER=ON`; no helper by default | unset |
 | `--expert-route-profile PATH` | Flash-Next only: atomically overwrite decode/verify routed-set JSON at startup, every five minutes at a settled round boundary, and at clean shutdown; no restart accumulation | unset |
 | `--qsa-select-budget 512\|1024\|2048` | qwen3.8-flash-next only: complete four-token QSA blocks each query attends to beyond its tail | `512` |
 | `--capture-context-checkpoint` | pin the current resume frontier `E` on an exact-hit / decode-only request (the same one-slot turn-rollback head automatic occupy-append already writes). A fresh one-shot run has `E == 0`, so this is a no-op unless a retained lane already exists in the process. | off |
@@ -278,6 +279,30 @@ through the first completing `</tool_call>`; the next round can then stop. Other
 conditions remain active, and raw output does not apply this structured-output guard.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
+
+### Experimental Flash-Next expert helper
+
+`--expert-helper-pci 0000:13:00.0` selects a full PCI address (four hex domain digits, two bus,
+two device, one function; device 00–1f and function 0–7), normalized to lowercase. Empty,
+malformed or abbreviated addresses are rejected. Only `qwen3.8-flash-next` accepts the option;
+OFF builds report that `NINFER_ENABLE_HIP_EXPERT_HELPER=ON` is required. Use the
+[dual-card build](maintainer/code-quality.md#opt-in-dual-card-development-container); the default
+CUDA-only build and execution remain unchanged.
+
+The helper owns immutable decode-resident experts chosen from the compiled CALIB profile. All
+prefill stays local; KV/cache pressure changes primary residency, never helper ownership.
+`--expert-route-profile PATH` writes statistics and is **not** a helper placement input flag.
+There is no runtime profile JSON sidecar. Startup verifies byte-preserving uploads and a
+cross-device nonce before readiness; missing/unsupported devices, allocation, registration or
+exchange errors fail startup without CUDA-only fallback. Helper errors after launch poison the
+round/Engine rather than licensing results or retrying on CUDA.
+
+Host overhead includes 32 MiB upload staging (released after upload) and up to about 34 MiB of
+mailboxes. Helper memory is reported separately; its CUDA panels are already included in
+workspace. Shared experts, routing, the proposal head and n-gram processing remain on the RTX
+5090. The local/remote FP32 join changes reduction association before the BF16 MoE boundary;
+bitwise equivalence across modes is not promised. Helper inference and speed qualification are
+pending; this flag is experimental, not a recommendation or a qualified performance result.
 
 ## Context and memory
 

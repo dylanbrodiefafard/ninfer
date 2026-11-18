@@ -317,6 +317,24 @@ Tools, constraints, reasoning budgets, logprobs and p-less sampling work as for 
 compare the product default, the base artifact, Strata, and RAM conversation TTFT. Speculation is workload-dependent;
 the base artifact wins the measured high-concurrency HTTP cases.
 
+### Experimental R9700 expert helper
+
+Flash-Next alone accepts `--expert-helper-pci 0000:13:00.0` in a build configured with
+`-DNINFER_ENABLE_HIP_EXPERT_HELPER=ON`. It selects one gfx1201 Radeon AI PRO R9700 for an
+immutable subset of decode/verification experts; one RTX 5090 remains the primary. Prefill,
+routing, shared experts and the draft network stay on CUDA. This is not a general ROCm port or
+a multi-GPU Engine. The flag defaults off; ordinary OFF builds discover no HIP toolchain and
+reject the option explicitly. See the [dual-card build recipe](docs/maintainer/code-quality.md#opt-in-dual-card-development-container).
+
+Placement uses a compiled routing profile, not a runtime JSON sidecar. Startup copies original
+expert records without repacking, checks their bytes and a mailbox nonce, and fails rather than
+falling back if the selected device or exchange is unusable. Extra host memory includes two
+16 MiB upload buffers (released after upload) and up to about 34 MiB of exchange storage; helper
+VRAM is separate from the CUDA KV budget. Local and helper FP32 partials join before one BF16
+rounding, so cross-mode arithmetic need not be bitwise identical. Helper-enabled inference,
+startup/lifecycle and end-to-end performance qualification are **pending**; no speedup or
+production-readiness claim is made. Ordinary Flash-Next measurements above are CUDA-only.
+
 ## Docker
 
 Requires Docker and the NVIDIA Container Toolkit on a Linux host with the supported GPU and

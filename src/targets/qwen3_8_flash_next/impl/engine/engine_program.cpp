@@ -123,6 +123,7 @@ void validate_sampling(const ResolvedSamplingParameters& sampling) {
     ProgramOptions out;
     out.ngram_table               = options.ngram_table_path;
     out.expert_route_profile_path = options.expert_route_profile_path;
+    out.expert_helper_pci         = options.expert_helper_pci;
     out.context_tokens            = static_cast<std::int32_t>(options.max_context);
     out.lanes                     = static_cast<std::int32_t>(options.max_concurrency);
     if (options.kv_capacity.mode == KvCapacityMode::Explicit) {
@@ -159,6 +160,8 @@ public:
         const std::size_t image_bytes = program.state().continuation_bytes();
         const std::size_t slab_bytes =
             std::size_t{image_slots} * options.max_concurrency * image_bytes;
+        // Program-owned helper mailboxes are already resident here and therefore already
+        // deducted from MemAvailable; only future checkpoint/RAM allocations enter host_bytes.
         const std::size_t host_bytes = slab_bytes + options.kv_ram_capacity_bytes;
         std::ifstream meminfo("/proc/meminfo");
         if (!meminfo) { throw std::runtime_error("cannot read available host RAM"); }
@@ -1456,11 +1459,25 @@ MemorySummary EngineProgram::memory_summary() const noexcept {
     out.sequence = ArenaMemorySummary{memory.state_bytes, memory.state_bytes, memory.state_bytes};
     // The prefill streaming windows borrow expert-cache slots (ProgramMemory::window_bytes lies
     // inside expert_cache_bytes), so they are not workspace.
-    const std::size_t workspace     = memory.activation_bytes + memory.workspace_bytes;
-    out.workspace                   = ArenaMemorySummary{workspace, workspace, workspace};
-    out.kv_payload_bytes            = memory.state_bytes;
-    out.expert_cache_bytes          = memory.expert_cache_bytes;
-    out.expert_cache_flex_bytes     = memory.flex_cache_bytes;
+    const std::size_t workspace = memory.activation_bytes + memory.workspace_bytes;
+    out.workspace               = ArenaMemorySummary{workspace, workspace, workspace};
+    out.kv_payload_bytes        = memory.state_bytes;
+    out.expert_cache_bytes      = memory.expert_cache_bytes;
+    out.expert_cache_flex_bytes = memory.flex_cache_bytes;
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    if (memory.helper) {
+        const auto& helper = *memory.helper;
+        out.expert_helper  = ExpertHelperMemorySummary{
+            .free_at_start_bytes    = helper.free_at_start_bytes,
+            .reserve_bytes          = helper.reserve_bytes,
+            .record_bytes           = helper.record_bytes,
+            .nonrecord_device_bytes = helper.nonrecord_device_bytes,
+            .cuda_device_bytes      = helper.cuda_device_bytes,
+            .mailbox_host_bytes     = helper.mailbox_host_bytes,
+            .record_counts          = helper.record_counts,
+        };
+    }
+#endif
     out.checkpoint_image_host_bytes = impl_->checkpoint_slab->capacity();
     return out;
 }

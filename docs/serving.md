@@ -918,6 +918,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--context-checkpoints off\|on\|a,b,c` | automatic prefill ladder: `off` captures none, `on` uses the standard marks (24576, 36864, 53248, 77824, 102400, 151552), and a comma list sets custom marks. `on` and custom lists require DFlash, selected automatically or with `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | `off` |
 | `--ngram-table PATH` | qwen3.8-flash-next only, and required by it: the 8-bit n-gram (PLE) table file (`ngram_table.int8.bin`); other targets reject it | unset |
+| `--expert-helper-pci DOMAIN:BUS:DEVICE.FUNCTION` | Experimental Flash-Next decode helper: one startup-selected gfx1201 R9700; requires `NINFER_ENABLE_HIP_EXPERT_HELPER=ON`; prefill stays local | unset |
 | `--expert-route-profile PATH` | Flash-Next only: atomically overwrite decode/verify routed-set JSON at startup, every five minutes at a settled round boundary, and at clean shutdown; no restart accumulation | unset |
 | `--qsa-select-budget 512\|1024\|2048` | qwen3.8-flash-next only: complete four-token QSA blocks each query attends to beyond its tail | `512` |
 | `--no-thinking` | disable thinking by default | thinking on |
@@ -1039,6 +1040,30 @@ not later hops in the same speculative round. There is
 no OpenAI or Anthropic schema field for this mode.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
+
+### Experimental expert-helper startup
+
+For Flash-Next only, add `--expert-helper-pci 0000:13:00.0` to the usual server command in an
+[opt-in dual-card build](maintainer/code-quality.md#opt-in-dual-card-development-container).
+The address must be a complete hexadecimal domain:bus:device.function (device 00–1f, function
+0–7); it is normalized to lowercase. Empty/malformed addresses, a different model identity or
+an OFF build are rejected. There is no request JSON field or per-request toggle; OpenAI and
+Anthropic schemas are unchanged. Omitting the flag keeps the ordinary CUDA path.
+
+One gfx1201 R9700 holds an immutable, compiled-profile-selected subset of routed experts for
+packed decode/verification. One RTX 5090 remains primary; prefill, shared experts, routing,
+n-gram state and drafting stay local. Upload checksum and startup nonce validation precede
+readiness. Missing/unsupported devices or failed initialization/exchange fail startup, never
+silently fall back. A failed helper round is drained and cannot publish output or cache state.
+This adds 32 MiB transient upload staging and up to about 34 MiB of pinned exchange storage,
+not another host copy of the expert arena. Startup logs and Engine memory summaries separate
+helper VRAM from primary fixed/KV-lendable cache and CUDA panels (included in workspace).
+
+The FP32 partial join changes reduction association, not represented weights; cross-mode output
+need not be bitwise identical. Helper-enabled inference, Engine lifecycle, protocol smoke and
+performance qualification remain pending. CUDA-only performance results do not qualify this
+experimental option. `--expert-route-profile` remains output-only; no runtime placement JSON
+input is supported.
 
 ## Metrics
 

@@ -4,6 +4,8 @@
 // belong to the one startup-selected device. Owners rebind their creation device for handle
 // operations and destruction, including when the calling host thread changes. Raw-handle users
 // bind the stream before submitting their own work.
+#include "core/expert_helper_pci.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -16,9 +18,6 @@ class HipError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
-
-// Strict domain:bus:device.function, normalized to lowercase. Throws invalid_argument.
-[[nodiscard]] std::string normalize_helper_pci(std::string_view pci);
 
 struct HipDeviceInfo {
     std::string pci, name, architecture;

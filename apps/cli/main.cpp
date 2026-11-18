@@ -284,6 +284,16 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                                              format_bytes(memory.expert_cache_flex_bytes) +
                                              " of idle KV pages");
     }
+    if (memory.expert_helper) {
+        const auto& helper = *memory.expert_helper;
+        print_metric("helper GPU records", format_bytes(helper.record_bytes));
+        print_metric("helper GPU auxiliary", format_bytes(helper.nonrecord_device_bytes));
+        print_metric("helper GPU reserve", format_bytes(helper.reserve_bytes));
+        print_metric("helper GPU free at start", format_bytes(helper.free_at_start_bytes));
+        print_metric("helper CUDA panels",
+                     format_bytes(helper.cuda_device_bytes) + " (in workspace)");
+        print_metric("helper host mailbox", format_bytes(helper.mailbox_host_bytes));
+    }
     print_metric("checkpoint host pinned", format_bytes(memory.checkpoint_image_host_bytes) + " (" +
                                                std::to_string(memory.checkpoint_image_pool_heads) +
                                                " pooled heads)");
@@ -432,11 +442,12 @@ int main(int argc, char** argv) {
         engine_options.keep_frac                = cli.keep_frac;
         engine_options.xattn_tau                = cli.xattn_tau;
         engine_options.speculative              = ninfer::product::resolve_speculative_startup(
-            cli.artifact_path, cli.speculative_selection, cli.speculative);
+            cli.artifact_path, cli.speculative_selection, cli.speculative, cli.expert_helper_pci);
         engine_options.enable_vision             = cli.enable_vision;
         engine_options.use_cuda_graph            = cli.use_cuda_graph;
         engine_options.ngram_table_path          = cli.ngram_table_path;
         engine_options.expert_route_profile_path = cli.expert_route_profile_path;
+        engine_options.expert_helper_pci         = cli.expert_helper_pci;
         engine_options.qsa_select_budget         = cli.qsa_select_budget;
         engine_options.load_progress             = load_progress.callback();
 
