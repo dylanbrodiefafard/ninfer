@@ -257,7 +257,7 @@ int check_gather(const std::filesystem::path& directory) {
         // hold the whole access set, so the second round is all hits and reads nothing.
         for (const std::size_t cache_rows :
              {std::size_t{16}, std::size_t{256}, std::size_t{4096}}) {
-            fn::NgramTable table({synthetic.path, cache_rows, 3});
+            fn::NgramTable table({synthetic.path, cache_rows});
             LruModel model(cache_rows);
             for (int round = 0; round < 3; ++round) {
                 failures += gather_round(table, synthetic.constants, model,
@@ -269,7 +269,7 @@ int check_gather(const std::filesystem::path& directory) {
         // cache, truncate the body so the next gather's misses hit both readable and missing pages,
         // then restore the file; the following rounds must match the model that never saw the
         // failure.
-        fn::NgramTable table({synthetic.path, 256, 3});
+        fn::NgramTable table({synthetic.path, 256});
         LruModel model(256);
         failures += gather_round(table, synthetic.constants, model, "before failure");
         // Different tokens make the failing gather access a different, partly cached row set.
