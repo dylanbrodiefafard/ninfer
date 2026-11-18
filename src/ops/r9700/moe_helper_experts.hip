@@ -3,8 +3,6 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
-#include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -184,6 +182,16 @@ struct Params {
 };
 
 // --- Synchronization -----------------------------------------------------------------------------
+//
+// Cross-workgroup publication (gated rows before job_done, contributions before the merge
+// counters) is an agent-scope release fence in every thread followed by a workgroup barrier,
+// after which one thread performs the release (or acq_rel) RMW. That is correct only because the
+// gfx12 lowering of the release fence makes each wave wait for its own stores (s_wait_storecnt 0)
+// before the barrier, so the RMW follows every wave's stores, not only its own thread's; the
+// acquiring side's agent-scope acquire fence lowers to global_inv, so no workgroup reads gated
+// rows or contributions from a stale cache line. Both lowerings were checked in the gfx1201 ISA of
+// this kernel (ROCm core-10.0, AMD clang 23); a toolchain that weakens either breaks the
+// publication.
 
 // A workgroup barrier ordering only LDS: __syncthreads' workgroup fence also waits for every
 // global load in flight, which would drain a slice's weight loads.
@@ -844,6 +852,8 @@ __device__ __forceinline__ void down_item(const Params& p, std::uint8_t* lds, co
             stage_store(regs, lane, scratch);
             wave_lds_sync();
             contribute(token, row, slice.multiply(scratch, lane, books));
+            // The next token's stage store reuses the scratch this token's multiply read.
+            wave_lds_sync();
         }
     }
 
@@ -895,7 +905,7 @@ __device__ __forceinline__ void wait_inputs(const Params& p, int item, int jobs)
     }
 }
 
-// Grid: at most the workgroups resident at once (moe_helper_experts), block kThreads.
+// Grid: kWorkgroupsPerUnit per WGP, at most one per item (moe_helper_experts), block kThreads.
 //
 // Prologue (every workgroup, identically): read N, sort the active route entries by
 // (expert, entry index) into `sorted` by rank counting, split them into jobs, load each job's
@@ -1096,27 +1106,13 @@ bool overlaps(const Span& a, const Span& b) {
     return a0 < b0 + b.bytes && b0 < a0 + a.bytes;
 }
 
-// Workgroups resident at once for a call extent, queried once per extent. The product drives one
-// helper device, the current one at the first call.
-int resident_workgroups(std::int32_t max_tokens) {
-    static std::array<std::atomic<int>, kMoeHelperMaxTokens + 1> cache{};
-    std::atomic<int>& entry = cache[static_cast<std::size_t>(max_tokens)];
-    if (const int known = entry.load(std::memory_order_relaxed); known > 0) { return known; }
-    int per_unit = 0;
-    hip_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(
-                  &per_unit, reinterpret_cast<const void*>(&moe_helper_experts_kernel), kThreads,
-                  lds_layout(max_tokens).bytes),
-              "occupancy query");
-    if (per_unit < 1) { throw std::logic_error("moe_helper_experts: a workgroup does not fit"); }
-    int device = 0;
-    int units  = 0;
-    hip_check(hipGetDevice(&device), "hipGetDevice");
-    hip_check(hipDeviceGetAttribute(&units, hipDeviceAttributeMultiprocessorCount, device),
-              "multiprocessor count");
-    const int workgroups = per_unit * units;
-    entry.store(workgroups, std::memory_order_relaxed);
-    return workgroups;
-}
+// Workgroups per workgroup processor (hipDeviceAttributeMultiprocessorCount counts WGPs on gfx12).
+// At this kernel's 213 VGPRs a SIMD32 holds seven waves, so a WGP's four SIMDs hold seven
+// four-wave workgroups. hipOccupancyMaxActiveBlocksPerMultiprocessor reports six, and an LDS
+// bound that falls to three at max_tokens 48; on the R9700 seven per WGP measured faster at every
+// extent (F3 T1 65.2 -> 61.5 us, T48 960 -> 897 us; NVFP4 T48 1279 -> 1203 us; T4..T20 unchanged).
+// The grid affects only speed: items are claimed by running workgroups, so any grid completes.
+constexpr int kWorkgroupsPerUnit = 7;
 
 } // namespace
 
@@ -1140,6 +1136,12 @@ MoeHelperExpertsWorkspace::MoeHelperExpertsWorkspace(std::int32_t max_tokens)
 }
 
 MoeHelperExpertsWorkspace::~MoeHelperExpertsWorkspace() { (void)hipFree(base_); }
+
+void MoeHelperExpertsWorkspace::reset(hipStream_t stream) {
+    // control, job_done and merge are contiguous from the base, ending where gated starts.
+    hip_check(hipMemsetAsync(base_, 0, workspace_layout(max_tokens_).gated, stream),
+              "workspace counter reset");
+}
 
 void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorkspace& workspace,
                         hipStream_t stream) {
@@ -1195,11 +1197,18 @@ void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorksp
     params.max_tokens = max_tokens;
     params.lds        = lds_layout(max_tokens);
 
+    int units = 0;
+    hip_check(hipDeviceGetAttribute(&units, hipDeviceAttributeMultiprocessorCount, device),
+              "multiprocessor count");
     // Items are bounded by 60 per active route entry; extra workgroups find none and exit.
-    const int grid = std::min(resident_workgroups(max_tokens), kItemsPerJob * kRoutes * max_tokens);
-    const auto lds_bytes = static_cast<unsigned>(params.lds.bytes);
-    moe_helper_experts_kernel<<<grid, kThreads, lds_bytes, stream>>>(params);
-    hip_check(hipGetLastError(), "kernel launch");
+    const int grid = std::min(kWorkgroupsPerUnit * units, kItemsPerJob * kRoutes * max_tokens);
+    // hipLaunchKernel returns this launch's status, not an earlier error still latched in the
+    // runtime's last-error state.
+    void* kernel_args[] = {&params};
+    hip_check(hipLaunchKernel(reinterpret_cast<const void*>(&moe_helper_experts_kernel),
+                              dim3(static_cast<unsigned>(grid)), dim3(kThreads), kernel_args,
+                              static_cast<std::size_t>(params.lds.bytes), stream),
+              "kernel launch");
 }
 
 } // namespace ninfer::ops

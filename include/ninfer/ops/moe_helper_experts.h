@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/moe_expert_record.h"
+#include "ninfer/ops/moe_helper_contract.h"
 
 #include <hip/hip_runtime_api.h> // hipStream_t
 
@@ -14,15 +15,6 @@ namespace ninfer::ops {
 // routed-expert records the RTX 5090 does not, and for one decode or verify round of one layer
 // returns the weighted sum of its experts' outputs per participating token; the 5090 adds the
 // shared expert and its own experts (docs/maintainer/qwen3.8-flash-next-expert-helper.md).
-
-// Compact tokens of one call (one decode or verify round of up to twelve requests, four columns
-// each), route entries per token (moe_route's top-k), and the routed experts of one layer.
-inline constexpr std::int32_t kMoeHelperMaxTokens      = 48;
-inline constexpr std::int32_t kMoeHelperRoutesPerToken = 10;
-inline constexpr std::int32_t kMoeHelperExperts        = 512;
-// Expert id of a route entry the helper does not own. Every id outside [0,512) is inactive; this is
-// the value producers write.
-inline constexpr std::int32_t kMoeHelperInactiveExpert = -1;
 
 /** One route entry of a compact token: an expert id in [0,512) or kMoeHelperInactiveExpert. */
 struct MoeHelperRoute {
@@ -85,7 +77,10 @@ struct MoeHelperExpertsArgs {
  * work-item and completion counters, the gate/up products and the per-route contributions.
  * Allocated on the device current at construction, with the counters zeroed; every completed call
  * leaves them zero again. Calls sharing a workspace must be ordered (one stream, or explicit
- * dependencies): it serves one call at a time.
+ * dependencies): it serves one call at a time. A call that does not complete (an aborted launch
+ * or graph, a device fault) leaves the counters in an arbitrary state, and the next call would
+ * then misassign work or wait forever: after any failed round, its owner calls reset() before
+ * the next call.
  */
 class MoeHelperExpertsWorkspace {
 public:
@@ -101,6 +96,14 @@ public:
     [[nodiscard]] int device() const noexcept { return device_; }
 
     [[nodiscard]] std::byte* base() const noexcept { return base_; }
+
+    /**
+     * Zeroes the counters on `stream` (asynchronously), restoring the state of a fresh workspace.
+     * No call using this workspace may be in flight or queued ahead of it on another stream; the
+     * next call must follow it in stream order. Throws std::runtime_error when the memset cannot
+     * be queued.
+     */
+    void reset(hipStream_t stream);
 
 private:
     std::byte* base_         = nullptr;

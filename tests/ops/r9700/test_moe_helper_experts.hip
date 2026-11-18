@@ -243,8 +243,15 @@ Inputs make_inputs(const BankState& bank, int tokens, int max_tokens, Routing ro
         const std::vector<int> shared = {500, 41, 302, 77, 115, 260, 334, 23, 455, 181};
         for (int t = 30; t < 46; ++t) { route_token(inputs, bank, t, shared, rng); }
         route_token(inputs, bank, 2, {17, 17, -1, 50, 61, -1, 70, 88, 97, 101}, rng);
+        // Ids at and above 512 are inactive like -1 (the contract's "outside [0,512)").
+        inputs.routes[3 * kRoutes + 4].expert = kExperts;
+        inputs.routes[3 * kRoutes + 7].expert = 0x7FFFFFFF;
     }
     return inputs;
+}
+
+bool active(const ops::MoeHelperRoute& route) {
+    return route.expert >= 0 && route.expert < kExperts;
 }
 
 // FP64 oracle of one token: sum over its active entries of w * E(x).
@@ -255,7 +262,7 @@ std::vector<double> oracle_token(const Fixture& fixture, const BankState& bank,
     std::vector<double> gated(kInter);
     for (int j = 0; j < kRoutes; ++j) {
         const auto& route = inputs.routes[static_cast<std::size_t>(t) * kRoutes + j];
-        if (route.expert < 0) { continue; }
+        if (!active(route)) { continue; }
         const auto id         = static_cast<std::size_t>(route.expert);
         const Expert& expert  = fixture.experts[static_cast<std::size_t>(bank.record[id])];
         const double scale[3] = {bank.matrix_scales[id * 3], bank.matrix_scales[id * 3 + 1],
@@ -287,7 +294,7 @@ std::vector<double> oracle_token(const Fixture& fixture, const BankState& bank,
 
 bool has_active(const Inputs& inputs, int t) {
     for (int j = 0; j < kRoutes; ++j) {
-        if (inputs.routes[static_cast<std::size_t>(t) * kRoutes + j].expert >= 0) { return true; }
+        if (active(inputs.routes[static_cast<std::size_t>(t) * kRoutes + j])) { return true; }
     }
     return false;
 }
@@ -335,9 +342,19 @@ public:
 
     // Poisons y (all-ones bits, a NaN), runs the Op and returns y's bits.
     std::vector<std::uint32_t> invoke(ops::MoeHelperExpertsWorkspace& workspace) {
-        y_.fill_bytes(0xFF);
+        poison();
         ops::moe_helper_experts(args(), workspace, nullptr);
         hip_check(hipDeviceSynchronize(), "moe_helper_experts");
+        return output();
+    }
+
+    // Poisons y and waits for the fill, so no stream can run ahead of it.
+    void poison() {
+        y_.fill_bytes(0xFF);
+        hip_check(hipDeviceSynchronize(), "poison y");
+    }
+
+    [[nodiscard]] std::vector<std::uint32_t> output() const {
         const std::vector<float> y = y_.download();
         std::vector<std::uint32_t> bits(y.size());
         std::memcpy(bits.data(), y.data(), y.size() * sizeof(float));
@@ -451,6 +468,78 @@ bool select_r9700() {
     return false;
 }
 
+class Stream {
+public:
+    Stream() { hip_check(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "stream"); }
+
+    ~Stream() { (void)hipStreamDestroy(stream_); }
+
+    Stream(const Stream&)            = delete;
+    Stream& operator=(const Stream&) = delete;
+
+    [[nodiscard]] hipStream_t get() const noexcept { return stream_; }
+
+private:
+    hipStream_t stream_ = nullptr;
+};
+
+// Calls of different extents sharing one workspace with no host synchronization between them:
+// queued back to back on one stream, then captured into one HIP graph replayed three times. Each
+// call must reproduce its standalone output bit for bit, so every call found the counters its
+// predecessor left zeroed.
+int queued_calls(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
+                 ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank) {
+    const Inputs a = make_inputs(bank, 20, 20, Routing::Skewed, 31U);
+    const Inputs b = make_inputs(bank, 48, 48, Routing::Mixed48, 32U);
+    const Inputs c = make_inputs(bank, 1, 4, Routing::Skewed, 33U);
+    std::vector<std::unique_ptr<Run>> runs;
+    std::vector<std::vector<std::uint32_t>> expected;
+    for (const Inputs* inputs : {&a, &b, &c}) {
+        runs.push_back(std::make_unique<Run>(fixture, store, *inputs));
+        runs.back()->set_bank(bank);
+        expected.push_back(runs.back()->invoke(workspace));
+    }
+    const Stream stream;
+    // a, b, c, a: the first a's output is overwritten by the last with the same bits.
+    const int order[]  = {0, 1, 2, 0};
+    const auto enqueue = [&] {
+        for (const int r : order) {
+            ops::moe_helper_experts(runs[static_cast<std::size_t>(r)]->args(), workspace,
+                                    stream.get());
+        }
+    };
+    int failures     = 0;
+    const auto check = [&](const std::string& label) {
+        for (std::size_t r = 0; r < runs.size(); ++r) {
+            if (runs[r]->output() != expected[r]) {
+                std::cerr << label << ": call " << r << " differs from its standalone output\n";
+                ++failures;
+            }
+        }
+    };
+    for (const auto& run : runs) { run->poison(); }
+    enqueue();
+    hip_check(hipStreamSynchronize(stream.get()), "queued calls");
+    check("queued calls");
+
+    hipGraph_t graph = nullptr;
+    hip_check(hipStreamBeginCapture(stream.get(), hipStreamCaptureModeThreadLocal), "capture");
+    enqueue();
+    hip_check(hipStreamEndCapture(stream.get(), &graph), "end capture");
+    hipGraphExec_t exec           = nullptr;
+    const hipError_t instantiated = hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    (void)hipGraphDestroy(graph);
+    hip_check(instantiated, "graph instantiate");
+    for (int replay = 0; replay < 3; ++replay) {
+        for (const auto& run : runs) { run->poison(); }
+        hip_check(hipGraphLaunch(exec, stream.get()), "graph launch");
+        hip_check(hipStreamSynchronize(stream.get()), "graph replay");
+        check("graph replay " + std::to_string(replay));
+    }
+    (void)hipGraphExecDestroy(exec);
+    return failures;
+}
+
 int run() {
     if (!select_r9700()) {
         std::printf("SKIP: no gfx1201 device\n");
@@ -488,10 +577,12 @@ int run() {
         {"T20", &wide, 20, 20, Routing::Skewed, 14U},
         {"T48 mixed ownership and sharing", &wide, 48, 48, Routing::Mixed48, 15U},
         {"T4 subnormal scales", &subnormal, 4, 4, Routing::Skewed, 16U},
-        // Tokens per expert: 2 (SIMT, two tokens), 3 (WMMA, one partial block), 40 (WMMA, three
-        // blocks of 16, 16 and 8).
+        // Tokens per expert: 2 and 3 (SIMT), 6 (WMMA at its threshold, one partial block), 17
+        // (WMMA, a full block and one token), 40 (WMMA, blocks of 16, 16 and 8).
         {"T2 concentrated", &wide, 2, 2, Routing::Concentrated, 18U},
         {"T3 concentrated", &wide, 3, 3, Routing::Concentrated, 19U},
+        {"T6 concentrated", &wide, 6, 6, Routing::Concentrated, 23U},
+        {"T17 concentrated", &wide, 17, 17, Routing::Concentrated, 24U},
         {"T40 concentrated", &wide, 40, 40, Routing::Concentrated, 20U},
         {"T20 concentrated subnormal", &subnormal, 20, 20, Routing::Concentrated, 22U},
         {"N0 of max 48", &wide, 0, 48, Routing::Skewed, 17U},
@@ -508,6 +599,8 @@ int run() {
             ++failures;
         }
     }
+
+    failures += queued_calls(*fixture, store, workspace, wide);
 
     // Contract rejection before any work is queued.
     const Inputs inputs = make_inputs(wide, 4, 4, Routing::Skewed, 21U);
