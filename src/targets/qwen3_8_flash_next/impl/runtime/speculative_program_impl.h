@@ -159,7 +159,9 @@ void Program::resolve_round(std::span<const std::int32_t> counts) {
             // Commit this deterministic cap only with publication, preserving rejection bytes.
             policy.ceiling =
                 std::min(policy.ceiling, choose_k(static_cast<std::int32_t>(counts.size())));
-            if (extent > 0 && counts[row] == pending_round_.counts[row]) {
+            // Matcher licensing can truncate a device walk even when every licensed
+            // token is published. Such a prefix is not an acceptance observation.
+            if (extent > 0 && counts[row] == pending_round_.raw_counts[row]) {
                 policy.observe(counts.size(), pending_k_, extent, pending_round_.accepted[row]);
             }
         }

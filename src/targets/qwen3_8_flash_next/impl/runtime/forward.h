@@ -229,6 +229,9 @@ struct SpeculativeRows {
     std::int32_t width = 0;
     std::span<const std::int32_t> tokens;
     std::span<const std::int32_t> counts;
+    // Device acceptance before matcher licensing; only fully published raw walks
+    // may train the adaptive policy. Empty for ordinary non-speculative packets.
+    std::span<const std::int32_t> raw_counts;
     std::span<const std::int32_t> accepted;
     // Root constraint failures only; hypothetical failures clip counts and retry at the root.
     std::span<const std::exception_ptr> row_errors;

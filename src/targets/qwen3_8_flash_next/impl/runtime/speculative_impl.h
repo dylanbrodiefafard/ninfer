@@ -316,6 +316,7 @@ SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
     return {.width      = width,
             .tokens     = span(output.tokens, count),
             .counts     = span(licensed_counts_, lanes.size()),
+            .raw_counts = span(output.counts, lanes.size()),
             .accepted   = span(licensed_accepted_, lanes.size()),
             .row_errors = span(mask_row_errors_, lanes.size()),
             .calibration =
