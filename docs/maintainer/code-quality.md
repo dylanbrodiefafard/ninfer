@@ -55,6 +55,30 @@ Compiler diagnostics need no separate step: every project C++ and CUDA translati
 with `NINFER_WARNINGS_AS_ERRORS=ON` by default. The policy applies only to NInfer targets;
 third-party sources keep their upstream flags.
 
+### Opt-in dual-card development container
+
+Work on the Qwen3.8-Flash-Next second-GPU expert helper (RTX 5090 plus Radeon AI PRO R9700,
+`gfx1201`) needs CUDA and HIP toolchains in one container. It has its own entry point, which
+leaves the CUDA-only `scripts/dev-setup.sh`, the `Dockerfile` stages, the
+`local/ninfer-builder:5090` image and the CMake defaults unchanged:
+
+```bash
+./scripts/dev-setup.sh            # builds the CUDA builder image it derives from
+./scripts/dev-setup-dual-gpu.sh
+```
+
+It builds `docker/dual-gpu.Dockerfile` as `local/ninfer-builder:dual-gpu`, copying the host ROCm
+tree (default `/opt/rocm/core-10.0`, override `NINFER_DUAL_ROCM_DIR`) into the image through the
+named build context `rocm`, so the container toolchain does not change with later host-tree
+updates. The HIP compiler is `/opt/rocm/core-10.0/lib/llvm/bin/clang++` with
+`--offload-arch=gfx1201`. The `ninfer-builder-dual-gpu` container adds `/dev/kfd`, `/dev/dri`
+and the host `render` group to the CUDA builder's devices, mounts the checkout at `/src` and its
+own `ninfer-dual-gpu-build-cache` volume at `/build`, and mounts `NINFER_MODELS_DIR` at `/models`
+and `NINFER_DATA_DIR` at `/data` read-only when they are set. The script header lists the other
+overrides. An existing container keeps its original image and mounts until it is recreated.
+
+### Running clang-tidy
+
 clang-tidy runs in the builder container against `/build/compile_commands.json`:
 
 ```bash
