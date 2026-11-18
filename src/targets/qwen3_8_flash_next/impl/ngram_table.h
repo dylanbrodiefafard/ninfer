@@ -69,7 +69,7 @@ public:
     struct Options {
         std::filesystem::path path;
         std::size_t cache_rows  = std::size_t{1} << 20; // rounded down to whole 8-row sets
-        std::int32_t io_threads = 32;
+        std::int32_t io_threads = 48;
     };
 
     explicit NgramTable(const Options& options);
