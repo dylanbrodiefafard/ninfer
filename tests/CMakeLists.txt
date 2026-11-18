@@ -703,3 +703,15 @@ add_test(NAME ninfer_qwen3_8_27b_eight_windows_real_test
   COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_qwen3_6_27b_cache_admission_real_test>
     --eight-windows)
 set_tests_properties(ninfer_qwen3_8_27b_eight_windows_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+if(NINFER_ENABLE_HIP_EXPERT_HELPER)
+  # Runs on the R9700 (the first gfx1201 device); labelled `hip` so CUDA-only runs can exclude it.
+  add_executable(ninfer_moe_helper_experts_test ops/r9700/test_moe_helper_experts.hip)
+  ninfer_hip_target(ninfer_moe_helper_experts_test)
+  target_include_directories(ninfer_moe_helper_experts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_options(ninfer_moe_helper_experts_test PRIVATE -ffp-contract=off)
+  target_link_libraries(ninfer_moe_helper_experts_test PRIVATE ninfer_hip_ops Threads::Threads)
+  add_test(NAME ninfer_moe_helper_experts_test
+    COMMAND $<TARGET_FILE:ninfer_moe_helper_experts_test>)
+  set_tests_properties(ninfer_moe_helper_experts_test PROPERTIES LABELS "kernel;hip" TIMEOUT 900 SKIP_RETURN_CODE 77)
+endif()

@@ -103,3 +103,9 @@ target_include_directories(ninfer_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party)
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
+
+if(NINFER_ENABLE_HIP_EXPERT_HELPER)
+  add_executable(ninfer_moe_helper_experts_bench ops/r9700/moe_helper_experts_bench.hip)
+  ninfer_hip_target(ninfer_moe_helper_experts_bench)
+  target_link_libraries(ninfer_moe_helper_experts_bench PRIVATE ninfer_hip_ops)
+endif()

@@ -1,0 +1,145 @@
+#pragma once
+
+#include "ninfer/ops/moe_expert_record.h"
+
+#include <hip/hip_runtime_api.h> // hipStream_t
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+
+namespace ninfer::ops {
+
+// Qwen3.8-Flash-Next second-GPU expert helper (Radeon AI PRO R9700, gfx1201). The helper holds
+// routed-expert records the RTX 5090 does not, and for one decode or verify round of one layer
+// returns the weighted sum of its experts' outputs per participating token; the 5090 adds the
+// shared expert and its own experts (docs/maintainer/qwen3.8-flash-next-expert-helper.md).
+
+// Compact tokens of one call (one decode or verify round of up to twelve requests, four columns
+// each), route entries per token (moe_route's top-k), and the routed experts of one layer.
+inline constexpr std::int32_t kMoeHelperMaxTokens      = 48;
+inline constexpr std::int32_t kMoeHelperRoutesPerToken = 10;
+inline constexpr std::int32_t kMoeHelperExperts        = 512;
+// Expert id of a route entry the helper does not own. Every id outside [0,512) is inactive; this is
+// the value producers write.
+inline constexpr std::int32_t kMoeHelperInactiveExpert = -1;
+
+/** One route entry of a compact token: an expert id in [0,512) or kMoeHelperInactiveExpert. */
+struct MoeHelperRoute {
+    std::int32_t expert;
+    float weight;
+};
+
+static_assert(sizeof(MoeHelperRoute) == 8);
+
+/**
+ * One layer's helper-owned experts, resident in the helper's device memory.
+ *
+ *   expert_table   U64 [512]: for each expert the helper owns, the 256-byte aligned device address
+ *                  of its record with its MoeExpertCodec in bit 0. A record holds exactly the bytes
+ *                  of the artifact's moe-expert-tiles-v1 record of its codec ("Routed-expert
+ *                  record" in ninfer/ops/moe_experts.h). Entries of experts no active route names
+ *                  are not read.
+ *   matrix_scales  FP32 [512][3]: element 3 e + m is expert e's multiplier of matrix m (0 gate,
+ *                  1 up, 2 down).
+ *   f3_books       the layer's F3G32 codebooks of gate, up and down (eight E2M1 nibbles each,
+ *                  entry v in bits 4v..4v+3), as the artifact's f3_codebooks row holds them;
+ *                  passed by value, so a captured graph keeps the books of its capture.
+ *
+ * Records, table and scales are read on the device when the call executes and must not change
+ * until it completes.
+ */
+struct MoeHelperExpertBank {
+    const std::uint64_t* expert_table = nullptr;
+    const float* matrix_scales        = nullptr;
+    std::array<std::uint32_t, 3> f3_books{};
+};
+
+/**
+ * Device operands of one moe_helper_experts call, with N = min(*tokens, max_tokens) compact tokens
+ * read on the device when the call executes.
+ *
+ *   tokens      I32 [1]: the compact token count; values below 0 count as 0.
+ *   max_tokens  host value in [1, kMoeHelperMaxTokens]: the extent every buffer below is sized for.
+ *   x           BF16 bits [max_tokens][2560], 16-byte aligned: rows [0,N) are the tokens' expert
+ *               input.
+ *   routes      [max_tokens][10] MoeHelperRoute, 8-byte aligned: rows [0,N) are the tokens' route
+ *               entries in route-slot order j = 0..9. An active entry names an expert the bank
+ *               owns; an inactive entry (kMoeHelperInactiveExpert) may appear anywhere in a row,
+ *               and its weight is not read. A token may name an expert more than once (each entry
+ *               contributes).
+ *   y           FP32 [max_tokens][2560], 16-byte aligned, disjoint from every other operand: rows
+ *               [0,N) receive the output; rows [N,max_tokens) are not written.
+ */
+struct MoeHelperExpertsArgs {
+    const std::int32_t* tokens   = nullptr;
+    std::int32_t max_tokens      = 0;
+    const std::uint16_t* x       = nullptr;
+    const MoeHelperRoute* routes = nullptr;
+    MoeHelperExpertBank bank;
+    float* y = nullptr;
+};
+
+/**
+ * Device workspace of moe_helper_experts for every call with max_tokens <= this max_tokens:
+ * work-item and completion counters, the gate/up products and the per-route contributions.
+ * Allocated on the device current at construction, with the counters zeroed; every completed call
+ * leaves them zero again. Calls sharing a workspace must be ordered (one stream, or explicit
+ * dependencies): it serves one call at a time.
+ */
+class MoeHelperExpertsWorkspace {
+public:
+    /** Allocates and zeroes the workspace; max_tokens in [1, kMoeHelperMaxTokens]. */
+    explicit MoeHelperExpertsWorkspace(std::int32_t max_tokens);
+    ~MoeHelperExpertsWorkspace();
+
+    MoeHelperExpertsWorkspace(const MoeHelperExpertsWorkspace&)            = delete;
+    MoeHelperExpertsWorkspace& operator=(const MoeHelperExpertsWorkspace&) = delete;
+
+    [[nodiscard]] std::int32_t max_tokens() const noexcept { return max_tokens_; }
+
+    [[nodiscard]] int device() const noexcept { return device_; }
+
+    [[nodiscard]] std::byte* base() const noexcept { return base_; }
+
+private:
+    std::byte* base_         = nullptr;
+    std::int32_t max_tokens_ = 0;
+    int device_              = 0;
+};
+
+/**
+ * Op: moe_helper_experts
+ *
+ * Math, for each compact token t < N with x_t = x[t,:] and its active route entries
+ * (e_j, w_j) = routes[t,j]:
+ *
+ *   E_e(x)  = D_e (SiLU(G_e x) * U_e x)          (SiLU(z) = z / (1 + exp(-z)), * elementwise)
+ *   y[t,:]  = sum_j w_j E_{e_j}(x_t)
+ *
+ * where G_e, U_e, D_e are expert e's record decoded as "Routed-expert record" in
+ * ninfer/ops/moe_experts.h specifies (code through the layer's F3 book or as E2M1, times its E4M3
+ * block scale), each multiplied by the expert's FP32 matrix scale. A token with no active entry
+ * gets y[t,:] = 0 exactly. There is no shared expert.
+ *
+ * Numeric: the oracle evaluates the formula in FP64 from the represented BF16 x, the decoded
+ * weights and the FP32 scales and route weights. Implementation profile: products of decoded codes
+ * (exact BF16 values) and BF16 x are exact and summed in FP32 over each scale group (v_dot2 for
+ * experts with few tokens, BF16 WMMA with FP32 accumulation for experts with many), then scaled
+ * by the E4M3 scale in FP32; matrix scales, SiLU and the gate/up product are FP32, and the product
+ * enters the down projection rounded once to BF16 (the RTX 5090 route's profile, not a semantic
+ * boundary). Each route's contribution is FP32, and a token's contributions are summed in
+ * route-slot order j = 0..9. No float atomics: y is bit-identical for identical inputs and
+ * routes; the path an expert takes depends on how many tokens name it.
+ *
+ * Execution: one kernel launch on `stream`, asynchronous, no host synchronization. N, routes,
+ * tables, scales and records are read on the device at execution, so a captured HIP graph stays
+ * valid while their contents change; its shape depends only on max_tokens. The workspace must
+ * belong to the current device and have max_tokens() >= args.max_tokens. Invalid extents,
+ * alignment, aliasing or workspace throw std::invalid_argument before any work is queued; a launch
+ * failure throws std::runtime_error.
+ */
+void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorkspace& workspace,
+                        hipStream_t stream);
+
+} // namespace ninfer::ops

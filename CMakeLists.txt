@@ -18,6 +18,8 @@ project(ninfer LANGUAGES C CXX CUDA)
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+option(NINFER_ENABLE_HIP_EXPERT_HELPER
+  "Build the Qwen3.8-Flash-Next R9700 (gfx1201) expert-helper HIP Ops" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -87,6 +89,9 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 include(cmake/xgrammar.cmake)
 # After the third-party xgrammar target, so its sources keep their upstream diagnostics.
 include(cmake/warnings.cmake)
+if(NINFER_ENABLE_HIP_EXPERT_HELPER)
+  include(cmake/hip_expert_helper.cmake)
+endif()
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
   libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
 pkg_check_modules(ZSTD REQUIRED libzstd)

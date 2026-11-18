@@ -307,6 +307,14 @@ add_library(ninfer_engine STATIC
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
+if(NINFER_ENABLE_HIP_EXPERT_HELPER)
+  # gfx1201 HIP Ops of the Flash-Next expert helper (cmake/hip_expert_helper.cmake).
+  add_library(ninfer_hip_ops STATIC
+    ops/r9700/moe_helper_experts.hip)
+  ninfer_hip_target(ninfer_hip_ops)
+  target_include_directories(ninfer_hip_ops PUBLIC ${PROJECT_SOURCE_DIR}/include)
+endif()
+
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
 add_subdirectory(targets/qwen3_8_flash_next)
