@@ -198,15 +198,15 @@ of explicit semantic contracts, with reusable CUDA implementation machinery, not
 mathematics in the target:
 
 1. **Partition/pack Op** (`moe_expert_partition`, new contract/wrapper/launcher in `src/ops`).
-   One 256-thread CTA scans at most 480 assignments, marks helper slots, and stably compacts
-   participating tokens in original packed-token order. Outputs are a ten-bit helper mask per
-   token, original-token → compact-token map, compact count N, BF16 activations and ten
-   `(I32 expert_id, FP32 weight)` entries per compact token. Non-helper slots use an explicitly
-   supported inactive sentinel in this *new* helper contract, never in ordinary `moe_experts`
-   or cache IDs. Preserve original route-slot order; do not renormalize either partition.
-   The CTA uses vectorized 16-byte mapped stores and barriers; after every writer's system
-   fence and a CTA barrier, its leader release-publishes the request header. Transport fencing
-   is supplied by core, not invented by the model. No host route readback or CUDA callback.
+   One 256-thread CTA scans at most 480 assignments and stably compacts participating tokens in
+   original packed-token order. Outputs are the original-token → compact-token map (−1 for a
+   token without helper routes), compact count N, BF16 activations and ten
+   `(I32 expert_id, FP32 weight)` entries per compact token, written directly into the mailbox
+   request planes. Non-helper slots carry id −1 and weight 0, the inactive sentinel of this
+   *new* helper contract, never of ordinary `moe_experts` or cache IDs. Preserve original
+   route-slot order; do not renormalize either partition. The Op writes payload only; core's
+   CUDA publish operation supplies the system fences and the release of the request header.
+   No host route readback or CUDA callback.
 2. **Local branch.** Admit/stage see only eligible local experts. Existing admitted/fill-stream
    fork, resident work, mapped misses, deferred slot work and commit remain ordered as in
    `moe_expert_cache.h`. Add `moe_experts_local_partial`: reuse grouping/gate-up/down kernels,
