@@ -357,7 +357,7 @@ public:
     // Arms the committed-root mask for prefill/ordinary sampling and binds the session for
     // exact per-prefix masks in chain verification. Throws RequestError (InvalidOutputConstraint)
     // when the root policy, after suppressed tokens, admits no token; the caller fails only
-    // that request. Forward propagates speculative matcher errors before publication.
+    // that request. Forward licenses safe prefixes and returns callback root errors per row.
     void arm_token_mask(LaneRecord& entry) {
         if (entry.output == nullptr || !entry.output->has_token_masks()) { return; }
         const std::array<TokenId, 1> root{0};

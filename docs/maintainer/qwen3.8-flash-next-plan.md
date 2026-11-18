@@ -422,7 +422,8 @@ Masks and sampling/node staging have startup-fixed addresses at the maximum chai
 Bindings change only at synchronized round boundaries. Constraint errors are attributed to the
 first failing node of each row by retrying prefixes on the error path. Failed tails get all-ones
 device masks so the graph can finish; Forward licenses only preceding columns and retains the
-raw sampled count for exact token-count rollback. If publication reaches that hypothetical
+raw sampled count for exact token-count rollback and to exclude matcher-truncated walks from
+adaptive acceptance observations. If publication reaches that hypothetical
 state, ordinary root validation fails only that request on the next round. A callback root error
 is returned through `row_errors` with zero publication, while healthy rows resolve independently.
 Unexpected transport/invariant errors still propagate before publication. Error paths and
@@ -438,8 +439,13 @@ checks greedy K3 against `SpeculativeBackend::None` for tools, budgets 2–6, an
 it requires accepted tool drafts and budget-sweep acceptance, schema-valid calls and exact
 forced-close accounting. `--dflash-mask-program` runs mixed session/one-shot/unmasked rows in
 non-lane-order compact batches with different extents, greedy and positive-temperature p-less
-acceptance, committed non-root binding masks, non-root singleton close masks, exact published
-token counts, and zero-publication rollback beside a healthy row. CPU frontend tests compare
+acceptance, committed non-root binding masks, exact published token counts, and zero-publication
+rollback beside a healthy row. Its rejected-probe replay fixes a cap one token ahead of an
+observed accepted reasoning draft, proving a non-root singleton close without relying on earlier
+acceptance alignment. Suppressing that close exercises nonempty hypothetical licensing, exact
+count rollback, unchanged adaptive observations, and request-local failure on the next root.
+The mixed harness resolves rejected stop rounds with zero publication and retries with model
+stops suppressed, matching the executor. CPU frontend tests compare
 every K3 hypothesis mask word with an independently committed-prefix root mask and reproduce
 first-node failures at columns 0–3 without advancing committed state.
 
