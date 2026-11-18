@@ -619,13 +619,13 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
 }
 
-// Device-scope release RMWs form one release sequence; the last CTA's acquire
-// load makes every participant's preceding stores visible before reduction.
-__device__ __forceinline__ int sampling_completion_add(std::int32_t* ptr, int expected) {
+// Each device-scope RMW publishes this CTA's stores and acquires the preceding
+// publishers through the counter's release sequence. Acquisition belongs to the
+// RMW whose result elects the finalizer; callers synchronize the CTA before its
+// cooperating threads consume the published data.
+__device__ __forceinline__ int sampling_completion_add(std::int32_t* ptr) {
     cuda::atomic_ref<std::int32_t, cuda::thread_scope_device> counter(*ptr);
-    const int done = counter.fetch_add(1, cuda::memory_order_release) + 1;
-    if (done == expected) { (void)counter.load(cuda::memory_order_acquire); }
-    return done;
+    return counter.fetch_add(1, cuda::memory_order_acq_rel) + 1;
 }
 
 __device__ __forceinline__ void sampling_publish_key(const SamplingWorkspace& workspace, int offset,

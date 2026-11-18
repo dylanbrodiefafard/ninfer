@@ -3335,6 +3335,16 @@ int column_eligibility_cases(int domain, int physical) {
     return failures;
 }
 
+int column_eligibility_publication_cases() {
+    int failures = 0;
+    // Fresh workspaces alternate truncated and p-less chain/tree sampling. Varying CTA arrival
+    // order across launches exercises publication of group 0's singleton column distributions.
+    for (int replay = 0; replay < 8; ++replay) {
+        failures += column_eligibility_cases(248077, 248320);
+    }
+    return failures;
+}
+
 // Proposal calibration against an FP64 oracle: per (temperature g, hop j, row b), the overlap
 // sum_c min(p'_j(c), q_j(c)^(T_d/T_g) / Z) between the independent p-less target law of verify
 // column j and the recorded proposal re-tempered to T_g. Row 0 is p-less with T_d = 0.6, a typical
@@ -3514,7 +3524,7 @@ int run_route_cases() {
     failures += p_less_proposal_calibration_case();
     failures += column_eligibility_cases(64, 64);
     failures += column_eligibility_cases(4096, 4096);
-    failures += column_eligibility_cases(248077, 248320);
+    failures += column_eligibility_publication_cases();
     const std::size_t k15 =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 1);
     if (k15 == 0 || k15 != ops::sampling_workspace_capacity_bytes(257, 16, 16) ||

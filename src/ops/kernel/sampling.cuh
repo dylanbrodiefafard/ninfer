@@ -201,7 +201,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
                                           p_less_red_val, p_less_red_aux, greedy_warp_keys);
         if (tid == 0) {
             sampling_p_less_store_moments(workspace, col, partial_blocks + group, group_moments);
-            const int done = sampling_completion_add(&workspace.group_done[col], group_count);
+            const int done = sampling_completion_add(&workspace.group_done[col]);
             is_last        = done == group_count ? 1 : 0;
         }
         __syncthreads();
@@ -229,7 +229,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         if (tid == 0) {
             const int out_off = sampling_partial_offset(workspace, col, partial_blocks + group, 0);
             sampling_publish_key(workspace, out_off, best);
-            const int done = sampling_completion_add(&workspace.group_done[col], group_count);
+            const int done = sampling_completion_add(&workspace.group_done[col]);
             is_last        = (done == group_count) ? 1 : 0;
         }
         __syncthreads();
@@ -277,7 +277,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
                 sampling_partial_offset(workspace, col, partial_blocks + group, rank);
             sampling_publish_key(workspace, out_off, published_keys[rank]);
         }
-        const int done = sampling_completion_add(&workspace.group_done[col], group_count);
+        const int done = sampling_completion_add(&workspace.group_done[col]);
         is_last        = (done == group_count) ? 1 : 0;
     }
     __syncthreads();
@@ -358,7 +358,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_p_less_mass_sample_ker
 
         if (threadIdx.x == 0) {
             sampling_p_less_store_tile_mass(workspace, col, partial, tile_mass);
-            const int done = sampling_completion_add(&workspace.group_done[col], partial_blocks);
+            const int done = sampling_completion_add(&workspace.group_done[col]);
             is_last        = done == partial_blocks ? 1 : 0;
         }
         __syncthreads();
