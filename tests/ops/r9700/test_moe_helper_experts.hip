@@ -1,5 +1,6 @@
 // moe_helper_experts Op test on the R9700 (gfx1201) against an independent FP64 oracle at the
-// Qwen3.8-Flash-Next record geometry.
+// Qwen3.8-Flash-Next record geometry, for decode-round extents (max_tokens <= 48) and prefill
+// extents up to the Op's capacity.
 //
 // Test experts are canonical codes and E4M3 scales written into the documented record layout by
 // the test-side packer and read back exactly by an independent reader
@@ -39,6 +40,8 @@ constexpr int kInter   = ops::kMoeIntermediate;
 constexpr int kExperts = ops::kMoeHelperExperts;
 constexpr int kRoutes  = ops::kMoeHelperRoutesPerToken;
 constexpr int kSkip    = 77;
+// The prefill workspace of most prefill cases: one 4096-token chunk.
+constexpr int kPrefillCapacity = 4096;
 
 // Criterion. Against the FP64 oracle, one rounding dominates: the gate/up product enters the down
 // projection rounded to BF16 (8 significant bits; relative RMS error about 2^-7 / sqrt(12) / 1.5
@@ -380,15 +383,19 @@ float bits_float(std::uint32_t bits) {
     return value;
 }
 
+// Tokens whose rows the oracle checks: every routed token up to kOracleTokens, else
+// kOracleTokens of them evenly spaced (the FP64 oracle costs about 5M multiply-adds per entry).
+constexpr std::size_t kOracleTokens = 512;
+
 // Checks y (bits [max_tokens][2560]): rows of tokens with active routes against the oracle, rows
 // of tokens without one exactly +0, rows at or past N untouched.
 int verify(const std::string& label, const Fixture& fixture, const BankState& bank,
            const Inputs& inputs, const std::vector<std::uint32_t>& bits) {
     int failures = 0;
-    std::vector<int> routed;
+    std::vector<int> all_routed;
     for (int t = 0; t < inputs.tokens; ++t) {
         if (has_active(inputs, t)) {
-            routed.push_back(t);
+            all_routed.push_back(t);
             continue;
         }
         for (int n = 0; n < kHidden; ++n) {
@@ -406,7 +413,22 @@ int verify(const std::string& label, const Fixture& fixture, const BankState& ba
             break;
         }
     }
-    if (routed.empty()) { return failures; }
+    if (all_routed.empty()) { return failures; }
+    // Rows the oracle samples out are still checked as written and finite.
+    for (const int t : all_routed) {
+        for (int n = 0; n < kHidden; ++n) {
+            if (!std::isfinite(bits_float(bits[static_cast<std::size_t>(t) * kHidden + n]))) {
+                std::cerr << label << ": token " << t << " has a non-finite or unwritten y\n";
+                ++failures;
+                break;
+            }
+        }
+    }
+    std::vector<int> routed;
+    for (std::size_t i = 0; i < kOracleTokens && i < all_routed.size(); ++i) {
+        routed.push_back(
+            all_routed[i * all_routed.size() / std::min(all_routed.size(), kOracleTokens)]);
+    }
 
     std::vector<std::vector<double>> expected(routed.size());
     {
@@ -433,10 +455,10 @@ int verify(const std::string& label, const Fixture& fixture, const BankState& ba
                                                      static_cast<std::int64_t>(got.size()));
     const bool pass =
         test::reduction_passes(stats, static_cast<std::int64_t>(got.size()), kCriterion);
-    std::printf("%-34s tokens=%zu rel_l2=%.3e (limit %.1e) max_abs=%.3e (limit %.3e) %s\n",
-                label.c_str(), routed.size(), stats.relative_l2, kCriterion.relative_l2,
-                stats.maximum_absolute_error, test::gross_error_limit(stats, kCriterion),
-                pass ? "ok" : "FAIL");
+    std::printf("%-38s tokens=%zu/%zu rel_l2=%.3e (limit %.1e) max_abs=%.3e (limit %.3e) %s\n",
+                label.c_str(), routed.size(), all_routed.size(), stats.relative_l2,
+                kCriterion.relative_l2, stats.maximum_absolute_error,
+                test::gross_error_limit(stats, kCriterion), pass ? "ok" : "FAIL");
     if (!pass) {
         std::cerr << label << ": criterion failed at index " << stats.maximum_error_index
                   << " actual=" << stats.actual_at_maximum
@@ -483,25 +505,26 @@ private:
     hipStream_t stream_ = nullptr;
 };
 
-// Calls of different extents sharing one workspace with no host synchronization between them:
-// queued back to back on one stream, then captured into one HIP graph replayed three times. Each
-// call must reproduce its standalone output bit for bit, so every call found the counters its
-// predecessor left zeroed.
+// Calls of different extents, decode-round and prefill, sharing one workspace with no host
+// synchronization between them: queued back to back on one stream, then captured into one HIP
+// graph replayed three times. Each call must reproduce its standalone output bit for bit, so every
+// call found the counters its predecessor left.
 int queued_calls(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
                  ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank) {
     const Inputs a = make_inputs(bank, 20, 20, Routing::Skewed, 31U);
     const Inputs b = make_inputs(bank, 48, 48, Routing::Mixed48, 32U);
     const Inputs c = make_inputs(bank, 1, 4, Routing::Skewed, 33U);
+    const Inputs d = make_inputs(bank, 200, 300, Routing::Skewed, 34U);
     std::vector<std::unique_ptr<Run>> runs;
     std::vector<std::vector<std::uint32_t>> expected;
-    for (const Inputs* inputs : {&a, &b, &c}) {
+    for (const Inputs* inputs : {&a, &b, &c, &d}) {
         runs.push_back(std::make_unique<Run>(fixture, store, *inputs));
         runs.back()->set_bank(bank);
         expected.push_back(runs.back()->invoke(workspace));
     }
     const Stream stream;
-    // a, b, c, a: the first a's output is overwritten by the last with the same bits.
-    const int order[]  = {0, 1, 2, 0};
+    // a, d, b, c, d, a: repeated calls overwrite their outputs with the same bits.
+    const int order[]  = {0, 3, 1, 2, 3, 0};
     const auto enqueue = [&] {
         for (const int r : order) {
             ops::moe_helper_experts(runs[static_cast<std::size_t>(r)]->args(), workspace,
@@ -540,6 +563,41 @@ int queued_calls(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
     return failures;
 }
 
+// At prefill extents a token's row depends only on its own inputs: reversing the tokens' order
+// (x rows and route rows) must reverse y's rows bit for bit.
+int order_independence(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
+                       ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank) {
+    const Inputs forward = make_inputs(bank, 300, 300, Routing::Skewed, 41U);
+    Inputs reversed      = forward;
+    const int tokens     = forward.tokens;
+    for (int t = 0; t < tokens; ++t) {
+        const auto from = static_cast<std::size_t>(tokens - 1 - t);
+        const auto to   = static_cast<std::size_t>(t);
+        std::copy_n(forward.x.begin() + static_cast<std::ptrdiff_t>(from * kHidden), kHidden,
+                    reversed.x.begin() + static_cast<std::ptrdiff_t>(to * kHidden));
+        std::copy_n(forward.routes.begin() + static_cast<std::ptrdiff_t>(from * kRoutes), kRoutes,
+                    reversed.routes.begin() + static_cast<std::ptrdiff_t>(to * kRoutes));
+    }
+    Run a(fixture, store, forward);
+    Run b(fixture, store, reversed);
+    a.set_bank(bank);
+    b.set_bank(bank);
+    const std::vector<std::uint32_t> ya = a.invoke(workspace);
+    const std::vector<std::uint32_t> yb = b.invoke(workspace);
+    for (int t = 0; t < tokens; ++t) {
+        const auto row_a = static_cast<std::size_t>(t) * kHidden;
+        const auto row_b = static_cast<std::size_t>(tokens - 1 - t) * kHidden;
+        if (!std::equal(ya.begin() + static_cast<std::ptrdiff_t>(row_a),
+                        ya.begin() + static_cast<std::ptrdiff_t>(row_a + kHidden),
+                        yb.begin() + static_cast<std::ptrdiff_t>(row_b))) {
+            std::cerr << "order independence: token " << t << " differs after reversal\n";
+            return 1;
+        }
+    }
+    std::printf("%-38s tokens=%d rows bit-identical\n", "T300 reversed token order", tokens);
+    return 0;
+}
+
 int run() {
     if (!select_r9700()) {
         std::printf("SKIP: no gfx1201 device\n");
@@ -557,7 +615,9 @@ int run() {
         const auto& record = fixture->experts[r].record;
         store.upload(record.data(), record.size(), fixture->offsets[r]);
     }
+    // A decode-round workspace, and a prefill workspace that also serves decode-round extents.
     ops::MoeHelperExpertsWorkspace workspace(ops::kMoeHelperMaxTokens);
+    ops::MoeHelperExpertsWorkspace prefill(kPrefillCapacity);
     const BankState wide      = make_bank(RecordSet::Wide, 7U);
     const BankState subnormal = make_bank(RecordSet::Subnormal, 8U);
 
@@ -568,39 +628,62 @@ int run() {
         int max_tokens;
         Routing routing;
         std::uint32_t seed;
+        ops::MoeHelperExpertsWorkspace* workspace;
     };
 
     const Case cases[] = {
-        {"T1", &wide, 1, 1, Routing::Skewed, 11U},
-        {"T2 of max 4", &wide, 2, 4, Routing::Skewed, 12U},
-        {"T4", &wide, 4, 4, Routing::Skewed, 13U},
-        {"T20", &wide, 20, 20, Routing::Skewed, 14U},
-        {"T48 mixed ownership and sharing", &wide, 48, 48, Routing::Mixed48, 15U},
-        {"T4 subnormal scales", &subnormal, 4, 4, Routing::Skewed, 16U},
+        {"T1", &wide, 1, 1, Routing::Skewed, 11U, &workspace},
+        {"T2 of max 4", &wide, 2, 4, Routing::Skewed, 12U, &workspace},
+        {"T4", &wide, 4, 4, Routing::Skewed, 13U, &workspace},
+        {"T20", &wide, 20, 20, Routing::Skewed, 14U, &workspace},
+        {"T48 mixed ownership and sharing", &wide, 48, 48, Routing::Mixed48, 15U, &workspace},
+        {"T4 subnormal scales", &subnormal, 4, 4, Routing::Skewed, 16U, &workspace},
         // Tokens per expert: 2 and 3 (SIMT), 6 (WMMA at its threshold, one partial block), 17
         // (WMMA, a full block and one token), 40 (WMMA, blocks of 16, 16 and 8).
-        {"T2 concentrated", &wide, 2, 2, Routing::Concentrated, 18U},
-        {"T3 concentrated", &wide, 3, 3, Routing::Concentrated, 19U},
-        {"T6 concentrated", &wide, 6, 6, Routing::Concentrated, 23U},
-        {"T17 concentrated", &wide, 17, 17, Routing::Concentrated, 24U},
-        {"T40 concentrated", &wide, 40, 40, Routing::Concentrated, 20U},
-        {"T20 concentrated subnormal", &subnormal, 20, 20, Routing::Concentrated, 22U},
-        {"N0 of max 48", &wide, 0, 48, Routing::Skewed, 17U},
+        {"T2 concentrated", &wide, 2, 2, Routing::Concentrated, 18U, &workspace},
+        {"T3 concentrated", &wide, 3, 3, Routing::Concentrated, 19U, &workspace},
+        {"T6 concentrated", &wide, 6, 6, Routing::Concentrated, 23U, &workspace},
+        {"T17 concentrated", &wide, 17, 17, Routing::Concentrated, 24U, &workspace},
+        {"T40 concentrated", &wide, 40, 40, Routing::Concentrated, 20U, &workspace},
+        {"T20 concentrated subnormal", &subnormal, 20, 20, Routing::Concentrated, 22U, &workspace},
+        {"N0 of max 48", &wide, 0, 48, Routing::Skewed, 17U, &workspace},
+        // Prefill extents (max_tokens > 48) on the prefill workspace, after a decode-round call
+        // on it: the route boundary at max_tokens 48 / 49, specials (no helper route, only helper
+        // routes, a repeated expert, ids >= 512), jobs of 128 + 128 + 44 tokens per expert,
+        // subnormal scales, N below max_tokens, and N = 0.
+        {"T48 on the prefill workspace", &wide, 48, 48, Routing::Mixed48, 15U, &prefill},
+        {"T49 (prefill boundary)", &wide, 49, 49, Routing::Skewed, 25U, &prefill},
+        {"T64 mixed ownership and sharing", &wide, 64, 64, Routing::Mixed48, 26U, &prefill},
+        {"T300 concentrated", &wide, 300, 300, Routing::Concentrated, 27U, &prefill},
+        {"T200 subnormal scales", &subnormal, 200, 200, Routing::Skewed, 28U, &prefill},
+        {"T130 concentrated subnormal", &subnormal, 130, 130, Routing::Concentrated, 29U, &prefill},
+        {"T2000 of max 4096", &wide, 2000, kPrefillCapacity, Routing::Skewed, 30U, &prefill},
+        {"N0 of max 4096", &wide, 0, kPrefillCapacity, Routing::Skewed, 31U, &prefill},
     };
     for (const Case& c : cases) {
         const Inputs inputs = make_inputs(*c.bank, c.tokens, c.max_tokens, c.routing, c.seed);
         Run run(*fixture, store, inputs);
         run.set_bank(*c.bank);
-        const std::vector<std::uint32_t> bits = run.invoke(workspace);
+        const std::vector<std::uint32_t> bits = run.invoke(*c.workspace);
         failures += verify(c.label, *fixture, *c.bank, inputs, bits);
         // A second call on the same workspace must find its counters reset and reproduce y.
-        if (run.invoke(workspace) != bits) {
+        if (run.invoke(*c.workspace) != bits) {
             std::cerr << c.label << ": repeated call is not bit-identical\n";
             ++failures;
         }
     }
 
-    failures += queued_calls(*fixture, store, workspace, wide);
+    failures += queued_calls(*fixture, store, prefill, wide);
+    failures += order_independence(*fixture, store, prefill, wide);
+    {
+        // The Op's capacity: every token routed, on a workspace of exactly that capacity.
+        ops::MoeHelperExpertsWorkspace full(ops::kMoeHelperExpertsMaxTokens);
+        const Inputs inputs = make_inputs(wide, ops::kMoeHelperExpertsMaxTokens,
+                                          ops::kMoeHelperExpertsMaxTokens, Routing::Skewed, 32U);
+        Run run(*fixture, store, inputs);
+        run.set_bank(wide);
+        failures += verify("T16384 (capacity)", *fixture, wide, inputs, run.invoke(full));
+    }
 
     // Contract rejection before any work is queued.
     const Inputs inputs = make_inputs(wide, 4, 4, Routing::Skewed, 21U);
@@ -612,13 +695,21 @@ int run() {
         args.max_tokens = 0;
         ops::moe_helper_experts(args, workspace, nullptr);
     });
-    failures += expect_rejected("max_tokens 49", [&] {
+    failures += expect_rejected("max_tokens 16385", [&] {
+        auto args       = valid.args();
+        args.max_tokens = ops::kMoeHelperExpertsMaxTokens + 1;
+        ops::moe_helper_experts(args, prefill, nullptr);
+    });
+    failures += expect_rejected("workspace too small",
+                                [&] { ops::moe_helper_experts(valid.args(), small, nullptr); });
+    failures += expect_rejected("prefill extent on a decode-round workspace", [&] {
         auto args       = valid.args();
         args.max_tokens = 49;
         ops::moe_helper_experts(args, workspace, nullptr);
     });
-    failures += expect_rejected("workspace too small",
-                                [&] { ops::moe_helper_experts(valid.args(), small, nullptr); });
+    failures += expect_rejected("workspace max_tokens 16385", [&] {
+        ops::MoeHelperExpertsWorkspace too_large(ops::kMoeHelperExpertsMaxTokens + 1);
+    });
     failures += expect_rejected("misaligned y", [&] {
         auto args = valid.args();
         args.y += 1;

@@ -1,5 +1,8 @@
 #include "ninfer/ops/moe_helper_experts.h"
 
+#include "ops/r9700/moe_helper_common.h"
+#include "ops/r9700/moe_helper_experts_grouped.h"
+
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -11,9 +14,26 @@
 namespace ninfer::ops {
 namespace {
 
+using detail::bf16_round;
+using detail::e4m3_to_float;
+using detail::hip_check;
+using detail::lds_barrier;
+using detail::load_record;
+using detail::record_address;
+using detail::RecordBytes;
+using detail::silu;
+using detail::U32x2;
+using detail::U32x4;
+using detail::wave_lds_sync;
+using detail::wmma;
+using detail::WmmaBf16;
+using detail::WmmaF32;
+
 // --- Geometry ----------------------------------------------------------------------------------
 //
-// One launch serves the whole call. Its work items are (job, row block) pairs, where a job is
+// This file holds the public wrapper and the persistent route of calls with max_tokens <= 48
+// (decode and verify rounds); larger calls take the grouped route
+// (moe_helper_experts_grouped.hip). One launch serves the whole call. Its work items are (job, row block) pairs, where a job is
 // one expert with every compact-token route entry naming it. A workgroup of four wave32 waves
 // computes one item; each wave computes one *slice*: one 32-row tile of a record plane over 640
 // consecutive K (five 128-K chunks), for the job's tokens.
@@ -193,24 +213,6 @@ struct Params {
 // this kernel (ROCm core-10.0, AMD clang 23); a toolchain that weakens either breaks the
 // publication.
 
-// A workgroup barrier ordering only LDS: __syncthreads' workgroup fence also waits for every
-// global load in flight, which would drain a slice's weight loads.
-__device__ __forceinline__ void lds_barrier() {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
-    // NOLINTNEXTLINE(portability-no-assembler): this wave's LDS accesses; no builtin on gfx12
-    asm volatile("s_wait_dscnt 0x0" ::: "memory");
-    __builtin_amdgcn_s_barrier_signal(-1);
-    __builtin_amdgcn_s_barrier_wait(-1);
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
-}
-
-// Orders one wave's LDS writes before its later LDS reads by other lanes of the same wave.
-__device__ __forceinline__ void wave_lds_sync() {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
-    __builtin_amdgcn_wave_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
-}
-
 __device__ __forceinline__ std::uint32_t atomic_add_agent(std::uint32_t* counter, int order) {
     return __hip_atomic_fetch_add(counter, 1U, order, __HIP_MEMORY_SCOPE_AGENT);
 }
@@ -249,14 +251,6 @@ __device__ __forceinline__ void pair_run(std::uint32_t el, std::uint32_t eh, std
     out[3] = __builtin_amdgcn_perm(oh, ol, 0x07030602U); // nibbles 5, 7
 }
 
-// Exact E4M3FN (bias 7, subnormals 2^-9 m) to FP32; the NaN encodings are not valid scales.
-__device__ __forceinline__ float e4m3_to_float(std::uint32_t bits) {
-    const std::uint32_t magnitude = bits & 0x7FU;
-    const float value = magnitude >= 8U ? __uint_as_float((magnitude << 20) + 0x3C000000U)
-                                        : static_cast<float>(magnitude) * 0x1p-9F;
-    return (bits & 0x80U) != 0 ? -value : value;
-}
-
 // Hides a register's value from the optimizer at this point: work derived from it cannot move
 // above the point, work feeding it cannot move below, and volatile asm keeps program order
 // (see Slice::multiply).
@@ -283,19 +277,6 @@ __device__ __forceinline__ void launder_vector(Vector& value) {
 
 using Bf16x2 = __bf16 __attribute__((ext_vector_type(2)));
 
-// Record bytes in the global address space. A record address comes from an integer table entry,
-// which would otherwise compile to flat loads; flat loads also count on the LDS wait counter, so
-// every LDS wait would drain the slice's in-flight record loads.
-using RecordBytes = const __attribute__((address_space(1))) std::uint8_t*;
-
-using U32x2 = std::uint32_t __attribute__((ext_vector_type(2)));
-using U32x4 = std::uint32_t __attribute__((ext_vector_type(4)));
-
-template <class T>
-__device__ __forceinline__ T load_record(RecordBytes bytes) {
-    return *reinterpret_cast<const __attribute__((address_space(1))) T*>(bytes);
-}
-
 __device__ __forceinline__ float dot2(std::uint32_t w, std::uint32_t x, float acc) {
     return __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(Bf16x2, w),
                                            __builtin_bit_cast(Bf16x2, x), acc, false);
@@ -313,15 +294,6 @@ __device__ __forceinline__ float dot_pairs(const std::uint32_t (&w)[16],
         b = dot2(w[i + 1], x[i + 1], b);
     }
     return a + b;
-}
-
-// gfx12 wave32 WMMA 16x16x16 BF16 -> FP32. Lane l holds A row l % 16 and B column l % 16 at K
-// 8 (l / 16) .. + 7 (eight BF16), and D column l % 16 at rows 8 (l / 16) .. + 7.
-using WmmaBf16 = __attribute__((__vector_size__(8 * sizeof(short)))) short;
-using WmmaF32  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
-
-__device__ __forceinline__ WmmaF32 wmma(const WmmaBf16& a, const WmmaBf16& b, const WmmaF32& c) {
-    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
 }
 
 // Reorders a decoded row from run order (pairs (0,2), (4,6), (1,3), (5,7) per run) to natural K
@@ -670,13 +642,6 @@ __device__ __forceinline__ void multiply_wmma(RecordBytes first_chunk, const Row
 
 // --- Items -------------------------------------------------------------------------------------
 
-__device__ __forceinline__ std::uint16_t bf16_round(float value) {
-    const std::uint32_t bits = __float_as_uint(value);
-    return static_cast<std::uint16_t>((bits + 0x7FFFU + ((bits >> 16) & 1U)) >> 16);
-}
-
-__device__ __forceinline__ float silu(float z) { return z / (1.0F + expf(-z)); }
-
 // The job's record address and expert, uniform across the workgroup.
 struct JobView {
     RecordBytes record;
@@ -694,9 +659,7 @@ __device__ __forceinline__ JobView view_job(const Job* jobs, int job) {
         __builtin_amdgcn_readfirstlane(static_cast<int>(value.entry >> 32)));
     const std::uint64_t entry = (static_cast<std::uint64_t>(hi) << 32) | lo;
     JobView view;
-    // The expert table holds record addresses as integers by contract.
-    view.record = reinterpret_cast<RecordBytes>(
-        entry & ~std::uint64_t{1}); // NOLINT(performance-no-int-to-ptr)
+    view.record = record_address(entry);
     view.f3     = (entry & 1U) != 0;
     view.expert = __builtin_amdgcn_readfirstlane(value.expert);
     view.begin  = __builtin_amdgcn_readfirstlane(value.begin);
@@ -1080,13 +1043,6 @@ __global__ void __launch_bounds__(kThreads) moe_helper_experts_kernel(const Para
 
 // --- Host --------------------------------------------------------------------------------------
 
-void hip_check(hipError_t status, const char* what) {
-    if (status != hipSuccess) {
-        throw std::runtime_error(std::string("moe_helper_experts: ") + what + ": " +
-                                 hipGetErrorString(status));
-    }
-}
-
 [[noreturn]] void reject(const std::string& message) {
     throw std::invalid_argument("moe_helper_experts: " + message);
 }
@@ -1114,20 +1070,45 @@ bool overlaps(const Span& a, const Span& b) {
 // The grid affects only speed: items are claimed by running workgroups, so any grid completes.
 constexpr int kWorkgroupsPerUnit = 7;
 
+// The workspace serves both routes: the persistent route's region for min(max_tokens, 48) tokens
+// from the base, then, when max_tokens exceeds 48, the grouped route's region.
+struct WorkspaceSplit {
+    std::int32_t persistent_tokens;
+    std::size_t grouped;
+    std::size_t bytes;
+};
+
+WorkspaceSplit workspace_split(std::int32_t max_tokens) {
+    WorkspaceSplit split{};
+    split.persistent_tokens = std::min(max_tokens, kMoeHelperMaxTokens);
+    split.grouped           = workspace_layout(split.persistent_tokens).bytes;
+    split.bytes             = split.grouped;
+    if (max_tokens > kMoeHelperMaxTokens) {
+        split.bytes += detail::moe_helper_grouped_workspace_bytes(max_tokens);
+    }
+    return split;
+}
+
+void check_extent(std::int32_t max_tokens, const char* what) {
+    if (max_tokens < 1 || max_tokens > kMoeHelperExpertsMaxTokens) {
+        reject(std::string(what) + " " + std::to_string(max_tokens) + " outside [1, " +
+               std::to_string(kMoeHelperExpertsMaxTokens) + "]");
+    }
+}
+
 } // namespace
 
 MoeHelperExpertsWorkspace::MoeHelperExpertsWorkspace(std::int32_t max_tokens)
     : max_tokens_(max_tokens) {
-    if (max_tokens < 1 || max_tokens > kMoeHelperMaxTokens) {
-        reject("workspace max_tokens " + std::to_string(max_tokens) + " outside [1, 48]");
-    }
+    check_extent(max_tokens, "workspace max_tokens");
     hip_check(hipGetDevice(&device_), "hipGetDevice");
-    const std::size_t bytes = workspace_layout(max_tokens).bytes;
-    void* base              = nullptr;
-    hip_check(hipMalloc(&base, bytes), "workspace hipMalloc");
+    const WorkspaceSplit split = workspace_split(max_tokens);
+    void* base                 = nullptr;
+    hip_check(hipMalloc(&base, split.bytes), "workspace hipMalloc");
     base_ = static_cast<std::byte*>(base);
     try {
-        hip_check(hipMemset(base_, 0, bytes), "workspace hipMemset");
+        // Only the persistent route's counters need zeroes; the grouped route resets its own.
+        hip_check(hipMemset(base_, 0, split.grouped), "workspace hipMemset");
         hip_check(hipDeviceSynchronize(), "workspace zero fill");
     } catch (...) {
         (void)hipFree(base_);
@@ -1137,18 +1118,22 @@ MoeHelperExpertsWorkspace::MoeHelperExpertsWorkspace(std::int32_t max_tokens)
 
 MoeHelperExpertsWorkspace::~MoeHelperExpertsWorkspace() { (void)hipFree(base_); }
 
+std::size_t MoeHelperExpertsWorkspace::device_bytes(std::int32_t max_tokens) {
+    check_extent(max_tokens, "workspace max_tokens");
+    return workspace_split(max_tokens).bytes;
+}
+
 void MoeHelperExpertsWorkspace::reset(hipStream_t stream) {
     // control, job_done and merge are contiguous from the base, ending where gated starts.
-    hip_check(hipMemsetAsync(base_, 0, workspace_layout(max_tokens_).gated, stream),
+    const std::int32_t persistent = workspace_split(max_tokens_).persistent_tokens;
+    hip_check(hipMemsetAsync(base_, 0, workspace_layout(persistent).gated, stream),
               "workspace counter reset");
 }
 
 void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorkspace& workspace,
                         hipStream_t stream) {
     const std::int32_t max_tokens = args.max_tokens;
-    if (max_tokens < 1 || max_tokens > kMoeHelperMaxTokens) {
-        reject("max_tokens " + std::to_string(max_tokens) + " outside [1, 48]");
-    }
+    check_extent(max_tokens, "max_tokens");
     if (max_tokens > workspace.max_tokens()) {
         reject("max_tokens " + std::to_string(max_tokens) + " exceeds the workspace's " +
                std::to_string(workspace.max_tokens()));
@@ -1179,7 +1164,14 @@ void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorksp
     hip_check(hipGetDevice(&device), "hipGetDevice");
     if (device != workspace.device()) { reject("workspace belongs to another device"); }
 
-    const WorkspaceLayout layout = workspace_layout(workspace.max_tokens());
+    const WorkspaceSplit split = workspace_split(workspace.max_tokens());
+    if (max_tokens > kMoeHelperMaxTokens) {
+        detail::moe_helper_experts_grouped(args, workspace.base() + split.grouped,
+                                           workspace.max_tokens(), device, stream);
+        return;
+    }
+
+    const WorkspaceLayout layout = workspace_layout(split.persistent_tokens);
     std::byte* base              = workspace.base();
     Params params{};
     params.tokens        = args.tokens;

@@ -331,7 +331,8 @@ if(NINFER_ENABLE_HIP_EXPERT_HELPER)
 
   # gfx1201 HIP Ops of the Flash-Next expert helper (cmake/hip_expert_helper.cmake).
   add_library(ninfer_hip_ops STATIC
-    ops/r9700/moe_helper_experts.hip)
+    ops/r9700/moe_helper_experts.hip
+    ops/r9700/moe_helper_experts_grouped.hip)
   ninfer_hip_target(ninfer_hip_ops)
   target_include_directories(ninfer_hip_ops PUBLIC ${PROJECT_SOURCE_DIR}/include)
 endif()
