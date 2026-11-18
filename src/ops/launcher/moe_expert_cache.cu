@@ -186,7 +186,8 @@ __global__ void __launch_bounds__(kAdmitThreads) moe_expert_cache_admit_kernel(
     const std::int32_t* __restrict__ ids, int id_count, std::uint64_t* __restrict__ expert_ptr,
     const std::uint64_t* __restrict__ host_ptr, std::uint64_t* __restrict__ fill_ptr,
     std::int32_t* __restrict__ slot_index, MoeExpertSlotPoolArgs pool0, MoeExpertSlotPoolArgs pool1,
-    std::int32_t* clock_hands, int layer, MoeAdmitPolicyArgs policy, std::uint64_t* counters) {
+    std::int32_t* clock_hands, int layer, MoeAdmitPolicyArgs policy, std::uint64_t* counters,
+    std::uint64_t* route_counts) {
     __shared__ AdmitShared shared;
     const int thread = static_cast<int>(threadIdx.x);
     const int lane   = thread % kWarpSize;
@@ -203,7 +204,9 @@ __global__ void __launch_bounds__(kAdmitThreads) moe_expert_cache_admit_kernel(
     bool miss[kMoeCacheCodecTags]   = {false, false};
     bool lookup[kMoeCacheCodecTags] = {false, false};
     if (thread < kMoeExperts && is_routed(shared, thread)) {
-        const int entry             = layer * kMoeExperts + thread;
+        const int entry = layer * kMoeExperts + thread;
+        // Thread e exclusively owns this layer's routed-set entry; calls are stream ordered.
+        if (route_counts != nullptr) { ++route_counts[entry]; }
         const std::uint64_t address = expert_ptr[entry];
         const std::uint64_t host    = host_ptr[entry];
         const int tag               = static_cast<int>(host & kCodecTagMask);
@@ -590,10 +593,10 @@ void moe_expert_cache_admit_launch(const std::int32_t* ids, std::int32_t id_coun
                                    MoeExpertSlotPoolArgs pool0, MoeExpertSlotPoolArgs pool1,
                                    std::int32_t* clock_hands, std::int32_t layer,
                                    MoeAdmitPolicyArgs policy, std::uint64_t* counters,
-                                   cudaStream_t stream) {
+                                   std::uint64_t* route_counts, cudaStream_t stream) {
     moe_expert_cache_admit_kernel<<<1, kAdmitThreads, 0, stream>>>(
         ids, id_count, expert_ptr, host_ptr, fill_ptr, slot_index, pool0, pool1, clock_hands, layer,
-        policy, counters);
+        policy, counters, route_counts);
     CUDA_CHECK(cudaGetLastError());
 }
 

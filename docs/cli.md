@@ -180,6 +180,7 @@ The RTX 5090 tree investigation is in
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--context-checkpoints off\|on\|a,b,c` | automatic prefill ladder: `off` captures none, `on` uses the standard marks (24576, 36864, 53248, 77824, 102400, 151552), and a comma list sets custom marks. `on` and custom lists require DFlash, selected automatically or with `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark, not the raw named size. Turn-rollback and turn (rewrite) checkpoints do not depend on the ladder. | `off` |
 | `--ngram-table PATH` | qwen3.8-flash-next only, and required by it: the 8-bit n-gram (PLE) table file (`ngram_table.int8.bin`); other targets reject it | unset |
+| `--expert-route-profile PATH` | Flash-Next only: atomically overwrite decode/verify routed-set JSON at startup, every five minutes at a settled round boundary, and at clean shutdown; no restart accumulation | unset |
 | `--qsa-select-budget 512\|1024\|2048` | qwen3.8-flash-next only: complete four-token QSA blocks each query attends to beyond its tail | `512` |
 | `--capture-context-checkpoint` | pin the current resume frontier `E` on an exact-hit / decode-only request (the same one-slot turn-rollback head automatic occupy-append already writes). A fresh one-shot run has `E == 0`, so this is a no-op unless a retained lane already exists in the process. | off |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |

@@ -20,6 +20,7 @@
 #include <cuda_runtime.h> // cudaStream_t
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -32,6 +33,7 @@ namespace ninfer::targets::qwen3_8_flash_next {
 
 struct ProgramOptions {
     std::filesystem::path ngram_table;
+    std::filesystem::path expert_route_profile_path;
     // Longest context one request may reach (prompt plus output), in [1,
     // ops::kQsaMaximumCapacity].
     std::int32_t context_tokens = 4096;
@@ -149,6 +151,7 @@ public:
     static constexpr std::size_t kDeviceReserveBytes = std::size_t{1} << 30;
 
     Program(const LoadedModel& model, const ProgramOptions& options, DeviceContext& device);
+    ~Program();
 
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
@@ -267,6 +270,10 @@ public:
     [[nodiscard]] const RoundTiming& last_round() const noexcept { return last_round_; }
 
 private:
+    // Runs only under exclusive Program ownership after the round transaction has settled.
+    // Forced writes serve startup and destruction; I/O and CUDA failures propagate.
+    void write_route_profile(bool force = false);
+
     enum class LanePhase : std::uint8_t { Closed, Prompt, Decoding };
 
     struct LaneControl {
@@ -302,6 +309,9 @@ private:
     bool masks_staged_ = false;
     SpeculativeOptions speculative_options_;
     std::optional<std::uint32_t> forced_adaptive_k_;
+    std::filesystem::path expert_route_profile_path_;
+    const std::chrono::steady_clock::time_point profile_started_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point profile_written_{};
 
     std::array<Lane, kMaxLanes> pending_lanes_{};
     std::array<std::int32_t, kMaxLanes> pending_extents_{};

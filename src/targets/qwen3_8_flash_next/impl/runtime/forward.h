@@ -20,6 +20,7 @@
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
+#include "runtime/expert_route_profile.h"
 
 #include <cuda_runtime.h> // cudaStream_t, cudaEvent_t
 
@@ -361,8 +362,11 @@ public:
     [[nodiscard]] Tensor logits(std::int32_t count) const;
 
     // Zeroes the expert-cache counters, which every admit (decode rounds and super-chunks narrower
-    // than window_min_tokens) accumulates from construction on; enqueued on the stream.
+    // than window_min_tokens) accumulates from construction on; synchronizes the stream.
     void clear_expert_cache_counts();
+    // Lifetime decode-only totals; never reset by the diagnostic counter clear. Exclusive
+    // Forward ownership is required; synchronizes the compute stream before returning.
+    [[nodiscard]] ExpertRouteProfile expert_route_profile();
 
     // The counters once the stream's enqueued work completes; synchronizes the stream.
     [[nodiscard]] ExpertCacheCounts expert_cache_counts();
@@ -476,9 +480,11 @@ private:
         Tensor score_logprobs;
         Tensor score_top_ids;
         Tensor score_top_logprobs;
-        // I64 [2,2] moe_expert_cache_admit counters (kind, codec), accumulated by every admit;
-        // the decode graphs capture their address.
+        // I64 [2,2] moe_expert_cache_admit counters (kind, codec) for prefill admits.
         Tensor expert_cache_counters;
+        // Lifetime-stable addresses shared by eager verification and every decode graph.
+        Tensor decode_cache_counters; // I64 [2,2]
+        Tensor decode_route_counts;   // I64 [512,48]
         // I64 [512,2]: column b holds the placements of the layer streamed through window b.
         Tensor window_columns;
         Tensor dflash_features;
@@ -672,11 +678,13 @@ private:
     std::optional<CudaEvent> drafts_ready_;
     std::vector<DecodeGraphDefinition> spec_a_definitions_, spec_b_definitions_;
     std::vector<DecodeGraphExecutable> spec_a_graphs_, spec_b_graphs_;
-    bool speculative_pending_          = false;
-    std::int32_t pending_verify_width_ = 0;
-    std::int32_t pending_verify_rows_  = 0;
-    std::int32_t feature_offset_       = 0;
-    std::int32_t feature_columns_      = 0;
+    bool speculative_pending_            = false;
+    std::int32_t pending_verify_width_   = 0;
+    std::int32_t pending_verify_rows_    = 0;
+    std::uint64_t decode_profile_rounds_ = 0;
+    std::array<std::uint64_t, 4> diagnostic_decode_baseline_{};
+    std::int32_t feature_offset_  = 0;
+    std::int32_t feature_columns_ = 0;
     // Pinned mirror of ChunkInputs at the same offsets from the activation arena base.
     PinnedHostBuffer input_staging_;
     // Recorded after each chunk's input upload; the host waits on it before rewriting the staging.

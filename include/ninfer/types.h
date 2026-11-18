@@ -219,6 +219,9 @@ struct EngineOptions {
     // qwen3.8-flash-next only, and required by it: the 8-bit n-gram (PLE) table file. Other
     // targets reject a non-empty path.
     std::filesystem::path ngram_table_path;
+    // Flash-Next only: overwrite this JSON with decode routed-set statistics every five minutes
+    // at a settled round boundary and at clean shutdown. Empty disables file output.
+    std::filesystem::path expert_route_profile_path;
     // qwen3.8-flash-next only; unset selects 512 blocks. Other targets reject a value.
     std::optional<QsaSelectBudget> qsa_select_budget;
     // Diagnostic baseline: disable repetition exclusions and internal regeneration,

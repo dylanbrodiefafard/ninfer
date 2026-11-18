@@ -261,6 +261,7 @@ SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
         throw std::logic_error(
             "Flash-Next CPU n-gram packet differs from its GPU verification IDs");
     }
+    ++decode_profile_rounds_;
     pending_verify_width_ = width;
     pending_verify_rows_  = rows;
     speculative_pending_  = true;

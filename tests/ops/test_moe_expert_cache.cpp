@@ -63,7 +63,7 @@ struct PoolModel {
 // The complete cache state as the contract defines it (tables are layer-major [512,L]).
 struct CacheModel {
     std::int32_t layers = 0;
-    std::vector<std::uint64_t> expert, host, fill;
+    std::vector<std::uint64_t> expert, host, fill, route_counts;
     std::array<PoolModel, kPools> pools;
     std::array<std::int32_t, kPools> hands{};
     // counters[kind + 2 codec], as the admit contract lays them out.
@@ -96,6 +96,7 @@ void model_admit(CacheModel& m, const std::vector<std::int32_t>& ids, std::int32
             const auto entry = static_cast<std::size_t>(layer) * kExperts + e;
             if (!routed[e]) { continue; }
             const std::size_t tag = m.host[entry] & 1U;
+            ++m.route_counts[entry];
             ++m.counters[counter_index(ops::MoeCacheCounter::Lookups, tag)];
             if (m.expert[entry] == m.host[entry]) {
                 ++m.counters[counter_index(ops::MoeCacheCounter::Misses, tag)];
@@ -233,7 +234,8 @@ public:
         : expert_(table_bytes(model)), host_(table_bytes(model)), fill_(table_bytes(model)),
           slot_index_(table_bytes(model) / 2), hands_(kPools * sizeof(std::int32_t)),
           counters_(kCounters * sizeof(std::int64_t)), counts_(table_bytes(model) / 2),
-          lookups_(sizeof(std::int32_t)) {
+          lookups_(sizeof(std::int32_t)), route_counts_(table_bytes(model)) {
+        model.route_counts.resize(static_cast<std::size_t>(model.layers) * kExperts);
         for (std::int32_t p = 0; p < kPools; ++p) {
             const auto fixed  = static_cast<std::size_t>(config[p].slots);
             const auto flex   = static_cast<std::size_t>(config[p].flex);
@@ -283,6 +285,7 @@ public:
                 .halving_lookups = model.halving_lookups,
             };
         }
+        route_counts_view_ = Tensor(route_counts_.data(), DType::I64, {kExperts, model.layers});
         counters_view_ = Tensor(counters_.data(), DType::I64, {ops::kMoeCacheCounterKinds, kPools});
         expert_view_   = Tensor(expert_.data(), DType::I64, {kExperts, model.layers});
         host_view_     = Tensor(host_.data(), DType::I64, {kExperts, model.layers});
@@ -297,6 +300,7 @@ public:
         slot_index_.copy_from_host(slot_index.data(), slot_index_.bytes());
         hands_.copy_from_host(m.hands.data(), hands_.bytes());
         counters_.copy_from_host(m.counters.data(), counters_.bytes());
+        route_counts_.copy_from_host(m.route_counts.data(), route_counts_.bytes());
         if (!m.counts.empty()) {
             counts_.copy_from_host(m.counts.data(), counts_.bytes());
             lookups_.copy_from_host(&m.lookups, lookups_.bytes());
@@ -332,6 +336,10 @@ public:
                                  from_device<std::int64_t>(counters_.data(), kCounters),
                                  std::vector<std::int64_t>(m.counters.begin(), m.counters.end()));
         failures += counters_.verify_guards(label + " counters");
+        failures +=
+            verify_exact((label + " route counts").c_str(),
+                         from_device<std::uint64_t>(route_counts_.data(), entries), m.route_counts);
+        failures += route_counts_.verify_guards(label + " route counts");
         if (!m.counts.empty()) {
             failures +=
                 verify_exact((label + " frequency counts").c_str(),
@@ -372,7 +380,8 @@ public:
         ops::moe_expert_cache_admit(ids, expert_view_, host_view_, fill_view_, cache_, layer,
                                     filter ? ops::MoeCacheAdmission::FrequencyFilter
                                            : ops::MoeCacheAdmission::EveryMiss,
-                                    stream, count_events ? &counters_view_ : nullptr);
+                                    stream, count_events ? &counters_view_ : nullptr,
+                                    count_events ? &route_counts_view_ : nullptr);
     }
 
     void lend(std::int32_t pool, ops::MoeCacheSlotRegion region, std::int32_t first,
@@ -395,10 +404,11 @@ private:
         return static_cast<std::size_t>(m.layers) * kExperts * sizeof(std::uint64_t);
     }
 
-    GuardedDeviceBuffer expert_, host_, fill_, slot_index_, hands_, counters_, counts_, lookups_;
+    GuardedDeviceBuffer expert_, host_, fill_, slot_index_, hands_, counters_, counts_, lookups_,
+        route_counts_;
     std::array<std::unique_ptr<DevicePool>, kPools> pools_;
     ops::MoeExpertCache cache_;
-    Tensor expert_view_, host_view_, fill_view_, counters_view_;
+    Tensor expert_view_, host_view_, fill_view_, counters_view_, route_counts_view_;
 };
 
 // Consistent random initial state: host addresses with random codecs (a fraction nvfp4_share of

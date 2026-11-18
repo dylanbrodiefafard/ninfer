@@ -918,6 +918,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--context-checkpoints off\|on\|a,b,c` | automatic prefill ladder: `off` captures none, `on` uses the standard marks (24576, 36864, 53248, 77824, 102400, 151552), and a comma list sets custom marks. `on` and custom lists require DFlash, selected automatically or with `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | `off` |
 | `--ngram-table PATH` | qwen3.8-flash-next only, and required by it: the 8-bit n-gram (PLE) table file (`ngram_table.int8.bin`); other targets reject it | unset |
+| `--expert-route-profile PATH` | Flash-Next only: atomically overwrite decode/verify routed-set JSON at startup, every five minutes at a settled round boundary, and at clean shutdown; no restart accumulation | unset |
 | `--qsa-select-budget 512\|1024\|2048` | qwen3.8-flash-next only: complete four-token QSA blocks each query attends to beyond its tail | `512` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--default-thinking-token-budget N\|off` | cap inherited by thinking requests that omit their reasoning budget | `off` |
@@ -933,6 +934,17 @@ curl http://127.0.0.1:8080/v1/models \
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
 | `--no-p-less-sampling` | opt out of p-less and use top-p/top-k/min-p/penalties | p-less on |
+
+`--expert-route-profile PATH` records unique `(layer, expert)` jobs per packed decode or
+verification round, not token assignments; prefill is excluded and rejected proposals count.
+Its version-1 JSON contains `identity: {model_id, weights_id}`, `uptime_s`, `rounds`,
+`codecs: {nvfp4: {decode_lookups, decode_misses}, f3g32: {decode_lookups, decode_misses}}`,
+`hit_rate`, `miss_bytes`, and integer `decode_lookups[48][512]` in layer-major order.
+`hit_rate` is hits divided by lookups (zero before any lookup); miss MB/round logs use decimal
+MB. The Program writes on its execution thread, replacing a same-directory `.tmp` file by
+rename. The directory must exist and one process must own the path. Idle time does not force
+a write until the next round; SIGKILL cannot save the final partial interval. Existing files
+are overwritten, not merged. The CLI accepts the same flag and format.
 
 Mixed prefill defaults to `--mixed-forward 4096 --mixed-forward-rounds 12
 --mixed-forward-min-tokens 4096`. Remaining uncached suffixes below 4,096 tokens finish

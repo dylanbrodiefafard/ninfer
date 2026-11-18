@@ -158,12 +158,15 @@ enum class MoeCacheAdmission : std::uint8_t {
  *      admitted or not. U is a set: an expert routed by several (token, k) pairs of the call
  *      counts once, matching the one record read per miss that the fill or moe_experts makes.
  *      The sums wrap modulo 2^64; the caller zeroes the counters when it starts a measurement.
+ *   5. Route counts (when route_counts is given): route_counts[u,l] += 1 for every u in U,
+ *      independent of residency and admission, wrapping modulo 2^64.
  *
  * Logical shapes:
  *   ids I32 [10,T], T >= 1 with 10 T < 2^31, every id in [0,512); expert_ptr, host_ptr and
  *   fill_ptr I64 [512,L], L >= 1 with 512 L < 2^31; 0 <= layer < L; counters, when not null,
  *   contiguous I64 [2,2] (kind, codec); frequency counts, when present, contiguous I32 [512,L]
- *   with lookups contiguous I32 [1]; cache.slot_index contiguous I32 [512,L].
+ *   with lookups contiguous I32 [1]; cache.slot_index contiguous I32 [512,L]; route_counts,
+ *   when not null, contiguous I64 [512,L], disjoint from all other arguments.
  *
  * Supported domain:
  *   Exact integer and address arithmetic. On entry the state is consistent: every fill_ptr entry
@@ -176,7 +179,8 @@ enum class MoeCacheAdmission : std::uint8_t {
  * Effects:
  *   Writes expert_ptr only for evicted owners (any layer), slot_index only for evicted owners and
  *   admitted misses, fill_ptr only in column layer, owner, referenced and clock_hands of the
- *   pools, the frequency state when present, and the counters when given; nothing else. Between
+ *   pools, the frequency state when present, and counters and route_counts when given;
+ *   nothing else. Between
  *   admit and commit an admitted miss already has its slot_index entry while its expert_ptr entry
  *   still names the host record.
  *   ids and host_ptr are read only. The state is consistent again after the commit. Invariants
@@ -194,9 +198,9 @@ enum class MoeCacheAdmission : std::uint8_t {
  *   moe_experts with a MoeExpertsDeferral of this layer's fill_ptr column (or of its
  *   moe_expert_cache_defer merge with a staging column, which reads the fill column before commit)
  *   and an event recorded after the fill, and then commit. Commit always follows the fill. All
- *   tensors and pool metadata are pairwise disjoint device memory. Calls sharing counters run in
- *   stream order (one stream): the single CTA adds each counter with one plain read-modify-write,
- *   no atomics.
+ *   tensors and pool metadata are pairwise disjoint device memory. Calls sharing counters or
+ *   route_counts run in stream order (one stream): the single CTA adds each counter, and thread
+ *   e increments route_counts[e,layer], with plain read-modify-writes; no atomics are needed.
  *
  * Workspace: none.
  *
@@ -207,7 +211,7 @@ enum class MoeCacheAdmission : std::uint8_t {
 void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor& host_ptr,
                             Tensor& fill_ptr, const MoeExpertCache& cache, std::int32_t layer,
                             MoeCacheAdmission admission, cudaStream_t stream,
-                            Tensor* counters = nullptr);
+                            Tensor* counters = nullptr, Tensor* route_counts = nullptr);
 
 /**
  * Op: moe_expert_cache_borrow / moe_expert_cache_return

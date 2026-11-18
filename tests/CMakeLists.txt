@@ -82,6 +82,9 @@ endfunction()
 
 # Artifact framing and model-independent runtime contracts.
 # Experimental Qwen3.8-Flash-Next runtime pieces (CPU and direct I/O; no GPU).
+ninfer_add_test(ninfer_flash_next_expert_route_profile_test
+  SOURCES targets/qwen3_8_flash_next/test_expert_route_profile.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next)
 ninfer_add_test(ninfer_flash_next_ngram_table_test
   SOURCES targets/qwen3_8_flash_next/test_ngram_table.cpp
   LIBRARIES ninfer_qwen3_8_flash_next)

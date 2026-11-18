@@ -10,6 +10,7 @@ add_library(ninfer_qwen3_8_flash_next STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/kv_extents.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/ple_feeder.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/program.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/expert_route_profile.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/state.cpp)
 target_include_directories(ninfer_qwen3_8_flash_next PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/impl)
 # LoadedModel retains the frontend resources in the shared Qwen3.6 frontend's resource type.

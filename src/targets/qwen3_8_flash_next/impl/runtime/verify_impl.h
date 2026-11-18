@@ -186,6 +186,7 @@ Tensor Forward::verify(std::span<const std::int32_t> lanes, std::span<const std:
         enqueue_layer_loop(batch, false, RowSource::Resident, {}, nullptr, kPleLayer, kLayers);
         head(0, chunk.tokens());
         CUDA_CHECK(cudaStreamSynchronize(stream_));
+        ++decode_profile_rounds_;
         pending_verify_width_ = width;
         pending_verify_rows_  = chunk.rows;
         return logits(chunk.tokens());
