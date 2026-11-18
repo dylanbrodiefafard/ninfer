@@ -16,6 +16,9 @@
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/moe_experts.h"
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+#    include "ninfer/ops/moe_expert_partition.h"
+#endif
 #include "ninfer/ops/moe_route.h"
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/qsa.h"
@@ -471,11 +474,19 @@ std::size_t Forward::device_bytes(const ModelView& model, const ForwardOptions& 
 
 Forward::Forward(const ModelView& model, State& state, PleRowFeeder& feeder,
                  ExpertResidency& experts, const ForwardOptions& options, cudaStream_t stream,
-                 Dflash* drafter)
+                 Dflash* drafter
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+                 ,
+                 ExpertHelper* helper
+#endif
+                 )
     : model_(model), drafter_(drafter), state_(state), feeder_(feeder),
       expert_table_(experts.expert_table()), host_table_(experts.host_table()),
       fill_table_(experts.fill_table()), cache_(experts.cache()), options_(validated(options)),
       stream_(stream),
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+      helper_(helper), helper_view_(helper ? helper->cuda_view() : ExpertHelperCudaView{}),
+#endif
       activations_(plan_activation_bytes(options_) + plan_verify_bytes(options_, state.lanes()) +
                    plan_staging_bytes(options_, state.lanes())),
       work_(plan_work_bytes(model, options_, state)),
@@ -543,6 +554,9 @@ Forward::Forward(const ModelView& model, State& state, PleRowFeeder& feeder,
 }
 
 Forward::~Forward() {
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    if (helper_) { helper_->cancel_and_drain(); }
+#endif
     // No enqueued work may outlive the buffers below; errors cannot propagate from here.
     static_cast<void>(cudaStreamSynchronize(stream_));
     static_cast<void>(cudaStreamSynchronize(fill_stream_.get()));
@@ -562,6 +576,16 @@ ExpertRouteProfile Forward::expert_route_profile() {
     ExpertRouteProfile out;
     out.decode_lookups.resize(static_cast<std::size_t>(kLayers) * ops::kMoeExperts);
     std::array<std::uint64_t, 4> counters{};
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    // Route-profile lookups describe global placement hotness. Helper-resident records are
+    // hits, not missing local cache lookups; cache diagnostics still describe only local work.
+    std::vector<std::uint64_t> hosts;
+    if (helper_) {
+        hosts.resize(out.decode_lookups.size());
+        CUDA_CHECK(cudaMemcpyAsync(hosts.data(), host_table_.data, host_table_.bytes(),
+                                   cudaMemcpyDeviceToHost, stream_));
+    }
+#endif
     CUDA_CHECK(cudaMemcpyAsync(out.decode_lookups.data(), chunk_.decode_route_counts.data,
                                chunk_.decode_route_counts.bytes(), cudaMemcpyDeviceToHost,
                                stream_));
@@ -575,6 +599,14 @@ ExpertRouteProfile Forward::expert_route_profile() {
             out.misses[codec] * static_cast<std::uint64_t>(ops::moe_expert_record_bytes(
                                     static_cast<ops::MoeExpertCodec>(codec)));
     }
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    if (helper_) {
+        out.lookups = {};
+        for (std::size_t i = 0; i < hosts.size(); ++i) {
+            out.lookups[hosts[i] & 1U] += out.decode_lookups[i];
+        }
+    }
+#endif
     out.rounds = decode_profile_rounds_;
     return out;
 }
@@ -1100,6 +1132,9 @@ SampledRows Forward::decode(std::span<const std::int32_t> lanes,
     feature_offset_  = 0;
     feature_columns_ = batch;
     try {
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        if (helper_) { static_cast<void>(helper_->begin_round(static_cast<std::uint32_t>(batch))); }
+#endif
         CUDA_CHECK(cudaEventRecord(replay_start_.get(), stream_));
         if (execution == DecodeExecution::Graph) {
             decode_a_graphs_[rows - 1].launch(stream_);
@@ -1128,7 +1163,16 @@ SampledRows Forward::decode(std::span<const std::int32_t> lanes,
         CUDA_CHECK(cudaEventRecord(replay_stop_.get(), stream_));
         CUDA_CHECK(cudaEventSynchronize(replay_stop_.get()));
         CUDA_CHECK(cudaEventElapsedTime(&last_replay_ms_, replay_start_.get(), replay_stop_.get()));
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        if (helper_) { helper_->finish_round(); }
+#endif
     } catch (...) {
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        if (helper_) {
+            drain_helper_round();
+            throw;
+        }
+#endif
         // A failed row read can follow layer zero's launch; drain its ingress and workspace
         // readers before a caller closes or reuses the lane and pinned frames.
         CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -1452,13 +1496,38 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
     // (the class comment) admits once its stage has read the tables, fills its admitted misses from
     // the stage's source column, and reads its staged records through the deferral; the round
     // stages the next layer around this one's MoE.
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    const Tensor eligible =
+        helper_ ? Tensor(const_cast<std::uint32_t*>(helper_view_.local_eligibility) +
+                             static_cast<std::size_t>(layer) * ops::kMoeExpertMaskWords,
+                         DType::I32, {ops::kMoeExpertMaskWords})
+                : Tensor{};
+    const bool helper_round = helper_ && chunk.lane < 0;
+    if (helper_round) {
+        Tensor map(helper_view_.compact_map, DType::I32, {tokens});
+        Tensor count(helper_view_.compact_count, DType::I32, {1});
+        Tensor compact_x(helper_view_.compact_x, DType::BF16, {kHidden, tokens});
+        Tensor compact_ids(helper_view_.compact_ids, DType::I32, {ops::kMoeTopK, tokens});
+        Tensor compact_weights(helper_view_.compact_weights, DType::FP32, {ops::kMoeTopK, tokens});
+        ops::moe_expert_partition(x, s.expert_ids, s.route_weights, eligible, map, count, compact_x,
+                                  compact_ids, compact_weights, stream_);
+        expert_mailbox_cuda_publish(helper_view_.mailbox, static_cast<std::uint32_t>(layer),
+                                    compact_x.data, compact_ids.data, compact_weights.data,
+                                    helper_view_.compact_count, stream_);
+    }
+#endif
     if (staged) { CUDA_CHECK(cudaStreamWaitEvent(stream_, stage_planned_.get(), 0)); }
     const ops::MoeCacheAdmission admission = chunk.rows >= 2
                                                  ? ops::MoeCacheAdmission::FrequencyFilter
                                                  : ops::MoeCacheAdmission::EveryMiss;
     ops::moe_expert_cache_admit(
         s.expert_ids, expert_table_, host_table_, fill_table_, cache_, layer, admission, stream_,
-        chunk.lane < 0 ? &chunk_.decode_cache_counters : &chunk_.expert_cache_counters, nullptr,
+        chunk.lane < 0 ? &chunk_.decode_cache_counters : &chunk_.expert_cache_counters,
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        helper_ ? &eligible : nullptr,
+#else
+        nullptr,
+#endif
         chunk.lane < 0 ? &chunk_.decode_route_counts : nullptr);
     CUDA_CHECK(cudaEventRecord(admitted_.get(), stream_));
     CUDA_CHECK(cudaStreamWaitEvent(fs, admitted_.get(), 0));
@@ -1472,10 +1541,22 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
     if (next) {
         const DeviceSpan span = staging_.span;
         Tensor stage = staging_.stage.slice(1, parity(following), 1).view({ops::kMoeExperts});
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        const Tensor next_eligible =
+            helper_ ? Tensor(const_cast<std::uint32_t*>(helper_view_.local_eligibility) +
+                                 static_cast<std::size_t>(following) * ops::kMoeExpertMaskWords,
+                             DType::I32, {ops::kMoeExpertMaskWords})
+                    : Tensor{};
+#endif
         ops::moe_expert_cache_stage(columns(staging_.ids, ops::kMoeTopK, tokens),
                                     kStagingCandidates, expert_table_, host_table_, following, span,
                                     staging_budget_bytes(following, tokens), stage, staging_.source,
-                                    fs);
+                                    fs
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+                                    ,
+                                    helper_ ? &next_eligible : nullptr
+#endif
+        );
         CUDA_CHECK(cudaEventRecord(stage_planned_.get(), fs));
     }
     ops::MoeExpertBank bank = weights.experts;
@@ -1490,8 +1571,17 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
     // filled_ follows the layer's staging copy on the fill stream, so it covers the staged records.
     const ops::MoeExpertsDeferral deferral{.slots = slots, .ready = filled_.get()};
     Tensor y = columns(chunk_.block_output, kHidden, tokens);
-    ops::moe_experts(x, s.expert_ids, s.route_weights, s.shared_scale, bank, y, work_, stream_,
-                     &deferral);
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    if (helper_round) {
+        Tensor partial(helper_view_.local_partial, DType::FP32, {kHidden, tokens});
+        ops::moe_experts_local_partial(x, s.expert_ids, s.route_weights, s.shared_scale, bank,
+                                       eligible, partial, work_, stream_, &deferral);
+    } else
+#endif
+    {
+        ops::moe_experts(x, s.expert_ids, s.route_weights, s.shared_scale, bank, y, work_, stream_,
+                         &deferral);
+    }
     if (next) {
         // The span's last readers (this moe_experts and, earlier on the fill stream, the admitted
         // fill) precede the copy, which the next layer's admitted fill and deferral follow.
@@ -1502,10 +1592,38 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
                                    ops::kMoeStagingFillBlocks);
     }
     ops::moe_expert_cache_commit(expert_table_, fill_table_, layer, stream_);
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    if (helper_round) {
+        expert_mailbox_cuda_acquire(helper_view_.mailbox, static_cast<std::uint32_t>(layer),
+                                    helper_view_.compact_count, helper_view_.remote_partial,
+                                    stream_);
+        const Tensor partial(helper_view_.local_partial, DType::FP32, {kHidden, tokens});
+        const Tensor remote(helper_view_.remote_partial, DType::FP32, {kHidden, tokens});
+        const Tensor map(helper_view_.compact_map, DType::I32, {tokens});
+        ops::moe_expert_partial_join(partial, map, remote, y, stream_);
+    }
+#endif
     ops::hyper_connection_inject(residual, y, write_scale, residual, stream_);
 }
 
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+void Forward::drain_helper_round() {
+    helper_->cancel_and_drain();
+    const auto status = cudaStreamSynchronize(fill_stream_.get());
+    // Both runtime streams and the fill stream have now had a join attempt. Preserve the
+    // sticky, contextual helper error instead of replacing it with a secondary CUDA error.
+    helper_->check_failure();
+    if (status != cudaSuccess) {
+        throw HipError(std::string("expert helper fill-stream drain: ") +
+                       cudaGetErrorString(status));
+    }
+}
+#endif
+
 void Forward::require_resolved() const {
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    if (helper_) { helper_->check_failure(); }
+#endif
     if (speculative_pending_) {
         throw std::logic_error(
             "Flash-Next must resolve its speculative candidate before forwarding");

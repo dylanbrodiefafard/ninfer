@@ -16,6 +16,7 @@ void mailbox_test_nonce(const void*, const void*, const void*, const void*, void
                         const std::uint32_t*, std::uint32_t*, const HipStream&);
 void mailbox_test_delay(const HipStream&);
 void mailbox_test_fail(ExpertMailboxView, const HipStream&);
+cudaError_t mailbox_test_cuda_error(cudaStream_t);
 
 namespace {
 void cuda_check(cudaError_t status) {
@@ -259,6 +260,62 @@ void teardown() {
     std::puts("mailbox missing-graph-B and active cancellation teardown=ok");
 }
 
+void late_finish() {
+    CudaStream cuda;
+    HipStream hip;
+    Panels panels;
+    panels.initialize(hip);
+    ExpertMailbox box(1);
+    panels.input(1, 0x31415926U);
+    for (int round = 0; round < 2; ++round) {
+        static_cast<void>(box.begin(1, cuda.value, hip));
+        for (std::uint32_t layer = 0; layer < 48; ++layer) {
+            panels.helper(box, layer, 1, hip);
+            panels.primary(box, layer, cuda.value);
+        }
+        cuda_check(cudaStreamSynchronize(cuda.value));
+        hip.synchronize();
+        if (round == 0) { std::this_thread::sleep_for(std::chrono::seconds(31)); }
+        box.finish();
+        require(box.failure().code == ExpertWireError::None,
+                "completed round poisoned by host stall");
+        panels.output(1, 0x31415926U, hip, 48);
+    }
+    std::puts("mailbox late finish and persistent-watchdog rearm=ok");
+}
+
+void asynchronous_error() {
+    // Intentional context poisoning runs in its own CTest process. CUDA handles cannot be
+    // destroyed through the failed context; retain them until process exit, as production does
+    // for allocations whose runtime join failed. HIP must still drain normally.
+    cudaStream_t cuda = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&cuda, cudaStreamNonBlocking));
+    HipStream hip;
+    {
+        ExpertMailbox box(1);
+        static_cast<void>(box.begin(1, cuda, hip));
+        mailbox_test_delay(hip); // The CUDA fault must still join independently queued HIP work.
+        const auto launch = mailbox_test_cuda_error(cuda);
+        require(launch == cudaSuccess || launch == cudaErrorIllegalAddress,
+                "unexpected fault-injection launch status");
+        bool typed = false;
+        try {
+            box.finish();
+        } catch (const HipError&) { typed = true; }
+        require(typed && box.failure().code == ExpertWireError::Runtime &&
+                    box.failure().side == ExpertWireSide::Host && !box.drained(),
+                "asynchronous CUDA error did not become a joined-watchdog Host failure");
+        box.cancel_and_drain();
+        bool sticky = false;
+        try {
+            box.finish();
+        } catch (const HipError&) { sticky = true; }
+        require(sticky, "asynchronous failure was not sticky");
+    }
+    require(hip.ready(), "asynchronous CUDA error left HIP work pending");
+    std::puts("mailbox asynchronous CUDA failure and non-terminating teardown=ok");
+}
+
 void round_deadline() {
     CudaStream cuda;
     HipStream hip;
@@ -282,6 +339,10 @@ int main(int argc, char** argv) {
                     info.architecture.c_str(), info.runtime_version);
         if (argc == 2 && std::string(argv[1]) == "round-deadline") {
             round_deadline();
+        } else if (argc == 2 && std::string(argv[1]) == "late-finish") {
+            late_finish();
+        } else if (argc == 2 && std::string(argv[1]) == "async-error") {
+            asynchronous_error();
         } else if (argc == 2) {
             failure_case(argv[1]);
         } else {

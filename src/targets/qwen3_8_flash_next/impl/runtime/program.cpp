@@ -222,7 +222,12 @@ Program::Program(const LoadedModel& model, const ProgramOptions& options, Device
                  options.calib_counts, device.stream),
 #endif
       forward_(model.view(), state_, feeder_, residency_, forward_options(model, options),
-               device.stream, dflash_.get()),
+               device.stream, dflash_.get()
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+                                  ,
+               helper_.get()
+#endif
+                   ),
       stream_(device.stream), mask_staging_(static_cast<std::size_t>(options.lanes) *
                                             State::kAllowedTokenWordStride * sizeof(std::uint32_t)),
       speculative_options_(options.speculative), forced_adaptive_k_(options.forced_adaptive_k),

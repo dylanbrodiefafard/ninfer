@@ -25,13 +25,15 @@ public:
                                       const HipStream& hip_stream);
     void cancel() noexcept;
     // Exception/teardown path: cancel and join, consuming only an already-latched protocol error.
-    // An unjoinable runtime terminates rather than permitting destruction of reachable memory.
+    // Failed runtime joins retain the backing until process exit, never free reachable memory.
     void cancel_and_drain() noexcept;
     // Coarse watchdog: 30 s until host cancellation, then drain bounded GPU polls. Throws HipError
-    // with the latched sequence/layer/side after both streams finish, never licenses failed output.
+    // with the latched sequence/layer/side after both join attempts, never licenses failed output.
     // Failure is sticky: later finish calls also fail, including after cancel_and_drain.
     void finish();
     [[nodiscard]] ExpertWireFailure failure() const;
+    // True at idle/joined boundaries. After a failed drain, enclosing owners must also be retained.
+    [[nodiscard]] bool drained() const noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

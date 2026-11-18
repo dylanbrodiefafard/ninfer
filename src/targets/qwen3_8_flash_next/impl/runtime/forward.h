@@ -21,6 +21,9 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "runtime/expert_route_profile.h"
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+#    include "runtime/expert_helper.h"
+#endif
 
 #include <cuda_runtime.h> // cudaStream_t, cudaEvent_t
 
@@ -114,9 +117,10 @@ struct ForwardObserver {
 
 /**
  * Expert-cache events since the last clear_expert_cache_counts, indexed by ops::MoeExpertCodec:
- * per admitting layer call (streamed super-chunks admit nothing), each distinct routed expert is
- * one lookup, and a miss when its record is not
- * resident, so its moe_expert_record_bytes cross PCIe once (moe_expert_cache_admit's counters).
+ * per admitting layer call (streamed super-chunks admit nothing), each distinct eligible routed
+ * expert is one lookup, and a miss when its record is not resident, so its moe_expert_record_bytes
+ * cross PCIe once (moe_expert_cache_admit's counters). Helper-owned routes are excluded from
+ * these local-cache diagnostics, but remain in the global route profile.
  */
 struct ExpertCacheCounts {
     std::array<std::int64_t, ops::kMoeCacheCodecTags> lookups{};
@@ -242,7 +246,12 @@ struct SpeculativeRows {
 class Forward {
 public:
     Forward(const ModelView& model, State& state, PleRowFeeder& feeder, ExpertResidency& experts,
-            const ForwardOptions& options, cudaStream_t stream, Dflash* drafter = nullptr);
+            const ForwardOptions& options, cudaStream_t stream, Dflash* drafter = nullptr
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+            ,
+            ExpertHelper* helper = nullptr
+#endif
+    );
 
     // Throws std::invalid_argument unless the options are valid (the constructor's check).
     static void validate(const ForwardOptions& options);
@@ -255,7 +264,7 @@ public:
     [[nodiscard]] static std::size_t
     device_bytes(const ModelView& model, const ForwardOptions& options, const State& state);
 
-    // Waits for the stream and the fill stream before releasing the buffers they use.
+    // Cancels/drains the optional helper, then waits for compute/fill before releasing storage.
     ~Forward();
 
     Forward(const Forward&)            = delete;
@@ -660,6 +669,10 @@ private:
     void capture_decode_graphs();
     [[nodiscard]] SampledRows sampled_rows(std::int32_t rows) const;
     [[nodiscard]] DecodeIngress& ingress_host() const noexcept;
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    // Exception path with a live helper: attempt all drains before reporting its sticky error.
+    void drain_helper_round();
+#endif
 
     const ModelView& model_;
     Dflash* drafter_;
@@ -672,6 +685,11 @@ private:
     ops::MoeExpertCache cache_;
     ForwardOptions options_;
     cudaStream_t stream_;
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    // Program constructs this owner before Forward and destroys it after Forward's drain.
+    ExpertHelper* helper_;
+    ExpertHelperCudaView helper_view_{};
+#endif
 
     DeviceArena activations_;
     WorkspaceArena work_;

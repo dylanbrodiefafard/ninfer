@@ -156,6 +156,11 @@ Tensor Forward::verify(std::span<const std::int32_t> lanes, std::span<const std:
     prepare_verify(lanes, tokens, width, valid_columns);
     auto& ingress = *static_cast<VerifyIngress*>(verify_ingress_staging_.value().data());
     try {
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        if (helper_) {
+            static_cast<void>(helper_->begin_round(static_cast<std::uint32_t>(tokens.size())));
+        }
+#endif
         CUDA_CHECK(cudaMemcpyAsync(verify_.ingress.data, &ingress, sizeof(ingress),
                                    cudaMemcpyHostToDevice, stream_));
         const Tensor canonical_ple = state_.ple_history();
@@ -186,11 +191,20 @@ Tensor Forward::verify(std::span<const std::int32_t> lanes, std::span<const std:
         enqueue_layer_loop(batch, false, RowSource::Resident, {}, nullptr, kPleLayer, kLayers);
         head(0, chunk.tokens());
         CUDA_CHECK(cudaStreamSynchronize(stream_));
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        if (helper_) { helper_->finish_round(); }
+#endif
         ++decode_profile_rounds_;
         pending_verify_width_ = width;
         pending_verify_rows_  = chunk.rows;
         return logits(chunk.tokens());
     } catch (...) {
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        if (helper_) {
+            drain_helper_round();
+            throw;
+        }
+#endif
         // An I/O or Op-validation failure may occur after layer zero started reading the pinned
         // ingress. Drain both streams before allowing this Forward's staging to be reused.
         CUDA_CHECK(cudaStreamSynchronize(stream_));

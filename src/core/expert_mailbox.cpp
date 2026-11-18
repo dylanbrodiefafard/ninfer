@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <condition_variable>
 #include <mutex>
 #include <exception>
@@ -74,7 +75,12 @@ struct CudaMappedMemory {
     }
 
     ~CudaMappedMemory() {
-        if (cudaFreeHost(host) != cudaSuccess) { std::terminate(); }
+        const auto status = cudaFreeHost(host);
+        if (status != cudaSuccess) {
+            // A poisoned CUDA context may reject deallocation. Keep the backing until process
+            // exit rather than terminate while propagating the original typed runtime failure.
+            std::fprintf(stderr, "expert mailbox release: %s\n", cudaGetErrorString(status));
+        }
     }
 };
 } // namespace
@@ -87,9 +93,12 @@ struct ExpertMailbox::Impl {
     cudaStream_t cuda_stream    = nullptr;
     const HipStream* hip_stream = nullptr;
     bool active                 = false;
+    bool drained                = true;
+    ExpertWireFailure host_failure{.code = ExpertWireError::None, .side = ExpertWireSide::Host};
+    std::mutex mutex;
+    std::condition_variable_any wake;
+    bool armed = false;
     std::chrono::steady_clock::time_point round_deadline;
-    std::atomic<bool> host_deadline{false};
-    std::uint32_t host_deadline_layer = 0;
     std::jthread watchdog;
     // Nonzero high word makes the startup exchange qualify the complete 64-bit sequence.
     std::uint64_t sequence = std::uint64_t{1} << 32;
@@ -110,6 +119,50 @@ struct ExpertMailbox::Impl {
                 view->slots[i].host_partial     = host.slots[i].partial;
             }
         }
+        watchdog = std::jthread([this](const std::stop_token& stop) {
+            std::unique_lock lock(mutex);
+            while (!stop.stop_requested()) {
+                wake.wait(lock, stop, [this] { return armed; });
+                if (stop.stop_requested()) { break; }
+                std::uint32_t pending = 0;
+                while (pending < kExpertMailboxLayers &&
+                       std::atomic_ref<std::uint64_t>(host.slots[pending].response->sequence)
+                               .load(std::memory_order_acquire) == sequence) {
+                    ++pending;
+                }
+                // Completion, not a later host finish call, ends the round's watchdog interval.
+                if (pending == kExpertMailboxLayers) {
+                    armed = false;
+                    continue;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= round_deadline) {
+                    host_failure = {.code     = ExpertWireError::Deadline,
+                                    .side     = ExpertWireSide::Host,
+                                    .sequence = sequence,
+                                    .layer    = pending};
+                    std::atomic_ref<std::uint64_t>(host.cancellation->sequence)
+                        .store(sequence, std::memory_order_release);
+                    armed = false;
+                    continue;
+                }
+                wake.wait_until(lock, stop,
+                                std::min(round_deadline, now + std::chrono::milliseconds(10)),
+                                [this] { return !armed; });
+            }
+        });
+    }
+
+    void disarm() {
+        std::lock_guard lock(mutex);
+        armed = false;
+        wake.notify_all();
+    }
+
+    void stop_watchdog() {
+        watchdog.request_stop();
+        wake.notify_all();
+        if (watchdog.joinable()) { watchdog.join(); }
     }
 };
 
@@ -122,20 +175,38 @@ std::size_t ExpertMailbox::allocation_bytes(std::uint32_t capacity) {
 
 ExpertMailbox::ExpertMailbox(std::uint32_t capacity) : impl_(std::make_unique<Impl>(capacity)) {}
 
-ExpertMailbox::~ExpertMailbox() { cancel_and_drain(); }
+ExpertMailbox::~ExpertMailbox() {
+    cancel_and_drain();
+    impl_->stop_watchdog();
+    // Failed runtime joins cannot prove the aliases unreachable. Retain their owners until
+    // process exit; normal and protocol-error drains still release everything normally.
+    if (!impl_->drained) {
+        std::fprintf(stderr, "expert mailbox retaining unjoined backing %p until process exit\n",
+                     static_cast<void*>(impl_.release()));
+    }
+}
 
 void ExpertMailbox::cancel_and_drain() noexcept {
     if (!impl_->active) { return; }
     cancel();
     try {
         finish();
-    } catch (const HipError&) {
-        // The error is preserved in failure(). Driver errors leaving work unjoined are fatal.
-        if (impl_->active || (impl_->host.failure->code == ExpertWireError::None &&
-                              impl_->host.peer_failure->code == ExpertWireError::None)) {
-            std::terminate();
+    } catch (...) {
+        // Expected protocol/runtime failures are already sticky. An unexpected host exception
+        // must also prevent reuse and retain backing whose quiescence cannot be established.
+        if (impl_->active) {
+            impl_->disarm();
+            impl_->active       = false;
+            impl_->drained      = false;
+            impl_->host_failure = {.code     = ExpertWireError::Runtime,
+                                   .side     = ExpertWireSide::Host,
+                                   .sequence = impl_->sequence,
+                                   .layer    = 0};
         }
-    } catch (...) { std::terminate(); }
+        impl_->stop_watchdog();
+        std::fprintf(stderr, "expert mailbox drain recorded failure for sequence=%llu\n",
+                     static_cast<unsigned long long>(impl_->sequence));
+    }
 }
 
 ExpertMailboxView ExpertMailbox::cuda_view() const noexcept { return impl_->cuda; }
@@ -161,36 +232,14 @@ std::uint64_t ExpertMailbox::begin(std::uint32_t tokens, void* cuda_stream,
     impl_->host.control->tokens   = tokens;
     impl_->host.control->sequence = ++impl_->sequence;
     std::atomic_thread_fence(std::memory_order_release);
-    impl_->active         = true;
-    const auto deadline   = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    impl_->round_deadline = deadline;
-    impl_->watchdog       = std::jthread([this, deadline](const std::stop_token& stop) {
-        std::mutex mutex;
-        std::condition_variable_any wake;
-        std::unique_lock lock(mutex);
-        while (!stop.stop_requested()) {
-            // Response sequences are single-writer completion/progress indicators. Details and
-            // results remain unlicensed until finish() joins both runtime streams.
-            std::uint32_t pending_layer = kExpertMailboxLayers - 1;
-            for (std::uint32_t layer = 0; layer < kExpertMailboxLayers; ++layer) {
-                if (std::atomic_ref<std::uint64_t>(impl_->host.slots[layer].response->sequence)
-                        .load(std::memory_order_acquire) != impl_->sequence) {
-                    pending_layer = layer;
-                    break;
-                }
-            }
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) {
-                impl_->host_deadline_layer = pending_layer;
-                impl_->host_deadline.store(true, std::memory_order_relaxed);
-                std::atomic_ref<std::uint64_t>(impl_->host.cancellation->sequence)
-                    .store(impl_->sequence, std::memory_order_release);
-                return;
-            }
-            wake.wait_until(lock, stop, std::min(deadline, now + std::chrono::milliseconds(10)),
-                            [] { return false; });
-        }
-    });
+    {
+        std::lock_guard lock(impl_->mutex);
+        impl_->active         = true;
+        impl_->drained        = false;
+        impl_->round_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        impl_->armed          = true;
+    }
+    impl_->wake.notify_all();
     return impl_->sequence;
 }
 
@@ -206,6 +255,7 @@ ExpertWireFailure ExpertMailbox::failure() const {
     if (impl_->active) {
         throw std::logic_error("mailbox failure details require a joined boundary");
     }
+    if (impl_->host_failure.code != ExpertWireError::None) { return impl_->host_failure; }
     const auto& cuda = *impl_->host.failure;
     const auto& hip  = *impl_->host.peer_failure;
     if (cuda.code == ExpertWireError::None) { return hip; }
@@ -220,40 +270,52 @@ void ExpertMailbox::finish() {
         check_failure(failure());
         return;
     }
-    while (true) {
-        const cudaError_t status = cudaStreamQuery(impl_->cuda_stream);
-        if (status != cudaSuccess && status != cudaErrorNotReady) {
-            cancel();
-            // synchronize below must still join HIP before any owner can release aliases.
-            impl_->hip_stream->synchronize();
-            check(status, "asynchronous completion");
-        }
-        const bool hip_ready = impl_->hip_stream->ready();
-        if (status == cudaSuccess && hip_ready) { break; }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    check(cudaStreamSynchronize(impl_->cuda_stream), "join CUDA round");
-    impl_->hip_stream->synchronize();
-    if (std::chrono::steady_clock::now() >= impl_->round_deadline) {
-        impl_->host_deadline.store(true, std::memory_order_relaxed);
+    const auto query = cudaStreamQuery(impl_->cuda_stream);
+    if (query != cudaSuccess && query != cudaErrorNotReady) { cancel(); }
+    std::exception_ptr hip_error;
+    try {
+        impl_->hip_stream->synchronize();
+    } catch (...) {
+        hip_error = std::current_exception();
         cancel();
     }
-    impl_->watchdog.request_stop();
-    impl_->watchdog.join();
-    impl_->active = false;
+    // No polling/sleep quantum on the completion path. The persistent watchdog remains armed
+    // during both blocking joins, unless all response sequences have already completed.
+    const auto status = cudaStreamSynchronize(impl_->cuda_stream);
+    impl_->disarm();
+    impl_->active  = false;
+    impl_->drained = status == cudaSuccess && !hip_error;
+    if (!impl_->drained || (query != cudaSuccess && query != cudaErrorNotReady)) {
+        impl_->host_failure = {.code     = ExpertWireError::Runtime,
+                               .side     = ExpertWireSide::Host,
+                               .sequence = impl_->sequence,
+                               .layer    = 0};
+        // A poisoned mailbox cannot begin again. Join its watchdog before reporting failure.
+        impl_->stop_watchdog();
+        // Runtime failure prevents alias reuse even if the other stream joined successfully.
+        if (hip_error) {
+            try {
+                std::rethrow_exception(hip_error);
+            } catch (const std::exception& error) {
+                throw HipError("expert mailbox HIP join sequence=" +
+                               std::to_string(impl_->sequence) + ": " + error.what());
+            }
+        }
+        throw HipError("expert mailbox CUDA join sequence=" + std::to_string(impl_->sequence) +
+                       " side=Host: " + cudaGetErrorString(status != cudaSuccess ? status : query));
+    }
     if (failure().code == ExpertWireError::None &&
         std::atomic_ref<std::uint64_t>(impl_->host.cancellation->sequence)
                 .load(std::memory_order_acquire) == impl_->sequence) {
-        *impl_->host.failure =
-            ExpertWireFailure{.code     = impl_->host_deadline.load(std::memory_order_relaxed)
-                                              ? ExpertWireError::Deadline
-                                              : ExpertWireError::Cancelled,
-                              .side     = ExpertWireSide::Host,
-                              .sequence = impl_->sequence,
-                              .layer    = impl_->host_deadline_layer};
+        impl_->host_failure = {.code     = ExpertWireError::Cancelled,
+                               .side     = ExpertWireSide::Host,
+                               .sequence = impl_->sequence,
+                               .layer    = 0};
     }
     check_failure(failure());
 }
+
+bool ExpertMailbox::drained() const noexcept { return impl_->drained; }
 
 void qualify_expert_mailbox(ExpertMailbox& mailbox, void* cuda_stream,
                             const HipStream& hip_stream) {
@@ -265,7 +327,11 @@ void qualify_expert_mailbox(ExpertMailbox& mailbox, void* cuda_stream,
         }
 
         ~DeviceAllocation() {
-            if (cudaFree(pointer) != cudaSuccess) { std::terminate(); }
+            const auto status = cudaFree(pointer);
+            if (status != cudaSuccess) {
+                std::fprintf(stderr, "expert mailbox nonce release: %s\n",
+                             cudaGetErrorString(status));
+            }
         }
     };
 

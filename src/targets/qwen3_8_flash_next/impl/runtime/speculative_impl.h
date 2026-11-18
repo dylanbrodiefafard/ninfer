@@ -222,6 +222,11 @@ SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
                        static_cast<std::size_t>(rows - 1);
     auto& output     = *static_cast<SpecEgress*>(spec_egress_staging_.value().data());
     try {
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        if (helper_) {
+            static_cast<void>(helper_->begin_round(static_cast<std::uint32_t>(width * rows)));
+        }
+#endif
         CUDA_CHECK(cudaEventRecord(replay_start_.get(), stream_));
         feature_offset_  = 0;
         feature_columns_ = width * rows;
@@ -249,7 +254,16 @@ SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
         CUDA_CHECK(cudaEventRecord(replay_stop_.get(), stream_));
         CUDA_CHECK(cudaEventSynchronize(replay_stop_.get()));
         CUDA_CHECK(cudaEventElapsedTime(&last_replay_ms_, replay_start_.get(), replay_stop_.get()));
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        if (helper_) { helper_->finish_round(); }
+#endif
     } catch (...) {
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        if (helper_) {
+            drain_helper_round();
+            throw;
+        }
+#endif
         CUDA_CHECK(cudaStreamSynchronize(stream_));
         CUDA_CHECK(cudaStreamSynchronize(fill_stream_.get()));
         throw;

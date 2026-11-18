@@ -201,11 +201,17 @@ mathematics in the target:
    One 256-thread CTA scans at most 480 assignments and stably compacts participating tokens in
    original packed-token order. Outputs are the original-token → compact-token map (−1 for a
    token without helper routes), compact count N, BF16 activations and ten
-   `(I32 expert_id, FP32 weight)` entries per compact token, written directly into the mailbox
-   request planes. Non-helper slots carry id −1 and weight 0, the inactive sentinel of this
+   `(I32 expert_id, FP32 weight)` entries per compact token, written into stable compact CUDA
+   VRAM panels owned by `ExpertHelper` and counted in `cuda_device_bytes`. Non-helper slots carry id −1 and weight 0, the inactive sentinel of this
    *new* helper contract, never of ordinary `moe_experts` or cache IDs. Preserve original
-   route-slot order; do not renormalize either partition. The Op writes payload only; core's
-   CUDA publish operation supplies the system fences and the release of the request header.
+   route-slot order; do not renormalize either partition. The compact map is also the join's
+   participation mask; no unused U16 helper-mask panel is allocated. Core's CUDA publish kernel
+   claims the mailbox writer guard **before** copying these panels, then supplies the system
+   fences and the request-header release. The Op never writes mapped storage. This keeps wire
+   synchronization in core rather than introducing a second guarded partition implementation.
+   For N compact tokens this adds a 5200 N-byte local VRAM read/write staging pair, not another
+   PCIe transfer: the same 5200 N bytes are sent to mapped host memory. Maximum compact storage
+   is 249,856 aligned bytes at T48; it is reused only after the layer's response/join.
    No host route readback or CUDA callback.
 2. **Local branch.** Admit/stage see only eligible local experts. Existing admitted/fill-stream
    fork, resident work, mapped misses, deferred slot work and commit remain ordered as in
@@ -265,7 +271,8 @@ Qualify 64-bit system atomics on both devices in the startup protocol test; phas
 flag round trip alone does not establish this extended packet protocol. Aligned payloads use
 `uint4` transactions. At T48 all 48 payload slots total 35.6 MB plus headers;
 at C1 K3 about 3.0 MB. These are small exchange allocations relative to 50.3 GB of pinned
-experts, not a second expert arena. Initialize backing storage once so fixed-capacity DMA never
+experts, not a second expert arena. Compact CUDA source panels add at most 249,856 device bytes;
+they are not another host exchange allocation. Initialize backing storage once so fixed-capacity DMA never
 reads uninitialized padding. Do not register any `ExpertHostStore` chunk with HIP.
 
 For every round, target `ExpertHelper::begin_round(T)` launches a pre-instantiated HIP graph:
@@ -299,9 +306,19 @@ status uses the same ordering. Use atomics with the measured supported system sc
 than wrap into a stale packet. Each round has at most one outstanding request per layer slot.
 
 All device polling is bounded: a **5-second layer wait deadline**, cancellation checks and a
-latched first-error record containing sequence/layer/side. A host watchdog queries completion
-and progress at coarse intervals while a round is active, with a **30-second round deadline**;
-these are failure bounds, not performance targets. On I/O exception between graph A and B,
+latched first-error record containing sequence/layer/side. One persistent host watchdog observes response completion
+and progress at coarse intervals while armed for a round, with a **30-second round deadline**;
+these are failure bounds, not performance targets. All 48 matching response sequences disarm
+it even if the host has not called finish; a host stall after completion is not a deadline error.
+Finish blocks on the HIP stream and then the CUDA stream without a polling sleep. Runtime errors
+are latched as typed Host failures only after the watchdog is disarmed and the round marked
+inactive; a failed runtime join also stops/joins the watchdog and retains enclosing storage until
+process exit, rather than terminating or freeing possibly reachable aliases. HIP resource owners
+bind their creation device for operations and destruction. HIP header/error details receive a
+system fence immediately before their release publication. A failed source-seal wait poisons the
+round and leaves N=0 instead of trapping the process; fixed DMA bytes never license failed jobs.
+Driver wedges remain subject to the external whole-process deadline below.
+On I/O exception between graph A and B,
 request cancellation of unsubmitted work before draining; do not leave HIP waiting for layers
 that CUDA will never publish. Already-submitted normal request cancellation drains the round
 and uses existing zero-publication semantics. On protocol timeout, the failed wait returns an

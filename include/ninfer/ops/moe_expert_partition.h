@@ -31,9 +31,11 @@ namespace ninfer::ops {
  *
  * Route-slot order j and the weights are unchanged (no renormalization). Columns r >= N of the
  * compact outputs are not written. The exact copy is the Op's semantics; its oracle is exact.
- * The three compact outputs are the request planes of the expert mailbox (core/expert_mailbox.h:
- * BF16 [T,2560], I32 [T,10], FP32 [T,10] and the U32 count); the helper side zips ids and weights
- * into moe_helper_experts' MoeHelperRoute entries.
+ * The three compact outputs are caller-owned stable CUDA VRAM panels, not mapped mailbox planes.
+ * In the helper schedule core/expert_mailbox.h copies their populated prefixes into the mapped
+ * request only after claiming its writer guard, then fences and release-publishes the header.
+ * The helper side zips ids and weights into moe_helper_experts' MoeHelperRoute entries. The
+ * compact map stays on CUDA; no separate per-token helper mask is produced or needed.
  *
  * Shapes: x BF16 [2560,T]; expert_ids I32 [10,T] with ids in [0,512) (moe_route's output; an id
  * outside is clamped into [0,512), the Op then reads only documented buffers); route_weights FP32

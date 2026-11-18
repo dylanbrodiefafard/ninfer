@@ -15,7 +15,7 @@ inline constexpr std::size_t kExpertPartialBytes       = 10240;
 inline constexpr std::uint64_t kExpertLayerDeadlineNs  = 5'000'000'000ULL;
 
 enum class ExpertWireStatus : std::uint32_t { Work = 1, Skip = 2, Failed = 3 };
-enum class ExpertWireError : std::uint32_t { None, Cancelled, Deadline, Protocol, Helper };
+enum class ExpertWireError : std::uint32_t { None, Cancelled, Deadline, Protocol, Helper, Runtime };
 enum class ExpertWireSide : std::uint32_t { Cuda = 1, Hip = 2, Host = 3 };
 
 // Each sequence has exactly one writer. Payload/status fields are protected by release/acquire

@@ -713,10 +713,20 @@ if(NINFER_ENABLE_HIP_EXPERT_HELPER)
   add_library(ninfer_expert_mailbox_test_hip OBJECT test_expert_mailbox_hip.hip)
   ninfer_hip_target(ninfer_expert_mailbox_test_hip)
   ninfer_add_test(ninfer_expert_mailbox_test
-    SOURCES test_expert_mailbox.cpp $<TARGET_OBJECTS:ninfer_expert_mailbox_test_hip>
+    SOURCES test_expert_mailbox.cpp test_expert_mailbox_cuda.cu
+      $<TARGET_OBJECTS:ninfer_expert_mailbox_test_hip>
     LIBRARIES ninfer_core Threads::Threads)
   set_target_properties(ninfer_expert_mailbox_test PROPERTIES LINKER_LANGUAGE CXX)
   set_tests_properties(ninfer_expert_mailbox_test PROPERTIES LABELS "cuda;hip;slow" TIMEOUT 240)
+  add_test(NAME ninfer_expert_mailbox_late_finish_test
+    COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_expert_mailbox_test> late-finish)
+  set_tests_properties(ninfer_expert_mailbox_late_finish_test PROPERTIES
+    LABELS "cuda;hip;slow" TIMEOUT 90)
+  # Deliberate context poisoning belongs in its own process, never the sanitizer replay suite.
+  add_test(NAME ninfer_expert_mailbox_async_error_test
+    COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_expert_mailbox_test> async-error)
+  set_tests_properties(ninfer_expert_mailbox_async_error_test PROPERTIES
+    LABELS "cuda;hip;slow" TIMEOUT 30)
 
   # Keep the placement oracle independent of both GPU runtimes.
   set(helper_runtime_dir ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_flash_next/impl/runtime)

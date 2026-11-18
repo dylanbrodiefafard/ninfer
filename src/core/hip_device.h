@@ -1,7 +1,9 @@
 #pragma once
 
 // Optional expert-helper runtime boundary. No HIP headers escape this interface. All objects
-// belong to the one startup-selected device; callers bind it before using their handles.
+// belong to the one startup-selected device. Owners rebind their creation device for handle
+// operations and destruction, including when the calling host thread changes. Raw-handle users
+// bind the stream before submitting their own work.
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -45,10 +47,12 @@ public:
 
     [[nodiscard]] void* get() const noexcept { return stream_; }
 
+    void bind() const;
     void synchronize() const;
     [[nodiscard]] bool ready() const;
 private:
     void* stream_ = nullptr;
+    int device_   = -1;
 };
 
 class HipEvent {
@@ -62,6 +66,7 @@ public:
     [[nodiscard]] bool ready() const;
 private:
     void* event_ = nullptr;
+    int device_  = -1;
 };
 
 class HipBuffer {
@@ -77,6 +82,7 @@ public:
 private:
     void* data_        = nullptr;
     std::size_t bytes_ = 0;
+    int device_        = -1;
 };
 
 class HipPinnedBuffer {
@@ -89,6 +95,7 @@ public:
     [[nodiscard]] void* data() const noexcept { return data_; }
 private:
     void* data_ = nullptr;
+    int device_ = -1;
 };
 
 // Explicit HIP registration of CUDA-owned mapped memory. Must die before its CUDA owner and
@@ -104,6 +111,7 @@ public:
 private:
     void* host_  = nullptr;
     void* alias_ = nullptr;
+    int device_  = -1;
 };
 
 // Explicit stream-capture transaction: destruction aborts an unfinished capture. Instantiate
@@ -121,6 +129,7 @@ private:
     void* graph_      = nullptr;
     void* executable_ = nullptr;
     bool capturing_   = true;
+    int device_       = -1;
 };
 
 void hip_copy_to_device(void* dst, const void* src, std::size_t bytes, const HipStream& stream);

@@ -24,6 +24,7 @@ __device__ void fail(ExpertMailboxView view, std::uint32_t layer, ExpertWireErro
         view.failure->side     = ExpertWireSide::Hip;
         view.failure->sequence = view.control->sequence;
         view.failure->layer    = layer;
+        __threadfence_system();
         __hip_atomic_store(reinterpret_cast<std::uint32_t*>(&view.failure->code),
                            static_cast<std::uint32_t>(code), __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_SYSTEM);
@@ -92,9 +93,10 @@ __global__ void import_packet(ExpertMailboxView view, std::uint32_t layer, void*
             while (__hip_atomic_load(&header->copy_guard, __ATOMIC_SEQ_CST,
                                      __HIP_MEMORY_SCOPE_SYSTEM) != 0) {
                 if (static_cast<std::uint64_t>(wall_clock64()) - seal_start >= deadline_ticks) {
-                    // A writer that cannot finish a bounded packet is a wedged runtime. Abort
-                    // the stream rather than run DMA against memory it might still modify.
-                    __builtin_trap();
+                    // The round is poisoned and count stays zero. Never abort the process for
+                    // a failed publisher; fixed DMA bytes cannot license any helper jobs.
+                    fail(view, layer, ExpertWireError::Deadline);
+                    break;
                 }
                 __builtin_amdgcn_s_sleep(1);
             }
@@ -131,6 +133,7 @@ __global__ void export_packet(ExpertMailboxView view, std::uint32_t layer, const
         header->compact_tokens = n;
         header->status = failed(view) ? ExpertWireStatus::Failed
                                       : (n == 0 ? ExpertWireStatus::Skip : ExpertWireStatus::Work);
+        __threadfence_system();
         __hip_atomic_store(&header->sequence, view.control->sequence, __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_SYSTEM);
     }
@@ -182,6 +185,7 @@ void validate(std::uint32_t layer, std::uint32_t tokens, ExpertMailboxView view)
 void expert_mailbox_hip_import(ExpertMailboxView view, std::uint32_t layer, void* x, void* ids,
                                void* weights, std::uint32_t* count, std::uint32_t tokens,
                                const HipStream& stream) {
+    stream.bind();
     validate(layer, tokens, view);
     int device = 0, khz = 0;
     check(hipGetDevice(&device), "current device");
@@ -204,6 +208,7 @@ void expert_mailbox_hip_import(ExpertMailboxView view, std::uint32_t layer, void
 void expert_mailbox_hip_export(ExpertMailboxView view, std::uint32_t layer, const void* partial,
                                const std::uint32_t* count, std::uint32_t tokens,
                                const HipStream& stream) {
+    stream.bind();
     validate(layer, tokens, view);
     if (tokens == 48) {
         hip_copy_to_host(view.slots[layer].host_partial, partial, tokens * kExpertPartialBytes,
@@ -216,6 +221,7 @@ void expert_mailbox_hip_export(ExpertMailboxView view, std::uint32_t layer, cons
 
 void expert_mailbox_hip_interleave(const void* first, const void* second, void* pairs,
                                    const std::uint32_t* count, const HipStream& stream) {
+    stream.bind();
     interleave<<<1, 256, 0, static_cast<hipStream_t>(stream.get())>>>(
         static_cast<const std::uint32_t*>(first), static_cast<const std::uint32_t*>(second),
         static_cast<std::uint64_t*>(pairs), count);
@@ -224,6 +230,7 @@ void expert_mailbox_hip_interleave(const void* first, const void* second, void* 
 
 void expert_mailbox_hip_checksum(const void* data, std::size_t bytes, std::uint64_t* result,
                                  const HipStream& stream) {
+    stream.bind();
     if (bytes == 0 || bytes % 8 != 0 || reinterpret_cast<std::uintptr_t>(data) % 8 != 0) {
         throw std::invalid_argument("HIP checksum requires nonempty aligned U64 span");
     }

@@ -22,7 +22,10 @@ struct ExpertHelperCudaView {
     const std::uint32_t* local_eligibility;
     float* local_partial;
     float* remote_partial;
-    std::uint16_t* helper_masks;
+    // Compact VRAM sources: partition writes these, then core owns the guarded mapped copy.
+    std::uint16_t* compact_x;
+    std::int32_t* compact_ids;
+    float* compact_weights;
     std::int32_t* compact_map;
     std::uint32_t* compact_count;
 };
@@ -48,6 +51,8 @@ public:
     // finish joins both streams and reports any first error before callers may license output.
     [[nodiscard]] std::uint64_t begin_round(std::uint32_t tokens);
     void finish_round();
+    // Idle-boundary check used by every Forward entry point; poisoned state cannot be reused.
+    void check_failure() const;
     void cancel_round() noexcept;
     void cancel_and_drain() noexcept;
 private:

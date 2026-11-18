@@ -23,6 +23,12 @@ void destroy_check(hipError_t status, const char* operation) noexcept {
     }
 }
 
+int current_device() {
+    int device = -1;
+    check(hipGetDevice(&device), "capture owning device");
+    return device;
+}
+
 bool complete(hipError_t status) {
     if (status == hipErrorNotReady) { return false; }
     check(status, "completion query");
@@ -76,7 +82,7 @@ HipDeviceInfo HipDevice::info() const {
     return result;
 }
 
-HipStream::HipStream() {
+HipStream::HipStream() : device_(current_device()) {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
     stream_ = stream;
@@ -84,20 +90,25 @@ HipStream::HipStream() {
 
 HipStream::~HipStream() {
     if (stream_ != nullptr) {
+        destroy_check(hipSetDevice(device_), "bind stream owner");
         destroy_check(hipStreamSynchronize(static_cast<hipStream_t>(stream_)), "drain stream");
         destroy_check(hipStreamDestroy(static_cast<hipStream_t>(stream_)), "destroy stream");
     }
 }
 
+void HipStream::bind() const { check(hipSetDevice(device_), "bind stream owner"); }
+
 void HipStream::synchronize() const {
+    bind();
     check(hipStreamSynchronize(static_cast<hipStream_t>(stream_)), "synchronize stream");
 }
 
 bool HipStream::ready() const {
+    bind();
     return complete(hipStreamQuery(static_cast<hipStream_t>(stream_)));
 }
 
-HipEvent::HipEvent() {
+HipEvent::HipEvent() : device_(current_device()) {
     hipEvent_t event = nullptr;
     check(hipEventCreateWithFlags(&event, hipEventDisableTiming | hipEventBlockingSync),
           "create event");
@@ -105,36 +116,49 @@ HipEvent::HipEvent() {
 }
 
 HipEvent::~HipEvent() {
+    destroy_check(hipSetDevice(device_), "bind event owner");
     destroy_check(hipEventDestroy(static_cast<hipEvent_t>(event_)), "destroy event");
 }
 
 void HipEvent::record(const HipStream& stream) {
+    check(hipSetDevice(device_), "bind event owner");
     check(hipEventRecord(static_cast<hipEvent_t>(event_), static_cast<hipStream_t>(stream.get())),
           "record event");
 }
 
 void HipEvent::synchronize() const {
+    check(hipSetDevice(device_), "bind event owner");
     check(hipEventSynchronize(static_cast<hipEvent_t>(event_)), "synchronize event");
 }
 
-bool HipEvent::ready() const { return complete(hipEventQuery(static_cast<hipEvent_t>(event_))); }
+bool HipEvent::ready() const {
+    check(hipSetDevice(device_), "bind event owner");
+    return complete(hipEventQuery(static_cast<hipEvent_t>(event_)));
+}
 
-HipBuffer::HipBuffer(std::size_t bytes) : bytes_(bytes) {
+HipBuffer::HipBuffer(std::size_t bytes) : bytes_(bytes), device_(current_device()) {
     if (bytes != 0) { check(hipMalloc(&data_, bytes), "allocate device buffer"); }
 }
 
 HipBuffer::~HipBuffer() {
-    if (data_ != nullptr) { destroy_check(hipFree(data_), "free device buffer"); }
+    if (data_ != nullptr) {
+        destroy_check(hipSetDevice(device_), "bind buffer owner");
+        destroy_check(hipFree(data_), "free device buffer");
+    }
 }
 
-HipPinnedBuffer::HipPinnedBuffer(std::size_t bytes) {
+HipPinnedBuffer::HipPinnedBuffer(std::size_t bytes) : device_(current_device()) {
     if (bytes == 0) { throw std::invalid_argument("HIP staging buffer cannot be empty"); }
     check(hipHostMalloc(&data_, bytes, hipHostMallocDefault), "allocate pinned staging");
 }
 
-HipPinnedBuffer::~HipPinnedBuffer() { destroy_check(hipHostFree(data_), "free pinned staging"); }
+HipPinnedBuffer::~HipPinnedBuffer() {
+    destroy_check(hipSetDevice(device_), "bind pinned buffer owner");
+    destroy_check(hipHostFree(data_), "free pinned staging");
+}
 
-HipHostRegistration::HipHostRegistration(void* host, std::size_t bytes) {
+HipHostRegistration::HipHostRegistration(void* host, std::size_t bytes)
+    : device_(current_device()) {
     check(hipHostRegister(host, bytes, hipHostRegisterMapped), "register CUDA-owned mailbox");
     const hipError_t status = hipHostGetDevicePointer(&alias_, host, 0);
     if (status != hipSuccess) {
@@ -145,15 +169,19 @@ HipHostRegistration::HipHostRegistration(void* host, std::size_t bytes) {
 }
 
 HipHostRegistration::~HipHostRegistration() {
+    destroy_check(hipSetDevice(device_), "bind registration owner");
     destroy_check(hipHostUnregister(host_), "unregister mailbox");
 }
 
 HipGraph::HipGraph(const HipStream& stream) : stream_(stream.get()) {
+    stream.bind();
+    device_ = current_device();
     check(hipStreamBeginCapture(static_cast<hipStream_t>(stream_), hipStreamCaptureModeThreadLocal),
           "begin capture");
 }
 
 HipGraph::~HipGraph() {
+    destroy_check(hipSetDevice(device_), "bind graph owner");
     if (capturing_) {
         hipGraph_t abandoned = nullptr;
         const hipError_t status =
@@ -175,6 +203,7 @@ HipGraph::~HipGraph() {
 }
 
 void HipGraph::instantiate() {
+    check(hipSetDevice(device_), "bind graph owner");
     if (!capturing_) { throw std::logic_error("HIP graph is already instantiated"); }
     hipGraph_t graph        = nullptr;
     const hipError_t status = hipStreamEndCapture(static_cast<hipStream_t>(stream_), &graph);
@@ -187,6 +216,7 @@ void HipGraph::instantiate() {
 }
 
 void HipGraph::launch(const HipStream& stream) const {
+    check(hipSetDevice(device_), "bind graph owner");
     if (executable_ == nullptr) { throw std::logic_error("HIP graph has no executable"); }
     check(hipGraphLaunch(static_cast<hipGraphExec_t>(executable_),
                          static_cast<hipStream_t>(stream.get())),
@@ -194,18 +224,21 @@ void HipGraph::launch(const HipStream& stream) const {
 }
 
 void hip_copy_to_device(void* dst, const void* src, std::size_t bytes, const HipStream& stream) {
+    stream.bind();
     check(hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice,
                          static_cast<hipStream_t>(stream.get())),
           "H2D copy");
 }
 
 void hip_copy_to_host(void* dst, const void* src, std::size_t bytes, const HipStream& stream) {
+    stream.bind();
     check(hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost,
                          static_cast<hipStream_t>(stream.get())),
           "D2H copy");
 }
 
 void hip_zero(void* dst, std::size_t bytes, const HipStream& stream) {
+    stream.bind();
     check(hipMemsetAsync(dst, 0, bytes, static_cast<hipStream_t>(stream.get())),
           "clear device buffer");
 }

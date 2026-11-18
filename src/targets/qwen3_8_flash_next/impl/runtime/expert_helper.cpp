@@ -73,8 +73,12 @@ struct ExpertHelper::Impl {
             static_cast<float*>(cuda_storage.alloc_bytes(max_t * kExpertPartialBytes).data);
         cuda.remote_partial =
             static_cast<float*>(cuda_storage.alloc_bytes(max_t * kExpertPartialBytes).data);
-        cuda.helper_masks = static_cast<std::uint16_t*>(
-            cuda_storage.alloc_bytes(max_t * sizeof(std::uint16_t)).data);
+        cuda.compact_x = static_cast<std::uint16_t*>(
+            cuda_storage.alloc_bytes(max_t * kExpertActivationBytes).data);
+        cuda.compact_ids = static_cast<std::int32_t*>(
+            cuda_storage.alloc_bytes(max_t * (kExpertMetadataBytes / 2)).data);
+        cuda.compact_weights =
+            static_cast<float*>(cuda_storage.alloc_bytes(max_t * (kExpertMetadataBytes / 2)).data);
         cuda.compact_map =
             static_cast<std::int32_t*>(cuda_storage.alloc_bytes(max_t * sizeof(std::int32_t)).data);
         cuda.compact_count =
@@ -192,14 +196,23 @@ ExpertHelper::ExpertHelper(const LoadedModel& model, const ExpertSlotPlan& fixed
     : impl_(std::make_unique<Impl>(model, fixed_primary, pci, lanes, speculative, cuda_stream,
                                    primary_flex_slots)) {}
 
-ExpertHelper::~ExpertHelper() { cancel_and_drain(); }
+ExpertHelper::~ExpertHelper() {
+    cancel_and_drain();
+    // Keep banks, graph storage and both runtimes' panels together if a join failed. The
+    // mailbox stops its watchdog before retention; no resources can outlive their backing.
+    if (!impl_->mailbox.drained()) {
+        std::fprintf(stderr, "expert helper retaining unjoined resources %p until process exit\n",
+                     static_cast<void*>(impl_.release()));
+    }
+}
 
 std::size_t ExpertHelper::cuda_device_bytes(std::uint32_t max_tokens) {
     if (max_tokens == 0 || max_tokens > 48) {
         throw std::invalid_argument("expert helper CUDA capacity must be [1,48]");
     }
     return 48 * 16 * sizeof(std::uint32_t) + 2 * aligned(max_tokens * kExpertPartialBytes) +
-           aligned(max_tokens * sizeof(std::uint16_t)) +
+           aligned(max_tokens * kExpertActivationBytes) +
+           2 * aligned(max_tokens * (kExpertMetadataBytes / 2)) +
            aligned(max_tokens * sizeof(std::int32_t)) + aligned(sizeof(std::uint32_t));
 }
 
@@ -225,11 +238,23 @@ std::uint64_t ExpertHelper::begin_round(std::uint32_t tokens) {
 
 void ExpertHelper::finish_round() {
     try {
-        impl_->execution->join();
+        impl_->device.bind();
         impl_->mailbox.finish();
+        // The stream is already joined; retire the execution's pending event for the next round.
+        impl_->execution->join();
     } catch (...) {
         impl_->mailbox.cancel_and_drain();
         throw;
+    }
+}
+
+void ExpertHelper::check_failure() const {
+    const auto error = impl_->mailbox.failure();
+    if (error.code != ExpertWireError::None) {
+        throw HipError("expert helper poisoned sequence=" + std::to_string(error.sequence) +
+                       " layer=" + std::to_string(error.layer) +
+                       " side=" + std::to_string(static_cast<unsigned>(error.side)) +
+                       " code=" + std::to_string(static_cast<unsigned>(error.code)));
     }
 }
 
