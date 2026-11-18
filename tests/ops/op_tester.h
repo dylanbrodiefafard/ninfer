@@ -269,10 +269,14 @@ public:
 
     std::size_t bytes() const noexcept { return payload_bytes_; }
 
+    // cudaMemset and a pageable cudaMemcpy may return before the device write lands, and tests
+    // submit the consumer on a non-blocking stream that does not order after the legacy stream,
+    // so both helpers wait for the legacy stream before returning.
     void fill(int byte_value = 0) {
         if (payload_bytes_ != 0) {
             cuda_check(cudaMemset(data(), byte_value, payload_bytes_),
                        "cudaMemset guarded payload");
+            cuda_check(cudaStreamSynchronize(cudaStreamLegacy), "guarded payload fill");
         }
     }
 
@@ -282,6 +286,7 @@ public:
         auto* destination = static_cast<std::uint8_t*>(data()) + byte_offset;
         cuda_check(cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice),
                    "cudaMemcpy host-to-guarded-device");
+        cuda_check(cudaStreamSynchronize(cudaStreamLegacy), "host-to-guarded-device copy");
     }
 
     void copy_to_host(void* destination, std::size_t count, std::size_t byte_offset = 0) const {
