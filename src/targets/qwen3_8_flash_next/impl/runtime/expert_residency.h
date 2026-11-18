@@ -114,6 +114,10 @@ plan_expert_slots(std::size_t budget_bytes,
 inline constexpr std::int32_t kExpertReferenceLimit  = 8;
 inline constexpr std::int64_t kFrequencyHalvingSlots = 8;
 
+// AllEligible warms zero-count eligible records into fixed slots only; it requires every
+// eligible record of each codec to fit. Calibrated preserves ordinary fixed+flex warm ordering.
+enum class ExpertWarmStart : std::uint8_t { Calibrated, AllEligible };
+
 /**
  * The device expert cache over an ExpertHostStore of L layers: the slot pools of plan, their CLOCK
  * state, and the tables (I64 holding U64 addresses, column l = layer l)
@@ -140,7 +144,10 @@ inline constexpr std::int64_t kFrequencyHalvingSlots = 8;
  * start: each pool receives its codec's experts with nonzero count in descending count order
  * (ties to the lower layer-major index), as many as it has slots, fixed and flex. The hottest
  * takes the last slot (the highest flex slot, which KvExpertExtents takes back last) and the
- * coldest admitted one follows the empty slots; every reference bit and hand is 0, so CLOCK first
+ * coldest admitted one follows the empty slots. A nonempty local_eligibility U32 [L,16]
+ * excludes zero bits from warm start. AllEligible instead warms every eligible record, including
+ * zero counts, into fixed slots (not reclaimable flex); every eligible codec must fit its fixed
+ * pool. Every reference bit and hand is 0, so CLOCK first
  * reclaims empty slots, then the coldest records. Without counts every slot starts empty and every
  * entry names the host record. The constructor copies the warm records on stream and synchronizes
  * it; it throws std::invalid_argument for invalid arguments and propagates CUDA failures.
@@ -152,7 +159,9 @@ class ExpertResidency {
 public:
     ExpertResidency(const ExpertHostStore& store, const ExpertSlotPlan& plan,
                     std::span<const std::uint64_t> flex_addresses,
-                    std::span<const std::uint64_t> calib_counts, cudaStream_t stream);
+                    std::span<const std::uint64_t> calib_counts, cudaStream_t stream,
+                    std::span<const std::uint32_t> local_eligibility = {},
+                    ExpertWarmStart warm_start                       = ExpertWarmStart::Calibrated);
 
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;

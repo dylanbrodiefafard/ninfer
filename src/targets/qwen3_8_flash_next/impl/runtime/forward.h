@@ -78,6 +78,11 @@ struct ForwardOptions {
     // Predictive expert staging of decode and verification rounds (the Forward class comment); it
     // changes no result, only when records cross PCIe. Disabled allocates no staging storage.
     ExpertStaging expert_staging = ExpertStaging::Enabled;
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    // Program-owned stable CUDA helper panels; included in device_bytes before fixed-slot
+    // planning, but allocated by ExpertHelper rather than this Forward's arenas.
+    std::size_t expert_helper_device_bytes = 0;
+#endif
 };
 
 /**
@@ -241,10 +246,11 @@ public:
     // Throws std::invalid_argument unless the options are valid (the constructor's check).
     static void validate(const ForwardOptions& options);
 
-    // Device bytes a Forward with these options allocates over `state` (its lane count and lane
-    // capacity): the super-chunk and sub-chunk activations, the decode frames, the staging storage
-    // and the transient workspace (the streaming windows borrow cache slots). CUDA Graph
-    // instantiation is not included.
+    // Device bytes reserved before cache planning over `state` (its lane count and capacity):
+    // Forward's super-chunk/sub-chunk activations, decode frames, staging and transient workspace
+    // (streaming windows borrow cache slots), plus Program-owned expert_helper_device_bytes in
+    // enabled builds. Forward does not allocate those helper panels. CUDA Graph instantiation is
+    // not included.
     [[nodiscard]] static std::size_t
     device_bytes(const ModelView& model, const ForwardOptions& options, const State& state);
 

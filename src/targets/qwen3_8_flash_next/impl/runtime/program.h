@@ -16,6 +16,9 @@
 #include "runtime/state.h"
 
 #include "core/device.h"
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+#    include "runtime/expert_helper.h"
+#endif
 
 #include <cuda_runtime.h> // cudaStream_t
 
@@ -26,6 +29,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::targets::qwen3_8_flash_next {
@@ -61,6 +65,9 @@ struct ProgramOptions {
     // Optional calibration routing count per expert, layer-major [48,512], for the cache's warm
     // start (ExpertResidency).
     std::span<const std::uint64_t> calib_counts;
+    // Internal startup placement control; product/Engine plumbing is separate. OFF builds reject
+    // a supplied PCI address before allocating lane state; nullopt preserves the ordinary path.
+    std::optional<std::string> expert_helper_pci;
 };
 
 // Throws std::invalid_argument for unsupported backend, chain or proposal-head options.
@@ -129,13 +136,19 @@ struct ProgramMemory {
     // Record bytes of the F3 flex slots: QSA pool pages (inside state_bytes) that the pool lends
     // to the cache while no lane reserves them.
     std::size_t flex_cache_bytes = 0;
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    std::optional<ExpertHelperMemory> helper;
+#endif
 };
 
 /**
  * Owns the parts of the Program and wires them in dependency order: the NgramTable (whose hash
  * constants must equal the artifact's), the State of every lane, the PleRowFeeder, the
  * KvExpertExtents over the State's QSA pool, the ExpertResidency with those extents' flex slots,
- * and the Forward with its decode graphs. Every lane operation that maps QSA pages first takes
+ * and the Forward with its decode graphs. With helper placement enabled, ExpertHelper is built
+ * after fixed-capacity planning and before ExpertResidency: it owns the immutable HIP banks,
+ * mailbox and stable CUDA panels, and its records are excluded from the residency's warm start.
+ * Every lane operation that maps QSA pages first takes
  * back the extents it needs (KvExpertExtents::make_room), and every one that releases pages lends
  * fully free extents back (give_back), so only pages no lane reserves hold expert records. The
  * model must outlive the Program; construction synchronizes the device stream while warming the
@@ -291,6 +304,9 @@ private:
     std::unique_ptr<Dflash> dflash_;
     // Withholds the pool's extents before residency_ writes warm records into them.
     KvExpertExtents extents_;
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    std::unique_ptr<ExpertHelper> helper_;
+#endif
     ExpertResidency residency_;
     Forward forward_;
     cudaStream_t stream_;

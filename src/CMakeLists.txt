@@ -310,6 +310,17 @@ ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
 if(NINFER_ENABLE_HIP_EXPERT_HELPER)
+  # CUDA and HIP sources stay in separate archives; only the opaque host interface crosses them.
+  add_library(ninfer_hip_core STATIC
+    core/hip_device.cpp
+    core/expert_mailbox.hip)
+  ninfer_hip_target(ninfer_hip_core)
+  target_link_libraries(ninfer_hip_core PRIVATE hip::host)
+  target_sources(ninfer_core PRIVATE
+    core/expert_mailbox.cpp
+    core/expert_mailbox.cu)
+  target_link_libraries(ninfer_core PRIVATE ninfer_hip_core)
+
   # gfx1201 HIP Ops of the Flash-Next expert helper (cmake/hip_expert_helper.cmake).
   add_library(ninfer_hip_ops STATIC
     ops/r9700/moe_helper_experts.hip)

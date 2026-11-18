@@ -185,13 +185,23 @@ ExpertSlotPlan plan_expert_slots(std::size_t budget_bytes,
 
 ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotPlan& plan,
                                  std::span<const std::uint64_t> flex_addresses,
-                                 std::span<const std::uint64_t> calib_counts, cudaStream_t stream)
+                                 std::span<const std::uint64_t> calib_counts, cudaStream_t stream,
+                                 std::span<const std::uint32_t> local_eligibility,
+                                 ExpertWarmStart warm_start)
     : layers_(store.layers()), plan_(plan),
       metadata_(metadata_capacity(layers_, plan_, flex_addresses.size())) {
     const std::size_t experts = static_cast<std::size_t>(layers_) * kRoutedExperts;
     if (!calib_counts.empty() && calib_counts.size() != experts) {
         throw std::invalid_argument("ExpertResidency: calib_counts must be empty or [L * 512]");
     }
+    if (!local_eligibility.empty() && local_eligibility.size() != experts / 32) {
+        throw std::invalid_argument(
+            "ExpertResidency: local_eligibility must be empty or U32[L,16]");
+    }
+    const auto eligible = [&](std::size_t entry) {
+        return local_eligibility.empty() ||
+               (local_eligibility[entry / 32] & (std::uint32_t{1} << (entry % 32))) != 0;
+    };
     constexpr auto kFlexTag = tag_of(MoeExpertCodec::F3G32);
     if (flex_addresses.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() -
                                                          plan_.slots[kFlexTag])) {
@@ -205,23 +215,32 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
     }
     flex_slots_ = static_cast<std::int32_t>(flex_addresses.size());
 
-    // Warm start: per pool, the experts with nonzero count, hottest first.
+    // Ordinary calibration retains its fixed+flex ordering; full eligible coverage is warmed
+    // into fixed storage so later KV reservation cannot evict it from initially idle extents.
     const std::span<const std::uint64_t> host = store.device_addresses();
     std::array<std::vector<std::int32_t>, kCodecs> warm;
-    if (!calib_counts.empty()) {
+    if (!calib_counts.empty() || warm_start == ExpertWarmStart::AllEligible) {
         std::vector<std::int32_t> order(experts);
         std::iota(order.begin(), order.end(), 0);
         std::stable_sort(order.begin(), order.end(), [&](std::int32_t a, std::int32_t b) {
+            if (calib_counts.empty()) { return a < b; }
             return calib_counts[static_cast<std::size_t>(a)] >
                    calib_counts[static_cast<std::size_t>(b)];
         });
         for (const std::int32_t code : order) {
             const auto entry = static_cast<std::size_t>(code);
-            if (calib_counts[entry] == 0) { break; }
+            if (warm_start == ExpertWarmStart::Calibrated && calib_counts[entry] == 0) { break; }
+            if (!eligible(entry)) { continue; }
             const std::size_t tag           = host[entry] & 1U;
             std::vector<std::int32_t>& list = warm[tag];
-            if (list.size() < pool_slots(plan_, flex_addresses.size(), tag)) {
+            const auto capacity             = warm_start == ExpertWarmStart::AllEligible
+                                                  ? static_cast<std::size_t>(plan_.slots[tag])
+                                                  : pool_slots(plan_, flex_addresses.size(), tag);
+            if (list.size() < capacity) {
                 list.push_back(code);
+            } else if (warm_start == ExpertWarmStart::AllEligible) {
+                throw std::invalid_argument(
+                    "ExpertResidency: eligible records exceed fixed capacity");
             }
         }
     }
@@ -271,8 +290,9 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
         std::vector<std::int32_t>& owner = owners[tag];
         owner.assign(slots, ops::kMoeCacheEmptySlot);
         for (std::size_t rank = 0; rank < warm[tag].size(); ++rank) {
-            const std::int32_t code                    = warm[tag][rank];
-            const std::size_t slot                     = slots - 1 - rank;
+            const std::int32_t code = warm[tag][rank];
+            const std::size_t slot =
+                (warm_start == ExpertWarmStart::AllEligible ? fixed : slots) - 1 - rank;
             const std::uint64_t address                = slot_address(slot);
             owner[slot]                                = code;
             slot_index[static_cast<std::size_t>(code)] = static_cast<std::int32_t>(slot);

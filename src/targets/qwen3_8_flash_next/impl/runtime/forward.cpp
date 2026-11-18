@@ -459,7 +459,11 @@ std::size_t Forward::device_bytes(const ModelView& model, const ForwardOptions& 
                                   const State& state) {
     const ForwardOptions checked = validated(options);
     return plan_activation_bytes(checked) + plan_verify_bytes(checked, state.lanes()) +
-           plan_staging_bytes(checked, state.lanes()) + plan_work_bytes(model, checked, state);
+           plan_staging_bytes(checked, state.lanes()) + plan_work_bytes(model, checked, state)
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+           + checked.expert_helper_device_bytes
+#endif
+        ;
 }
 
 Forward::Forward(const ModelView& model, State& state, PleRowFeeder& feeder,

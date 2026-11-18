@@ -707,6 +707,42 @@ add_test(NAME ninfer_qwen3_8_27b_eight_windows_real_test
 set_tests_properties(ninfer_qwen3_8_27b_eight_windows_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 
 if(NINFER_ENABLE_HIP_EXPERT_HELPER)
+  add_library(ninfer_expert_mailbox_test_hip OBJECT test_expert_mailbox_hip.hip)
+  ninfer_hip_target(ninfer_expert_mailbox_test_hip)
+  ninfer_add_test(ninfer_expert_mailbox_test
+    SOURCES test_expert_mailbox.cpp $<TARGET_OBJECTS:ninfer_expert_mailbox_test_hip>
+    LIBRARIES ninfer_core Threads::Threads)
+  set_target_properties(ninfer_expert_mailbox_test PROPERTIES LINKER_LANGUAGE CXX)
+  set_tests_properties(ninfer_expert_mailbox_test PROPERTIES LABELS "cuda;hip;slow" TIMEOUT 240)
+
+  # Keep the placement oracle independent of both GPU runtimes.
+  set(helper_runtime_dir ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_flash_next/impl/runtime)
+  add_executable(ninfer_flash_next_helper_placement_test
+    targets/test_flash_next_helper_placement.cpp
+    ${helper_runtime_dir}/expert_helper_placement.cpp)
+  target_include_directories(ninfer_flash_next_helper_placement_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${helper_runtime_dir}/..)
+  add_test(NAME ninfer_flash_next_helper_placement_test
+    COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_flash_next_helper_placement_test>)
+  set_tests_properties(ninfer_flash_next_helper_placement_test PROPERTIES LABELS cpu)
+
+  # This executable must remain runnable with the NVIDIA device unavailable: no CUDA archive or
+  # runtime dependency, including transitively through the complete Flash-Next runtime.
+  ninfer_add_test(ninfer_flash_next_helper_upload_test
+    SOURCES targets/test_flash_next_helper_upload.cpp
+      ${helper_runtime_dir}/expert_helper_upload.cpp
+      ${helper_runtime_dir}/expert_helper_placement.cpp
+    LIBRARIES ninfer_hip_core)
+  target_include_directories(ninfer_flash_next_helper_upload_test PRIVATE ${helper_runtime_dir}/..)
+  set_target_properties(ninfer_flash_next_helper_upload_test PROPERTIES LINKER_LANGUAGE CXX)
+  set_tests_properties(ninfer_flash_next_helper_upload_test PROPERTIES LABELS hip TIMEOUT 90)
+
+  ninfer_add_test(ninfer_flash_next_helper_graph_test
+    SOURCES targets/test_flash_next_helper_graph.cpp
+    LIBRARIES ninfer_qwen3_8_flash_next)
+  set_target_properties(ninfer_flash_next_helper_graph_test PROPERTIES LINKER_LANGUAGE CXX)
+  set_tests_properties(ninfer_flash_next_helper_graph_test PROPERTIES LABELS "cuda;hip" TIMEOUT 120)
+
   # Runs on the R9700 (the first gfx1201 device); labelled `hip` so CUDA-only runs can exclude it.
   add_executable(ninfer_moe_helper_experts_test ops/r9700/test_moe_helper_experts.hip)
   ninfer_hip_target(ninfer_moe_helper_experts_test)

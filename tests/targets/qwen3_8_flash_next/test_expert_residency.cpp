@@ -259,6 +259,44 @@ void test_store_and_residency() {
                fn::kFrequencyHalvingSlots * static_cast<std::int64_t>(6 + 9 + kFlex),
            "halving period over fixed and flex slots");
 
+    // Helper placement leaves only three eligible experts, including a zero-count F3 record.
+    // Full coverage must warm fixed slots even while flex extents are available; helper-owned
+    // entries remain their original CUDA host addresses and never become warm owners.
+    {
+        std::array<std::uint32_t, 16> eligibility{};
+        eligibility[0] = (1U << 0) | (1U << 1) | (1U << 5);
+        std::vector<std::uint64_t> filtered_counts(512, 0);
+        filtered_counts[0]   = 4;
+        filtered_counts[5]   = 9;
+        filtered_counts[301] = 1000; // hotter than eligible experts, but not eligible
+        fn::ExpertResidency full(store, fn::ExpertSlotPlan{{1, 2}}, flex_addresses, filtered_counts,
+                                 context.stream, eligibility, fn::ExpertWarmStart::AllEligible);
+        auto full_cache  = full.cache();
+        const auto index = download<std::int32_t>(full_cache.slot_index.data, 512);
+        const auto table = download<std::uint64_t>(full.expert_table().data, 512);
+        for (std::size_t e = 0; e < 512; ++e) {
+            const bool eligible = e == 0 || e == 1 || e == 5;
+            expect(eligible ? index[e] >= 0 : index[e] == ops::kMoeCacheNoSlot,
+                   "full helper-filtered slot index");
+            expect(eligible ? table[e] != addresses[e] : table[e] == addresses[e],
+                   "helper-filtered host/slot addresses");
+        }
+        expect(index[0] == 1 && index[1] == 0 && index[5] == 0,
+               "full coverage keeps zero counts in fixed slots");
+        const auto owners = download<std::int32_t>(full_cache.pools[1].owner.data, 2 + kFlex);
+        expect(std::all_of(owners.begin() + 2, owners.end(),
+                           [](auto owner) { return owner == ops::kMoeCacheEmptySlot; }),
+               "full coverage does not depend on flex");
+        fn::ExpertResidency calibrated(store, fn::ExpertSlotPlan{{1, 1}}, flex_addresses,
+                                       filtered_counts, context.stream, eligibility);
+        const auto calibrated_index =
+            download<std::int32_t>(calibrated.cache().slot_index.data, 512);
+        expect(calibrated_index[0] == static_cast<std::int32_t>(kFlex) &&
+                   calibrated_index[1] == ops::kMoeCacheNoSlot &&
+                   calibrated_index[301] == ops::kMoeCacheNoSlot,
+               "filtered calibration preserves highest-flex warm order and excludes zeros");
+    }
+
     // One admit/commit through the residency views: F3 expert 1 (count 0, not warm) takes F3 slot
     // 0, the coldest warm record (or an empty slot), whose owner returns to host memory; NVFP4
     // expert 301 (the hottest, slot 5) is a hit.

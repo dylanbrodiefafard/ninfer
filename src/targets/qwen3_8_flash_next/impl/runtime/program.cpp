@@ -1,6 +1,9 @@
 #include "runtime/program.h"
 
 #include "core/device.h"
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+#    include "runtime/expert_helper_profile.h"
+#endif
 
 #include <cuda_runtime.h>
 
@@ -50,6 +53,12 @@ bool speculative_enabled(const ProgramOptions& options) {
 // options, so the checks run before any device state is allocated.
 std::int32_t checked_lanes(const NgramTable& table, const LoadedModel& model,
                            const ProgramOptions& options) {
+#ifndef NINFER_ENABLE_HIP_EXPERT_HELPER
+    if (options.expert_helper_pci) {
+        throw std::invalid_argument(
+            "expert helper requires a build with NINFER_ENABLE_HIP_EXPERT_HELPER=ON");
+    }
+#endif
     const NgramHashConstants& stored          = table.constants();
     const NgramHashConstants& model_constants = model.ngram_constants();
     if (stored.multipliers != model_constants.multipliers ||
@@ -104,6 +113,14 @@ ForwardOptions forward_options(const LoadedModel& model, const ProgramOptions& o
     }
     constexpr auto kAlignment = static_cast<std::size_t>(ops::kMoeRecordAlignment);
     ForwardOptions forward    = options.forward;
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    forward.expert_helper_device_bytes = 0;
+    if (options.expert_helper_pci) {
+        const auto max_t =
+            static_cast<std::uint32_t>(options.lanes * (speculative_enabled(options) ? 4 : 1));
+        forward.expert_helper_device_bytes = ExpertHelper::cuda_device_bytes(max_t);
+    }
+#endif
     if (speculative_enabled(options)) {
         forward.max_verify_width = kDflashWidth;
         forward.dflash_features  = DflashExecution::Enabled;
@@ -183,13 +200,32 @@ Program::Program(const LoadedModel& model, const ProgramOptions& options, Device
                   ? std::make_unique<Dflash>(model.view(), state_, device.stream)
                   : nullptr),
       extents_(state_.pool(), options.kv_format, device.stream, device.copy_stream),
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+      helper_(options.expert_helper_pci
+                  ? std::make_unique<ExpertHelper>(model, slot_plan(model, options, state_),
+                                                   *options.expert_helper_pci, options.lanes,
+                                                   speculative_enabled(options), device.stream,
+                                                   extents_.flex_addresses().size())
+                  : nullptr),
+      residency_(
+          model.experts(), helper_ ? helper_->primary_plan() : slot_plan(model, options, state_),
+          extents_.flex_addresses(),
+          helper_ ? std::span<const std::uint64_t>(kExpertHelperCalibCounts) : options.calib_counts,
+          device.stream,
+          helper_ ? std::span<const std::uint32_t>(helper_->placement().local_eligibility)
+                  : std::span<const std::uint32_t>{},
+          helper_ && helper_->placement().full_coverage ? ExpertWarmStart::AllEligible
+                                                        : ExpertWarmStart::Calibrated),
+#else
       residency_(model.experts(), slot_plan(model, options, state_), extents_.flex_addresses(),
                  options.calib_counts, device.stream),
+#endif
       forward_(model.view(), state_, feeder_, residency_, forward_options(model, options),
                device.stream, dflash_.get()),
       stream_(device.stream), mask_staging_(static_cast<std::size_t>(options.lanes) *
                                             State::kAllowedTokenWordStride * sizeof(std::uint32_t)),
-      speculative_options_(options.speculative), forced_adaptive_k_(options.forced_adaptive_k) {}
+      speculative_options_(options.speculative), forced_adaptive_k_(options.forced_adaptive_k) {
+}
 
 std::int32_t Program::lanes() const noexcept { return state_.lanes(); }
 
@@ -463,13 +499,20 @@ std::vector<float> Program::score(std::span<const std::int32_t> tokens) {
 ProgramMemory Program::memory() const noexcept {
     return ProgramMemory{
         .state_bytes      = state_.device_bytes(),
-        .activation_bytes = forward_.activation_bytes(),
-        .workspace_bytes  = forward_.workspace_bytes() + (dflash_ ? dflash_->workspace_bytes() : 0),
-        .window_bytes     = forward_.window_bytes(),
+        .activation_bytes = forward_.activation_bytes()
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+                            + (helper_ ? helper_->memory().cuda_device_bytes : 0)
+#endif
+            ,
+        .workspace_bytes = forward_.workspace_bytes() + (dflash_ ? dflash_->workspace_bytes() : 0),
+        .window_bytes    = forward_.window_bytes(),
         .expert_cache_bytes = residency_.plan().bytes(),
         .flex_cache_bytes =
             static_cast<std::size_t>(residency_.flex_slots()) *
             static_cast<std::size_t>(ops::moe_expert_record_bytes(ops::MoeExpertCodec::F3G32)),
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+        .helper = helper_ ? std::optional<ExpertHelperMemory>(helper_->memory()) : std::nullopt,
+#endif
     };
 }
 
