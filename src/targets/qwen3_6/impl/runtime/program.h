@@ -24,7 +24,7 @@
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
-#include "targets/qwen3_6/impl/runtime/token_masks.h"
+#include "targets/qwen3_6/impl/frontend/token_masks.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 

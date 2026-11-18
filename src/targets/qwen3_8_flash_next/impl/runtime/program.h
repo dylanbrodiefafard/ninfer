@@ -200,13 +200,15 @@ public:
     // Replaces the lane's sampling; applies from the lane's next sampled token on. Throws
     // std::invalid_argument for invalid parameters.
     void set_sampling(Lane lane, const LaneSampling& sampling);
-    // Restricts the lane's next sampled token (the completing prefill_step or the lane's next
-    // decode row) to the tokens whose bit is set in `words` (kAllowedTokenWords U32; bit v of word
-    // v / 32 marks token v eligible), intersected with the suppressed tokens. The words are copied;
-    // the mask is consumed by that one sampled token, so a caller re-arms it for every token it
-    // constrains. It never affects next_logprob or the top log probabilities. At least one
-    // eligible token must remain.
-    void set_allowed_tokens(Lane lane, std::span<const std::uint32_t> words);
+    // Arms a root mask (kAllowedTokenWords U32; bit v % 32 of word v / 32 marks token v eligible),
+    // intersected with suppressed tokens. The words are copied and consumed by the next sampling
+    // call; callers re-arm before each constrained prefill/ordinary decode/speculative round.
+    // Logprobs remain unmodified. At least one eligible token must remain. An optional session
+    // must describe the same root policy and supply exact masks after hypothetical prefixes in
+    // chain verification. It must outlive the next synchronized sampling call and remain
+    // unchanged during it. Without a session the row stays root-only.
+    void set_allowed_tokens(Lane lane, std::span<const std::uint32_t> words,
+                            const qwen3_6::OutputSession* output = nullptr);
     // Drops an armed mask that no token has consumed yet.
     void clear_allowed_tokens(Lane lane);
     // Tokens the lane holds (prompt and output so far).
@@ -280,7 +282,8 @@ private:
         LanePhase phase = LanePhase::Closed;
         LaneSampling sampling;
         // An eligibility mask is in the lane's State storage for its next sampled token.
-        bool mask_armed = false;
+        bool mask_armed                           = false;
+        const qwen3_6::OutputSession* mask_output = nullptr;
         SpeculativeStats speculative;
     };
 

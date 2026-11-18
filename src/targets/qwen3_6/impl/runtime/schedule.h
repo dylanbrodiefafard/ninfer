@@ -12,7 +12,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
-#include "targets/qwen3_6/impl/runtime/token_masks.h"
+#include "targets/qwen3_6/impl/frontend/token_masks.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"

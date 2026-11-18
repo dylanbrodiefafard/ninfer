@@ -351,11 +351,10 @@ public:
         return (tokens + step - 1) / step;
     }
 
-    // Restricts the lane's next sampled token to its output session's grammar, budget or replay
-    // policy (OutputSession::fill_token_masks at the committed root), as the family Program does
-    // for ordinary rounds. The Program consumes the mask with that token. Throws RequestError
-    // (InvalidOutputConstraint) when the policy, after the suppressed tokens, admits no token; the
-    // caller fails only that request.
+    // Arms the committed-root mask for prefill/ordinary sampling and binds the session for
+    // exact per-prefix masks in chain verification. Throws RequestError (InvalidOutputConstraint)
+    // when the root policy, after suppressed tokens, admits no token; the caller fails only
+    // that request. Forward propagates speculative matcher errors before publication.
     void arm_token_mask(LaneRecord& entry) {
         if (entry.output == nullptr || !entry.output->has_token_masks()) { return; }
         const std::array<TokenId, 1> root{0};
@@ -378,7 +377,7 @@ public:
             throw RequestError(RequestErrorKind::InvalidOutputConstraint,
                                "the output constraint leaves no eligible token");
         }
-        program.set_allowed_tokens(entry.lane.value(), mask_words);
+        program.set_allowed_tokens(entry.lane.value(), mask_words, entry.output);
     }
 
     // The cycle-exit continuation for the lane's next sampled token: thinking-phase p-less rows at
@@ -705,6 +704,10 @@ public:
     std::array<TokenId, kMaximumConcurrency> decode_inputs{};
     std::array<std::uint32_t, kMaximumConcurrency> decode_limits{}, pending_members{};
     std::size_t pending_size = 0;
+    // Successful executor rows map back into the full Program packet. Matcher root
+    // errors resolve with zero publication before their lanes can be closed.
+    std::array<std::size_t, kMaximumConcurrency> pending_program_rows{};
+    std::size_t pending_program_size = 0;
     // Storage of the last decode round by membership row, which the executor reads until the
     // next round.
     std::array<TokenId, kRoundTokens> round_tokens{};
@@ -1120,13 +1123,12 @@ EngineProgram::decode_batch(std::span<const std::uint32_t> lanes,
             self.close(entry);
             continue;
         }
-        round.cycle_exclusions.at(row)        = entry.sampling.typical_exclude >= 0;
-        self.decode_lanes.at(sampled_rows)    = *entry.lane;
-        self.decode_inputs.at(sampled_rows)   = entry.generated.back();
-        self.decode_limits.at(sampled_rows)   = budgets[row].generated_tokens_remaining;
-        self.pending_members.at(sampled_rows) = lanes[row];
-        row_of.at(sampled_rows++)             = row;
-        logprobs                              = logprobs || entry.token_logprobs;
+        round.cycle_exclusions.at(row)      = entry.sampling.typical_exclude >= 0;
+        self.decode_lanes.at(sampled_rows)  = *entry.lane;
+        self.decode_inputs.at(sampled_rows) = entry.generated.back();
+        self.decode_limits.at(sampled_rows) = budgets[row].generated_tokens_remaining;
+        row_of.at(sampled_rows++)           = row;
+        logprobs                            = logprobs || entry.token_logprobs;
     }
 
     const std::size_t batch = lanes.size();
@@ -1138,13 +1140,21 @@ EngineProgram::decode_batch(std::span<const std::uint32_t> lanes,
             std::span<const TokenId>(self.decode_inputs).first(sampled_rows),
             std::span<const std::uint32_t>(self.decode_limits).first(sampled_rows),
             logprobs ? RoundLogprobs::Report : RoundLogprobs::Skip);
-        const double seconds = seconds_since(started);
-        width                = static_cast<std::size_t>(packet.width);
-        const bool deferred  = self.program.pending_speculative();
+        const double seconds      = seconds_since(started);
+        width                     = static_cast<std::size_t>(packet.width);
+        const bool deferred       = self.program.pending_speculative();
+        self.pending_program_size = sampled_rows;
+        std::size_t pending_rows  = 0;
         for (std::size_t sampled = 0; sampled < sampled_rows; ++sampled) {
             const std::size_t row   = row_of.at(sampled);
             Impl::LaneRecord& entry = self.records.at(lanes[row]);
             const auto count        = packet.counts[sampled];
+            if (!packet.row_errors.empty() && packet.row_errors[sampled]) {
+                round.row_errors.at(row) = packet.row_errors[sampled];
+                continue;
+            }
+            self.pending_members[pending_rows]        = lanes[row];
+            self.pending_program_rows[pending_rows++] = sampled;
             if (count < 1 || count > packet.width) {
                 throw std::logic_error("Flash-Next returned an invalid licensed packet extent");
             }
@@ -1180,7 +1190,12 @@ EngineProgram::decode_batch(std::span<const std::uint32_t> lanes,
             }
             entry.sampled = entry.sampled_tokens[0];
         }
-        self.pending_size = sampled_rows;
+        self.pending_size = pending_rows;
+        if (pending_rows == 0) {
+            const std::array<std::int32_t, kMaximumConcurrency> discard{};
+            self.program.resolve_round(std::span(discard).first(self.pending_program_size));
+            self.pending_program_size = 0;
+        }
     }
     round.tokens     = std::span<const TokenId>(self.round_tokens).first(batch * width);
     round.row_counts = std::span<const std::int32_t>(self.round_counts).first(batch);
@@ -1285,12 +1300,14 @@ void EngineProgram::resolve_pending_batch(std::span<const std::uint32_t> lanes,
             (count == 0 && cancelled[row] == 0 && !discard)) {
             throw std::logic_error("Flash-Next publication is not a valid licensed prefix");
         }
-        counts[row] = static_cast<std::int32_t>(count);
+        counts[self.pending_program_rows[row]] = static_cast<std::int32_t>(count);
     }
     const auto started = Clock::now();
-    self.program.resolve_round(std::span<const std::int32_t>(counts).first(lanes.size()));
-    const double seconds = seconds_since(started);
-    self.pending_size    = 0;
+    self.program.resolve_round(
+        std::span<const std::int32_t>(counts).first(self.pending_program_size));
+    self.pending_program_size = 0;
+    const double seconds      = seconds_since(started);
+    self.pending_size         = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         Impl::LaneRecord& entry = self.record(lanes[row]);
         const auto count        = accepted_tokens[row];

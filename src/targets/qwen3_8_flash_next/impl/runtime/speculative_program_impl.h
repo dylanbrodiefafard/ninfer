@@ -49,6 +49,7 @@ SpeculativeRows Program::decode_round(std::span<const Lane> lanes,
     const auto batch    = static_cast<std::int32_t>(lanes.size());
     auto k              = choose_k(batch);
     std::int32_t live_k = 0;
+    std::array<const qwen3_6::OutputSession*, kMaxLanes> outputs{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         if (open_control(lanes[row]).phase != LanePhase::Decoding || output_limits[row] == 0) {
             throw std::logic_error("Flash-Next round row is not decode-ready");
@@ -67,10 +68,13 @@ SpeculativeRows Program::decode_round(std::span<const Lane> lanes,
                                    : k;
         const auto extent = std::min({static_cast<std::int64_t>(request_k),
                                       static_cast<std::int64_t>(output_limits[row]) - 1, room - 1});
-        // A history-dependent eligibility mask describes only its root decision. Such a row
-        // stays root-only instead of applying a stale mask to unobserved future histories.
-        pending_extents_[row] =
-            config.allowed_token_words == nullptr ? static_cast<std::int32_t>(extent) : 0;
+        const auto& control = open_control(lanes[row]);
+        outputs[row]        = control.mask_armed ? control.mask_output : nullptr;
+        // A raw one-shot bitset cannot describe future prefixes. Session-backed masks
+        // are filled independently for every valid hypothesis after proposal IDs exist.
+        pending_extents_[row] = config.allowed_token_words != nullptr && outputs[row] == nullptr
+                                    ? 0
+                                    : static_cast<std::int32_t>(extent);
         if (pending_extents_[row] != 0) { live_k = std::max(live_k, request_k); }
         pending_lanes_[row] = lanes[row];
     }
@@ -112,10 +116,11 @@ SpeculativeRows Program::decode_round(std::span<const Lane> lanes,
         pending_round_ = forward_.speculate(
             lanes, anchors,
             std::span<const ops::SamplingConfig>(round_sampling_).first(lanes.size()), k,
-            std::span<const std::int32_t>(pending_extents_).first(lanes.size()), logprobs);
+            std::span<const std::int32_t>(pending_extents_).first(lanes.size()), logprobs,
+            std::span<const qwen3_6::OutputSession* const>(outputs).first(lanes.size()));
         last_round_ = {.gather_seconds = forward_.last_gather_seconds(),
                        .replay_ms      = forward_.last_replay_ms()};
-        for (const auto lane : lanes) { open_control(lane).mask_armed = false; }
+        for (const auto lane : lanes) { clear_allowed_tokens(lane); }
     }
     pending_batch_ = true;
     return pending_round_;

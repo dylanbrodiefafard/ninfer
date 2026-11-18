@@ -519,6 +519,8 @@ Forward::Forward(const ModelView& model, State& state, PleRowFeeder& feeder,
         std::construct_at(static_cast<SpecIngress*>(spec_ingress_staging_->data()));
         std::construct_at(static_cast<SpecEgress*>(spec_egress_staging_->data()));
         drafts_ready_.emplace(cudaEventDisableTiming | cudaEventBlockingSync);
+        token_masks_ = std::make_unique<qwen3_6::TokenMaskExchange>(
+            verify_.token_masks, verify_.mask_sampling, verify_.mask_nodes, stream_);
         CUDA_CHECK(
             cudaMemsetAsync(verify_.spec_egress.data, 0, verify_.spec_egress.bytes(), stream_));
     }
@@ -542,6 +544,7 @@ Forward::~Forward() {
     // No enqueued work may outlive the buffers below; errors cannot propagate from here.
     static_cast<void>(cudaStreamSynchronize(stream_));
     static_cast<void>(cudaStreamSynchronize(fill_stream_.get()));
+    static_cast<void>(cudaStreamSynchronize(mask_stream_.get()));
 }
 
 void Forward::clear_expert_cache_counts() {

@@ -124,7 +124,7 @@ add_test(NAME ninfer_qwen3_8_flash_next_program_parity_real_test
     $<TARGET_FILE:ninfer_qwen3_8_flash_next_engine_real_test> --program-parity)
 set_tests_properties(ninfer_qwen3_8_flash_next_program_parity_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
-foreach(mode IN ITEMS retained reuse-parity ram-tiers disk-tiers live-tiers)
+foreach(mode IN ITEMS retained reuse-parity ram-tiers disk-tiers live-tiers dflash-masks dflash-mask-program)
   string(REPLACE "-" "_" test_mode "${mode}")
   add_test(NAME ninfer_qwen3_8_flash_next_${test_mode}_real_test
     COMMAND ${NINFER_TEST_LAUNCHER}

@@ -1,7 +1,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
-#include "targets/qwen3_6/impl/runtime/token_masks.h"
+#include "targets/qwen3_6/impl/frontend/token_masks.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 #include "text/unicode.h"
@@ -170,6 +170,8 @@ void run() {
     DeviceContext device;
     constexpr int words = (family::kTokenDomain + 31) / 32;
     DeviceArena arena(std::size_t{4} * 1024 * 1024);
+    auto one_shot = arena.alloc(DType::I32, {words});
+    CUDA_CHECK(cudaMemsetAsync(one_shot.data, 0xff, one_shot.bytes(), device.stream));
     auto masks       = arena.alloc(DType::I32, {words, width_max, capacity});
     auto sampling    = arena.alloc(DType::I32, {int(sizeof(ops::SamplingConfig) / 4), capacity});
     auto nodes       = arena.alloc(DType::I32, {width_max, capacity, 2});
@@ -189,7 +191,7 @@ void run() {
 
     for (int batch : {1, 2, 3, 4, 5, 6, 1}) {
         for (bool tree : {false, true}) {
-            for (int width : {3, 5}) {
+            for (int width : {1, 3, 4, 5}) {
                 // Production gives each (batch, draft width) its own topology.
                 // CUDA cannot update a 2D memcpy node across changing extents.
                 DecodeGraphExecutable graph;
@@ -229,7 +231,13 @@ void run() {
                     for (int row = 0; row < batch; ++row) {
                         outputs[row]      = ((row + replay) % 3 == 2) ? nullptr : &sessions[row];
                         configs[row].seed = 100 + row + replay * 10;
-                        counts[row]       = width - (replay % 2);
+                        counts[row]       = std::max(1, width - (replay % 2));
+                        configs[row].allowed_token_words = nullptr;
+                        if (!outputs[row] && replay % 2 != 0) {
+                            counts[row] = 1;
+                            configs[row].allowed_token_words =
+                                static_cast<const std::uint32_t*>(one_shot.data);
+                        }
                         const std::array<int, 5> tokens{0, 1000 + '1' + row, 32, 1000 + '<',
                                                         1000 + '/'};
                         for (int node = 0; node < width; ++node) {
@@ -263,8 +271,10 @@ void run() {
                         require(actual_config[row].seed == configs[row].seed,
                                 "stale captured sampling binding");
                         if (!outputs[row]) {
-                            require(actual_config[row].allowed_token_words == nullptr,
-                                    "unconstrained row retained grammar");
+                            require(actual_config[row].allowed_token_words ==
+                                            configs[row].allowed_token_words &&
+                                        actual_config[row].allowed_token_column_stride == 0,
+                                    "row without a session lost its one-shot sampling domain");
                             continue;
                         }
                         std::vector<int> row_parents(counts[row]);
@@ -312,6 +322,67 @@ void run() {
                             "callback failure left a constrained sampling domain");
             }
         }
+    }
+    // Each request has its own first failing node. A callback must preserve healthy
+    // rows and report root/hypothetical errors without turning them into a batch fault.
+    {
+        std::array<family::OutputSession, 4> capped;
+        PromptInput input;
+        input.options.enable_thinking = true;
+        input.messages.push_back(
+            ChatMessage{.role = ChatRole::User, .parts = {MessagePart{.text = "x"}}});
+        const auto prompt = frontend.prepare(input);
+        configs.fill({});
+        counts.fill(4);
+        for (std::size_t row = 0; row < capped.size(); ++row) {
+            capped[row] = frontend.make_output_session(
+                prompt, {}, {.thinking_token_budget = static_cast<std::uint32_t>(row + 1)});
+            (void)capped[row].preview(std::array<TokenId, 1>{1}, 100, FinishReason::OutputLimit);
+            (void)capped[row].commit_preview();
+            outputs[row]                        = &capped[row];
+            configs[row].suppressed_token_count = 1;
+            configs[row].suppressed_tokens[0]   = 248069;
+        }
+        outputs[4] = &sessions[4];
+        outputs[5] = nullptr;
+        for (std::size_t row = 0; row < capacity; ++row) {
+            for (std::size_t node = 0; node < 4; ++node) {
+                ids[row * 4 + node] = node == 0 ? 0 : 1;
+            }
+        }
+        Tensor chain_ids(ids_storage.data, DType::I32, {4, capacity});
+        Tensor chain_counts(counts_storage.data, DType::I32, {capacity});
+        CUDA_CHECK(cudaMemcpyAsync(chain_ids.data, ids.data(), 4 * capacity * sizeof(int),
+                                   cudaMemcpyHostToDevice, device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(chain_counts.data, counts.data(), counts.size() * sizeof(int),
+                                   cudaMemcpyHostToDevice, device.stream));
+        exchange.bind(outputs, configs);
+        DecodeGraphDefinition definition;
+        definition.capture(device.stream, [&] {
+            const auto submission = exchange.enqueue(chain_ids, nullptr, chain_counts,
+                                                     device.stream, device.host_stream);
+            CUDA_CHECK(cudaStreamWaitEvent(device.stream, submission.ready, 0));
+            CUDA_CHECK(cudaMemcpyAsync(result_masks.data(), masks.data, masks.bytes(),
+                                       cudaMemcpyDeviceToHost, device.stream));
+        });
+        DecodeGraphExecutable graph;
+        graph.instantiate(definition);
+        graph.launch(device.stream);
+        device.synchronize();
+        const auto results = exchange.results();
+        const auto* actual = static_cast<const std::uint32_t*>(result_masks.data());
+        for (std::size_t row = 0; row < capacity; ++row) {
+            require(results[row].safe_columns == (row < 4 ? row : 4) &&
+                        static_cast<bool>(results[row].error) == (row < 4),
+                    "captured matcher failure lost its row/node attribution");
+            if (row < 4) {
+                const auto* begin = actual + row * width_max * words + row * words;
+                require(std::all_of(begin, actual + (row + 1) * width_max * words,
+                                    [](std::uint32_t word) { return word == ~std::uint32_t{0}; }),
+                        "failed mask tail was unsafe for device completion");
+            }
+        }
+        configs.fill({});
     }
     // An exception between fork and join must drain the callback before its
     // borrowed session dies, even though compute never waits on masks_ready.

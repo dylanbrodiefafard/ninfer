@@ -1,4 +1,4 @@
-#include "targets/qwen3_6/impl/runtime/token_masks.h"
+#include "targets/qwen3_6/impl/frontend/token_masks.h"
 #include "core/device.h"
 #include "core/nvtx.h"
 
@@ -41,6 +41,40 @@ void validate_budget_domain(const OutputSession& output, const ops::SamplingConf
 
 } // namespace
 
+TokenMaskResult fill_token_mask_row(const OutputSession& output, const ops::SamplingConfig& config,
+                                    std::span<const TokenId> tokens,
+                                    std::span<const std::int32_t> parents,
+                                    std::span<std::uint32_t> words) {
+    if (tokens.empty() || parents.size() != tokens.size() ||
+        words.size() != tokens.size() * kWords) {
+        throw std::invalid_argument("invalid token mask row shape");
+    }
+    const auto fill_prefix = [&](std::size_t count) {
+        output.fill_token_masks(tokens.first(count), parents.first(count),
+                                words.first(count * kWords));
+        validate_budget_domain(output, config, words.data(), count);
+    };
+    try {
+        fill_prefix(tokens.size());
+        return {.safe_columns = tokens.size()};
+    } catch (const RequestError&) {
+        for (std::size_t count = 1; count <= tokens.size(); ++count) {
+            try {
+                fill_prefix(count);
+            } catch (const RequestError&) {
+                const auto error = std::current_exception();
+                const auto safe  = count - 1;
+                // A failing batch fill may have partially overwritten earlier masks.
+                if (safe != 0) { fill_prefix(safe); }
+                std::fill(words.begin() + static_cast<std::ptrdiff_t>(safe * kWords), words.end(),
+                          ~std::uint32_t{0});
+                return {.safe_columns = safe, .error = error};
+            }
+        }
+        throw std::logic_error("token mask constraint failure did not reproduce on its prefix");
+    }
+}
+
 TokenMaskExchange::TokenMaskExchange(Tensor masks, Tensor sampling, Tensor nodes,
                                      cudaStream_t compute)
     : masks_(masks), sampling_(sampling), nodes_(nodes), width_(masks.ne[1]),
@@ -58,6 +92,7 @@ TokenMaskExchange::TokenMaskExchange(Tensor masks, Tensor sampling, Tensor nodes
     }
     outputs_.resize(capacity_, nullptr);
     configs_.resize(capacity_);
+    results_.resize(capacity_);
     (void)nvtx::registered_message(nvtx::Name::TokenGrammarMasks);
     std::fill_n(static_cast<std::uint32_t*>(host_masks_.data()), masks.bytes() / 4,
                 ~std::uint32_t{0});
@@ -68,7 +103,7 @@ TokenMaskExchange::TokenMaskExchange(Tensor masks, Tensor sampling, Tensor nodes
 }
 
 TokenMaskExchange::~TokenMaskExchange() {
-    // The Program drains DeviceContext before any bound session or exchange dies.
+    // The owner drains every submission stream before any bound session or exchange dies.
     if (masks_ready_) { (void)cudaEventDestroy(masks_ready_); }
     if (candidates_ready_) { (void)cudaEventDestroy(candidates_ready_); }
 }
@@ -80,6 +115,7 @@ void TokenMaskExchange::bind(std::span<const OutputSession* const> outputs,
     }
     outputs_.assign(outputs.begin(), outputs.end());
     configs_.assign(sampling.begin(), sampling.end());
+    results_.assign(outputs.size(), TokenMaskResult{});
     error_ = {};
 }
 
@@ -197,31 +233,38 @@ void TokenMaskExchange::fill() {
     const auto* ids    = static_cast<const TokenId*>(host_ids_.data());
     auto* parents      = static_cast<std::int32_t*>(host_parents_.data());
     for (std::size_t row = 0; row < outputs_.size(); ++row) {
-        configs[row]                             = configs_[row];
-        configs[row].allowed_token_words         = nullptr;
-        configs[row].allowed_token_column_stride = 0;
-        if (!outputs_[row] || !outputs_[row]->has_token_masks()) { continue; }
+        configs[row] = configs_[row];
         if (counts[row] < 1 || static_cast<std::size_t>(counts[row]) > width_) {
             throw std::logic_error("invalid token grammar verification node count");
         }
         const auto count = static_cast<std::size_t>(counts[row]);
+        results_[row]    = {.safe_columns = count};
+        // A caller without a session may supply a one-shot root mask. Its row must
+        // have one valid column; only sessions can extend a policy over a prefix.
+        if (!outputs_[row] || !outputs_[row]->has_token_masks()) { continue; }
         if (!tree_) {
             for (std::size_t node = 0; node < count; ++node) {
                 parents[row * width_ + node] = static_cast<std::int32_t>(node) - 1;
             }
         }
         std::fill_n(host_mask(row), width_ * kWords, ~std::uint32_t{0});
-        outputs_[row]->fill_token_masks({ids + row * width_, count},
-                                        {parents + row * width_, count},
-                                        {host_mask(row), count * kWords});
-        validate_budget_domain(*outputs_[row], configs[row], host_mask(row), count);
+        results_[row] =
+            fill_token_mask_row(*outputs_[row], configs[row], {ids + row * width_, count},
+                                {parents + row * width_, count}, {host_mask(row), count * kWords});
         configs[row].allowed_token_words         = device_mask(row);
         configs[row].allowed_token_column_stride = kWords;
     }
 }
 
-void TokenMaskExchange::rethrow_error() const {
+std::span<const TokenMaskResult> TokenMaskExchange::results() const {
     if (error_) { std::rethrow_exception(error_); }
+    return results_;
+}
+
+void TokenMaskExchange::rethrow_error() const {
+    for (const auto& result : results()) {
+        if (result.error) { std::rethrow_exception(result.error); }
+    }
 }
 
 } // namespace ninfer::targets::qwen3_6

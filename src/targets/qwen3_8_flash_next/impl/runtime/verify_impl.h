@@ -42,6 +42,11 @@ Forward::VerifyStorage Forward::allocate_verify(Allocator& allocator, const Forw
         storage.lengths        = allocator.alloc(DType::I32, {lanes});
         storage.anchors        = allocator.alloc(DType::I32, {lanes});
         storage.count_snapshot = allocator.alloc(DType::I32, {kVocabRows, lanes});
+        storage.token_masks =
+            allocator.alloc(DType::I32, {(kTokenDomain + 31) / 32, kDflashWidth, lanes});
+        storage.mask_sampling = allocator.alloc(
+            DType::U8, {static_cast<std::int32_t>(sizeof(ops::SamplingConfig)), lanes});
+        storage.mask_nodes = allocator.alloc(DType::I32, {kDflashWidth, lanes, 2});
     }
     return storage;
 }

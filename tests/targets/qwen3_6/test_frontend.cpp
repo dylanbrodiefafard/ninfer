@@ -9,6 +9,7 @@
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 #include "targets/qwen3_6/impl/frontend/token_grammar.h"
+#include "targets/qwen3_6/impl/frontend/token_masks.h"
 #include "targets/qwen3_6/official_tokenizer_dir.h"
 #include "text/unicode.h"
 
@@ -1756,6 +1757,36 @@ int test_single_reasoning_close(const Frontend& frontend) {
     return failures;
 }
 
+// Independent state-transition oracle: compare each hypothetical chain column with
+// the root mask after publishing exactly that prefix into another session.
+int check_chain_masks(ninfer::targets::qwen3_6::OutputSession& hypothetical,
+                      ninfer::targets::qwen3_6::OutputSession& committed,
+                      std::span<const ninfer::TokenId> nodes) {
+    const auto words = fi::TokenGrammarState::mask_words;
+    std::vector<std::int32_t> parents(nodes.size());
+    for (std::size_t node = 0; node < nodes.size(); ++node) {
+        parents[node] = static_cast<std::int32_t>(node) - 1;
+    }
+    std::vector<std::uint32_t> masks(nodes.size() * words), root(words), unchanged(words);
+    hypothetical.fill_token_masks(nodes, parents, masks);
+    int failures = 0;
+    const std::array<ninfer::TokenId, 1> root_id{0};
+    const std::array<std::int32_t, 1> root_parent{-1};
+    for (std::size_t node = 0; node < nodes.size(); ++node) {
+        if (node != 0) {
+            (void)committed.preview(nodes.subspan(node, 1), 100, ninfer::FinishReason::OutputLimit);
+            (void)committed.commit_preview();
+        }
+        committed.fill_token_masks(root_id, root_parent, root);
+        failures += check(std::equal(root.begin(), root.end(), masks.begin() + node * words),
+                          "chain column mask differs from independently committed prefix");
+    }
+    hypothetical.fill_token_masks(root_id, root_parent, unchanged);
+    failures += check(std::equal(unchanged.begin(), unchanged.end(), masks.begin()),
+                      "hypothetical chain mask fill mutated committed output state");
+    return failures;
+}
+
 int test_reasoning_token_limit(const Frontend& frontend) {
     using ninfer::FinishReason;
     using ninfer::OutputChannel;
@@ -1781,6 +1812,8 @@ int test_reasoning_token_limit(const Frontend& frontend) {
                  (static_cast<unsigned>(token) % 32)) &
                 1U) != 0;
     };
+    auto serial = frontend.make_output_session(prompt, {}, cap);
+    failures += check_chain_masks(session, serial, nodes);
     session.fill_token_masks(nodes, parents, masks);
     failures += check(permits(0, 1) && permits(1, 248069) && !permits(1, 15) &&
                           !permits(2, 248069) && permits(2, 15),
@@ -1811,6 +1844,53 @@ int test_reasoning_token_limit(const Frontend& frontend) {
     (void)session.preview(std::array<TokenId, 1>{15}, 1, FinishReason::OutputLimit);
     failures += check(channel_text(session.commit_preview(), OutputChannel::Content) == "answer",
                       "reasoning limit prevented ordinary answer continuation");
+
+    // A real empty-domain failure moves from a hypothetical node to the committed
+    // root after publishing its safe prefix. Other rows must retain their own masks.
+    for (std::size_t failed_node = 0; failed_node < 4; ++failed_node) {
+        auto failing = frontend.make_output_session(
+            prompt, {}, {.thinking_token_budget = static_cast<std::uint32_t>(failed_node + 1)});
+        (void)failing.preview(std::array<TokenId, 1>{1}, 100, FinishReason::OutputLimit);
+        (void)failing.commit_preview();
+        const std::array<TokenId, 4> chain{0, 1, 1, 1};
+        std::vector<std::uint32_t> filled(chain.size() * fi::TokenGrammarState::mask_words);
+        ninfer::ops::SamplingConfig suppressed;
+        suppressed.suppressed_token_count = 1;
+        suppressed.suppressed_tokens[0]   = 248069;
+        const auto result = ninfer::targets::qwen3_6::fill_token_mask_row(failing, suppressed,
+                                                                          chain, parents, filled);
+        failures += check(result.error && result.safe_columns == failed_node,
+                          "mask failure was not attributed to its first hypothetical node");
+        failures += check(
+            std::all_of(filled.begin() + static_cast<std::ptrdiff_t>(
+                                             failed_node * fi::TokenGrammarState::mask_words),
+                        filled.end(), [](std::uint32_t word) { return word == ~std::uint32_t{0}; }),
+            "failed hypothesis tail did not receive safe device fallback masks");
+        if (failed_node != 0) {
+            std::vector<std::uint32_t> expected(failed_node * fi::TokenGrammarState::mask_words);
+            failing.fill_token_masks(std::span(chain).first(failed_node),
+                                     std::span(parents).first(failed_node), expected);
+            failures += check(std::equal(expected.begin(), expected.end(), filled.begin()),
+                              "failing tail corrupted the exact preceding masks");
+        }
+        const auto healthy =
+            ninfer::targets::qwen3_6::fill_token_mask_row(failing, {}, chain, parents, filled);
+        failures += check(!healthy.error && healthy.safe_columns == chain.size() &&
+                              failing.reasoning_limit_stats().used_tokens == 1,
+                          "failed mask fill poisoned another row or committed budget state");
+        for (std::size_t node = 0; node < failed_node; ++node) {
+            (void)failing.preview(std::array<TokenId, 1>{1}, 100, FinishReason::OutputLimit);
+            (void)failing.commit_preview();
+        }
+        const std::array<TokenId, 1> root{0};
+        const std::array<std::int32_t, 1> root_parent{-1};
+        const auto at_root = ninfer::targets::qwen3_6::fill_token_mask_row(
+            failing, suppressed, root, root_parent,
+            std::span(filled).first(fi::TokenGrammarState::mask_words));
+        failures +=
+            check(at_root.error && at_root.safe_columns == 0,
+                  "hypothetical constraint failure did not resurface at the committed root");
+    }
 
     auto natural = frontend.make_output_session(prompt, {}, {.thinking_token_budget = 3});
     (void)natural.preview(std::array<TokenId, 2>{3, 4}, 10, FinishReason::OutputLimit);
@@ -3208,6 +3288,10 @@ int test_declared_tool_publication() {
     auto prompt  = frontend.prepare(std::move(input));
     auto output  = frontend.make_output_session(prompt, {});
     int failures = check(output.has_token_grammar(), "declared tools did not attach a grammar");
+    auto hypothetical = frontend.make_output_session(prompt, {});
+    auto serial       = frontend.make_output_session(prompt, {});
+    failures +=
+        check_chain_masks(hypothetical, serial, std::array<ninfer::TokenId, 4>{0, 16, 17, 32});
     const std::vector<ninfer::TokenId> tokens{22, 16, 17, 32, 18, 32, 32, 19, 32, 20};
     std::string visible;
     for (auto token : tokens) {

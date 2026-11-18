@@ -9,7 +9,7 @@ target_sources(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/token_grammar.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/generation_recovery.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/prefix_identity.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/token_masks.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/token_masks.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/kv_ram_cache.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/kv_disk_cache.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/decoder_state.cpp
