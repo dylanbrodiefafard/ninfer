@@ -582,3 +582,87 @@ Ordered ownership packages, allowing parallel implementation without shared-file
 Until handoff, the concurrent Op/CMake/test owner keeps those files exclusively. Resolve API
 changes through that owner, not overlapping edits or a second helper Op. This design task writes
 only this document; it does not execute any of the implementation or GPU-verification packages.
+
+## 11. Second stage: both-card prefill, streaming load and a cold host residue
+
+Starts after the decode qualification of §8 passes. It changes the product contract above:
+with a helper, prefill also runs on both cards, and host RAM holds only the experts neither card
+keeps. The CUDA-only configuration keeps its pinned 50.3 GB store and streaming windows; only
+its load path changes (11.3).
+
+### 11.1 Three-tier placement
+
+Placement stays static for the Program's lifetime and is still computed after the KV, lane,
+workspace and helper reservations. Counts come from the compiled profile, generated from the
+served route-profile JSON.
+
+- **P, pinned on the 5090:** the highest-count records filling every fixed slot of both codec
+  pools (the 11% NVFP4 split is unchanged). Admission never evicts P.
+- **H, on the R9700:** as in §3, taken outside P in descending `count / record_bytes` until the
+  31 GiB budget is full.
+- **T, the tail:** everything else. It lives in a pinned, device-mapped **host residue** that
+  holds only T. On the 5090, T uses only flex slots, filled on demand and by the background
+  refill of `flash-next-flex-reclaim`. When a T record is not resident, `moe_experts` reads it
+  through its mapped host address, as it does today. NVFP4 records of T are always read through
+  mapped memory, because flex slots are F3-only.
+
+When P and H together cover all 24,576 records, T is empty: no host residue and no flex demand.
+Small KV configurations reach this (§3, capacity table). At `--kv-capacity 1000000` with 8
+lanes, the planning estimate is P about 12 GB, H 33.3 GB and T about 5 GB, about 2,400 records
+and 0.14% of route assignments in the VM profile. The startup log reports the actual values.
+
+`ExpertResidency` owns a pinned fixed region (P, written once at load and never a victim) and the
+flex pool (T only). Admission, staging and frequency state cover only T. The P and H masks are
+uploaded once, next to the existing helper eligibility bitset.
+
+### 11.2 Prefill on both cards
+
+Prefill uses the grouped route of the helper expert Op (`kMoeHelperExpertsMaxTokens` = 16,384,
+commit 64d3dfda on `flash-next-helper-prefill`). For each sub-chunk of a layer, the 5090
+partitions helper-owned routes and sends the BF16 activations, IDs and weights over the
+mailbox's DMA path. The R9700 returns a **BF16** partial for prefill (FP32 stays for decode). The
+5090 joins it with its local partial.
+
+- **Overlap.** Prefill is layer-major over the super-chunk (plan, "Prefill runs layer-major"). A
+  sub-chunk's MoE output feeds only the next layer, so the helper work of sub-chunk s overlaps the
+  5090's mixer and local experts for sub-chunks s+1 and later. Per layer, only the last
+  sub-chunk's round trip is exposed. Link cost at 4,096 tokens is about 21 MB each way, about
+  3.2 ms per direction at the measured x4 rate; the R9700 needs 1.83 ms per layer at that size.
+- **Windows.** In helper mode, the streaming windows and their per-super-chunk copies (about 1 s
+  for each windowed super-chunk) are removed. P is resident; H runs remotely; T is read through
+  mapped memory. Prefill no longer evicts or borrows decode cache slots.
+- **Numerical profile.** The BF16 return adds one BF16 rounding of the helper partial before the
+  join. This is a declared implementation profile for prefill only, and it amends the §2
+  "no intermediate BF16 merge" boundary of the criteria for this route. It is gated by the same
+  frozen OFF-versus-ON method as §8's tonight gate: teacher-forced 4x512 panel, mean/p99 KL and
+  top-1 against the same reference. Decode remains FP32-joined.
+- **Interruption** stays at 16,384-token super-chunk boundaries. A helper prefill round
+  completes or poisons like a decode round. There is no CUDA-only fallback.
+
+### 11.3 Streaming load
+
+No artifact page cache and no 50 GB temporary. The two codec record tensors are read
+sequentially with `O_DIRECT` into four reusable pinned bounce buffers of 64 MiB. Each record goes
+straight to its destination: a P slot (CUDA H2D on the copy stream), an H bank (HIP H2D), or the
+host residue (CPU copy). A buffer is reused only after the events of all copies from it
+complete. Non-expert tensors use the same reader. Peak extra host memory is 256 MiB plus the
+residue.
+
+- The CUDA-only configuration streams into its pinned store the same way, which removes the page
+  cache copy of 55 GB but keeps the 50.3 GB store.
+- Verification: the existing bounded per-record checksum readback, extended to P slots and the
+  residue, against CPU checksums of the read file bytes.
+- Load time: measure the host's native sequential read rate of the artifact. The VM's 2-minute
+  read is a virtio `cache=none` figure, not a host one.
+
+### 11.4 Packages
+
+| Package | Deliverable | Verification |
+|---|---|---|
+| 8. Placement v2 and residue | P/H/T placement, pinned P region, T-only admission/flex, residue store; AGENTS.md and plan contract wording | CPU placement oracle (exact masks/bytes at small KV and 1M/8 lanes); admission never evicts P; full-coverage case has no residue; decode exact versus §8's qualified helper build when T is empty |
+| 9. Streaming loader | `O_DIRECT` bounce-buffer reader for all tensors, direct dispatch to P/H/residue/store | Exact record checksums on every destination; peak RSS and load time on the host |
+| 10. Both-card prefill | Forward prefill rounds, mailbox prefill transport, BF16-return variant of the grouped Op (owner: Op/kernel owner), window removal in helper mode | FP64 Op oracle for the BF16-return route; frozen OFF-versus-ON panel gate; prefill/decode state exactness, interruption and tiers; prefill tok/s at 1.7K, 16K and 64K tokens, ON versus OFF |
+
+Package 8 precedes 9 (the loader needs the masks). Package 10 can proceed in parallel with 9.
+The idle-timeout eviction and background refill (branch `flash-next-flex-reclaim`) are separate
+and apply to both configurations.
