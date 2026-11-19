@@ -626,8 +626,10 @@ mailbox's DMA path. The R9700 returns a **BF16** partial for prefill (FP32 stays
 - **Overlap.** Prefill is layer-major over the super-chunk (plan, "Prefill runs layer-major"). A
   sub-chunk's MoE output feeds only the next layer, so the helper work of sub-chunk s overlaps the
   5090's mixer and local experts for sub-chunks s+1 and later. Per layer, only the last
-  sub-chunk's round trip is exposed. Link cost at 4,096 tokens is about 21 MB each way, about
-  3.2 ms per direction at the measured x4 rate; the R9700 needs 1.83 ms per layer at that size.
+  sub-chunk's round trip is exposed. At 4,096 tokens that is about 21 MB each way: 3.26 ms one
+  way alone, and 3.94 ms for both directions in flight (measured 6.3 GB/s H2D and 5.3 GB/s D2H
+  concurrently, `ninfer_expert_helper_link_probe`). The R9700 needs 1.81 ms per layer with BF16
+  return at that size.
 - **Windows.** In helper mode, the streaming windows and their per-super-chunk copies (about 1 s
   for each windowed super-chunk) are removed. P is resident; H runs remotely; T is read through
   mapped memory. Prefill no longer evicts or borrows decode cache slots.
