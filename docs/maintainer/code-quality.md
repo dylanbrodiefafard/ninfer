@@ -75,7 +75,15 @@ updates. The HIP compiler is `/opt/rocm/core-10.0/lib/llvm/bin/clang++` with
 and the host `render` group to the CUDA builder's devices, mounts the checkout at `/src` and its
 own `ninfer-dual-gpu-build-cache` volume at `/build`, and mounts `NINFER_MODELS_DIR` at `/models`
 and `NINFER_DATA_DIR` at `/data` read-only when they are set. The script header lists the other
-overrides. An existing container keeps its original image and mounts until it is recreated.
+overrides. An existing container keeps its original image, mounts and environment until it is
+recreated.
+
+The script requires `NINFER_DUAL_HELPER_ROCM_UUID`, the R9700's ROCm UUID: the `Uuid` of the
+`gfx1201` agent in `rocminfo` (`GPU-` followed by hex digits; the host's iGPU has none). The
+container sets `ROCR_VISIBLE_DEVICES` to it and `HIP_VISIBLE_DEVICES=0`, so HIP sees exactly the
+R9700. The HIP runtime also treats `CUDA_VISIBLE_DEVICES` as a device filter, so without
+`HIP_VISIBLE_DEVICES` a `CUDA_VISIBLE_DEVICES` naming the NVIDIA primary hides the R9700 and
+helper startup fails. Keep those variables when running NInfer in that container.
 
 Configure the optional feature explicitly in that container (the default remains OFF):
 

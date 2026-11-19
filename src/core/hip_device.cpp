@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 
 namespace ninfer {
@@ -37,7 +38,21 @@ bool complete(hipError_t status) {
 } // namespace
 
 HipDevice::HipDevice(std::string_view pci) : pci_(normalize_helper_pci(pci)) {
-    check(hipDeviceGetByPCIBusId(&ordinal_, pci_.c_str()), "select PCI device");
+    if (const hipError_t status = hipDeviceGetByPCIBusId(&ordinal_, pci_.c_str());
+        status != hipSuccess) {
+        std::string message = std::string("expert helper HIP: select PCI device ") + pci_ + ": " +
+                              hipGetErrorString(status);
+        // The HIP runtime also applies CUDA_VISIBLE_DEVICES, normally the NVIDIA primary's UUID,
+        // as its own device filter; HIP_VISIBLE_DEVICES overrides it.
+        if (std::getenv("CUDA_VISIBLE_DEVICES") != nullptr &&
+            std::getenv("HIP_VISIBLE_DEVICES") == nullptr) {
+            message += "; CUDA_VISIBLE_DEVICES is set and HIP_VISIBLE_DEVICES is not, and HIP "
+                       "applies CUDA_VISIBLE_DEVICES as its device filter: set "
+                       "HIP_VISIBLE_DEVICES=0 and ROCR_VISIBLE_DEVICES to the helper's ROCm "
+                       "UUID (the Uuid of its gfx1201 agent in rocminfo)";
+        }
+        throw HipError(message);
+    }
     bind();
     hipDeviceProp_t properties{};
     check(hipGetDeviceProperties(&properties, ordinal_), "device properties");

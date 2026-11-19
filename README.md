@@ -326,6 +326,12 @@ routing, shared experts and the draft network stay on CUDA. This is not a genera
 a multi-GPU Engine. The flag defaults off; ordinary OFF builds discover no HIP toolchain and
 reject the option explicitly. See the [dual-card build recipe](docs/maintainer/code-quality.md#opt-in-dual-card-development-container).
 
+Dual-card runs need `ROCR_VISIBLE_DEVICES=<R9700 ROCm UUID>` (the `Uuid` of the `gfx1201` agent
+in `rocminfo`) and `HIP_VISIBLE_DEVICES=0` in the environment: the HIP runtime also honors
+`CUDA_VISIBLE_DEVICES` as its device filter, so a `CUDA_VISIBLE_DEVICES` that selects the NVIDIA
+primary hides the R9700 unless `HIP_VISIBLE_DEVICES` is set, and startup then fails naming this
+cause. The dual-card container script sets both.
+
 Placement uses a compiled routing profile, not a runtime JSON sidecar. Startup copies original
 expert records without repacking, checks their bytes and a mailbox nonce, and fails rather than
 falling back if the selected device or exchange is unusable. Extra host memory includes two
