@@ -4,10 +4,10 @@
 #include <string>
 
 // One CTA of 256 independent lanes checks every transported word, including odd-count metadata
-// tails and interleaved field association, and writes a nonce-bearing output. No shared state; bad
-// is an AMD-local atomic counter.
-__global__ void nonce(const void* x, const void* ids, const void* weights, const void* pairs,
-                      void* out, const std::uint32_t* count, std::uint32_t* bad) {
+// tails, and writes a nonce-bearing output in place into the response payload (out is the slot's
+// HIP partial alias), as the helper Op does. No shared state; bad is an AMD-local atomic counter.
+__global__ void nonce(const void* x, const void* ids, const void* weights, void* out,
+                      const std::uint32_t* count, std::uint32_t* bad) {
     const auto n      = *count;
     const auto* input = static_cast<const std::uint32_t*>(x);
     const auto seed   = n == 0 ? 0U : input[0];
@@ -19,12 +19,6 @@ __global__ void nonce(const void* x, const void* ids, const void* weights, const
             atomicAdd(bad, 1U);
         }
         if (static_cast<const std::uint32_t*>(weights)[i] != (seed ^ i ^ 0x56780000U)) {
-            atomicAdd(bad, 1U);
-        }
-        const auto* fields = static_cast<const std::uint32_t*>(pairs);
-        const auto field   = static_cast<std::size_t>(i) * 2;
-        if (fields[field] != (seed ^ i ^ 0x12340000U) ||
-            fields[field + 1] != (seed ^ i ^ 0x56780000U)) {
             atomicAdd(bad, 1U);
         }
     }
@@ -41,11 +35,10 @@ __global__ void delay(std::uint64_t ticks) {
     }
 }
 
-void mailbox_test_nonce(const void* x, const void* ids, const void* weights, const void* pairs,
-                        void* out, const std::uint32_t* count, std::uint32_t* bad,
+void mailbox_test_nonce(const void* x, const void* ids, const void* weights, void* out,
+                        const std::uint32_t* count, std::uint32_t* bad,
                         const ninfer::HipStream& stream) {
-    nonce<<<1, 256, 0, static_cast<hipStream_t>(stream.get())>>>(x, ids, weights, pairs, out, count,
-                                                                 bad);
+    nonce<<<1, 256, 0, static_cast<hipStream_t>(stream.get())>>>(x, ids, weights, out, count, bad);
     const auto status = hipGetLastError();
     if (status != hipSuccess) {
         throw ninfer::HipError(std::string("nonce launch: ") + hipGetErrorString(status));

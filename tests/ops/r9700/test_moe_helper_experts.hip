@@ -22,12 +22,14 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -150,6 +152,53 @@ private:
     T* data_ = nullptr;
     std::size_t count_;
 };
+
+// Host memory registered with HIP and mapped into the device, as the expert-helper mailbox's
+// response payload is: data() is the device alias, and the host reads the bytes directly.
+template <class T>
+class MappedHostArray {
+public:
+    explicit MappedHostArray(std::size_t count) : count_(count) {
+        const std::size_t bytes = (count * sizeof(T) + 4095) / 4096 * 4096;
+        host_                   = static_cast<T*>(std::aligned_alloc(4096, bytes));
+        if (host_ == nullptr) { throw std::bad_alloc(); }
+        try {
+            hip_check(hipHostRegister(host_, bytes, hipHostRegisterMapped), "hipHostRegister");
+        } catch (...) {
+            std::free(host_);
+            throw;
+        }
+        void* alias = nullptr;
+        if (hipHostGetDevicePointer(&alias, host_, 0) != hipSuccess) {
+            (void)hipHostUnregister(host_);
+            std::free(host_);
+            throw std::runtime_error("hipHostGetDevicePointer failed");
+        }
+        alias_ = static_cast<T*>(alias);
+    }
+
+    ~MappedHostArray() {
+        (void)hipHostUnregister(host_);
+        std::free(host_);
+    }
+
+    MappedHostArray(const MappedHostArray&)            = delete;
+    MappedHostArray& operator=(const MappedHostArray&) = delete;
+
+    [[nodiscard]] T* data() const noexcept { return alias_; }
+
+    [[nodiscard]] std::vector<T> download() const { return std::vector<T>(host_, host_ + count_); }
+
+    void fill_bytes(int value) { std::memset(host_, value, count_ * sizeof(T)); }
+
+private:
+    T* host_  = nullptr;
+    T* alias_ = nullptr;
+    std::size_t count_;
+};
+
+// Where a Run's y lives: device memory, or host memory mapped into the device.
+enum class YMemory : std::uint8_t { Device, MappedHost };
 
 float bf16_round(float value) {
     std::uint32_t bits = 0;
@@ -290,11 +339,17 @@ BankState make_bank(RecordSet set, std::uint32_t seed) {
     return bank;
 }
 
+// One route entry of a compact token, uploaded as the Op's expert and weight planes.
+struct Route {
+    std::int32_t expert;
+    float weight;
+};
+
 struct Inputs {
     int tokens; // N
     int max_tokens;
     std::vector<float> x; // [max_tokens][2560], BF16-representable
-    std::vector<ops::MoeHelperRoute> routes;
+    std::vector<Route> routes;
 };
 
 // How a case routes its tokens. Skewed: moe_route-like top-10 of biased logits, so popular
@@ -329,7 +384,7 @@ Inputs make_inputs(const BankState& bank, int tokens, int max_tokens, Routing ro
     const auto rows = static_cast<std::size_t>(max_tokens);
     Inputs inputs{
         tokens, max_tokens, std::vector<float>(rows * kHidden),
-        std::vector<ops::MoeHelperRoute>(rows * kRoutes, {ops::kMoeHelperInactiveExpert, 0.0F})};
+        std::vector<Route>(rows * kRoutes, {ops::kMoeHelperInactiveExpert, 0.0F})};
     std::uniform_real_distribution<float> value(-2.0F, 2.0F);
     for (auto& v : inputs.x) { v = bf16_round(value(rng)); }
     std::vector<double> bias(kExperts);
@@ -368,7 +423,7 @@ Inputs make_inputs(const BankState& bank, int tokens, int max_tokens, Routing ro
     return inputs;
 }
 
-bool active(const ops::MoeHelperRoute& route) {
+bool active(const Route& route) {
     return route.expert >= 0 && route.expert < kExperts;
 }
 
@@ -421,14 +476,21 @@ bool has_active(const Inputs& inputs, int t) {
 class Run {
 public:
     Run(const Fixture& fixture, const DeviceArray<std::uint8_t>& store, const Inputs& inputs,
-        OutputDtype dtype = OutputDtype::Fp32, Profile profile = Profile::A16)
+        OutputDtype dtype = OutputDtype::Fp32, Profile profile = Profile::A16,
+        YMemory y_memory = YMemory::Device)
         : fixture_(fixture), store_(store), inputs_(inputs), dtype_(dtype), profile_(profile),
           rows_(static_cast<std::size_t>(inputs.max_tokens)), tokens_(1),
           x_(profile == Profile::A16 ? rows_ * kHidden : 1),
           x_codes_(profile == Profile::A8 ? rows_ * kHidden : 1),
-          x_scales_(profile == Profile::A8 ? rows_ : 1), routes_(rows_ * kRoutes),
+          x_scales_(profile == Profile::A8 ? rows_ : 1), experts_(rows_ * kRoutes),
+          weights_(rows_ * kRoutes),
           table_(kExperts), scales_(kExperts * 3),
-          y_(rows_ * kHidden * (dtype == OutputDtype::Bf16 ? 1 : 2)) {
+          y_(y_memory == YMemory::Device ? rows_ * kHidden * (dtype == OutputDtype::Bf16 ? 1 : 2)
+                                         : 1) {
+        if (y_memory == YMemory::MappedHost) {
+            mapped_y_ = std::make_unique<MappedHostArray<std::uint16_t>>(
+                rows_ * kHidden * (dtype == OutputDtype::Bf16 ? 1 : 2));
+        }
         if (profile == Profile::A8) {
             const E4m3Rows rows = quantize_rows(inputs.x.data(), rows_, kHidden);
             x_codes_.upload(rows.codes);
@@ -438,7 +500,14 @@ public:
             for (std::size_t i = 0; i < x_bits.size(); ++i) { x_bits[i] = bf16_bits(inputs.x[i]); }
             x_.upload(x_bits);
         }
-        routes_.upload(inputs.routes);
+        std::vector<std::int32_t> experts(inputs.routes.size());
+        std::vector<float> weights(inputs.routes.size());
+        for (std::size_t e = 0; e < inputs.routes.size(); ++e) {
+            experts[e] = inputs.routes[e].expert;
+            weights[e] = inputs.routes[e].weight;
+        }
+        experts_.upload(experts);
+        weights_.upload(weights);
         const std::int32_t n = inputs.tokens;
         tokens_.upload(&n, 1);
     }
@@ -466,11 +535,11 @@ public:
         } else {
             args.x = x_.data();
         }
-        args.routes             = routes_.data();
+        args.routes             = {experts_.data(), weights_.data()};
         args.bank.expert_table  = table_.data();
         args.bank.matrix_scales = scales_.data();
         args.bank.f3_books      = fixture_.books;
-        args.y                  = y_.data();
+        args.y                  = mapped_y_ ? mapped_y_->data() : y_.data();
         args.output_dtype       = dtype_;
         return args;
     }
@@ -485,12 +554,16 @@ public:
 
     // Poisons y and waits for the fill, so no stream can run ahead of it.
     void poison() {
-        y_.fill_bytes(0xFF);
+        if (mapped_y_) {
+            mapped_y_->fill_bytes(0xFF);
+        } else {
+            y_.fill_bytes(0xFF);
+        }
         hip_check(hipDeviceSynchronize(), "poison y");
     }
 
     [[nodiscard]] std::vector<std::uint32_t> output() const {
-        const std::vector<std::uint16_t> y = y_.download();
+        const std::vector<std::uint16_t> y = mapped_y_ ? mapped_y_->download() : y_.download();
         std::vector<std::uint32_t> bits(rows_ * kHidden);
         if (dtype_ == OutputDtype::Bf16) {
             for (std::size_t i = 0; i < y.size(); ++i) {
@@ -513,10 +586,12 @@ private:
     DeviceArray<std::uint16_t> x_;
     DeviceArray<std::uint8_t> x_codes_;
     DeviceArray<float> x_scales_;
-    DeviceArray<ops::MoeHelperRoute> routes_;
+    DeviceArray<std::int32_t> experts_;
+    DeviceArray<float> weights_;
     DeviceArray<std::uint64_t> table_;
     DeviceArray<float> scales_;
     DeviceArray<std::uint16_t> y_;
+    std::unique_ptr<MappedHostArray<std::uint16_t>> mapped_y_;
 };
 
 float bits_float(std::uint32_t bits) {
@@ -763,6 +838,28 @@ int queued_calls(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
     }
     (void)hipGraphExecDestroy(exec);
     return failures;
+}
+
+// A decode-extent call whose y is host memory mapped into the device (the expert-helper
+// mailbox's response payload, which the Op writes in place): the oracle's criterion, and the
+// bits of the same call with a device y.
+int mapped_output(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
+                  ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank) {
+    const char* label   = "T16 y in mapped host memory";
+    const Inputs inputs = make_inputs(bank, 16, 16, Routing::Skewed, 33U);
+    Run device(fixture, store, inputs);
+    Run mapped(fixture, store, inputs, OutputDtype::Fp32, Profile::A16, YMemory::MappedHost);
+    device.set_bank(bank);
+    mapped.set_bank(bank);
+    const std::vector<std::uint32_t> expected = mapped.invoke(workspace);
+    int failures                              = 0;
+    if (device.invoke(workspace) != expected) {
+        std::cerr << label << ": y differs from the device-memory call\n";
+        ++failures;
+    }
+    std::vector<Output> outputs;
+    outputs.push_back(Output{"A16", expected, {}, kCriterion});
+    return failures + verify(label, fixture, bank, inputs, outputs);
 }
 
 // At prefill extents a token's row depends only on its own inputs: reversing the tokens' order
@@ -1040,6 +1137,7 @@ int run() {
     };
     for (const Case& c : cases) { check_case(c); }
 
+    failures += mapped_output(*fixture, store, workspace, wide);
     for (const auto dtype : {OutputDtype::Fp32, OutputDtype::Bf16}) {
         failures += queued_calls(*fixture, store, prefill, wide, dtype);
         for (const auto profile : {Profile::A16, Profile::A8}) {

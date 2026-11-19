@@ -117,7 +117,6 @@ struct ExpertMailbox::Impl {
                 view->slots[i].host_activations = host.slots[i].activations;
                 view->slots[i].host_ids         = host.slots[i].ids;
                 view->slots[i].host_weights     = host.slots[i].weights;
-                view->slots[i].host_partial     = host.slots[i].partial;
             }
         }
         watchdog = std::jthread([this](const std::stop_token& stop) {
@@ -406,10 +405,12 @@ void qualify_expert_mailbox(ExpertMailbox& mailbox, void* cuda_stream,
     hip_stream.synchronize();
     try {
         static_cast<void>(mailbox.begin(1, cuda_stream, hip_stream));
-        expert_mailbox_hip_import(mailbox.hip_view(), 0, hx.data(), hi.data(), hw.data(),
-                                  static_cast<std::uint32_t*>(hn.data()), 1, hip_stream);
-        expert_mailbox_hip_export(mailbox.hip_view(), 0, hp.data(),
-                                  static_cast<std::uint32_t*>(hn.data()), 1, hip_stream);
+        expert_mailbox_hip_import(mailbox.hip_view(), 0, std::nullopt, hx.data(), hi.data(),
+                                  hw.data(), static_cast<std::uint32_t*>(hn.data()), 1, hip_stream);
+        expert_mailbox_hip_store_partial(mailbox.hip_view(), 0, hp.data(),
+                                         static_cast<std::uint32_t*>(hn.data()), 1, hip_stream);
+        expert_mailbox_hip_respond(mailbox.hip_view(), 0, static_cast<std::uint32_t*>(hn.data()), 1,
+                                   hip_stream);
         expert_mailbox_cuda_publish(mailbox.cuda_view(), 0, x.pointer, ids.pointer, weights.pointer,
                                     static_cast<std::uint32_t*>(count.pointer), cuda_stream);
         expert_mailbox_cuda_acquire(mailbox.cuda_view(), 0,

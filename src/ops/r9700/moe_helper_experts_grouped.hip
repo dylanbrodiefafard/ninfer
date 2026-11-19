@@ -230,7 +230,8 @@ constexpr Layout layout_of(std::int32_t capacity) {
 
 struct GroupParams {
     const std::int32_t* tokens;
-    const MoeHelperRoute* routes;
+    const std::int32_t* experts;
+    const float* weights;
     const std::uint64_t* expert_table;
     std::uint32_t* control;
     std::uint32_t* counts;
@@ -299,7 +300,7 @@ __global__ void __launch_bounds__(kGroupThreads) count_routes_kernel(const Group
 #pragma unroll
     for (int i = 0; i < kEntriesPerThread; ++i) {
         const int e = begin + tid + kGroupThreads * i;
-        experts[i]  = e < entries ? p.routes[e].expert : kMoeHelperInactiveExpert;
+        experts[i]  = e < entries ? p.experts[e] : kMoeHelperInactiveExpert;
     }
     lds_barrier();
 #pragma unroll
@@ -424,11 +425,13 @@ __global__ void __launch_bounds__(kGroupThreads) scatter_routes_kernel(const Gro
 
     // This block's entries: wave w, round i, lane l holds entry e = 4096 block + 512 w + 32 i + l.
     const int wave_begin = block * kGroupEntries + wave * kWaveEntries;
-    MoeHelperRoute routes[kEntriesPerThread];
+    std::int32_t experts[kEntriesPerThread];
+    float weights[kEntriesPerThread];
 #pragma unroll
     for (int i = 0; i < kEntriesPerThread; ++i) {
         const int e = wave_begin + kWaveSize * i + lane;
-        routes[i]   = e < entries ? p.routes[e] : MoeHelperRoute{kMoeHelperInactiveExpert, 0.0F};
+        experts[i]  = e < entries ? p.experts[e] : kMoeHelperInactiveExpert;
+        weights[i]  = active_expert(experts[i]) ? p.weights[e] : 0.0F;
     }
     for (int e = tid; e < kGroupWaves * kMoeHelperExperts; e += kGroupThreads) {
         bases[e / kMoeHelperExperts][e % kMoeHelperExperts] = 0;
@@ -436,7 +439,7 @@ __global__ void __launch_bounds__(kGroupThreads) scatter_routes_kernel(const Gro
     lds_barrier();
 #pragma unroll
     for (int i = 0; i < kEntriesPerThread; ++i) {
-        if (active_expert(routes[i].expert)) { atomicAdd(&bases[wave][routes[i].expert], 1U); }
+        if (active_expert(experts[i])) { atomicAdd(&bases[wave][experts[i]], 1U); }
     }
     lds_barrier();
     for (int x = 0; x < 2; ++x) {
@@ -452,7 +455,7 @@ __global__ void __launch_bounds__(kGroupThreads) scatter_routes_kernel(const Gro
 #pragma unroll
     for (int i = 0; i < kEntriesPerThread; ++i) {
         const int e         = wave_begin + kWaveSize * i + lane;
-        const int expert    = routes[i].expert;
+        const int expert    = experts[i];
         const bool valid    = active_expert(expert);
         std::uint32_t peers = __builtin_amdgcn_ballot_w32(valid);
 #pragma unroll
@@ -468,7 +471,7 @@ __global__ void __launch_bounds__(kGroupThreads) scatter_routes_kernel(const Gro
                     bases[wave][expert] +
                     static_cast<std::uint32_t>(__builtin_popcount(peers & lower_lanes));
                 p.token_of[at]  = static_cast<std::uint32_t>(e / kRoutes);
-                p.weight_of[at] = routes[i].weight;
+                p.weight_of[at] = weights[i];
                 position        = static_cast<std::int32_t>(at);
             }
             p.position[e] = position;
@@ -1402,7 +1405,8 @@ void moe_helper_experts_grouped(const MoeHelperExpertsArgs& args, std::byte* reg
     const int units     = unit_count(device);
 
     const GroupParams group{args.tokens,
-                            args.routes,
+                            args.routes.experts,
+                            args.routes.weights,
                             args.bank.expert_table,
                             control,
                             reinterpret_cast<std::uint32_t*>(region + layout.counts),

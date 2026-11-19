@@ -63,11 +63,10 @@ struct ExpertMailboxSlot {
     void* ids;
     void* weights;
     void* partial;
-    // CPU aliases are only for host-enqueued DMA, never kernel dereference.
+    // CPU aliases are only for host-enqueued T48 request DMA, never kernel dereference.
     void* host_activations = nullptr;
     void* host_ids         = nullptr;
     void* host_weights     = nullptr;
-    void* host_partial     = nullptr;
 };
 
 struct ExpertMailboxView {

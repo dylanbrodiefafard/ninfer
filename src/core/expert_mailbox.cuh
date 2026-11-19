@@ -16,7 +16,8 @@ __device__ inline std::uint64_t now_ns() {
 }
 
 __device__ inline void fail(ExpertMailboxView view, std::uint32_t layer, ExpertWireError code) {
-    // One CUDA stream, one leader per serialized kernel: this line has a single writer.
+    // One CUDA stream and one failure-writing leader per serialized kernel (observe_response
+    // never calls this): the line has a single writer.
     // Cancellation is drain control, not a fatal diagnosis. A later fatal cause may replace
     // cancellation on this side; peer records are never written and fatal records stay sticky.
     const auto own    = Error(view.failure->code).load(cuda::memory_order_acquire);
@@ -86,7 +87,17 @@ __device__ inline void publish_request(ExpertMailboxView view, std::uint32_t lay
     }
 }
 
-// Leader only. Caller broadcasts the result with a CTA barrier before any payload reader runs.
+// Leader only, after the sequence matched: the header must describe exactly this layer's Work
+// response for count compact tokens. Reads nothing but the header.
+__device__ inline bool response_matches(const ExpertWireHeader& header, ExpertMailboxView view,
+                                        std::uint32_t layer, std::uint32_t count) {
+    return header.version == kExpertWireVersion && header.layer == layer &&
+           header.tokens == view.control->tokens && header.compact_tokens == count &&
+           header.status == ExpertWireStatus::Work;
+}
+
+// Leader of the first acquiring CTA only, the layer's single CUDA failure writer. Caller
+// broadcasts the result with a CTA barrier before any payload reader runs.
 __device__ inline bool acquire_response(ExpertMailboxView view, std::uint32_t layer,
                                         std::uint32_t count) {
     if (count > view.control->tokens) {
@@ -110,12 +121,26 @@ __device__ inline bool acquire_response(ExpertMailboxView view, std::uint32_t la
         fail(view, layer, ExpertWireError::Cancelled);
         return false;
     }
-    if (header->version != kExpertWireVersion || header->layer != layer ||
-        header->tokens != view.control->tokens || header->compact_tokens != count ||
-        header->status != ExpertWireStatus::Work) {
+    if (!response_matches(*header, view, layer, count)) {
         fail(view, layer, ExpertWireError::Protocol);
         return false;
     }
     return true;
+}
+
+// Leader of every other acquiring CTA: the same acquire and checks, but no deadline and no
+// failure record. The first CTA is active whenever another is (count >= 1), and every way its
+// leader stops early (protocol, cancellation, deadline) leaves a cancellation or failure code
+// that cancelled() observes, so this wait ends within that leader's deadline. Caller broadcasts
+// the result with a CTA barrier before any payload reader runs.
+__device__ inline bool observe_response(ExpertMailboxView view, std::uint32_t layer,
+                                        std::uint32_t count) {
+    if (count > view.control->tokens) { return false; }
+    auto* header = view.slots[layer].response;
+    while (Sequence(header->sequence).load(cuda::memory_order_acquire) != view.control->sequence) {
+        if (cancelled(view)) { return false; }
+        __nanosleep(64);
+    }
+    return !cancelled(view) && response_matches(*header, view, layer, count);
 }
 } // namespace ninfer::expert_wire_cuda

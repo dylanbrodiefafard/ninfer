@@ -8,6 +8,9 @@
 // call's records into the next. Every call has max_tokens = T and N = T. Routing modes:
 //   all           moe_route-like: each token's ten experts are the top ten of biased random
 //                 logits, all owned by the helper (a decode round of helper-only experts).
+//   decode        all, with the helper owning the ids not divisible by 3 (341 experts) and the
+//                 other slots inactive: about 6.7 active entries per token, the helper share of
+//                 a measured 8-lane DFlash K1 decode (106 of 160 entries per T = 16 round).
 //   concentrated  every token routes the same ten experts (T tokens per expert).
 //   helper        prefill split: the helper owns ids not divisible by 3 (341 experts); each route
 //                 slot is a helper route with probability 0.2, conditioned on at least one per
@@ -19,7 +22,8 @@
 // warm clocks and touched workspace pages also at large T.
 //
 //   ninfer_moe_helper_experts_bench [--codec f3|nvfp4|mixed]
-//       [--routing all|concentrated|helper|skewed] [--output fp32|bf16] [--activation a16|a8]
+//       [--routing all|decode|concentrated|helper|skewed] [--output fp32|bf16]
+//       [--activation a16|a8]
 //       [--tokens T ...]
 #include "ninfer/ops/moe_helper_experts.h"
 
@@ -105,8 +109,14 @@ __global__ void read_records_kernel(const std::uint64_t* addresses, const std::u
     if (fold == 0x9E3779B9U) { sink[0] = fold; }
 }
 
+// One route entry, uploaded as the Op's expert and weight planes.
+struct Route {
+    std::int32_t expert;
+    float weight;
+};
+
 struct RouteSet {
-    std::vector<MoeHelperRoute> routes;
+    std::vector<Route> routes;
     std::vector<std::uint64_t> addresses; // distinct records
     std::vector<std::uint64_t> units;
     double bytes   = 0.0;
@@ -142,13 +152,14 @@ int main_impl(int argc, char** argv) {
             extents.push_back(std::stoi(argv[++i]));
         } else {
             std::cerr << "usage: " << argv[0]
-                      << " [--codec f3|nvfp4|mixed] [--routing all|concentrated|helper|skewed]"
+                      << " [--codec f3|nvfp4|mixed]"
+                         " [--routing all|decode|concentrated|helper|skewed]"
                          " [--output fp32|bf16] [--activation a16|a8] [--tokens T ...]\n";
             return 2;
         }
     }
-    if (routing != "all" && routing != "concentrated" && routing != "helper" &&
-        routing != "skewed") {
+    if (routing != "all" && routing != "decode" && routing != "concentrated" &&
+        routing != "helper" && routing != "skewed") {
         std::cerr << "unknown routing " << routing << '\n';
         return 2;
     }
@@ -220,8 +231,10 @@ int main_impl(int argc, char** argv) {
                             hipMemcpyHostToDevice),
                   "x scales");
     }
-    const DeviceArray<MoeHelperRoute> routes_buffer(kRouteSets * rows * kMoeHelperRoutesPerToken);
-    MoeHelperRoute* routes = routes_buffer.get();
+    const DeviceArray<std::int32_t> experts_buffer(kRouteSets * rows * kMoeHelperRoutesPerToken);
+    const DeviceArray<float> weights_buffer(kRouteSets * rows * kMoeHelperRoutesPerToken);
+    std::int32_t* experts = experts_buffer.get();
+    float* weights        = weights_buffer.get();
     const DeviceArray<std::uint64_t> addresses_buffer(kRouteSets * kMoeHelperExperts);
     const DeviceArray<std::uint64_t> units_buffer(kRouteSets * kMoeHelperExperts);
     const DeviceArray<std::uint32_t> sink_buffer(1);
@@ -301,6 +314,10 @@ int main_impl(int argc, char** argv) {
                         }
                     }
                     for (int j = 0; j < kMoeHelperRoutesPerToken; ++j) {
+                        if (routing == "decode" && order[j] % 3 == 0) {
+                            set.routes.push_back({kMoeHelperInactiveExpert, 0.0F});
+                            continue;
+                        }
                         set.routes.push_back({order[j], 0.1F});
                         distinct.insert(order[j]);
                         ++set.entries;
@@ -316,11 +333,20 @@ int main_impl(int argc, char** argv) {
         }
         for (int s = 0; s < kRouteSets; ++s) {
             const auto& set = sets[static_cast<std::size_t>(s)];
-            hip_check(hipMemcpy(routes + static_cast<std::size_t>(s) * max_extent *
-                                             kMoeHelperRoutesPerToken,
-                                set.routes.data(), set.routes.size() * sizeof(MoeHelperRoute),
-                                hipMemcpyHostToDevice),
-                      "routes");
+            std::vector<std::int32_t> set_experts(set.routes.size());
+            std::vector<float> set_weights(set.routes.size());
+            for (std::size_t e = 0; e < set.routes.size(); ++e) {
+                set_experts[e] = set.routes[e].expert;
+                set_weights[e] = set.routes[e].weight;
+            }
+            const std::size_t offset =
+                static_cast<std::size_t>(s) * max_extent * kMoeHelperRoutesPerToken;
+            hip_check(hipMemcpy(experts + offset, set_experts.data(),
+                                set_experts.size() * sizeof(std::int32_t), hipMemcpyHostToDevice),
+                      "experts");
+            hip_check(hipMemcpy(weights + offset, set_weights.data(),
+                                set_weights.size() * sizeof(float), hipMemcpyHostToDevice),
+                      "weights");
             hip_check(hipMemcpy(read_addresses + s * kMoeHelperExperts, set.addresses.data(),
                                 set.addresses.size() * 8, hipMemcpyHostToDevice),
                       "addresses");
@@ -353,8 +379,9 @@ int main_impl(int argc, char** argv) {
             } else {
                 args.x = x;
             }
-            args.routes =
-                routes + static_cast<std::size_t>(s) * max_extent * kMoeHelperRoutesPerToken;
+            const std::size_t offset =
+                static_cast<std::size_t>(s) * max_extent * kMoeHelperRoutesPerToken;
+            args.routes = {experts + offset, weights + offset};
             args.bank.expert_table  = table_device;
             args.bank.matrix_scales = scales_device;
             args.bank.f3_books      = {0x76419CEFU, 0x76419CEFU, 0x76419CEFU};
