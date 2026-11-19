@@ -85,7 +85,20 @@ void dflash_mask_cases(const Inputs& inputs) {
                             result.reasoning_limit.forced_closes == 1,
                         "masked chat did not exercise the reasoning-budget forced close");
             }
-            if (tools) {
+            // Declared tools arm the grammar mask whatever the model then emits. A reasoning
+            // budget of a few tokens can make the greedy model answer in prose instead of
+            // calling the tool, so only the unbudgeted case requires the call itself; budgeted
+            // speculative runs must publish exactly the reference's calls.
+            if (tools && budget != 0 && speculative) {
+                require(result.tool_calls.size() == references[test].tool_calls.size() &&
+                            std::ranges::equal(result.tool_calls, references[test].tool_calls,
+                                               [](const auto& a, const auto& b) {
+                                                   return a.name == b.name &&
+                                                          a.arguments_json == b.arguments_json;
+                                               }),
+                        "masked speculation changed the published tool calls");
+            }
+            if (tools && budget == 0) {
                 require(result.tool_calls.size() == 1 &&
                             result.tool_calls.front().name == "record_result" &&
                             nlohmann::json::parse(result.tool_calls.front().arguments_json) ==
