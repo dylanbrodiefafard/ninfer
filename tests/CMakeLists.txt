@@ -135,6 +135,13 @@ endforeach()
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES test_ninfer_artifact_reader.cpp
   LIBRARIES ninfer_artifact)
+# Streams both routed-record tensors of the real Flash-Next artifact (about 50 GB) with O_DIRECT
+# and compares them with a buffered read; needs no GPU.
+ninfer_add_test(ninfer_artifact_direct_stream_real_test
+  SOURCES test_artifact_direct_stream_real.cpp
+  LIBRARIES ninfer_artifact)
+set_tests_properties(ninfer_artifact_direct_stream_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
 ninfer_add_test(ninfer_cache_tensor_identity_test
   SOURCES test_cache_tensor_identity.cpp
   LIBRARIES ninfer_engine ninfer_artifact)

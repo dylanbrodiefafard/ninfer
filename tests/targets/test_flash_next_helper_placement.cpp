@@ -67,7 +67,9 @@ void check(std::span<const MoeExpertCodec> codecs, std::span<const std::uint64_t
     std::array<std::size_t, 2> helper_bytes{};
     std::array<std::size_t, 48> layer_bytes{};
     std::array<std::array<std::int32_t, 2>, 48> layer_counts{};
-    std::uint64_t helper_routes = 0, total_routes = 0;
+    std::array<std::int32_t, 2> primary_counts{}, tail_counts{};
+    std::array<std::size_t, 2> primary_bytes{}, tail_bytes{};
+    std::uint64_t helper_routes = 0, total_routes = 0, primary_routes = 0, tail_routes = 0;
     for (const auto i : candidates) {
         if (bytes(i) <= available) {
             helper[i] = true;
@@ -89,14 +91,50 @@ void check(std::span<const MoeExpertCodec> codecs, std::span<const std::uint64_t
         } else {
             ++local_counts[tag];
         }
+        require((actual.tier(i) == ExpertPlacementTier::Primary) == protected_core[i]);
+        require((actual.tier(i) == ExpertPlacementTier::Helper) == helper[i]);
+        if (protected_core[i]) {
+            ++primary_counts[tag];
+            primary_bytes[tag] += bytes(i);
+            primary_routes += counts[i];
+        } else if (!helper[i]) {
+            ++tail_counts[tag];
+            tail_bytes[tag] += bytes(i);
+            tail_routes += counts[i];
+        }
+    }
+    require(actual.primary_counts == primary_counts && actual.tail_counts == tail_counts);
+    require(actual.primary_bytes == primary_bytes && actual.tail_bytes == tail_bytes);
+    require(actual.primary_routes == primary_routes && actual.tail_routes == tail_routes);
+    require(primary_routes + helper_routes + tail_routes == total_routes);
+    for (std::size_t tag = 0; tag < 2; ++tag) {
+        require(primary_counts[tag] == fixed[tag]);
+        require(primary_counts[tag] + helper_counts[tag] + tail_counts[tag] ==
+                static_cast<std::int32_t>(std::ranges::count_if(
+                    codecs, [&](MoeExpertCodec c) { return static_cast<std::size_t>(c) == tag; })));
     }
     require(actual.helper_counts == helper_counts && actual.remaining_counts == local_counts);
     require(actual.helper_bytes == helper_bytes && actual.layer_bytes == layer_bytes &&
             actual.layer_counts == layer_counts);
     require(actual.helper_routes == helper_routes && actual.total_routes == total_routes);
-    require(actual.full_coverage == expect_full && used <= budget);
+    require(actual.full_coverage == expect_full &&
+            (tail_counts == std::array<std::int32_t, 2>{}) == expect_full && used <= budget);
     std::printf("placement budget=%zu fixed=%d/%d helper=%d/%d bytes=%zu full=%d exact=ok\n",
                 budget, fixed[0], fixed[1], helper_counts[0], helper_counts[1], used, expect_full);
+}
+
+// Independent restatement of the documented slot split: 11% of the budget to NVFP4 slots, F3 slots
+// take the rest, NVFP4 slots grow into what F3 cannot use; no pool exceeds its codec count.
+std::array<std::int32_t, 2> fixed_slots(std::uint64_t budget) {
+    const std::uint64_t nvfp4_record = 2764800, f3_record = 1996800, nvfp4_total = 1583,
+                        f3_total = 22993;
+    auto fit = [](std::uint64_t bytes, std::uint64_t record, std::uint64_t total) {
+        return std::min(bytes / record, total);
+    };
+    const auto nvfp4 = fit(budget / 100 * 11, nvfp4_record, nvfp4_total);
+    const auto f3    = fit(budget - nvfp4 * nvfp4_record, f3_record, f3_total);
+    return {static_cast<std::int32_t>(fit(budget - f3 * f3_record, nvfp4_record, nvfp4_total)),
+            static_cast<std::int32_t>(f3)};
 }
 } // namespace
 
@@ -115,7 +153,24 @@ int main() {
               false); // skip a larger record and keep looking
         check(codecs, kExpertHelperCalibCounts, {1583, 22993}, 0,
               true); // no flex, full fixed coverage
+        // Small KV: the fixed pools hold at least 17.0 GB, so P plus a 31 GiB H leaves T empty.
+        // 1M-token KV with 8 lanes: a fixed budget near 12 GB leaves a nonempty T.
+        for (const std::uint64_t budget :
+             {std::uint64_t{24'600'000'000}, std::uint64_t{19'950'000'000},
+              std::uint64_t{17'100'000'000}}) {
+            check(codecs, kExpertHelperCalibCounts, fixed_slots(budget), std::size_t{31} << 30,
+                  true);
+        }
+        for (const std::uint64_t budget :
+             {std::uint64_t{12'000'000'000}, std::uint64_t{15'000'000'000}}) {
+            check(codecs, kExpertHelperCalibCounts, fixed_slots(budget), std::size_t{31} << 30,
+                  false);
+        }
         std::vector<std::uint64_t> zeros(codecs.size(), 0);
+        // H budget edge: exactly every record fits; 256 bytes less leaves a nonempty T.
+        constexpr std::size_t kAll = 1583 * std::size_t{2764800} + 22993 * std::size_t{1996800};
+        check(codecs, zeros, {0, 0}, kAll, true);
+        check(codecs, zeros, {0, 0}, kAll - 256, false);
         check(codecs, zeros, {1, 1}, std::size_t{60} << 30, true); // zeros included, stable ties
         zeros[0] = 100;
         zeros[1] = 1;

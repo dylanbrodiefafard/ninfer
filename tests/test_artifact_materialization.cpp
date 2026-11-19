@@ -242,8 +242,9 @@ int main() {
         require(parallel.stats().tensor_count == parallel_handles.size() &&
                     parallel.stats().h2d_bytes == parallel_handles.size() * 2 &&
                     parallel.stats().peak_staging_bytes ==
-                        8 * ninfer::artifact::Reader::direct_io_alignment,
-                "parallel materialization did not exercise eight reusable staging slots");
+                        ninfer::artifact::Reader::stream_buffer_count *
+                            ninfer::artifact::Reader::stream_buffer_bytes,
+                "multi-span materialization did not stream through the four bounce buffers");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
