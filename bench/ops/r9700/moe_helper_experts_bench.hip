@@ -16,7 +16,7 @@
 //   skewed        helper with popularity sigma 1.5: a few experts receive hundreds of tokens.
 //
 //   ninfer_moe_helper_experts_bench [--codec f3|nvfp4|mixed]
-//       [--routing all|concentrated|helper|skewed] [--tokens T ...]
+//       [--routing all|concentrated|helper|skewed] [--output fp32|bf16] [--tokens T ...]
 #include "ninfer/ops/moe_helper_experts.h"
 
 #include <hip/hip_runtime.h>
@@ -109,8 +109,9 @@ struct RouteSet {
 };
 
 int main_impl(int argc, char** argv) {
-    std::string codec_mode = "f3";
-    std::string routing    = "all";
+    std::string codec_mode            = "f3";
+    std::string routing               = "all";
+    MoeHelperOutputDtype output_dtype = MoeHelperOutputDtype::Fp32;
     std::vector<int> extents;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -118,12 +119,19 @@ int main_impl(int argc, char** argv) {
             codec_mode = argv[++i];
         } else if (arg == "--routing" && i + 1 < argc) {
             routing = argv[++i];
+        } else if (arg == "--output" && i + 1 < argc) {
+            const std::string dtype = argv[++i];
+            if (dtype != "fp32" && dtype != "bf16") {
+                throw std::invalid_argument("output must be fp32 or bf16");
+            }
+            output_dtype =
+                dtype == "bf16" ? MoeHelperOutputDtype::Bf16 : MoeHelperOutputDtype::Fp32;
         } else if (arg == "--tokens" && i + 1 < argc) {
             extents.push_back(std::stoi(argv[++i]));
         } else {
             std::cerr << "usage: " << argv[0]
                       << " [--codec f3|nvfp4|mixed] [--routing all|concentrated|helper|skewed]"
-                         " [--tokens T ...]\n";
+                         " [--output fp32|bf16] [--tokens T ...]\n";
             return 2;
         }
     }
@@ -209,7 +217,8 @@ int main_impl(int argc, char** argv) {
     hip_check(hipGetDeviceProperties(&properties, device), "properties");
     const int read_grid = properties.multiProcessorCount * 16;
 
-    std::printf("codec=%s routing=%s\n", codec_mode.c_str(), routing.c_str());
+    std::printf("codec=%s routing=%s output=%s\n", codec_mode.c_str(), routing.c_str(),
+                output_dtype == MoeHelperOutputDtype::Bf16 ? "bf16" : "fp32");
     std::printf("%5s %8s %9s %10s %10s %9s %9s %10s %7s %9s\n", "T", "entries", "distinct",
                 "MB/call", "op_us", "TFLOP/s", "op_GB/s", "read_us", "of_roof", "N0_us");
     for (const int tokens : extents) {
@@ -324,6 +333,7 @@ int main_impl(int argc, char** argv) {
             args.bank.matrix_scales = scales_device;
             args.bank.f3_books      = {0x76419CEFU, 0x76419CEFU, 0x76419CEFU};
             args.y                  = y;
+            args.output_dtype       = output_dtype;
             moe_helper_experts(args, workspace, nullptr);
         };
         const auto read_call = [&](int s) {

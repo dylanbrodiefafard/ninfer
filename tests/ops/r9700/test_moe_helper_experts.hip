@@ -47,14 +47,32 @@ constexpr int kPrefillCapacity = 4096;
 // projection rounded to BF16 (8 significant bits; relative RMS error about 2^-7 / sqrt(12) / 1.5
 // ~= 1.5e-3 for values spread over a binade). Its independent element errors pass through the
 // down matrix with the same gain as the product itself, so each route's contribution carries
-// about 1.5e-3 relative RMS error, and so does their weighted sum. The output is FP32 (no output
-// rounding); FP32 sums over K = 2560 and 640, the per-group E4M3 scaling and the FP32 SiLU stay
+// about 1.5e-3 relative RMS error, and so does their weighted sum. An FP32 output adds no output
+// rounding; FP32 sums over K = 2560 and 640, the per-group E4M3 scaling and the FP32 SiLU stay
 // below 1e-5. Expected relative L2 is about 1.5e-3; the bound allows 3e-3. Pointwise, the error
 // is Gaussian-like with RMS near 1.5e-3 rms(y) ~= 4e-4 max|y| (rms/max ~ 1/4 for these sums), so
 // six deviations stay under 2.5e-3 max|y|; the gross cap is 4e-3 of the largest reference
 // magnitude of the case, an absolute bound that elements cancelling to near zero also meet.
 constexpr test::ReductionCriterion kCriterion{/*relative_l2*/ 3.0e-3, /*gross_absolute*/ 0.0,
                                               /*gross_relative_to_max_reference*/ 4.0e-3};
+
+// BF16 output criterion, derived from one BF16 rounding of the FP32 partial z that kCriterion
+// bounds against the FP64 oracle r. Round to nearest even with 8 significant bits gives
+// |bf16(z) - z| <= u |z| per element, u = 2^-8 (BF16 has FP32's exponent range, so only FP32
+// subnormals, 2^-126 and below, could exceed it, by at most 2^-134 absolute). With
+// ||z - r|| <= e ||r|| and so ||z|| <= (1 + e) ||r||, the triangle inequality gives
+// ||bf16(z) - r|| <= (e + u (1 + e)) ||r||: in the L2 norm for relative_l2, and per element with
+// |z_i| <= (1 + g) max|r| for the gross cap g. The BF16 route is checked against the same
+// unrounded oracle with these bounds, and every element it writes must equal the RNE BF16 of the
+// FP32 route's element bit for bit.
+constexpr double kBf16UnitRoundoff = 0x1p-8;
+constexpr test::ReductionCriterion kBf16Criterion{
+    /*relative_l2*/ kCriterion.relative_l2 + kBf16UnitRoundoff * (1.0 + kCriterion.relative_l2),
+    /*gross_absolute*/ 0.0,
+    /*gross_relative_to_max_reference*/ kCriterion.gross_relative_to_max_reference +
+        kBf16UnitRoundoff * (1.0 + kCriterion.gross_relative_to_max_reference)};
+
+using OutputDtype = ops::MoeHelperOutputDtype;
 
 void hip_check(hipError_t status, const char* what) {
     if (status != hipSuccess) {
@@ -305,10 +323,12 @@ bool has_active(const Inputs& inputs, int t) {
 // Device bank, inputs and one Op invocation.
 class Run {
 public:
-    Run(const Fixture& fixture, const DeviceArray<std::uint8_t>& store, const Inputs& inputs)
-        : fixture_(fixture), store_(store), inputs_(inputs),
+    Run(const Fixture& fixture, const DeviceArray<std::uint8_t>& store, const Inputs& inputs,
+        OutputDtype dtype = OutputDtype::Fp32)
+        : fixture_(fixture), store_(store), inputs_(inputs), dtype_(dtype),
           rows_(static_cast<std::size_t>(inputs.max_tokens)), tokens_(1), x_(rows_ * kHidden),
-          routes_(rows_ * kRoutes), table_(kExperts), scales_(kExperts * 3), y_(rows_ * kHidden) {
+          routes_(rows_ * kRoutes), table_(kExperts), scales_(kExperts * 3),
+          y_(rows_ * kHidden * (dtype == OutputDtype::Bf16 ? 1 : 2)) {
         std::vector<std::uint16_t> x_bits(inputs.x.size());
         for (std::size_t i = 0; i < x_bits.size(); ++i) { x_bits[i] = bf16_bits(inputs.x[i]); }
         x_.upload(x_bits);
@@ -340,6 +360,7 @@ public:
         args.bank.matrix_scales = scales_.data();
         args.bank.f3_books      = fixture_.books;
         args.y                  = y_.data();
+        args.output_dtype       = dtype_;
         return args;
     }
 
@@ -358,9 +379,15 @@ public:
     }
 
     [[nodiscard]] std::vector<std::uint32_t> output() const {
-        const std::vector<float> y = y_.download();
-        std::vector<std::uint32_t> bits(y.size());
-        std::memcpy(bits.data(), y.data(), y.size() * sizeof(float));
+        const std::vector<std::uint16_t> y = y_.download();
+        std::vector<std::uint32_t> bits(rows_ * kHidden);
+        if (dtype_ == OutputDtype::Bf16) {
+            for (std::size_t i = 0; i < y.size(); ++i) {
+                bits[i] = static_cast<std::uint32_t>(y[i]) << 16;
+            }
+        } else {
+            std::memcpy(bits.data(), y.data(), bits.size() * sizeof(std::uint32_t));
+        }
         return bits;
     }
 
@@ -368,13 +395,14 @@ private:
     const Fixture& fixture_;
     const DeviceArray<std::uint8_t>& store_;
     const Inputs& inputs_;
+    OutputDtype dtype_;
     std::size_t rows_;
     DeviceArray<std::int32_t> tokens_;
     DeviceArray<std::uint16_t> x_;
     DeviceArray<ops::MoeHelperRoute> routes_;
     DeviceArray<std::uint64_t> table_;
     DeviceArray<float> scales_;
-    DeviceArray<float> y_;
+    DeviceArray<std::uint16_t> y_;
 };
 
 float bits_float(std::uint32_t bits) {
@@ -390,8 +418,21 @@ constexpr std::size_t kOracleTokens = 512;
 // Checks y (bits [max_tokens][2560]): rows of tokens with active routes against the oracle, rows
 // of tokens without one exactly +0, rows at or past N untouched.
 int verify(const std::string& label, const Fixture& fixture, const BankState& bank,
-           const Inputs& inputs, const std::vector<std::uint32_t>& bits) {
+           const Inputs& inputs, const std::vector<std::uint32_t>& bits,
+           const std::vector<std::uint32_t>& bf16 = {}) {
     int failures = 0;
+    // Expanded BF16 bits preserve exact comparison, including +0 and the unwritten poison.
+    for (std::size_t i = 0; i < bf16.size(); ++i) {
+        const auto expected =
+            i < static_cast<std::size_t>(inputs.tokens) * kHidden
+                ? static_cast<std::uint32_t>(bf16_bits(bf16_round(bits_float(bits[i])))) << 16
+                : 0xFFFF0000U;
+        if (bf16[i] != expected) {
+            std::cerr << label << ": BF16 differs from one RNE of FP32 at " << i << '\n';
+            ++failures;
+            break;
+        }
+    }
     std::vector<int> all_routed;
     for (int t = 0; t < inputs.tokens; ++t) {
         if (has_active(inputs, t)) {
@@ -434,6 +475,7 @@ int verify(const std::string& label, const Fixture& fixture, const BankState& ba
     {
         constexpr std::size_t kOracleThreads = 8;
         std::vector<std::jthread> workers;
+        workers.reserve(kOracleThreads);
         for (std::size_t w = 0; w < kOracleThreads; ++w) {
             workers.emplace_back([&, w] {
                 for (std::size_t i = w; i < routed.size(); i += kOracleThreads) {
@@ -464,6 +506,22 @@ int verify(const std::string& label, const Fixture& fixture, const BankState& ba
                   << " actual=" << stats.actual_at_maximum
                   << " reference=" << stats.reference_at_maximum << '\n';
         ++failures;
+    }
+    if (!bf16.empty()) {
+        got.clear();
+        for (const int t : routed) {
+            const auto row = static_cast<std::size_t>(t) * kHidden;
+            for (std::size_t n = 0; n < kHidden; ++n) { got.push_back(bits_float(bf16[row + n])); }
+        }
+        const auto bf16_stats = test::compute_reduction_stats(
+            got.data(), reference.data(), static_cast<std::int64_t>(got.size()));
+        const bool bf16_pass = test::reduction_passes(
+            bf16_stats, static_cast<std::int64_t>(got.size()), kBf16Criterion);
+        std::printf("%-38s BF16 rel_l2=%.3e (limit %.3e) max_abs=%.3e (limit %.3e) %s\n",
+                    label.c_str(), bf16_stats.relative_l2, kBf16Criterion.relative_l2,
+                    bf16_stats.maximum_absolute_error,
+                    test::gross_error_limit(bf16_stats, kBf16Criterion), bf16_pass ? "ok" : "FAIL");
+        if (!bf16_pass) { ++failures; }
     }
     return failures;
 }
@@ -510,7 +568,8 @@ private:
 // graph replayed three times. Each call must reproduce its standalone output bit for bit, so every
 // call found the counters its predecessor left.
 int queued_calls(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
-                 ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank) {
+                 ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank,
+                 OutputDtype prefill_dtype) {
     const Inputs a = make_inputs(bank, 20, 20, Routing::Skewed, 31U);
     const Inputs b = make_inputs(bank, 48, 48, Routing::Mixed48, 32U);
     const Inputs c = make_inputs(bank, 1, 4, Routing::Skewed, 33U);
@@ -518,7 +577,9 @@ int queued_calls(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
     std::vector<std::unique_ptr<Run>> runs;
     std::vector<std::vector<std::uint32_t>> expected;
     for (const Inputs* inputs : {&a, &b, &c, &d}) {
-        runs.push_back(std::make_unique<Run>(fixture, store, *inputs));
+        const auto dtype =
+            inputs->max_tokens > ops::kMoeHelperMaxTokens ? prefill_dtype : OutputDtype::Fp32;
+        runs.push_back(std::make_unique<Run>(fixture, store, *inputs, dtype));
         runs.back()->set_bank(bank);
         expected.push_back(runs.back()->invoke(workspace));
     }
@@ -566,7 +627,8 @@ int queued_calls(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
 // At prefill extents a token's row depends only on its own inputs: reversing the tokens' order
 // (x rows and route rows) must reverse y's rows bit for bit.
 int order_independence(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
-                       ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank) {
+                       ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank,
+                       OutputDtype dtype) {
     const Inputs forward = make_inputs(bank, 300, 300, Routing::Skewed, 41U);
     Inputs reversed      = forward;
     const int tokens     = forward.tokens;
@@ -578,8 +640,8 @@ int order_independence(const Fixture& fixture, const DeviceArray<std::uint8_t>& 
         std::copy_n(forward.routes.begin() + static_cast<std::ptrdiff_t>(from * kRoutes), kRoutes,
                     reversed.routes.begin() + static_cast<std::ptrdiff_t>(to * kRoutes));
     }
-    Run a(fixture, store, forward);
-    Run b(fixture, store, reversed);
+    Run a(fixture, store, forward, dtype);
+    Run b(fixture, store, reversed, dtype);
     a.set_bank(bank);
     b.set_bank(bank);
     const std::vector<std::uint32_t> ya = a.invoke(workspace);
@@ -594,7 +656,8 @@ int order_independence(const Fixture& fixture, const DeviceArray<std::uint8_t>& 
             return 1;
         }
     }
-    std::printf("%-38s tokens=%d rows bit-identical\n", "T300 reversed token order", tokens);
+    std::printf("%-38s tokens=%d rows bit-identical (%s)\n", "T300 reversed token order", tokens,
+                dtype == OutputDtype::Bf16 ? "BF16" : "FP32");
     return 0;
 }
 
@@ -660,29 +723,37 @@ int run() {
         {"T2000 of max 4096", &wide, 2000, kPrefillCapacity, Routing::Skewed, 30U, &prefill},
         {"N0 of max 4096", &wide, 0, kPrefillCapacity, Routing::Skewed, 31U, &prefill},
     };
-    for (const Case& c : cases) {
+    const auto check_case = [&](const Case& c) {
         const Inputs inputs = make_inputs(*c.bank, c.tokens, c.max_tokens, c.routing, c.seed);
-        Run run(*fixture, store, inputs);
-        run.set_bank(*c.bank);
-        const std::vector<std::uint32_t> bits = run.invoke(*c.workspace);
-        failures += verify(c.label, *fixture, *c.bank, inputs, bits);
-        // A second call on the same workspace must find its counters reset and reproduce y.
-        if (run.invoke(*c.workspace) != bits) {
-            std::cerr << c.label << ": repeated call is not bit-identical\n";
-            ++failures;
+        std::vector<std::uint32_t> fp32;
+        std::vector<std::uint32_t> bf16;
+        for (const auto dtype : {OutputDtype::Fp32, OutputDtype::Bf16}) {
+            if (dtype == OutputDtype::Bf16 && c.max_tokens <= ops::kMoeHelperMaxTokens) {
+                continue;
+            }
+            Run run(*fixture, store, inputs, dtype);
+            run.set_bank(*c.bank);
+            auto& bits = dtype == OutputDtype::Bf16 ? bf16 : fp32;
+            bits       = run.invoke(*c.workspace);
+            // Every dtype must find reset counters and reproduce y, including at capacity.
+            if (run.invoke(*c.workspace) != bits) {
+                std::cerr << c.label << ": repeated call is not bit-identical\n";
+                ++failures;
+            }
         }
-    }
+        failures += verify(c.label, *fixture, *c.bank, inputs, fp32, bf16);
+    };
+    for (const Case& c : cases) { check_case(c); }
 
-    failures += queued_calls(*fixture, store, prefill, wide);
-    failures += order_independence(*fixture, store, prefill, wide);
+    for (const auto dtype : {OutputDtype::Fp32, OutputDtype::Bf16}) {
+        failures += queued_calls(*fixture, store, prefill, wide, dtype);
+        failures += order_independence(*fixture, store, prefill, wide, dtype);
+    }
     {
         // The Op's capacity: every token routed, on a workspace of exactly that capacity.
         ops::MoeHelperExpertsWorkspace full(ops::kMoeHelperExpertsMaxTokens);
-        const Inputs inputs = make_inputs(wide, ops::kMoeHelperExpertsMaxTokens,
-                                          ops::kMoeHelperExpertsMaxTokens, Routing::Skewed, 32U);
-        Run run(*fixture, store, inputs);
-        run.set_bank(wide);
-        failures += verify("T16384 (capacity)", *fixture, wide, inputs, run.invoke(full));
+        check_case({"T16384 (capacity)", &wide, ops::kMoeHelperExpertsMaxTokens,
+                    ops::kMoeHelperExpertsMaxTokens, Routing::Skewed, 32U, &full});
     }
 
     // Contract rejection before any work is queued.
@@ -700,6 +771,11 @@ int run() {
         args.max_tokens = ops::kMoeHelperExpertsMaxTokens + 1;
         ops::moe_helper_experts(args, prefill, nullptr);
     });
+    failures += expect_rejected("BF16 output on decode extent", [&] {
+        auto args         = valid.args();
+        args.output_dtype = OutputDtype::Bf16;
+        ops::moe_helper_experts(args, workspace, nullptr);
+    });
     failures += expect_rejected("workspace too small",
                                 [&] { ops::moe_helper_experts(valid.args(), small, nullptr); });
     failures += expect_rejected("prefill extent on a decode-round workspace", [&] {
@@ -712,12 +788,12 @@ int run() {
     });
     failures += expect_rejected("misaligned y", [&] {
         auto args = valid.args();
-        args.y += 1;
+        args.y    = static_cast<std::uint16_t*>(args.y) + 1;
         ops::moe_helper_experts(args, workspace, nullptr);
     });
     failures += expect_rejected("y aliases x", [&] {
         auto args = valid.args();
-        args.y    = reinterpret_cast<float*>(const_cast<std::uint16_t*>(args.x));
+        args.y    = const_cast<std::uint16_t*>(args.x);
         ops::moe_helper_experts(args, workspace, nullptr);
     });
 

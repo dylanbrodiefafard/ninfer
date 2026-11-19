@@ -52,6 +52,13 @@ struct MoeHelperExpertBank {
 };
 
 /**
+ * Storage type of the helper partial y. Fp32 serves every max_tokens and is the decode and
+ * verification return; Bf16 serves only max_tokens > kMoeHelperMaxTokens (48), the prefill
+ * return, and halves the bytes sent back over the link.
+ */
+enum class MoeHelperOutputDtype : std::uint8_t { Fp32, Bf16 };
+
+/**
  * Device operands of one moe_helper_experts call, with N = min(*tokens, max_tokens) compact tokens
  * read on the device when the call executes.
  *
@@ -65,8 +72,9 @@ struct MoeHelperExpertBank {
  *               owns; an inactive entry (kMoeHelperInactiveExpert) may appear anywhere in a row,
  *               and its weight is not read. A token may name an expert more than once (each entry
  *               contributes).
- *   y           FP32 [max_tokens][2560], 16-byte aligned, disjoint from every other operand: rows
- *               [0,N) receive the output; rows [N,max_tokens) are not written.
+ *   y           output_dtype [max_tokens][2560], 16-byte aligned, disjoint from every other
+ *               operand: rows [0,N) receive the output; rows [N,max_tokens) are not written.
+ *   output_dtype y's element type: Fp32 at every max_tokens, Bf16 only at max_tokens > 48.
  */
 struct MoeHelperExpertsArgs {
     const std::int32_t* tokens   = nullptr;
@@ -74,7 +82,8 @@ struct MoeHelperExpertsArgs {
     const std::uint16_t* x       = nullptr;
     const MoeHelperRoute* routes = nullptr;
     MoeHelperExpertBank bank;
-    float* y = nullptr;
+    void* y                           = nullptr;
+    MoeHelperOutputDtype output_dtype = MoeHelperOutputDtype::Fp32;
 };
 
 /**
@@ -146,8 +155,10 @@ private:
  * as code times E4M3 scale, which is exact in BF16, and sum the full K. Matrix scales, SiLU and
  * the gate/up product are FP32, and the product enters the down projection rounded once to BF16
  * (the RTX 5090 route's profile, not a semantic boundary). Each route's contribution is FP32, and
- * a token's contributions are summed in route-slot order j = 0..9. No float atomics: y is
- * bit-identical for identical inputs, routes and max_tokens; at max_tokens <= 48 the path an
+ * a token's contributions are summed in route-slot order j = 0..9. An Fp32 y is that sum; a Bf16
+ * y is its explicit output cast, one round-to-nearest-even conversion to BF16, so it equals the
+ * BF16 rounding of the Fp32 y of the same call bit for bit. No float atomics: y is bit-identical
+ * for identical inputs, routes, max_tokens and output dtype; at max_tokens <= 48 the path an
  * expert takes depends on how many tokens name it, and above it a token's row does not depend on
  * the other tokens.
  *
@@ -155,8 +166,8 @@ private:
  * tables, scales and records are read on the device at execution, so a captured HIP graph stays
  * valid while their contents change; its shape depends only on max_tokens. The workspace must
  * belong to the current device and have max_tokens() >= args.max_tokens. Invalid extents,
- * alignment, aliasing or workspace throw std::invalid_argument before any work is queued; a launch
- * failure throws std::runtime_error.
+ * output dtype, alignment, aliasing or workspace throw std::invalid_argument before any work is
+ * queued; a launch failure throws std::runtime_error.
  */
 void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorkspace& workspace,
                         hipStream_t stream);

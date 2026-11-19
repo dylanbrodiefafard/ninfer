@@ -28,7 +28,7 @@ namespace {
 //            .. +31) over K = 640 and writes each route's FP32 contribution
 //            s_d w_j (D gated)[row] to contributions[p][row].
 //   combine  per token t < N: y[t,:] = sum of its active entries' contributions in route-slot
-//            order j = 0..9, starting from +0.
+//            order j = 0..9, starting from +0, then stores FP32 or rounds once to BF16.
 //
 // The GEMM kernels are persistent: each workgroup claims items from a counter in order, so the
 // largest jobs start first and the partial ones fill the tail. Every contribution is computed by
@@ -194,7 +194,7 @@ struct CombineParams {
     const std::int32_t* tokens;
     const std::int32_t* position;
     const float* contributions;
-    float* y;
+    void* y;
     std::int32_t max_tokens;
 };
 
@@ -809,11 +809,13 @@ constexpr int gemm_lds_bytes() {
 // --- Combine -------------------------------------------------------------------------------------
 
 // Grid: min(max_tokens, kCombineBlocksPerUnit per WGP), block kCombineThreads; token t by
-// workgroup t mod grid. Rows t >= N are not written.
+// workgroup t mod grid. Each thread sums four columns in FP32, then stores 16 FP32 bytes or
+// eight BF16 bytes (one rounding per column). No LDS or barriers. Rows t >= N are not written;
+// y is 16-byte aligned and its row stride is 2560 elements in the selected output dtype.
+template <MoeHelperOutputDtype Dtype>
 __global__ void __launch_bounds__(kCombineThreads) combine_kernel(const CombineParams p) {
     const int tokens          = token_count(p.tokens, p.max_tokens);
     const auto* contributions = reinterpret_cast<const float4*>(p.contributions);
-    auto* y                   = reinterpret_cast<float4*>(p.y);
     for (int t = static_cast<int>(blockIdx.x); t < tokens; t += static_cast<int>(gridDim.x)) {
         int positions[kRoutes];
 #pragma unroll
@@ -834,7 +836,16 @@ __global__ void __launch_bounds__(kCombineThreads) combine_kernel(const CombineP
                     sum.w += v.w;
                 }
             }
-            y[t * kRowVectors + column] = sum;
+            const int index = t * kRowVectors + column;
+            if constexpr (Dtype == MoeHelperOutputDtype::Bf16) {
+                *reinterpret_cast<U32x2*>(static_cast<std::uint16_t*>(p.y) + 4 * index) = {
+                    static_cast<std::uint32_t>(bf16_round(sum.x)) |
+                        (static_cast<std::uint32_t>(bf16_round(sum.y)) << 16),
+                    static_cast<std::uint32_t>(bf16_round(sum.z)) |
+                        (static_cast<std::uint32_t>(bf16_round(sum.w)) << 16)};
+            } else {
+                static_cast<float4*>(p.y)[index] = sum;
+            }
         }
     }
 }
@@ -919,7 +930,10 @@ void moe_helper_experts_grouped(const MoeHelperExpertsArgs& args, std::byte* reg
            stream, "down launch");
 
     const CombineParams combine{args.tokens, position, contributions, args.y, args.max_tokens};
-    launch(&combine_kernel, std::min(args.max_tokens, kCombineBlocksPerUnit * units),
+    const auto combine_kernel_ptr = args.output_dtype == MoeHelperOutputDtype::Bf16
+                                        ? &combine_kernel<MoeHelperOutputDtype::Bf16>
+                                        : &combine_kernel<MoeHelperOutputDtype::Fp32>;
+    launch(combine_kernel_ptr, std::min(args.max_tokens, kCombineBlocksPerUnit * units),
            kCombineThreads, 0, combine, stream, "combine launch");
 }
 

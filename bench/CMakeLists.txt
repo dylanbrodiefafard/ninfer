@@ -108,4 +108,9 @@ if(NINFER_ENABLE_HIP_EXPERT_HELPER)
   add_executable(ninfer_moe_helper_experts_bench ops/r9700/moe_helper_experts_bench.hip)
   ninfer_hip_target(ninfer_moe_helper_experts_bench)
   target_link_libraries(ninfer_moe_helper_experts_bench PRIVATE ninfer_hip_ops)
+
+  # Hardware calibration probe of the expert mailbox's host <-> R9700 copies, not an Op bench.
+  add_executable(ninfer_expert_helper_link_probe ${PROJECT_SOURCE_DIR}/tools/expert_helper_link_probe.hip)
+  ninfer_hip_target(ninfer_expert_helper_link_probe)
+  target_link_libraries(ninfer_expert_helper_link_probe PRIVATE ninfer_hip_core)
 endif()

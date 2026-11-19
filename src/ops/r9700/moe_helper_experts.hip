@@ -33,10 +33,10 @@ using detail::WmmaF32;
 //
 // This file holds the public wrapper and the persistent route of calls with max_tokens <= 48
 // (decode and verify rounds); larger calls take the grouped route
-// (moe_helper_experts_grouped.hip). One launch serves the whole call. Its work items are (job, row block) pairs, where a job is
-// one expert with every compact-token route entry naming it. A workgroup of four wave32 waves
-// computes one item; each wave computes one *slice*: one 32-row tile of a record plane over 640
-// consecutive K (five 128-K chunks), for the job's tokens.
+// (moe_helper_experts_grouped.hip). One launch serves the whole call. Its work items are (job, row
+// block) pairs, where a job is one expert with every compact-token route entry naming it. A
+// workgroup of four wave32 waves computes one item; each wave computes one *slice*: one 32-row tile
+// of a record plane over 640 consecutive K (five 128-K chunks), for the job's tokens.
 //
 //   gate|up item (job, tile r in [0,40)): wave w takes chunks 5w..5w+4 of gate|up tile r (gate
 //     and up rows 16r..16r+15, K = 640w..640w+639); the four K quarters are summed in the
@@ -1148,8 +1148,20 @@ void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorksp
         !aligned(args.y, 16)) {
         reject("misaligned operand");
     }
+    std::size_t output_bytes = 0;
+    switch (args.output_dtype) {
+    case MoeHelperOutputDtype::Fp32:
+        output_bytes = sizeof(float);
+        break;
+    case MoeHelperOutputDtype::Bf16:
+        if (max_tokens <= kMoeHelperMaxTokens) { reject("BF16 output requires max_tokens > 48"); }
+        output_bytes = sizeof(std::uint16_t);
+        break;
+    default:
+        reject("invalid output dtype");
+    }
     const auto rows = static_cast<std::size_t>(max_tokens);
-    const Span y{args.y, rows * kMoeHidden * sizeof(float)};
+    const Span y{args.y, rows * kMoeHidden * output_bytes};
     const Span inputs[] = {
         {args.tokens, sizeof(std::int32_t)},
         {args.x, rows * kMoeHidden * sizeof(std::uint16_t)},
@@ -1179,7 +1191,7 @@ void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorksp
     params.routes        = args.routes;
     params.expert_table  = args.bank.expert_table;
     params.matrix_scales = args.bank.matrix_scales;
-    params.y             = args.y;
+    params.y             = static_cast<float*>(args.y);
     params.control       = reinterpret_cast<std::uint32_t*>(base);
     params.job_done      = reinterpret_cast<std::uint32_t*>(base + layout.job_done);
     params.merge         = reinterpret_cast<std::uint32_t*>(base + layout.merge);
