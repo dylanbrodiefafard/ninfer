@@ -106,7 +106,9 @@ context checkpoints, the optimized proposal head, explicit verify widths, Vision
 sparse or Sage attention. Its experimental `--expert-helper-pci` option selects one gfx1201
 R9700 in an opt-in HIP-enabled build for immutable decode/verification expert placement only.
 The NVIDIA primary retains routing, shared experts, drafting, all prefill and all request/KV
-state. Helper completion joins settled rounds; failures poison execution without fallback.
+state. In helper mode the primary's fixed expert slots hold a pinned hot set, its flex slots only
+the tail, and prefill streams no windows (records outside them are read from mapped host memory).
+Helper completion joins settled rounds; failures poison execution without fallback.
 Compiled routing counts are placement policy, not artifact metadata or continuation state.
 Helper-enabled inference/performance qualification remains pending; default execution is unchanged.
 The workload is one NVIDIA primary, at most that one startup-selected helper, one resident model

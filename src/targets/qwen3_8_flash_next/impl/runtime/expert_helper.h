@@ -19,7 +19,11 @@ struct ExpertHelperMemory {
 
 struct ExpertHelperCudaView {
     ExpertMailboxView mailbox;
+    // Layer-major U32[48,16] device bitsets. local_eligibility is P union T and selects the routes
+    // the 5090 computes; admission_eligibility is the F3 records of T, the only records its cache
+    // admits or stages (every P record is pinned, every NVFP4 record of T stays mapped).
     const std::uint32_t* local_eligibility;
+    const std::uint32_t* admission_eligibility;
     float* local_partial;
     float* remote_partial;
     // Compact VRAM sources: partition writes these, then core owns the guarded mapped copy.

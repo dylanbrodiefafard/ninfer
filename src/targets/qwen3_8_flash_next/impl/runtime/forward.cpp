@@ -1520,6 +1520,12 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
                              static_cast<std::size_t>(layer) * ops::kMoeExpertMaskWords,
                          DType::I32, {ops::kMoeExpertMaskWords})
                 : Tensor{};
+    // Admission covers only the F3 records of T: P is pinned and H is remote.
+    const Tensor admit_eligible =
+        helper_ ? Tensor(const_cast<std::uint32_t*>(helper_view_.admission_eligibility) +
+                             static_cast<std::size_t>(layer) * ops::kMoeExpertMaskWords,
+                         DType::I32, {ops::kMoeExpertMaskWords})
+                : Tensor{};
     const bool helper_round = helper_ && chunk.lane < 0;
     if (helper_round) {
         Tensor map(helper_view_.compact_map, DType::I32, {tokens});
@@ -1542,7 +1548,7 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
         s.expert_ids, expert_table_, host_table_, fill_table_, cache_, layer, admission, stream_,
         chunk.lane < 0 ? &chunk_.decode_cache_counters : &chunk_.expert_cache_counters,
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
-        helper_ ? &eligible : nullptr,
+        helper_ ? &admit_eligible : nullptr,
 #else
         nullptr,
 #endif
@@ -1561,7 +1567,7 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
         Tensor stage = staging_.stage.slice(1, parity(following), 1).view({ops::kMoeExperts});
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
         const Tensor next_eligible =
-            helper_ ? Tensor(const_cast<std::uint32_t*>(helper_view_.local_eligibility) +
+            helper_ ? Tensor(const_cast<std::uint32_t*>(helper_view_.admission_eligibility) +
                                  static_cast<std::size_t>(following) * ops::kMoeExpertMaskWords,
                              DType::I32, {ops::kMoeExpertMaskWords})
                     : Tensor{};

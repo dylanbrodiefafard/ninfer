@@ -259,42 +259,76 @@ void test_store_and_residency() {
                fn::kFrequencyHalvingSlots * static_cast<std::int64_t>(6 + 9 + kFlex),
            "halving period over fixed and flex slots");
 
-    // Helper placement leaves only three eligible experts, including a zero-count F3 record.
-    // Full coverage must warm fixed slots even while flex extents are available; helper-owned
-    // entries remain their original CUDA host addresses and never become warm owners.
+    // Three tiers over plan {1 NVFP4, 2 F3} fixed slots: NVFP4 301 and F3 0 and 1 are pinned, the
+    // admission domain is the F3 records 2 and 7, and every other record (NVFP4 5, helper or
+    // tail) keeps its mapped host address. Pinned slots are protected for good: owner -2, table
+    // entry at the slot, slot index -1. Calibrated warm start fills only flex slots with eligible
+    // records, never a fixed slot and never the hotter ineligible record 300.
     {
-        std::array<std::uint32_t, 16> eligibility{};
-        eligibility[0] = (1U << 0) | (1U << 1) | (1U << 5);
-        std::vector<std::uint64_t> filtered_counts(512, 0);
-        filtered_counts[0]   = 4;
-        filtered_counts[5]   = 9;
-        filtered_counts[301] = 1000; // hotter than eligible experts, but not eligible
-        fn::ExpertResidency full(store, fn::ExpertSlotPlan{{1, 2}}, flex_addresses, filtered_counts,
-                                 context.stream, eligibility, fn::ExpertWarmStart::AllEligible);
-        auto full_cache  = full.cache();
-        const auto index = download<std::int32_t>(full_cache.slot_index.data, 512);
-        const auto table = download<std::uint64_t>(full.expert_table().data, 512);
-        for (std::size_t e = 0; e < 512; ++e) {
-            const bool eligible = e == 0 || e == 1 || e == 5;
-            expect(eligible ? index[e] >= 0 : index[e] == ops::kMoeCacheNoSlot,
-                   "full helper-filtered slot index");
-            expect(eligible ? table[e] != addresses[e] : table[e] == addresses[e],
-                   "helper-filtered host/slot addresses");
+        std::vector<std::int32_t> primary_slots(512, -1);
+        primary_slots[301] = 0;
+        primary_slots[1]   = 0;
+        primary_slots[0]   = 1;
+        std::array<std::uint32_t, 16> admit{};
+        admit[0] = (1U << 2) | (1U << 7);
+        std::vector<std::uint64_t> tier_counts(512, 0);
+        tier_counts[7]   = 9;
+        tier_counts[300] = 1000;
+        fn::ExpertResidency tiered(store, fn::ExpertSlotPlan{{1, 2}}, flex_addresses, tier_counts,
+                                   context.stream, {primary_slots, admit});
+        auto tier_cache    = tiered.cache();
+        const auto index   = download<std::int32_t>(tier_cache.slot_index.data, 512);
+        const auto table   = download<std::uint64_t>(tiered.expert_table().data, 512);
+        const auto owner   = download<std::int32_t>(tier_cache.pools[1].owner.data, 2 + kFlex);
+        const auto nv_own  = download<std::int32_t>(tier_cache.pools[0].owner.data, 1);
+        const auto f3_base = reinterpret_cast<std::uint64_t>(tier_cache.pools[1].slots.data);
+        const auto nv_base = reinterpret_cast<std::uint64_t>(tier_cache.pools[0].slots.data);
+        expect(table[1] == (f3_base | 1U) && table[0] == ((f3_base + kF3Bytes) | 1U) &&
+                   table[301] == nv_base,
+               "pinned table entries name their fixed slots");
+        expect(index[0] == -1 && index[1] == -1 && index[301] == -1, "pinned slot index stays -1");
+        expect(owner[0] == ops::kMoeCacheBorrowedSlot && owner[1] == ops::kMoeCacheBorrowedSlot &&
+                   nv_own[0] == ops::kMoeCacheBorrowedSlot,
+               "pinned slots are protected");
+        expect(owner[2 + kFlex - 1] == 7 && index[7] == static_cast<std::int32_t>(1 + kFlex) &&
+                   table[7] == (flex_addresses[kFlex - 1] | 1U) && table[300] == addresses[300] &&
+                   table[5] == addresses[5] && table[2] == addresses[2],
+               "only the eligible record is warm, in the highest flex slot");
+        for (const std::size_t e : {std::size_t{0}, std::size_t{1}}) {
+            // NOLINTNEXTLINE(performance-no-int-to-ptr): a device address as the tables hold it.
+            const auto* const slot = reinterpret_cast<const void*>(table[e] & ~std::uint64_t{1});
+            const auto slot_bytes  = download<std::byte>(slot, kF3Bytes);
+            expect(std::equal(slot_bytes.begin(), slot_bytes.end(), store.record(0, e).begin()),
+                   "pinned slot contents");
         }
-        expect(index[0] == 1 && index[1] == 0 && index[5] == 0,
-               "full coverage keeps zero counts in fixed slots");
-        const auto owners = download<std::int32_t>(full_cache.pools[1].owner.data, 2 + kFlex);
-        expect(std::all_of(owners.begin() + 2, owners.end(),
-                           [](auto owner) { return owner == ops::kMoeCacheEmptySlot; }),
-               "full coverage does not depend on flex");
-        fn::ExpertResidency calibrated(store, fn::ExpertSlotPlan{{1, 1}}, flex_addresses,
-                                       filtered_counts, context.stream, eligibility);
-        const auto calibrated_index =
-            download<std::int32_t>(calibrated.cache().slot_index.data, 512);
-        expect(calibrated_index[0] == static_cast<std::int32_t>(kFlex) &&
-                   calibrated_index[1] == ops::kMoeCacheNoSlot &&
-                   calibrated_index[301] == ops::kMoeCacheNoSlot,
-               "filtered calibration preserves highest-flex warm order and excludes zeros");
+        expect(tier_cache.frequency.halving_lookups ==
+                   fn::kFrequencyHalvingSlots * static_cast<std::int64_t>(kFlex),
+               "halving period counts flex slots only");
+
+        // Routing pinned, ineligible and one missing eligible record admits only the eligible one,
+        // into an empty flex slot: CLOCK passes the protected fixed slots.
+        ninfer::DeviceBuffer tier_ids(10 * sizeof(std::int32_t));
+        const std::vector<std::int32_t> routed{2, 0, 1, 5, 301, 3, 2, 0, 1, 5};
+        tier_ids.copy_from_host(routed.data(), tier_ids.bytes);
+        ninfer::DeviceBuffer mask_storage(sizeof(admit));
+        mask_storage.copy_from_host(admit.data(), mask_storage.bytes);
+        const Tensor admit_view(mask_storage.p, DType::I32, {16});
+        Tensor tier_expert = tiered.expert_table();
+        Tensor tier_fill   = tiered.fill_table();
+        ops::moe_expert_cache_admit(
+            Tensor(tier_ids.p, DType::I32, {10, 1}), tier_expert, tiered.host_table(), tier_fill,
+            tier_cache, 0, ops::MoeCacheAdmission::EveryMiss, context.stream, nullptr, &admit_view);
+        ops::moe_expert_cache_commit(tier_expert, tier_fill, 0, context.stream);
+        check(cudaStreamSynchronize(context.stream), "tiered admit");
+        const auto after       = download<std::uint64_t>(tier_expert.data, 512);
+        const auto after_owner = download<std::int32_t>(tier_cache.pools[1].owner.data, 2 + kFlex);
+        expect(after[0] == table[0] && after[1] == table[1] && after[301] == table[301] &&
+                   after[5] == addresses[5] && after[3] == addresses[3] &&
+                   after[2] == (flex_addresses[0] | 1U),
+               "admission leaves pinned and ineligible entries and admits record 2");
+        expect(after_owner[0] == ops::kMoeCacheBorrowedSlot &&
+                   after_owner[1] == ops::kMoeCacheBorrowedSlot && after_owner[2] == 2,
+               "admission never takes a pinned slot");
     }
 
     // One admit/commit through the residency views: F3 expert 1 (count 0, not warm) takes F3 slot

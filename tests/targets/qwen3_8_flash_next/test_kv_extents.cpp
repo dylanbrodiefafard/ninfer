@@ -357,7 +357,7 @@ void test_idle_reclaim_refill() {
     device.synchronize_all();
 }
 
-// Local eligibility can fit entirely in low slots while high flex slots remain empty. A later
+// Admission eligibility can fit entirely in low slots while high flex slots remain empty. A later
 // KV borrow makes some of those records nonresident; no give_back occurs to request refill.
 void test_borrow_restarts_refill() {
     ninfer::DeviceContext device(0);
@@ -370,8 +370,11 @@ void test_borrow_restarts_refill() {
     plan.slots = {0, 4};
     std::array<std::uint32_t, ops::kMoeExpertMaskWords> eligibility{};
     eligibility[0] = (1U << 10) - 1U;
+    // Records 100 to 103 are pinned in the four fixed slots; the tail is records 0 to 9.
+    std::vector<std::int32_t> primary_slots(fn::kRoutedExperts, -1);
+    std::iota(primary_slots.begin() + 100, primary_slots.begin() + 104, 0);
     fn::ExpertResidency cache(store, plan, extents.flex_addresses(), {}, device.stream,
-                              eligibility);
+                              {primary_slots, eligibility});
     std::array<std::int32_t, ops::kMoeTopK> ids{};
     std::iota(ids.begin(), ids.end(), 0);
     ninfer::DeviceBuffer routes_storage(sizeof(ids));
