@@ -9,10 +9,34 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <type_traits>
 #include <string_view>
 #include <vector>
 
 namespace ninfer::artifact {
+
+// Four pinned, 4096-aligned stream_buffer_bytes bounce buffers for Reader::stream, each with a
+// CUDA event that releases it after device copies read from it. One instance serves one load
+// phase at a time. Construction throws on a pinned allocation or CUDA event failure.
+class PinnedReadBuffers {
+public:
+    PinnedReadBuffers();
+    ~PinnedReadBuffers();
+    PinnedReadBuffers(const PinnedReadBuffers&)            = delete;
+    PinnedReadBuffers& operator=(const PinnedReadBuffers&) = delete;
+
+    [[nodiscard]] Reader::StreamBuffers views() const;
+
+    // Records an event on stream after the copies just enqueued from buffer slot and returns the
+    // completion that blocks the host until they finish. This object must outlive the completion.
+    [[nodiscard]] Reader::Completion release_after_copies(std::size_t slot, cudaStream_t stream);
+
+private:
+    struct EventDestroyer;
+
+    std::vector<PinnedHostBuffer> buffers_;
+    std::vector<std::unique_ptr<std::remove_pointer_t<cudaEvent_t>, EventDestroyer>> events_;
+};
 
 struct LoadProgress {
     std::function<void(std::string_view, std::uint64_t, std::uint64_t)> callback;

@@ -1,6 +1,7 @@
 #include "load/binder.h"
 
 #include "artifact/binder.h"
+#include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "artifact/typed_binding.h"
 #include "core/device.h"
@@ -11,18 +12,17 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
+#include <future>
+#include <memory>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
 #include <initializer_list>
-#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <variant>
 #include <vector>
 
@@ -555,98 +555,70 @@ ModelPlan bind_model(artifact::Binder& binder) {
     return plan;
 }
 
-// Copies every routed record from the artifact into the host store. A records tensor holds the
-// experts of its codec in layer-major order. Reading is spread over threads because the store is
-// tens of gigabytes; write_record of distinct records is thread-safe. The calling thread reports
-// the record bytes written so far to `progress` (phase "experts") until every worker has finished.
-void fill_expert_store(const artifact::Binder& binder, const ModelPlan& plan,
-                       ExpertHostStore& store, const artifact::LoadProgress* progress) {
+// Streams every routed record from the artifact into the host store with direct I/O. A records
+// tensor holds the experts of its codec in layer-major order, so each streamed chunk of whole
+// records maps onto consecutive entries of that codec's slice of the codec map. The store copy of
+// a chunk runs on its own thread while the reader fills the next bounce buffer; a buffer is
+// reused once its copy has finished. Distinct records are written by distinct chunks, so
+// write_record needs no lock. The calling thread reports the record bytes written so far to
+// `progress` (phase "experts") after every chunk and once more at the end.
+void fill_expert_store(const artifact::Reader& reader, const artifact::Binder& binder,
+                       const ModelPlan& plan, ExpertHostStore& store,
+                       const artifact::LoadProgress* progress) {
     struct Source {
-        std::span<const std::byte> bytes;
+        artifact::PayloadSpan tensor;
         std::size_t record_bytes = 0;
-        std::int64_t next        = 0;
+        std::vector<std::int32_t> experts; // layer-major global indices, in file order
     };
 
     std::array<Source, 2> sources{
         Source{
-            binder.payload(plan.e2m1_records).data,
-            static_cast<std::size_t>(ops::moe_expert_record_bytes(ops::MoeExpertCodec::Nvfp4G16))},
-        Source{binder.payload(plan.f3_records).data,
-               static_cast<std::size_t>(ops::moe_expert_record_bytes(ops::MoeExpertCodec::F3G32))},
+            binder.payload(plan.e2m1_records),
+            static_cast<std::size_t>(ops::moe_expert_record_bytes(ops::MoeExpertCodec::Nvfp4G16)),
+            {}},
+        Source{binder.payload(plan.f3_records),
+               static_cast<std::size_t>(ops::moe_expert_record_bytes(ops::MoeExpertCodec::F3G32)),
+               {}},
     };
-
-    struct Job {
-        std::int32_t layer;
-        std::int32_t expert;
-        std::span<const std::byte> record;
-    };
-
-    std::vector<Job> jobs;
-    jobs.reserve(plan.codecs.size());
     for (std::int32_t i = 0; i < kRoutedExpertsTotal; ++i) {
-        const ops::MoeExpertCodec codec = plan.codecs.at(static_cast<std::size_t>(i));
-        Source& source                  = sources.at(static_cast<std::size_t>(codec));
-        const std::size_t offset = static_cast<std::size_t>(source.next) * source.record_bytes;
-        if (offset + source.record_bytes > source.bytes.size()) {
-            throw artifact::ArtifactError("routed-expert records are shorter than their codec map");
-        }
-        jobs.push_back(Job{.layer  = i / ops::kMoeExperts,
-                           .expert = i % ops::kMoeExperts,
-                           .record = source.bytes.subspan(offset, source.record_bytes)});
-        ++source.next;
+        sources.at(static_cast<std::size_t>(plan.codecs.at(static_cast<std::size_t>(i))))
+            .experts.push_back(i);
     }
+    std::uint64_t total = 0;
     for (const Source& source : sources) {
-        if (static_cast<std::size_t>(source.next) * source.record_bytes != source.bytes.size()) {
+        if (source.experts.size() * source.record_bytes != source.tensor.data.size()) {
             throw artifact::ArtifactError("routed-expert record count differs from the codec map");
         }
+        total += source.tensor.data.size();
     }
 
-    constexpr std::size_t kThreads   = 8;
-    constexpr auto kProgressInterval = std::chrono::milliseconds(250);
-    const bool report                = progress != nullptr && progress->callback;
+    const bool report = progress != nullptr && progress->callback;
     std::atomic<std::uint64_t> written{0};
-    std::mutex state_mutex;
-    std::condition_variable finished_cv;
-    std::size_t finished = 0;
-    std::exception_ptr failure;
-    {
-        // jthreads join on every exit path, including a failed thread start or a throwing
-        // progress callback.
-        std::vector<std::jthread> threads;
-        threads.reserve(kThreads);
-        for (std::size_t t = 0; t < kThreads; ++t) {
-            threads.emplace_back([&, t] {
-                try {
-                    for (std::size_t j = t; j < jobs.size(); j += kThreads) {
-                        store.write_record(jobs[j].layer, jobs[j].expert, jobs[j].record);
-                        written.fetch_add(jobs[j].record.size(), std::memory_order_relaxed);
-                    }
-                } catch (...) {
-                    const std::lock_guard<std::mutex> lock(state_mutex);
-                    if (!failure) { failure = std::current_exception(); }
+    artifact::PinnedReadBuffers staging;
+    for (const Source& source : sources) {
+        if (source.tensor.data.empty()) { continue; }
+        const auto consume = [&](artifact::PayloadSpan chunk,
+                                 std::size_t) -> artifact::Reader::Completion {
+            const std::size_t first = static_cast<std::size_t>(
+                (chunk.absolute_offset - source.tensor.absolute_offset) / source.record_bytes);
+            auto copy = std::async(std::launch::async, [&source, &store, &written, chunk, first] {
+                for (std::size_t j = 0; j * source.record_bytes < chunk.data.size(); ++j) {
+                    const std::int32_t index = source.experts.at(first + j);
+                    store.write_record(
+                        index / ops::kMoeExperts, index % ops::kMoeExperts,
+                        chunk.data.subspan(j * source.record_bytes, source.record_bytes));
                 }
-                {
-                    const std::lock_guard<std::mutex> lock(state_mutex);
-                    ++finished;
-                }
-                finished_cv.notify_one();
+                written.fetch_add(chunk.data.size(), std::memory_order_relaxed);
             });
-        }
-        std::uint64_t total = 0;
-        for (const Job& job : jobs) { total += job.record.size(); }
-        std::unique_lock<std::mutex> lock(state_mutex);
-        // At least one report, the last one after every worker finished.
-        do {
-            (void)finished_cv.wait_for(lock, kProgressInterval,
-                                       [&] { return finished == threads.size(); });
             if (report) {
-                lock.unlock();
                 progress->callback("experts", written.load(std::memory_order_relaxed), total);
-                lock.lock();
             }
-        } while (finished != threads.size());
+            return [copy = std::make_shared<std::future<void>>(std::move(copy))] { copy->get(); };
+        };
+        (void)reader.stream({source.tensor.absolute_offset, source.tensor.data.size()},
+                            staging.views(), consume, source.record_bytes);
     }
-    if (failure) { std::rethrow_exception(failure); }
+    if (report) { progress->callback("experts", written.load(std::memory_order_relaxed), total); }
 }
 
 } // namespace
@@ -678,7 +650,7 @@ LoadedModel::LoadedModel(const artifact::Reader& reader, DeviceContext& device,
     };
 
     experts_ = std::make_unique<ExpertHostStore>(plan.codecs, kExpertHostChunkBytes);
-    fill_expert_store(binder, plan, *experts_, progress);
+    fill_expert_store(reader, binder, plan, *experts_, progress);
 
     const auto& d   = dense_;
     view_.embedding = materialize_matrix(d, plan.embedding);

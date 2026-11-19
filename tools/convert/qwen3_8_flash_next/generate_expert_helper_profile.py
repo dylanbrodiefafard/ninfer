@@ -40,7 +40,10 @@ def read_counts(path: Path) -> tuple[list[int], str]:
 def read_server_profile(path: Path) -> tuple[list[int], dict, str]:
     raw = path.read_bytes()
     profile = json.loads(raw)
-    if profile["version"] != 1 or profile["identity"] != "qwen3.8-flash-next/f3-fp8-nvfp4":
+    if profile["version"] != 1 or profile["identity"] != {
+        "model_id": "qwen3.8-flash-next",
+        "weights_id": "f3-fp8-nvfp4",
+    }:
         raise ValueError("server profile version or identity mismatch")
     rows = profile["decode_lookups"]
     if (
@@ -51,8 +54,8 @@ def read_server_profile(path: Path) -> tuple[list[int], dict, str]:
         raise ValueError("server decode_lookups must have shape [48,512]")
     counts = [v for row in rows for v in row]
     codecs = ("nvfp4", "f3g32")
-    lookups = [profile["decode_lookups_by_codec"][c] for c in codecs]
-    misses = [profile["decode_misses_by_codec"][c] for c in codecs]
+    lookups = [profile["codecs"][c]["decode_lookups"] for c in codecs]
+    misses = [profile["codecs"][c]["decode_misses"] for c in codecs]
     integers = counts + lookups + misses + [profile["rounds"], profile["miss_bytes"]]
     if any(type(v) is not int or not 0 <= v < 1 << 64 for v in integers):
         raise ValueError("server counters must be uint64 integers")
