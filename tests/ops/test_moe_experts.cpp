@@ -5,9 +5,13 @@
 // (matrix, row, K) value from the header's byte formulas; the round trip must be exact. The oracle
 // decodes the canonical codes (through the matrix's F3 codebook or as E2M1) times the exact E4M3
 // scale, applies the FP32 matrix scales and evaluates the complete routed + shared SwiGLU sum in
-// FP64 from the represented BF16 x.
+// FP64 from the represented BF16 x. Both activation profiles are checked against it, each with
+// its own criterion; the A8 profile is additionally checked against the same FP64 formula
+// evaluated on its represented activations (the host A8 codec of x and of the BF16 gated rows), a
+// supplementary control with the tight A16-like criterion.
 #include "ninfer/ops/moe_expert_partition.h"
 #include "ninfer/ops/moe_experts.h"
+#include "ops/moe_a8_activation_reference.h"
 #include "ops/moe_expert_record_reference.h"
 #include "ops/op_tester.h"
 #include "ops/sanitizer_scope.h"
@@ -36,6 +40,7 @@ using namespace ninfer::test;
 
 namespace {
 
+using ops::MoeActivationProfile;
 using ops::MoeExpertCodec;
 
 constexpr int kHidden        = ops::kMoeHidden;
@@ -67,6 +72,39 @@ constexpr ReductionCriterion partial_criterion() {
     return {/*relative_l2*/ 3.0e-3, /*gross_absolute*/ 0.0,
             /*gross_relative_to_max_reference*/ 4.0e-3};
 }
+
+// A8 criterion against the BF16-input oracle. E4M3 keeps 4 significant bits: round-to-nearest has
+// unit roundoff u = 2^-4 per element in the normal range, and an absolute error of at most 2^-10
+// scale below it (subnormal codes); with a row scale of max|v| / 448 the subnormal part adds at
+// most 2^-10 sqrt(K) / 448 < 1.2e-4 of a row's norm. The rounding error of a value in [2^e,
+// 2^(e+1)) is close to uniform on +-2^(e-4), so its relative RMS is 2^-3 / sqrt(12) = 3.6e-2 for a
+// value at the bottom of its binade and about 2.6e-2 for values spread over binades (the test's
+// uniform x gives 2.55e-2). Errors of distinct K are independent, so a weight row's dot product
+// carries the relative RMS e of its input vector: (1) x's rounding gives the gate and up
+// pre-activations e_x; (2) the gate/up product h = SiLU(g) u inherits sqrt(kappa^2 + 1) e_x, with
+// kappa = d ln SiLU(g) / d ln g = 1 + g (1 - sigma(g)) at most 1.28 for g > 0 and below 1 in
+// magnitude where |g| <~ 1 carries the energy; (3) h's own rounding adds e_h; (4) the down rows
+// carry the vector error, and the eleven contributions' independent errors keep the relative
+// size. Expected: sqrt(2 e^2 + e^2) with e = 2.6e-2 is 4.5e-2; the bound takes e = 3.6e-2 and
+// kappa = 1.3: sqrt((1.64 * 3.6e-2)^2 + (3.6e-2)^2) = 6.9e-2; the independent A16 terms (2.1e-3)
+// add in quadrature, so relative L2 <= 7e-2. Pointwise the error is Gaussian-like with RMS <= 7e-2
+// rms(y); over the sampled outputs max|y| is about 4 rms(y), so six deviations stay below 1.1e-1
+// max|y|.
+constexpr ReductionCriterion a8_output_criterion() {
+    return {/*relative_l2*/ 7.0e-2, /*gross_absolute*/ 0.0,
+            /*gross_relative_to_max_reference*/ 1.1e-1};
+}
+
+// A8 local partial: the FP32 sum loses only the A16 output-rounding term, within the same bound.
+constexpr ReductionCriterion a8_partial_criterion() { return a8_output_criterion(); }
+
+// Supplementary A8 control against the oracle evaluated on the represented activations (the host
+// codec of x and of the gated rows rounded to BF16): the activation roundings are shared, leaving
+// the A16 terms (y's BF16 rounding, FP32 accumulation) plus rare one-ulp differences of a gated
+// BF16 value between the FP32 kernel and the FP64 oracle, which can move that value's code or, for
+// a row's largest value, the row's scale by about 2^-8 (shifting that row's represented values by
+// about 0.4% plus a few re-rounded codes). The output criterion above bounds this.
+constexpr ReductionCriterion represented_a8_criterion() { return output_criterion(); }
 
 using moe_record::Expert;
 using moe_record::ScaleMode;
@@ -225,8 +263,10 @@ void set_token(Inputs& inputs, int t, const std::vector<int>& ids,
     }
 }
 
+// With outliers, every eighth token has one channel at 64 times the uniform range, so most of its
+// A8 codes fall in the lower binades and some in the subnormal range.
 Inputs make_inputs(const Fixture& fixture, const BankState& state, int tokens, Routing routing,
-                   bool shared, std::uint32_t seed) {
+                   bool shared, std::uint32_t seed, bool outliers = false) {
     std::mt19937 rng(seed);
     std::normal_distribution<double> normal(0.0, 1.0);
     const auto extent = static_cast<std::size_t>(tokens);
@@ -234,6 +274,14 @@ Inputs make_inputs(const Fixture& fixture, const BankState& state, int tokens, R
                   std::vector<std::int32_t>(extent * kTopK), std::vector<float>(extent * kTopK),
                   std::vector<float>(extent, 0.0F)};
     fill_uniform(inputs.x, seed + 1, -2.0F, 2.0F);
+    if (outliers) {
+        std::uniform_int_distribution<int> channel(0, kHidden - 1);
+        for (int t = 0; t < tokens; t += 8) {
+            inputs
+                .x[static_cast<std::size_t>(t) * kHidden + static_cast<std::size_t>(channel(rng))] =
+                (t % 16 == 0 ? 128.0F : -128.0F);
+        }
+    }
     round_to_bf16(inputs.x);
     if (shared) {
         for (auto& scale : inputs.shared_scale) {
@@ -284,11 +332,21 @@ Inputs make_inputs(const Fixture& fixture, const BankState& state, int tokens, R
 // other experts (the helper's share).
 enum class Part : std::uint8_t { All, Local, Helper };
 
+// The oracle's activations: the represented BF16 x (the Op's mathematical oracle), or the A8
+// profile's represented activations (the supplementary control): x replaced by its A8 codec
+// values and each expert's gate/up product rounded to BF16 and replaced by its A8 codec values.
+enum class OracleInput : std::uint8_t { Bf16, RepresentedA8 };
+
 // FP64 oracle of one token; `local` (one flag per expert id) selects Local and Helper.
 std::vector<double> oracle_token(const Fixture& fixture, const BankState& state,
                                  const Inputs& inputs, int t, Part part = Part::All,
-                                 const std::vector<bool>* local = nullptr) {
-    const float* x = inputs.x.data() + static_cast<std::size_t>(t) * kHidden;
+                                 const std::vector<bool>* local = nullptr,
+                                 OracleInput input              = OracleInput::Bf16) {
+    const float* row = inputs.x.data() + static_cast<std::size_t>(t) * kHidden;
+    std::vector<double> x(row, row + kHidden);
+    if (input == OracleInput::RepresentedA8) {
+        x = moe_a8::decode(moe_a8::encode(std::span<const float>(row, kHidden), kHidden), kHidden);
+    }
     std::vector<double> y(kHidden, 0.0);
     std::vector<double> gated(kInter);
     const auto expert_output = [&](const float* gate, const float* up, const float* down,
@@ -305,6 +363,13 @@ std::vector<double> oracle_token(const Fixture& fixture, const BankState& state,
             g *= scale[0];
             u *= scale[1];
             gated[i] = g / (1.0 + std::exp(-g)) * u;
+        }
+        if (input == OracleInput::RepresentedA8) {
+            std::vector<float> rounded(gated.size());
+            for (std::size_t i = 0; i < gated.size(); ++i) {
+                rounded[i] = bf16_to_f32(f32_to_bf16(static_cast<float>(gated[i])));
+            }
+            gated = moe_a8::decode(moe_a8::encode(rounded, kInter), kInter);
         }
         for (std::size_t n = 0; n < y.size(); ++n) {
             double sum            = 0.0;
@@ -355,14 +420,15 @@ std::vector<int> sample_tokens(int tokens, int samples, std::uint32_t seed) {
 std::vector<std::vector<double>> oracle_tokens(const Fixture& fixture, const BankState& state,
                                                const Inputs& inputs, const std::vector<int>& tokens,
                                                Part part                      = Part::All,
-                                               const std::vector<bool>* local = nullptr) {
+                                               const std::vector<bool>* local = nullptr,
+                                               OracleInput input              = OracleInput::Bf16) {
     std::vector<std::vector<double>> expected(tokens.size());
     std::vector<std::jthread> workers;
     workers.reserve(kOracleThreads);
     for (std::size_t w = 0; w < kOracleThreads; ++w) {
         workers.emplace_back([&, w] {
             for (std::size_t i = w; i < tokens.size(); i += kOracleThreads) {
-                expected[i] = oracle_token(fixture, state, inputs, tokens[i], part, local);
+                expected[i] = oracle_token(fixture, state, inputs, tokens[i], part, local, input);
             }
         });
     }
@@ -370,22 +436,32 @@ std::vector<std::vector<double>> oracle_tokens(const Fixture& fixture, const Ban
     return expected;
 }
 
-// Compares the sampled tokens of y (BF16 bits [T][2560]) against the oracle.
+// Compares the sampled tokens of y (BF16 bits [T][2560]) against the oracle with the profile's
+// criterion and, for A8, against the represented-activation control.
 int verify_output(const std::string& label, const Fixture& fixture, const BankState& state,
                   const Inputs& inputs, const std::vector<std::uint16_t>& bits,
-                  const std::vector<int>& sampled) {
-    const std::vector<std::vector<double>> expected =
-        oracle_tokens(fixture, state, inputs, sampled);
+                  const std::vector<int>& sampled, MoeActivationProfile profile) {
     std::vector<double> got;
-    std::vector<double> reference;
-    for (std::size_t i = 0; i < sampled.size(); ++i) {
-        const auto row = static_cast<std::size_t>(sampled[i]) * kHidden;
-        for (std::size_t n = 0; n < kHidden; ++n) {
-            got.push_back(bf16_to_f32(bits[row + n]));
-            reference.push_back(expected[i][n]);
-        }
+    for (const int token : sampled) {
+        const auto row = static_cast<std::size_t>(token) * kHidden;
+        for (std::size_t n = 0; n < kHidden; ++n) { got.push_back(bf16_to_f32(bits[row + n])); }
     }
-    return verify_reduction(label, got, reference, output_criterion());
+    const auto compare = [&](const std::string& name, OracleInput input,
+                             const ReductionCriterion& criterion) {
+        const std::vector<std::vector<double>> expected =
+            oracle_tokens(fixture, state, inputs, sampled, Part::All, nullptr, input);
+        std::vector<double> reference;
+        for (const auto& token : expected) {
+            reference.insert(reference.end(), token.begin(), token.end());
+        }
+        return verify_reduction(name, got, reference, criterion);
+    };
+    if (profile == MoeActivationProfile::A16) {
+        return compare(label, OracleInput::Bf16, output_criterion());
+    }
+    return compare(label, OracleInput::Bf16, a8_output_criterion()) +
+           compare(label + " represented-A8 control", OracleInput::RepresentedA8,
+                   represented_a8_criterion());
 }
 
 class Stream {
@@ -449,16 +525,16 @@ private:
 // Device copies of one case's inputs, expert table and matrix scales, and one Op invocation.
 class Run {
 public:
-    Run(const Fixture& fixture, const Inputs& inputs)
-        : fixture_(fixture), tokens_(inputs.tokens), x_(to_device_bf16(inputs.x)),
-          ids_(to_device(inputs.ids)), weights_(to_device(inputs.weights)),
-          shared_scale_(to_device(inputs.shared_scale)),
+    Run(const Fixture& fixture, const Inputs& inputs, MoeActivationProfile profile)
+        : fixture_(fixture), profile_(profile), tokens_(inputs.tokens),
+          x_(to_device_bf16(inputs.x)), ids_(to_device(inputs.ids)),
+          weights_(to_device(inputs.weights)), shared_scale_(to_device(inputs.shared_scale)),
           table_(static_cast<std::size_t>(kExperts) * sizeof(std::int64_t)),
           scales_(static_cast<std::size_t>(kExperts) * 3 * sizeof(float)),
           shared_scales_(3 * sizeof(float)),
           y_(static_cast<std::size_t>(inputs.tokens) * kHidden * sizeof(std::uint16_t)),
           partial_(static_cast<std::size_t>(inputs.tokens) * kHidden * sizeof(float)),
-          workspace_(ops::moe_experts_workspace_capacity_bytes(inputs.tokens)) {}
+          workspace_(ops::moe_experts_workspace_capacity_bytes(inputs.tokens, profile)) {}
 
     void upload(const BankState& state) {
         std::vector<std::int64_t> entries(kExperts);
@@ -501,7 +577,7 @@ public:
         Tensor weights(weights_.p, DType::FP32, {kTopK, tokens_});
         Tensor scale(shared_scale_.p, DType::FP32, {tokens_});
         Tensor y(y_.data(), DType::BF16, {kHidden, tokens_});
-        ops::moe_experts(x, ids, weights, scale, bank(), y, workspace_, stream, deferral);
+        ops::moe_experts(x, ids, weights, scale, bank(), profile_, y, workspace_, stream, deferral);
     }
 
     // moe_experts_local_partial into the FP32 partial, local_experts I32 [16].
@@ -513,8 +589,8 @@ public:
         Tensor scale(shared_scale_.p, DType::FP32, {tokens_});
         Tensor mask(local_experts.p, DType::I32, {ops::kMoeExpertMaskWords});
         Tensor partial(partial_.data(), DType::FP32, {kHidden, tokens_});
-        ops::moe_experts_local_partial(x, ids, weights, scale, bank(), mask, partial, workspace_,
-                                       stream, deferral);
+        ops::moe_experts_local_partial(x, ids, weights, scale, bank(), profile_, mask, partial,
+                                       workspace_, stream, deferral);
     }
 
     // Poisons y and the partial and orders the poison before work on any stream.
@@ -553,6 +629,7 @@ public:
 
 private:
     const Fixture& fixture_;
+    MoeActivationProfile profile_;
     int tokens_;
     DeviceBuffer x_, ids_, weights_, shared_scale_, table_, scales_, shared_scales_;
     GuardedDeviceBuffer y_;
@@ -669,7 +746,13 @@ struct Case {
     bool graph;
     int deferred; // routed experts read through a deferral; 0: a deferral defers none; -1: none
     std::uint32_t seed;
+    MoeActivationProfile profile = MoeActivationProfile::A16;
+    bool outliers                = false; // make_inputs' outlier tokens
 };
+
+const char* profile_name(MoeActivationProfile profile) {
+    return profile == MoeActivationProfile::A8 ? " a8" : "";
+}
 
 std::string describe(const Case& c) {
     const char* routing = c.routing == Routing::Skewed     ? "skewed"
@@ -678,25 +761,31 @@ std::string describe(const Case& c) {
     const char* records = c.records == RecordSet::Standard    ? ""
                           : c.records == RecordSet::Subnormal ? " subnormal-scales"
                                                               : " narrow-scales";
-    return "moe_experts T=" + std::to_string(c.tokens) + " " + routing +
-           (c.mixed ? " mixed-host" : " device") + records + (c.graph ? " graph" : "") +
+    return "moe_experts" + std::string(profile_name(c.profile)) + " T=" + std::to_string(c.tokens) +
+           " " + routing + (c.mixed ? " mixed-host" : " device") + records +
+           (c.outliers ? " outliers" : "") + (c.graph ? " graph" : "") +
            (c.deferred < 0 ? "" : " deferred=" + std::to_string(c.deferred));
 }
 
 int run_case(const Fixture& fixture, const Case& c) {
     const std::string label = describe(c);
     const BankState state   = make_bank_state(c.records, 0, c.mixed, c.seed + 5);
-    const Inputs inputs =
-        make_inputs(fixture, state, c.tokens, c.routing, c.records == RecordSet::Standard, c.seed);
+    const Inputs inputs     = make_inputs(fixture, state, c.tokens, c.routing,
+                                          c.records == RecordSet::Standard, c.seed, c.outliers);
     const std::vector<int> sampled = sample_tokens(c.tokens, c.samples, c.seed + 9);
-    Run run(fixture, inputs);
+    Run run(fixture, inputs, c.profile);
     run.upload(state);
     run.poison_output();
     run.invoke(nullptr);
     cuda_synchronize();
     const std::vector<std::uint16_t> bits = run.output();
-    int failures = verify_output(label, fixture, state, inputs, bits, sampled);
+    int failures = verify_output(label, fixture, state, inputs, bits, sampled, c.profile);
     failures += run.verify_guards(label + " y");
+    // Determinism: a second call on the same inputs is bit-identical.
+    run.poison_output();
+    run.invoke(nullptr);
+    cuda_synchronize();
+    failures += verify_exact((label + " repeat").c_str(), run.output(), bits);
 
     if (c.deferred >= 0) {
         // Eager: the copies run on a second stream after a host sleep; the Op's stream waits for
@@ -751,7 +840,7 @@ int run_case(const Fixture& fixture, const Case& c) {
         graph.replay(stream.get());
         const std::vector<std::uint16_t> replayed = run.output();
         failures += verify_output(label + " replay after table change", fixture, changed, inputs,
-                                  replayed, sampled);
+                                  replayed, sampled, c.profile);
         run.poison_output();
         run.invoke(nullptr);
         cuda_synchronize();
@@ -800,19 +889,31 @@ void unmap_remote(Run& run, const Fixture& fixture, const BankState& state,
     }
 }
 
-// Compares the FP32 partial [T][2560] of every token against the Local restriction of the oracle.
+// Compares the FP32 partial [T][2560] of every token against the Local restriction of the oracle
+// with the profile's criterion and, for A8, against the represented-activation control.
 int verify_partial(const std::string& label, const Fixture& fixture, const BankState& state,
                    const Inputs& inputs, const std::vector<bool>& local,
-                   const std::vector<float>& partial) {
+                   const std::vector<float>& partial, MoeActivationProfile profile) {
     std::vector<int> tokens(static_cast<std::size_t>(inputs.tokens));
     std::iota(tokens.begin(), tokens.end(), 0);
-    const std::vector<std::vector<double>> expected =
-        oracle_tokens(fixture, state, inputs, tokens, Part::Local, &local);
-    std::vector<double> got(partial.begin(), partial.end());
-    std::vector<double> reference;
-    reference.reserve(got.size());
-    for (const auto& row : expected) { reference.insert(reference.end(), row.begin(), row.end()); }
-    return verify_reduction(label, got, reference, partial_criterion());
+    const std::vector<double> got(partial.begin(), partial.end());
+    const auto compare = [&](const std::string& name, OracleInput input,
+                             const ReductionCriterion& criterion) {
+        const std::vector<std::vector<double>> expected =
+            oracle_tokens(fixture, state, inputs, tokens, Part::Local, &local, input);
+        std::vector<double> reference;
+        reference.reserve(got.size());
+        for (const auto& row : expected) {
+            reference.insert(reference.end(), row.begin(), row.end());
+        }
+        return verify_reduction(name, got, reference, criterion);
+    };
+    if (profile == MoeActivationProfile::A16) {
+        return compare(label, OracleInput::Bf16, partial_criterion());
+    }
+    return compare(label, OracleInput::Bf16, a8_partial_criterion()) +
+           compare(label + " represented-A8 control", OracleInput::RepresentedA8,
+                   partial_criterion());
 }
 
 struct SplitCase {
@@ -822,6 +923,7 @@ struct SplitCase {
     bool graph;
     int deferred; // routed experts (local or not) read through a deferral; -1: no deferral
     std::uint32_t seed;
+    MoeActivationProfile profile = MoeActivationProfile::A16;
 };
 
 std::string describe(const SplitCase& c) {
@@ -831,14 +933,16 @@ std::string describe(const SplitCase& c) {
     const char* locality = c.locality == Locality::All    ? "all-local"
                            : c.locality == Locality::None ? "none-local"
                                                           : "random-local";
-    return "moe_experts split T=" + std::to_string(c.tokens) + " " + routing + " " + locality +
+    return "moe_experts" + std::string(profile_name(c.profile)) +
+           " split T=" + std::to_string(c.tokens) + " " + routing + " " + locality +
            (c.graph ? " graph" : "") +
            (c.deferred < 0 ? "" : " deferred=" + std::to_string(c.deferred));
 }
 
 // moe_experts_local_partial against the Local oracle (with every non-local record unmapped), then
 // moe_expert_partition and moe_expert_partial_join with the helper's share given as the FP32
-// rounding of its oracle: the joined y against the full oracle. All-local partials round to
+// rounding of its oracle (for A8, of the represented-activation oracle): the joined y against the
+// full oracle. All-local partials round to
 // moe_experts' output bit for bit (the same slot-order sum). With graph, a captured local partial
 // is replayed after the bitset and the table change.
 int run_split_case(const Fixture& fixture, const SplitCase& c) {
@@ -847,7 +951,7 @@ int run_split_case(const Fixture& fixture, const SplitCase& c) {
     const Inputs inputs           = make_inputs(fixture, state, c.tokens, c.routing, true, c.seed);
     const std::vector<bool> local = make_locality(c.locality, c.seed + 7);
     const auto tokens             = static_cast<std::size_t>(c.tokens);
-    Run run(fixture, inputs);
+    Run run(fixture, inputs, c.profile);
     run.upload(state);
     run.poison_output();
     run.invoke(nullptr);
@@ -860,7 +964,8 @@ int run_split_case(const Fixture& fixture, const SplitCase& c) {
     run.invoke_local(nullptr, mask);
     cuda_synchronize();
     const std::vector<float> partial = run.partial_output();
-    int failures = verify_partial(label + " partial", fixture, state, inputs, local, partial);
+    int failures =
+        verify_partial(label + " partial", fixture, state, inputs, local, partial, c.profile);
     failures += run.verify_partial_guards(label + " partial");
     if (c.locality == Locality::All) {
         std::vector<std::uint16_t> rounded(partial.size());
@@ -893,8 +998,11 @@ int run_split_case(const Fixture& fixture, const SplitCase& c) {
     for (int t = 0; t < c.tokens; ++t) {
         if (map[static_cast<std::size_t>(t)] >= 0) { participants.push_back(t); }
     }
-    const std::vector<std::vector<double>> remote =
-        oracle_tokens(fixture, state, inputs, participants, Part::Helper, &local);
+    // The helper's share follows the same activation profile (the R9700 helper's A8 prefill
+    // applies the same codec), so for A8 it is the represented-activation oracle.
+    const std::vector<std::vector<double>> remote = oracle_tokens(
+        fixture, state, inputs, participants, Part::Helper, &local,
+        c.profile == MoeActivationProfile::A8 ? OracleInput::RepresentedA8 : OracleInput::Bf16);
     for (std::size_t i = 0; i < participants.size(); ++i) {
         const auto column =
             static_cast<std::size_t>(map[static_cast<std::size_t>(participants[i])]) * kHidden;
@@ -916,8 +1024,9 @@ int run_split_case(const Fixture& fixture, const SplitCase& c) {
     }
     std::vector<int> all(tokens);
     std::iota(all.begin(), all.end(), 0);
-    failures += verify_output(label + " joined", fixture, state, inputs,
-                              from_device<std::uint16_t>(y.data(), tokens * kHidden), all);
+    failures +=
+        verify_output(label + " joined", fixture, state, inputs,
+                      from_device<std::uint16_t>(y.data(), tokens * kHidden), all, c.profile);
     failures += y.verify_guards(label + " joined y");
 
     if (c.deferred >= 0) {
@@ -956,7 +1065,7 @@ int run_split_case(const Fixture& fixture, const SplitCase& c) {
         graph.replay(stream.get());
         const std::vector<float> replayed = run.partial_output();
         failures += verify_partial(label + " replay after bitset change", fixture, state, inputs,
-                                   changed, replayed);
+                                   changed, replayed, c.profile);
         run.poison_output();
         run.invoke_local(nullptr, mask);
         cuda_synchronize();
@@ -969,7 +1078,7 @@ int run_split_case(const Fixture& fixture, const SplitCase& c) {
 int invalid_argument_cases(const Fixture& fixture) {
     const BankState state = make_bank_state(RecordSet::Standard, 0, false, 3U);
     const Inputs inputs   = make_inputs(fixture, state, 2, Routing::Skewed, true, 3U);
-    Run run(fixture, inputs);
+    Run run(fixture, inputs, MoeActivationProfile::A16);
     run.upload(state);
     // Validation rejects these calls before the workspace is used.
     WorkspaceArena workspace(256);
@@ -979,7 +1088,8 @@ int invalid_argument_cases(const Fixture& fixture) {
         Tensor weights(run.weights_data(), DType::FP32, {kTopK, 2});
         Tensor scale(run.shared_scale_data(), DType::FP32, {2});
         Tensor y(y_data, DType::BF16, {kHidden, 2});
-        ops::moe_experts(x, ids, weights, scale, run.bank(), y, workspace, nullptr);
+        ops::moe_experts(x, ids, weights, scale, run.bank(), MoeActivationProfile::A16, y,
+                         workspace, nullptr);
     };
     int failures = 0;
     failures += expect_invalid_argument([&] { call(DType::FP32, run.y_data()); },
@@ -987,10 +1097,14 @@ int invalid_argument_cases(const Fixture& fixture) {
     failures += expect_invalid_argument([&] { call(DType::I32, run.x_data()); },
                                         "moe_experts accepted y aliasing x");
     failures += expect_invalid_argument(
-        [] { (void)ops::moe_experts_workspace_capacity_bytes(ops::kMoeMaxTokens + 1); },
-        "moe_experts_workspace_capacity_bytes accepted T=8193");
-    failures += expect_invalid_argument([] { (void)ops::moe_experts_workspace_capacity_bytes(0); },
-                                        "moe_experts_workspace_capacity_bytes accepted T=0");
+        [] {
+            (void)ops::moe_experts_workspace_capacity_bytes(ops::kMoeMaxTokens + 1,
+                                                            MoeActivationProfile::A8);
+        },
+        "moe_experts_workspace_capacity_bytes accepted T=16385");
+    failures += expect_invalid_argument(
+        [] { (void)ops::moe_experts_workspace_capacity_bytes(0, MoeActivationProfile::A16); },
+        "moe_experts_workspace_capacity_bytes accepted T=0");
     const DeviceBuffer mask = to_device(locality_words(make_locality(Locality::All, 0U)));
     const auto call_local   = [&](DType partial_dtype, std::int32_t mask_words) {
         Tensor x(run.x_data(), DType::BF16, {kHidden, 2});
@@ -999,7 +1113,8 @@ int invalid_argument_cases(const Fixture& fixture) {
         Tensor scale(run.shared_scale_data(), DType::FP32, {2});
         Tensor bits(mask.p, DType::I32, {mask_words});
         Tensor partial(run.y_data(), partial_dtype, {kHidden, 2});
-        ops::moe_experts_local_partial(x, ids, weights, scale, run.bank(), bits, partial, workspace,
+        ops::moe_experts_local_partial(x, ids, weights, scale, run.bank(),
+                                       MoeActivationProfile::A16, bits, partial, workspace,
                                        nullptr);
     };
     failures += expect_invalid_argument([&] { call_local(DType::BF16, ops::kMoeExpertMaskWords); },
@@ -1042,9 +1157,33 @@ int run_full(const Fixture& fixture) {
         {1025, Routing::Skewed, true, RecordSet::Subnormal, 48, false, -1, 61U},
         {4096, Routing::Skewed, true, RecordSet::Standard, 48, true, -1, 67U},
         {8192, Routing::Skewed, true, RecordSet::Standard, 48, false, -1, 71U},
+        {16384, Routing::Skewed, false, RecordSet::Standard, 48, false, -1, 87U},
+        // A8 (one 64-token tile at every T): a single token with a deferral, a concentrated
+        // routing in one job per expert with a graph replay after a table change and in two jobs
+        // per expert (64 + 1) with narrow scales (every block scale within a binade step, so a
+        // misapplied block scale is not hidden by the scale spread), subnormal scales, outlier
+        // activations (subnormal codes), distinct routing with more deferred work items than one
+        // wave, and the prefill extents up to a 16,384-token super-chunk.
+        {1, Routing::Skewed, true, RecordSet::Standard, 48, false, 6, 301U,
+         MoeActivationProfile::A8},
+        {17, Routing::Concentrated, true, RecordSet::Standard, 48, true, -1, 303U,
+         MoeActivationProfile::A8},
+        {48, Routing::Distinct, true, RecordSet::Standard, 48, false, 40, 305U,
+         MoeActivationProfile::A8},
+        {65, Routing::Concentrated, true, RecordSet::Narrow, 65, false, 6, 307U,
+         MoeActivationProfile::A8},
+        {300, Routing::Skewed, true, RecordSet::Subnormal, 48, false, -1, 309U,
+         MoeActivationProfile::A8},
+        {1025, Routing::Skewed, true, RecordSet::Standard, 48, false, 6, 311U,
+         MoeActivationProfile::A8, true},
+        {4096, Routing::Skewed, true, RecordSet::Standard, 48, true, 40, 313U,
+         MoeActivationProfile::A8},
+        {16384, Routing::Skewed, false, RecordSet::Standard, 48, false, -1, 315U,
+         MoeActivationProfile::A8},
     };
     for (const Case& c : cases) { failures += run_case(fixture, c); }
-    // The helper round's extents: one decode token, a 4-column verify lane, and twelve lanes.
+    // The helper round's extents: one decode token, a 4-column verify lane, and twelve lanes
+    // (moe_expert_partition's range), also under A8.
     const std::vector<SplitCase> split_cases = {
         {1, Routing::Skewed, Locality::Random, false, 6, 201U},
         {4, Routing::Skewed, Locality::Random, true, -1, 203U},
@@ -1052,14 +1191,17 @@ int run_full(const Fixture& fixture) {
         {20, Routing::Distinct, Locality::None, false, -1, 207U},
         {48, Routing::Skewed, Locality::Random, true, 40, 209U},
         {48, Routing::Distinct, Locality::All, false, -1, 211U},
+        {48, Routing::Skewed, Locality::Random, true, 40, 213U, MoeActivationProfile::A8},
+        {48, Routing::Distinct, Locality::All, false, -1, 215U, MoeActivationProfile::A8},
     };
     for (const SplitCase& c : split_cases) { failures += run_split_case(fixture, c); }
     return failures;
 }
 
-// Reduced cases running every token tile, codec and placement once, the deferral at a single
-// job, at split jobs, with nothing deferred, and with more deferred work items than one wave of
-// CTAs, and the expert-helper split at a verify lane and at twelve lanes, for compute-sanitizer.
+// Reduced cases running every token tile, codec, placement and activation profile once, the
+// deferral at a single job, at split jobs, with nothing deferred, and with more deferred work
+// items than one wave of CTAs, and the expert-helper split at a verify lane and at twelve lanes,
+// for compute-sanitizer.
 int run_sanitizer(const Fixture& fixture) {
     const std::vector<Case> cases = {
         {1, Routing::Skewed, true, RecordSet::Standard, 1, false, 6, 101U},
@@ -1068,12 +1210,17 @@ int run_sanitizer(const Fixture& fixture) {
         {48, Routing::Distinct, true, RecordSet::Standard, 4, false, 40, 113U},
         {257, Routing::Skewed, true, RecordSet::Standard, 4, false, -1, 107U},
         {1025, Routing::Skewed, true, RecordSet::Standard, 4, false, -1, 109U},
+        {65, Routing::Concentrated, true, RecordSet::Standard, 4, false, 6, 115U,
+         MoeActivationProfile::A8},
+        {300, Routing::Skewed, true, RecordSet::Standard, 4, false, -1, 117U,
+         MoeActivationProfile::A8},
     };
     int failures = 0;
     for (const Case& c : cases) { failures += run_case(fixture, c); }
     const std::vector<SplitCase> split_cases = {
         {4, Routing::Skewed, Locality::Random, false, 6, 221U},
         {48, Routing::Distinct, Locality::Random, false, -1, 223U},
+        {48, Routing::Distinct, Locality::Random, false, -1, 225U, MoeActivationProfile::A8},
     };
     for (const SplitCase& c : split_cases) { failures += run_split_case(fixture, c); }
     return failures;

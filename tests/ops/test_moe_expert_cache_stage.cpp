@@ -165,7 +165,7 @@ int placement_cases(cudaStream_t stream) {
                  {"nvfp4 only", 1.0, 0.4, Ids::Repeats},
                  {"f3 only", 0.0, 0.5, Ids::OutOfRange}};
 
-    const std::int32_t token_counts[] = {1, 4, 20, 96, ops::kMoeMaxTokens};
+    const std::int32_t token_counts[] = {1, 4, 20, 96, ops::kMoeStageMaxTokens};
     const std::int32_t ks[]           = {1, 4, 10};
     for (const auto& mix : mixes) {
         const Tables t = random_tables(mix.nvfp4_share, mix.resident, rng);
