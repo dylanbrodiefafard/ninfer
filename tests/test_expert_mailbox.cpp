@@ -6,14 +6,15 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 using namespace ninfer;
-void mailbox_test_nonce(const void*, const void*, const void*, const void*, void*,
-                        const std::uint32_t*, std::uint32_t*, const HipStream&);
+void mailbox_test_nonce(const void*, const void*, const void*, void*, const std::uint32_t*,
+                        std::uint32_t*, const HipStream&);
 void mailbox_test_delay(const HipStream&);
 void mailbox_test_fail(ExpertMailboxView, const HipStream&);
 cudaError_t mailbox_test_cuda_error(cudaStream_t);
@@ -64,13 +65,10 @@ struct CudaGraph {
 struct Panels {
     CudaBuffer x{48 * 48 * kExpertActivationBytes}, ids{48 * 48 * 40}, weights{48 * 48 * 40},
         out{48 * 48 * kExpertPartialBytes}, count{4};
-    HipBuffer hx{48 * kExpertActivationBytes}, hi{48 * 40}, hw{48 * 40}, pairs{48 * 80},
-        ho{48 * kExpertPartialBytes}, hn{4}, bad{4};
+    HipBuffer hx{48 * kExpertActivationBytes}, hi{48 * 40}, hw{48 * 40}, hn{4}, bad{4};
 
     void initialize(const HipStream& stream) {
-        for (auto* p : {&hx, &hi, &hw, &pairs, &ho, &hn, &bad}) {
-            hip_zero(p->data(), p->size(), stream);
-        }
+        for (auto* p : {&hx, &hi, &hw, &hn, &bad}) { hip_zero(p->data(), p->size(), stream); }
         stream.synchronize();
     }
 
@@ -116,16 +114,23 @@ struct Panels {
         }
     }
 
+    // Layer `layer` of a helper round: the import publishes the previous layer's response, and
+    // the nonce kernel stands in for the helper Op, writing the response payload in place
+    // through the HIP alias. respond() publishes the round's last layer.
     void helper(ExpertMailbox& box, std::uint32_t layer, std::uint32_t t, const HipStream& stream) {
-        expert_mailbox_hip_import(box.hip_view(), layer, hx.data(), hi.data(), hw.data(),
-                                  static_cast<std::uint32_t*>(hn.data()), t, stream);
-        expert_mailbox_hip_interleave(hi.data(), hw.data(), pairs.data(),
-                                      static_cast<std::uint32_t*>(hn.data()), stream);
-        mailbox_test_nonce(hx.data(), hi.data(), hw.data(), pairs.data(), ho.data(),
+        expert_mailbox_hip_import(
+            box.hip_view(), layer,
+            layer == 0 ? std::nullopt : std::optional<std::uint32_t>(layer - 1), hx.data(),
+            hi.data(), hw.data(), static_cast<std::uint32_t*>(hn.data()), t, stream);
+        mailbox_test_nonce(hx.data(), hi.data(), hw.data(), box.hip_view().slots[layer].partial,
                            static_cast<std::uint32_t*>(hn.data()),
                            static_cast<std::uint32_t*>(bad.data()), stream);
-        expert_mailbox_hip_export(box.hip_view(), layer, ho.data(),
-                                  static_cast<std::uint32_t*>(hn.data()), t, stream);
+    }
+
+    void respond(ExpertMailbox& box, std::uint32_t layer, std::uint32_t t,
+                 const HipStream& stream) {
+        expert_mailbox_hip_respond(box.hip_view(), layer, static_cast<std::uint32_t*>(hn.data()), t,
+                                   stream);
     }
 
     void primary(ExpertMailbox& box, std::uint32_t layer, cudaStream_t stream) {
@@ -153,6 +158,7 @@ void replay() {
     for (const auto t : {1U, 4U, 20U, 48U, 4U, 1U}) {
         HipGraph helper(hip);
         for (std::uint32_t l = 0; l < 48; ++l) { panels.helper(box, l, t, hip); }
+        panels.respond(box, 47, t, hip);
         helper.instantiate();
         CudaGraph primary;
         cuda_check(cudaStreamBeginCapture(cuda.value, cudaStreamCaptureModeThreadLocal));
@@ -191,7 +197,10 @@ void failure_case(const std::string& mode, std::uint32_t t = 1) {
         cuda_check(cudaStreamSynchronize(cuda.value));
         box.cancel();
     }
-    if (mode != "cuda-deadline") { panels.helper(box, 0, t, hip); }
+    if (mode != "cuda-deadline") {
+        panels.helper(box, 0, t, hip);
+        panels.respond(box, 0, t, hip);
+    }
     if (mode == "late-cancel") {
         expert_mailbox_cuda_publish(box.cuda_view(), 0, panels.x.data, panels.ids.data,
                                     panels.weights.data,
@@ -255,6 +264,7 @@ void teardown() {
         ExpertMailbox box(48);
         HipGraph helper(hip);
         for (std::uint32_t l = 0; l < 48; ++l) { panels.helper(box, l, 48, hip); }
+        panels.respond(box, 47, 48, hip);
         helper.instantiate();
         static_cast<void>(box.begin(48, cuda.value, hip));
         helper.launch(hip);
@@ -267,6 +277,7 @@ void teardown() {
         ExpertMailbox box(1);
         static_cast<void>(box.begin(1, cuda.value, hip));
         panels.helper(box, 0, 1, hip);
+        panels.respond(box, 0, 1, hip);
         // Active destructor must cancel and join before alias unregistration.
     }
     require(hip.ready(), "active teardown left HIP work running");
@@ -284,6 +295,7 @@ void host_exception_reuse() {
         for (std::uint32_t layer = 0; layer < 48; ++layer) {
             panels.helper(box, layer, tokens, hip);
         }
+        panels.respond(box, 47, tokens, hip);
         helper.instantiate();
         panels.input(1, 0x10203040U);
         bool original = false;
@@ -327,6 +339,7 @@ void late_finish() {
             panels.helper(box, layer, 1, hip);
             panels.primary(box, layer, cuda.value);
         }
+        panels.respond(box, 47, 1, hip);
         cuda_check(cudaStreamSynchronize(cuda.value));
         hip.synchronize();
         if (round == 0) { std::this_thread::sleep_for(std::chrono::seconds(31)); }

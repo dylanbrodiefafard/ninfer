@@ -20,13 +20,18 @@ namespace ninfer::ops {
 // Token capacity of one moe_helper_experts call: a prefill chunk of up to 16384 tokens.
 inline constexpr std::int32_t kMoeHelperExpertsMaxTokens = 16384;
 
-/** One route entry of a compact token: an expert id in [0,512) or kMoeHelperInactiveExpert. */
-struct MoeHelperRoute {
-    std::int32_t expert;
-    float weight;
+/**
+ * The route entries of the compact tokens as two planes (the expert-helper wire's layout), entry
+ * e = 10 t + j holding route slot j of compact token t:
+ *
+ *   experts  I32 [max_tokens][10], 4-byte aligned: an expert id in [0,512) or
+ *            kMoeHelperInactiveExpert.
+ *   weights  FP32 [max_tokens][10], 4-byte aligned: the entry's route weight.
+ */
+struct MoeHelperRoutes {
+    const std::int32_t* experts = nullptr;
+    const float* weights        = nullptr;
 };
-
-static_assert(sizeof(MoeHelperRoute) == 8);
 
 /**
  * One layer's helper-owned experts, resident in the helper's device memory.
@@ -103,13 +108,17 @@ struct MoeHelperE4m3Rows {
  *               expert input. A8: nullptr.
  *   x_e4m3      A8: the E4M3 rows of the tokens' BF16 expert input (MoeHelperE4m3Rows). A16: both
  *               pointers nullptr.
- *   routes      [max_tokens][10] MoeHelperRoute, 8-byte aligned: rows [0,N) are the tokens' route
- *               entries in route-slot order j = 0..9. An active entry names an expert the bank
- *               owns; an inactive entry (kMoeHelperInactiveExpert) may appear anywhere in a row,
- *               and its weight is not read. A token may name an expert more than once (each entry
+ *   routes      MoeHelperRoutes: rows [0,N) of both planes are the tokens' route entries in
+ *               route-slot order j = 0..9. An active entry names an expert the bank owns; an
+ *               inactive entry (kMoeHelperInactiveExpert) may appear anywhere in a row, and its
+ *               weight is not read. A token may name an expert more than once (each entry
  *               contributes).
  *   y           output_dtype [max_tokens][2560], 16-byte aligned, disjoint from every other
- *               operand: rows [0,N) receive the output; rows [N,max_tokens) are not written.
+ *               operand: rows [0,N) receive the output; rows [N,max_tokens) are not written. y
+ *               may be host memory mapped into the device (the expert-helper mailbox's response
+ *               payload): the call writes it with plain stores, complete when its kernels
+ *               complete, so an observer on another agent needs a later system-scope release in
+ *               stream order (a fence that writes back the device L2, then the publishing store).
  *   output_dtype y's element type: Fp32 at every max_tokens, Bf16 only at max_tokens > 48.
  */
 struct MoeHelperExpertsArgs {
@@ -118,7 +127,7 @@ struct MoeHelperExpertsArgs {
     MoeHelperActivationProfile activation = MoeHelperActivationProfile::A16;
     const std::uint16_t* x                = nullptr;
     MoeHelperE4m3Rows x_e4m3;
-    const MoeHelperRoute* routes = nullptr;
+    MoeHelperRoutes routes;
     MoeHelperExpertBank bank;
     void* y                           = nullptr;
     MoeHelperOutputDtype output_dtype = MoeHelperOutputDtype::Fp32;
@@ -176,7 +185,7 @@ private:
  * Op: moe_helper_experts
  *
  * Math, for each compact token t < N with x_t = x[t,:] and its active route entries
- * (e_j, w_j) = routes[t,j]:
+ * (e_j, w_j) = (routes.experts[t,j], routes.weights[t,j]):
  *
  *   E_e(x)  = D_e (SiLU(G_e x) * U_e x)          (SiLU(z) = z / (1 + exp(-z)), * elementwise)
  *   y[t,:]  = sum_j w_j E_{e_j}(x_t)

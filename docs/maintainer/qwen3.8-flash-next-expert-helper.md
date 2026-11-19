@@ -20,8 +20,8 @@ local-prefill reads or the immutable host backing store.
 Use CUDA-owned mapped pinned mailboxes registered with HIP, separate request/response cache
 lines, and system-scope release/acquire. **Prequeue a HIP graph containing all 48 layer programs
 before launching CUDA graph A**, rather than implementing another persistent expert engine.
-There is no CPU per-layer dispatch. Small rounds use vectorized mapped transfers; T48 uses
-prequeued DMA. The helper is idle between rounds, not a permanently spinning controller.
+There is no CPU per-layer dispatch. Small-round requests use vectorized mapped transfers and
+T48 requests prequeued DMA; the helper Op writes every response in place in mapped memory. The helper is idle between rounds, not a permanently spinning controller.
 
 Evidence, all on this host, is the Strata study and phase reports under
 `out/sol/dual-gpu/{report,phase0-report,phase0b-report}.md`. Phase 0b supersedes phase 0's ~250 µs
@@ -43,8 +43,10 @@ qualified multi-launch HIP Op is not justified by that possible ~20 µs/layer sa
 this choice only if measured launch overhead prevents the required end-to-end win.
 
 The 20 MiB R9700 read floor is 72.959 µs, 287.4 GB/s, not an expert-kernel timing or the card's
-bandwidth ceiling. Phase 0's synthetic expert-read kernel is not a useful compute cost model.
-No GPU experiment was run for this design.
+bandwidth ceiling. The measured roof (2026-11-18, standalone HIP read probe, R9700, ROCm
+core-10.0) is 638 GB/s for a 2 GiB grid-stride stream and 620 GB/s for 40 random 2.0 MB records
+of a 33 GB bank read in 16–32 KiB pieces, about one decode call's record set. Phase 0's synthetic
+expert-read kernel is not a useful compute cost model.
 
 ## 2. Ownership, build and activation
 
@@ -232,7 +234,8 @@ mathematics in the target:
    Ordinary `moe_experts` remains the complete BF16-output Op, including for all prefill.
 3. **Helper branch.** HIP acquires the header, imports BF16 compact activations and metadata,
    groups its active assignments by expert, runs the separately qualified expert Op, and forms
-   FP32 `[2560,N]` weighted partials in original route-slot order. No float atomics, shared
+   FP32 `[2560,N]` weighted partials in original route-slot order, written in place into the
+   mapped response payload. No float atomics, shared
    expert, routing, n-gram data or intermediate gate/up traffic. Return FP32 even if internal
    matmul operands/intermediates follow the HIP Op's qualified private precision profile.
 4. **Join.** After local expert work and cache commit, core's captured CUDA wait acquires the
@@ -286,22 +289,25 @@ experts, not a second expert arena. Compact CUDA source panels add at most 249,8
 they are not another host exchange allocation. Initialize backing storage once so fixed-capacity DMA never
 reads uninitialized padding. Do not register any `ExpertHostStore` chunk with HIP.
 
-For every round, target `ExpertHelper::begin_round(T)` launches a pre-instantiated HIP graph:
-48 repetitions of bounded wait/import → helper Op → export/publish, serialized on one helper
-stream with reusable VRAM scratch. For T<48, import/export kernels copy populated prefixes
-through the mapped aliases. At T48, use fixed-T H2D/D2H DMA into/from VRAM staging after the
-request acquire and before response publication, matching the measured winning large-T route.
-Initialize VRAM DMA staging as well as host backing once; inactive output rows must remain valid
-transfer bytes even though CUDA never consumes them. T21–47 remain on the mapped path because
-no measured crossover is established there. The Op consumes device N/job counts, so graph shape
-does not depend on host routing results.
+For every round, target `ExpertHelper::begin_round(T)` launches a pre-instantiated HIP graph,
+serialized on one helper stream with reusable VRAM scratch: per layer L, one import kernel
+(publishing response L − 1, then the bounded wait/import of request L) and the helper Op, which
+takes the imported ID and weight planes as they arrive and writes its FP32 rows directly into
+response L's mapped payload through the HIP alias; one respond kernel publishes layer 47. For
+T<48 the import kernel copies populated request prefixes through the mapped aliases; at T48
+fixed-T H2D DMA into VRAM staging follows the request acquire, matching the measured winning
+large-T route. Initialize VRAM DMA staging as well as host backing once. The response needs no
+copy at any T: the Op's epilogue stores spread over its workgroups and overlap its own compute
+(an export kernel copying the payload with one CTA cost 48 µs per layer at 8-lane K1, T16).
+T21–47 remain on the mapped request path because no measured crossover is established there.
+The Op consumes device N/job counts, so graph shape does not depend on host routing results.
 No device-side kernel launches, cross-runtime events, native uncancellable wait-value calls,
 per-layer CPU thread dispatch or GPU-wide resident-worker barriers.
 
 If N=0, CUDA publishes a sequence-stamped SKIP header only and casts its local FP32 partial
 directly to the BF16 MoE output: **no CUDA wait, remote output read or helper-vector add**. HIP consumes/acknowledges SKIP, zeroes job
 counts, and its Op kernels do no jobs. The mapped path transfers no token payload. Prequeued
-T48 DMA nodes still move fixed initialized capacity even for SKIP; do not claim device-conditional
+T48 request DMA nodes still move fixed initialized capacity even for SKIP; do not claim device-conditional
 DMA or zero helper-side cost. Measure that queue overhead and the round-end drain explicitly.
 Per-layer slots prevent consecutive skipped layers from overwriting unconsumed headers.
 Join the HIP completion event before reusing any slot for the next round, including an all-SKIP
@@ -309,10 +315,15 @@ round; CUDA's skip alone does not grant host reuse. For sparse T48 traffic this 
 is a qualification risk, not permission to add a CPU dispatcher silently.
 
 Sequence equality, layer and shape checks reject stale/late responses; flags are not reset per
-layer or graph replay. Write payload → writer system fences → group barrier → release sequence;
-consumer leader acquire → group barrier → payload read. For DMA, publication follows completed
-stream-ordered copies, with the system-visibility fence supplied by the export node. Abort/error
-status uses the same ordering. Use atomics with the measured supported system scope, never
+layer or graph replay. Requests: write payload → writer system fences → group barrier → release
+sequence; consumer leader acquire → group barrier → payload read. For request DMA, the Op reads
+only after the stream-ordered copies complete. Responses: the Op's plain payload stores complete
+with its kernel; the next import (or the final respond) kernel's leader then issues a
+system-scope release fence, which on gfx12 writes back the device L2 (`global_wb scope:SYS`,
+then `s_wait_storecnt 0`) and so covers every earlier kernel's stores, before the release store
+of the sequence; consumer leader acquire → group barrier → payload read. A response whose round
+failed or was cancelled is published as Failed, and its payload is not licensed whatever the Op
+wrote. Abort/error status uses the same ordering. Use atomics with the measured supported system scope, never
 `volatile` as synchronization. At 64-bit sequence exhaustion, fail at an idle boundary rather
 than wrap into a stale packet. Each round has at most one outstanding request per layer slot.
 
@@ -532,7 +543,7 @@ separate binaries/build directories (no checkout/reset while another agent works
   panel when it answers whether the opt-in path improves the intended workload.
 
 Instrument per-layer helper rows/unique experts, local hits/residual miss bytes, split/join,
-helper import/compute/export and exposed CUDA wait; report mailbox prequeue/drain host time.
+helper import/compute/respond and exposed CUDA wait; report mailbox prequeue/drain host time.
 Use whole-inference attribution only if these fail to explain end-to-end results; kernel
 profiling follows a demonstrated bottleneck. Any expert-kernel tuning follows `tools.kdev`
 and the [kernel-iteration rules](kernel-iteration.md), owned by the Op agent.

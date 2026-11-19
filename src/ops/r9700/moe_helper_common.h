@@ -31,12 +31,11 @@ __device__ __forceinline__ void wave_lds_sync() {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
 }
 
-// Exact E4M3FN (bias 7, subnormals 2^-9 m) to FP32; the NaN encodings are not valid scales.
+// Exact E4M3FN (bias 7, subnormals 2^-9 m) to FP32 of the low byte of `bits`, by gfx12's
+// v_cvt_f32_fp8 (OCP E4M3FN; every finite code converts exactly, checked exhaustively on the
+// R9700); the NaN encodings are not valid scales.
 __device__ __forceinline__ float e4m3_to_float(std::uint32_t bits) {
-    const std::uint32_t magnitude = bits & 0x7FU;
-    const float value = magnitude >= 8U ? __uint_as_float((magnitude << 20) + 0x3C000000U)
-                                        : static_cast<float>(magnitude) * 0x1p-9F;
-    return (bits & 0x80U) != 0 ? -value : value;
+    return __builtin_amdgcn_cvt_f32_fp8(static_cast<int>(bits), 0);
 }
 
 // Record bytes in the global address space. A record address comes from an integer table entry,

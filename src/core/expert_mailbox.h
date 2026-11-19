@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace ninfer {
 class ExpertMailbox {
@@ -54,18 +55,26 @@ void expert_mailbox_cuda_publish(ExpertMailboxView view, std::uint32_t layer, co
 void expert_mailbox_cuda_acquire(ExpertMailboxView view, std::uint32_t layer,
                                  const std::uint32_t* count, void* partial, void* stream);
 
-// HIP import/export use caller-owned VRAM staging. count is always zero on SKIP/error; downstream
-// Op kernels must consume it. T48 fixed-capacity DMA is ordered between acquire/publish kernels.
-void expert_mailbox_hip_import(ExpertMailboxView view, std::uint32_t layer, void* x, void* ids,
+// HIP side of a round, in stream order per layer L: expert_mailbox_hip_import(L, respond = L - 1
+// for L > 0) acquires request L into caller-owned VRAM staging (x, ids and weights planes; count
+// is always zero on SKIP/error, and downstream Op kernels must consume it), the helper Op writes
+// rows [0, count) of response L in place through the slot's HIP partial alias, and the next
+// import, or expert_mailbox_hip_respond after the round's last layer, publishes response L with
+// a system-scope release. respond is exactly L - 1 (std::nullopt for L = 0), and count is the
+// buffer the import of L - 1 wrote, unmodified since (the Op only reads it): the publication
+// reports that count. T48 fixed-capacity request DMA is ordered after the import kernel.
+void expert_mailbox_hip_import(ExpertMailboxView view, std::uint32_t layer,
+                               std::optional<std::uint32_t> respond, void* x, void* ids,
                                void* weights, std::uint32_t* count, std::uint32_t tokens,
                                const HipStream& stream);
-void expert_mailbox_hip_export(ExpertMailboxView view, std::uint32_t layer, const void* partial,
-                               const std::uint32_t* count, std::uint32_t tokens,
-                               const HipStream& stream);
-// Raw metadata layout transform: zip two U32 planes of ten fields per compact row into U64
-// entries (low word from first, high word from second). No ID/weight interpretation.
-void expert_mailbox_hip_interleave(const void* first, const void* second, void* pairs,
-                                   const std::uint32_t* count, const HipStream& stream);
+void expert_mailbox_hip_respond(ExpertMailboxView view, std::uint32_t layer,
+                                const std::uint32_t* count, std::uint32_t tokens,
+                                const HipStream& stream);
+// Startup qualification's stand-in for the helper Op: writes rows [0, *count) of a VRAM partial
+// into response `layer`'s payload through the HIP alias with plain stores, unpublished.
+void expert_mailbox_hip_store_partial(ExpertMailboxView view, std::uint32_t layer,
+                                      const void* partial, const std::uint32_t* count,
+                                      std::uint32_t tokens, const HipStream& stream);
 // Exact bounded per-record byte checksum; result is one U64 per span, no expert mathematics.
 void expert_mailbox_hip_checksum(const void* data, std::size_t bytes, std::uint64_t* result,
                                  const HipStream& stream);

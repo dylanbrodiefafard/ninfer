@@ -2,6 +2,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -57,14 +58,44 @@ __device__ void copy_bytes(void* destination, const void* source, std::uint32_t 
     }
 }
 
-// One 256-thread CTA per layer. Leader performs bounded system acquire, shared count and barrier
-// transfer acquisition to all payload readers. No mapped payload access on SKIP/error. The wall
-// clock has the constant frequency queried by the host (not the variable shader clock).
-__global__ void import_packet(ExpertMailboxView view, std::uint32_t layer, void* x, void* ids,
-                              void* weights, std::uint32_t* count, std::uint32_t tokens,
-                              std::uint64_t deadline_ticks) {
+// No response to publish ahead of an import (the round's first layer).
+constexpr std::uint32_t kNoResponse = 0xFFFFFFFFU;
+
+// Leader only: publishes the response of `layer` for its n compact tokens. The payload rows
+// [0, n) were written in place through the HIP alias (ExpertMailboxSlot::partial) by earlier
+// kernels of this stream, the helper Op or the qualification store. Stream order completes those
+// stores before this kernel starts, and the system-scope release fence ahead of the sequence store
+// (gfx12: global_wb scope:SCOPE_SYS, then s_wait_storecnt 0) writes back any of them still held in
+// the device L2, so a consumer that acquires the sequence reads the payload. A failed or cancelled
+// round publishes Failed; its payload is not licensed whatever it holds.
+__device__ void publish_response(ExpertMailboxView view, std::uint32_t layer, std::uint32_t n,
+                                 std::uint32_t tokens) {
+    if (load(&view.cancellation->sequence) == view.control->sequence) {
+        fail(view, layer, ExpertWireError::Cancelled);
+    }
+    auto* header           = view.slots[layer].response;
+    header->version        = kExpertWireVersion;
+    header->layer          = layer;
+    header->tokens         = tokens;
+    header->compact_tokens = n;
+    header->status         = failed(view) ? ExpertWireStatus::Failed
+                                          : (n == 0 ? ExpertWireStatus::Skip : ExpertWireStatus::Work);
+    __threadfence_system();
+    __hip_atomic_store(&header->sequence, view.control->sequence, __ATOMIC_RELEASE,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+// One 256-thread CTA per layer. The leader first publishes the previous layer's response (respond
+// != kNoResponse; *count still holds that layer's compact count), then performs the bounded
+// system acquire of this layer's request; a shared count and barrier transfer acquisition to all
+// payload readers. No mapped payload access on SKIP/error. The wall clock has the constant
+// frequency queried by the host (not the variable shader clock).
+__global__ void import_packet(ExpertMailboxView view, std::uint32_t layer, std::uint32_t respond,
+                              void* x, void* ids, void* weights, std::uint32_t* count,
+                              std::uint32_t tokens, std::uint64_t deadline_ticks) {
     __shared__ std::uint32_t n;
     if (threadIdx.x == 0) {
+        if (respond != kNoResponse) { publish_response(view, respond, *count, tokens); }
         n                = 0;
         const auto start = static_cast<std::uint64_t>(wall_clock64());
         auto* header     = view.slots[layer].request;
@@ -123,40 +154,18 @@ __global__ void import_packet(ExpertMailboxView view, std::uint32_t layer, void*
     }
 }
 
-// One 256-thread CTA. Every mapped writer fences before the barrier and leader release; the DMA
-// path has already completed its stream-ordered copy. Empty jobs acknowledge SKIP without copying.
-__global__ void export_packet(ExpertMailboxView view, std::uint32_t layer, const void* partial,
-                              const std::uint32_t* count, std::uint32_t tokens) {
-    const auto n = *count;
-    if (tokens != 48 && !failed(view)) {
-        copy_bytes(view.slots[layer].partial, partial, n * kExpertPartialBytes);
-    }
-    __threadfence_system();
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        if (load(&view.cancellation->sequence) == view.control->sequence) {
-            fail(view, layer, ExpertWireError::Cancelled);
-        }
-        auto* header           = view.slots[layer].response;
-        header->version        = kExpertWireVersion;
-        header->layer          = layer;
-        header->tokens         = tokens;
-        header->compact_tokens = n;
-        header->status = failed(view) ? ExpertWireStatus::Failed
-                                      : (n == 0 ? ExpertWireStatus::Skip : ExpertWireStatus::Work);
-        __threadfence_system();
-        __hip_atomic_store(&header->sequence, view.control->sequence, __ATOMIC_RELEASE,
-                           __HIP_MEMORY_SCOPE_SYSTEM);
-    }
+// One thread publishes the response of `layer` (the round's last), as import_packet does for the
+// layers before it.
+__global__ void respond_packet(ExpertMailboxView view, std::uint32_t layer,
+                               const std::uint32_t* count, std::uint32_t tokens) {
+    publish_response(view, layer, *count, tokens);
 }
 
-// One CTA, independent lanes zip at most 480 metadata fields. No barriers/shared memory;
-// each destination U64 is written exactly once. Inputs are U32 aligned, output U64 aligned.
-__global__ void interleave(const std::uint32_t* first, const std::uint32_t* second,
-                           std::uint64_t* pairs, const std::uint32_t* count) {
-    for (std::uint32_t i = threadIdx.x; i < *count * 10; i += blockDim.x) {
-        pairs[i] = first[i] | (static_cast<std::uint64_t>(second[i]) << 32U);
-    }
+// One 256-thread CTA writes rows [0, *count) of a VRAM partial into the slot's response payload
+// through the HIP alias with plain stores, as the helper Op writes it (startup qualification).
+__global__ void store_partial(ExpertMailboxView view, std::uint32_t layer, const void* partial,
+                              const std::uint32_t* count) {
+    copy_bytes(view.slots[layer].partial, partial, *count * kExpertPartialBytes);
 }
 
 // One CTA reduces an exact position-sensitive U64 checksum, with modular addition. Records are
@@ -193,18 +202,23 @@ void validate(std::uint32_t layer, std::uint32_t tokens, ExpertMailboxView view)
 }
 } // namespace
 
-void expert_mailbox_hip_import(ExpertMailboxView view, std::uint32_t layer, void* x, void* ids,
+void expert_mailbox_hip_import(ExpertMailboxView view, std::uint32_t layer,
+                               std::optional<std::uint32_t> respond, void* x, void* ids,
                                void* weights, std::uint32_t* count, std::uint32_t tokens,
                                const HipStream& stream) {
     stream.bind();
     validate(layer, tokens, view);
+    if (respond.has_value() != (layer != 0) || (respond && *respond + 1 != layer)) {
+        throw std::invalid_argument(
+            "expert HIP mailbox import must respond for exactly the previous layer");
+    }
     int device = 0, khz = 0;
     check(hipGetDevice(&device), "current device");
     check(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device), "wall clock rate");
     if (khz <= 0) { throw HipError("expert helper has no constant wall clock"); }
     const auto ticks = static_cast<std::uint64_t>(khz) * (kExpertLayerDeadlineNs / 1'000'000);
     import_packet<<<1, 256, 0, static_cast<hipStream_t>(stream.get())>>>(
-        view, layer, x, ids, weights, count, tokens, ticks);
+        view, layer, respond.value_or(kNoResponse), x, ids, weights, count, tokens, ticks);
     check(hipGetLastError(), "import launch");
     if (tokens == 48) {
         hip_copy_to_device(x, view.slots[layer].host_activations, tokens * kExpertActivationBytes,
@@ -216,27 +230,24 @@ void expert_mailbox_hip_import(ExpertMailboxView view, std::uint32_t layer, void
     }
 }
 
-void expert_mailbox_hip_export(ExpertMailboxView view, std::uint32_t layer, const void* partial,
-                               const std::uint32_t* count, std::uint32_t tokens,
-                               const HipStream& stream) {
+void expert_mailbox_hip_respond(ExpertMailboxView view, std::uint32_t layer,
+                                const std::uint32_t* count, std::uint32_t tokens,
+                                const HipStream& stream) {
     stream.bind();
     validate(layer, tokens, view);
-    if (tokens == 48) {
-        hip_copy_to_host(view.slots[layer].host_partial, partial, tokens * kExpertPartialBytes,
-                         stream);
-    }
-    export_packet<<<1, 256, 0, static_cast<hipStream_t>(stream.get())>>>(view, layer, partial,
-                                                                         count, tokens);
-    check(hipGetLastError(), "export launch");
+    respond_packet<<<1, 1, 0, static_cast<hipStream_t>(stream.get())>>>(view, layer, count,
+                                                                        tokens);
+    check(hipGetLastError(), "respond launch");
 }
 
-void expert_mailbox_hip_interleave(const void* first, const void* second, void* pairs,
-                                   const std::uint32_t* count, const HipStream& stream) {
+void expert_mailbox_hip_store_partial(ExpertMailboxView view, std::uint32_t layer,
+                                      const void* partial, const std::uint32_t* count,
+                                      std::uint32_t tokens, const HipStream& stream) {
     stream.bind();
-    interleave<<<1, 256, 0, static_cast<hipStream_t>(stream.get())>>>(
-        static_cast<const std::uint32_t*>(first), static_cast<const std::uint32_t*>(second),
-        static_cast<std::uint64_t*>(pairs), count);
-    check(hipGetLastError(), "interleave launch");
+    validate(layer, tokens, view);
+    store_partial<<<1, 256, 0, static_cast<hipStream_t>(stream.get())>>>(view, layer, partial,
+                                                                         count);
+    check(hipGetLastError(), "partial store launch");
 }
 
 void expert_mailbox_hip_checksum(const void* data, std::size_t bytes, std::uint64_t* result,

@@ -18,7 +18,6 @@ using detail::bf16_round;
 using detail::e4m3_to_float;
 using detail::hip_check;
 using detail::lds_barrier;
-using detail::load_record;
 using detail::record_address;
 using detail::RecordBytes;
 using detail::silu;
@@ -46,9 +45,10 @@ using detail::WmmaF32;
 //     over the full K = 640 and writes each route's FP32 contribution s_d w_j (D gated).
 //
 // Items are claimed in order from one counter: every gate|up item (job-major), then every down
-// item (job-major). A down item needs its job's 40 gate|up items complete; since those were
-// claimed earlier by running workgroups, which never wait on later items, the wait cannot
-// deadlock whatever the residency.
+// item (job-major), with the jobs ordered by descending token count, so the items that compute
+// longest start first and the call ends on one-token items. A down item needs its job's 40
+// gate|up items complete; since those were claimed earlier by running workgroups, which never wait
+// on later items, the wait cannot deadlock whatever the residency.
 //
 // A slice runs one of two paths, chosen per job by its token count:
 //   SIMT (fewer than kWmmaMinTokens tokens): the wave holds all five chunks' record bytes in
@@ -56,8 +56,12 @@ using detail::WmmaF32;
 //     token's activations staged in LDS. Decode work scales with the tokens.
 //   WMMA (kWmmaMinTokens or more): per 16-token block, each row is decoded once into an LDS tile
 //     and multiplied with BF16 WMMA against activations read from global memory (multiply_wmma).
-// A route's contribution is the FP32 down output times its weight; contributions are summed per
-// token in route-slot order by the down item that completes them (no float atomics).
+// Both planes run the same multiply code (run_item). A route's contribution is the FP32 down
+// output times its weight; contributions are summed per token in route-slot order by the down
+// item that completes them (no float atomics).
+//
+// The call streams its records once (stream_record), while x, the gated rows and the
+// contributions it reuses stay in the L2.
 
 constexpr int kWaveSize      = 32;
 constexpr int kWaves         = 4;
@@ -187,7 +191,8 @@ constexpr WorkspaceLayout workspace_layout(std::int32_t max_tokens) {
 struct Params {
     const std::int32_t* tokens;
     const std::uint16_t* x;
-    const MoeHelperRoute* routes;
+    const std::int32_t* experts;
+    const float* weights;
     const std::uint64_t* expert_table;
     const float* matrix_scales;
     float* y;
@@ -227,6 +232,17 @@ __device__ __forceinline__ std::uint32_t atomic_add_agent(std::uint32_t* counter
 // v_dot2 pairs a weight with the activation of its own K. Every decoded value is a signed E2M1
 // value (at most two significant bits), exact in BF16; the E4M3 block scale is applied to the
 // FP32 sum of its group's products.
+
+// Record loads are non-temporal: a call reads each record byte once (the WMMA path re-reads a
+// slice once per 16-token block), so the record stream, the call's bulk traffic, must not evict
+// the x rows, gated rows and contributions every item reuses. Measured on the R9700 with real
+// 8-lane DFlash K1 decode route sets (T = 16, ~75 experts, ~159 MB of records per call), temporal
+// record loads cost ~6% (309 against 291 us per call).
+template <class T>
+__device__ __forceinline__ T stream_record(RecordBytes bytes) {
+    return __builtin_nontemporal_load(
+        reinterpret_cast<const __attribute__((address_space(1))) T*>(bytes));
+}
 
 // Eight nibbles (K offsets 0..7 of a run, nibble n at bits 4n..4n+3) through an 8-entry table;
 // the nibble's bit 3 is ignored. Returns the high-byte lookups so a caller can set sign bits.
@@ -323,10 +339,10 @@ struct F3Codec {
 
     __device__ __forceinline__ static Raw load(RecordBytes chunk, int lane) {
         Raw raw;
-        raw.scales = load_record<std::uint32_t>(chunk + 4 * lane);
+        raw.scales = stream_record<std::uint32_t>(chunk + 4 * lane);
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
-            const auto value = load_record<U32x4>(chunk + 128 + 16 * (kWaveSize * j + lane));
+            const auto value = stream_record<U32x4>(chunk + 128 + 16 * (kWaveSize * j + lane));
             raw.words[j][0]  = value.x;
             raw.words[j][1]  = value.y;
             raw.words[j][2]  = value.z;
@@ -389,12 +405,12 @@ struct Nvfp4Codec {
 
     __device__ __forceinline__ static Raw load(RecordBytes chunk, int lane) {
         Raw raw;
-        const auto scales = load_record<U32x2>(chunk + 8 * lane);
+        const auto scales = stream_record<U32x2>(chunk + 8 * lane);
         raw.scales[0]     = scales.x;
         raw.scales[1]     = scales.y;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const auto value = load_record<U32x4>(chunk + 256 + 16 * (kWaveSize * j + lane));
+            const auto value = stream_record<U32x4>(chunk + 256 + 16 * (kWaveSize * j + lane));
             raw.words[j][0]  = value.x;
             raw.words[j][1]  = value.y;
             raw.words[j][2]  = value.z;
@@ -692,136 +708,120 @@ __device__ __forceinline__ void write_gated(const Params& p, const std::uint8_t*
     lds_barrier();
 }
 
-// gate|up item: four K-quarter slices of tile `tile`; writes the job's gated rows 16 tile .. +15.
-// SIMT: one token at a time (two barriers each). WMMA: blocks of 16 tokens (two barriers each).
-template <class Codec>
-__device__ __forceinline__ void gate_up_item(const Params& p, std::uint8_t* lds, const JobView& job,
-                                             int tile) {
-    const int tid          = static_cast<int>(threadIdx.x);
-    const int lane         = tid % kWaveSize;
-    const int wave         = tid / kWaveSize;
-    const auto* sorted     = reinterpret_cast<const std::uint16_t*>(lds + p.lds.sorted);
-    std::uint8_t* scratch  = lds + wave * kWaveScratchBytes;
-    auto* partial          = reinterpret_cast<float*>(scratch);
-    const Lut books[2]     = {p.books[0], p.books[1]};
-    const float gate_scale = p.matrix_scales[3 * job.expert];
-    const float up_scale   = p.matrix_scales[3 * job.expert + 1];
-    const auto x_row       = [&](int token) {
-        return p.x + static_cast<std::int64_t>(sorted[job.begin + token] / kRoutes) * kMoeHidden +
-               wave * kSliceK;
-    };
-    const RecordBytes first_chunk =
-        job.record + static_cast<std::int64_t>(20 * tile + 5 * wave) * Codec::kChunkBytes;
-    if (job.count >= kWmmaMinTokens) {
-        for (int first = 0; first < job.count; first += kWmmaTokens) {
-            const int tokens = min(kWmmaTokens, job.count - first);
-            WmmaF32 acc[2];
-            multiply_wmma<Codec>(
-                first_chunk, [&](int t) { return x_row(first + t); }, tokens, scratch, lane, books,
-                acc);
-            // The partial sums replace the tile: [token][local row].
-            const int token0 = 8 * (lane / 16);
-#pragma unroll
-            for (int h = 0; h < 2; ++h) {
-#pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    if (token0 + e < tokens) {
-                        partial[(token0 + e) * 32 + 16 * h + lane % 16] = acc[h][e];
-                    }
-                }
-            }
-            write_gated(p, lds, job, tile, first, tokens, gate_scale, up_scale);
-        }
-        return;
-    }
-
-    // The first token's activations are requested before the record, so waiting for them does
-    // not wait for the record loads (loads return in order).
-    StageRegs regs;
-    stage_load(regs, lane, x_row(0));
-    __builtin_amdgcn_sched_barrier(0);
-    Slice<Codec> slice;
-    slice.load(first_chunk, lane);
-    __builtin_amdgcn_sched_barrier(0);
-    for (int token = 0; token < job.count; ++token) {
-        if (token > 0) { stage_load(regs, lane, x_row(token)); }
-        stage_store(regs, lane, scratch);
-        wave_lds_sync();
-        const float sum = slice.multiply(scratch, lane, books);
-        // The wave's partial sums replace its staged activations, indexed by local row g + 8 c.
-        wave_lds_sync();
-        partial[lane / 4 + 8 * (lane % 4)] = sum;
-        write_gated(p, lds, job, tile, token, 1, gate_scale, up_scale);
-    }
-}
-
-// down item: four row tiles of group `group`, each a full-K slice; writes every route's
-// contribution rows 128 group .. +127 (SIMT per token or WMMA per 16-token block), then merges
+// One item of either plane. gate|up item (index = tile r): wave w takes chunks 5w..5w+4 of
+// gate|up tile r against its K quarter of each token's x and writes the job's gated rows
+// 16 r .. +15. down item (index = group d): wave w takes down tile 4d + w over the full K against
+// each token's gated row and writes every route's contribution rows 128 d .. +127, then merges
 // each token whose contributions for these rows are now all present.
+//
+// Both planes run the same multiply code (one Slice::multiply and one multiply_wmma per codec):
+// the plane only selects the record offset, the books, the activation source and the per-token
+// epilogue, so the instruction cache holds one body per codec whichever plane a workgroup of the
+// WGP runs. SIMT handles one token at a time; WMMA blocks of 16 tokens.
 template <class Codec>
-__device__ __forceinline__ void down_item(const Params& p, std::uint8_t* lds, const JobView& job,
-                                          int group, int& merge_count) {
-    const int tid          = static_cast<int>(threadIdx.x);
-    const int lane         = tid % kWaveSize;
-    const int wave         = tid / kWaveSize;
-    const auto* sorted     = reinterpret_cast<const std::uint16_t*>(lds + p.lds.sorted);
-    const auto* mask       = reinterpret_cast<const std::uint16_t*>(lds + p.lds.mask);
-    auto* merges           = reinterpret_cast<std::uint16_t*>(lds + p.lds.merges);
-    std::uint8_t* scratch  = lds + wave * kWaveScratchBytes;
-    const Lut books[2]     = {p.books[2], p.books[2]};
-    const float down_scale = p.matrix_scales[3 * job.expert + 2];
-    const int tile         = kWaves * group + wave;
-    const auto gated_row   = [&](int token) {
-        return p.gated + static_cast<std::int64_t>(job.begin + token) * kMoeIntermediate;
+__device__ __forceinline__ void run_item(const Params& p, std::uint8_t* lds, const JobView& job,
+                                         bool down, int index, int& merge_count) {
+    const int tid         = static_cast<int>(threadIdx.x);
+    const int lane        = tid % kWaveSize;
+    const int wave        = tid / kWaveSize;
+    const auto* sorted    = reinterpret_cast<const std::uint16_t*>(lds + p.lds.sorted);
+    std::uint8_t* scratch = lds + wave * kWaveScratchBytes;
+    auto* partial         = reinterpret_cast<float*>(scratch);
+    const Lut books[2]    = {p.books[down ? 2 : 0], p.books[down ? 2 : 1]};
+    // The job's matrix scales, read once: the contribution stores below may alias them as far as
+    // the compiler knows.
+    const float* job_scales = p.matrix_scales + 3 * job.expert;
+    const float gate_scale  = job_scales[0];
+    const float up_scale    = job_scales[1];
+    const float down_scale  = job_scales[2];
+    // down: this wave's row tile; gate|up: the item's tile, whose K quarter the wave selects.
+    const int tile = down ? kWaves * index + wave : index;
+    const RecordBytes first_chunk =
+        job.record +
+        static_cast<std::int64_t>(down ? kDownPlaneChunk + 5 * tile : 20 * tile + 5 * wave) *
+            Codec::kChunkBytes;
+    // The activations a token's slice multiplies: its gated row (down) or its x quarter.
+    const auto source = [&](int token) {
+        return down ? p.gated + static_cast<std::int64_t>(job.begin + token) * kMoeIntermediate
+                    : p.x +
+                          static_cast<std::int64_t>(sorted[job.begin + token] / kRoutes) *
+                              kMoeHidden +
+                          wave * kSliceK;
     };
     // Route entry e = 10 t + j of the job's token and its contribution row.
     const auto contribute = [&](int token, int row, float sum) {
         const int entry    = sorted[job.begin + token];
-        const float weight = p.routes[entry].weight;
+        const float weight = p.weights[entry];
         p.contributions[static_cast<std::int64_t>(entry) * kMoeHidden + row] =
             sum * down_scale * weight;
     };
-    const RecordBytes first_chunk =
-        job.record + static_cast<std::int64_t>(kDownPlaneChunk + 5 * tile) * Codec::kChunkBytes;
     if (job.count >= kWmmaMinTokens) {
-        const int row = 32 * tile + lane % 16;
         for (int first = 0; first < job.count; first += kWmmaTokens) {
             const int tokens = min(kWmmaTokens, job.count - first);
             WmmaF32 acc[2];
             multiply_wmma<Codec>(
-                first_chunk, [&](int t) { return gated_row(first + t); }, tokens, scratch, lane,
+                first_chunk, [&](int t) { return source(first + t); }, tokens, scratch, lane,
                 books, acc);
             const int token0 = 8 * (lane / 16);
+            if (down) {
+                const int row = 32 * tile + lane % 16;
 #pragma unroll
-            for (int h = 0; h < 2; ++h) {
+                for (int h = 0; h < 2; ++h) {
 #pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    if (token0 + e < tokens) {
-                        contribute(first + token0 + e, row + 16 * h, acc[h][e]);
+                    for (int e = 0; e < 8; ++e) {
+                        if (token0 + e < tokens) {
+                            contribute(first + token0 + e, row + 16 * h, acc[h][e]);
+                        }
                     }
                 }
+            } else {
+                // The partial sums replace the tile: [token][local row].
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        if (token0 + e < tokens) {
+                            partial[(token0 + e) * 32 + 16 * h + lane % 16] = acc[h][e];
+                        }
+                    }
+                }
+                write_gated(p, lds, job, index, first, tokens, gate_scale, up_scale);
             }
         }
     } else {
+        // The first token's activations are requested before the record, so waiting for them
+        // does not wait for the record loads (loads return in order).
         StageRegs regs;
-        stage_load(regs, lane, gated_row(0));
+        stage_load(regs, lane, source(0));
         __builtin_amdgcn_sched_barrier(0);
         Slice<Codec> slice;
         slice.load(first_chunk, lane);
         __builtin_amdgcn_sched_barrier(0);
-        const int row = 32 * tile + lane / 4 + 8 * (lane % 4);
+        // Local row g + 8 c of the lane's quad-reduced sum (Slice::multiply).
+        const int local_row = lane / 4 + 8 * (lane % 4);
         for (int token = 0; token < job.count; ++token) {
-            if (token > 0) { stage_load(regs, lane, gated_row(token)); }
+            if (token > 0) { stage_load(regs, lane, source(token)); }
             stage_store(regs, lane, scratch);
             wave_lds_sync();
-            contribute(token, row, slice.multiply(scratch, lane, books));
-            // The next token's stage store reuses the scratch this token's multiply read.
+            const float sum = slice.multiply(scratch, lane, books);
+            // The scratch the multiply read takes the wave's partial sums (gate|up) or the next
+            // token's stage (down).
             wave_lds_sync();
+            if (down) {
+                contribute(token, 32 * tile + local_row, sum);
+            } else {
+                partial[local_row] = sum;
+                write_gated(p, lds, job, index, token, 1, gate_scale, up_scale);
+            }
         }
     }
+    if (!down) { return; }
 
     // Publish the contributions, then count them per (token, group). The thread that completes a
     // token's count lists it; the counter is reset by its merge below, its last use in the call.
+    const int group  = index;
+    const auto* mask = reinterpret_cast<const std::uint16_t*>(lds + p.lds.mask);
+    auto* merges     = reinterpret_cast<std::uint16_t*>(lds + p.lds.merges);
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     lds_barrier();
     for (int i = tid; i < job.count; i += kThreads) {
@@ -868,12 +868,25 @@ __device__ __forceinline__ void wait_inputs(const Params& p, int item, int jobs)
     }
 }
 
+// Workgroups per workgroup processor (hipDeviceAttributeMultiprocessorCount counts WGPs on gfx12).
+// The kernel is compiled for seven waves per SIMD32 (amdgpu_waves_per_eu, at most 216 VGPRs), so
+// a WGP's four SIMDs hold seven four-wave workgroups. hipOccupancyMaxActiveBlocksPerMultiprocessor
+// reports six, and an LDS bound that falls to three at max_tokens 48; on the R9700 seven per WGP
+// measured faster at every extent (F3 T1 65.2 -> 61.5 us, T48 960 -> 897 us; NVFP4 T48 1279 ->
+// 1203 us; T4..T20 unchanged), and eight (192 VGPRs, with spills) slower on real decode route
+// sets. The grid affects only speed: items are claimed by running workgroups, so any grid
+// completes.
+constexpr int kWorkgroupsPerUnit = 7;
+// A workgroup holds one wave on each of a WGP's four SIMD32s, so workgroups per WGP equal waves
+// per SIMD (the amdgpu_waves_per_eu value).
+static_assert(kWaves == 4);
+
 // Grid: kWorkgroupsPerUnit per WGP, at most one per item (moe_helper_experts), block kThreads.
 //
 // Prologue (every workgroup, identically): read N, sort the active route entries by
-// (expert, entry index) into `sorted` by rank counting, split them into jobs, load each job's
-// expert-table entry, and zero the output rows of tokens without an active entry (token t by
-// workgroup t mod grid).
+// (expert, entry index) into `sorted` by rank counting, split them into jobs, order the jobs by
+// descending token count, load each job's expert-table entry, and zero the output rows of tokens
+// without an active entry (token t by workgroup t mod grid).
 //
 // Main loop: claim items from control[0]; the first claim is issued at entry and each next one
 // when an item starts, consumed when it ends, and thread 0 waits there for a down item's inputs
@@ -883,7 +896,8 @@ __device__ __forceinline__ void wait_inputs(const Params& p, int item, int jobs)
 // Exit: the last workgroup to count itself on control[1] resets the counters it and the others
 // advanced (control and job_done; the merge counters were reset by their merges), so the next
 // call starts from zero.
-__global__ void __launch_bounds__(kThreads) moe_helper_experts_kernel(const Params p) {
+__global__ void __launch_bounds__(kThreads)
+    __attribute__((amdgpu_waves_per_eu(kWorkgroupsPerUnit))) moe_helper_experts_kernel(const Params p) {
     extern __shared__ __attribute__((aligned(16))) std::uint8_t lds[];
     __shared__ int s_item[2];
     __shared__ int s_valid;
@@ -906,7 +920,7 @@ __global__ void __launch_bounds__(kThreads) moe_helper_experts_kernel(const Para
 
     // Sort keys; an entry outside [0,512) is inactive.
     for (int e = tid; e < routes; e += kThreads) {
-        const int expert = p.routes[e].expert;
+        const int expert = p.experts[e];
         keys[e] = expert >= 0 && expert < kMoeHelperExperts
                       ? (static_cast<std::uint32_t>(expert) << 9) | static_cast<std::uint32_t>(e)
                       : kInvalidKey;
@@ -975,7 +989,32 @@ __global__ void __launch_bounds__(kThreads) moe_helper_experts_kernel(const Para
     for (int j = tid; j < job_count; j += kThreads) {
         const int end = j + 1 < job_count ? jobs[j + 1].begin : valid;
         jobs[j].count = static_cast<std::uint16_t>(end - jobs[j].begin);
-        jobs[j].entry = p.expert_table[jobs[j].expert];
+    }
+    // Order the jobs by descending token count (ties by expert), so the items that compute
+    // longest are claimed first and the call ends on one-token items. Thread i owns jobs i + 128 k
+    // (k < 4, 10 * 48 <= 4 * kThreads); the order is a pure function of the routes, identical in
+    // every workgroup, as the job indices of the work items and job_done require.
+    lds_barrier();
+    Job owned[4];
+    int rank[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int j = tid + kThreads * k;
+        if (j >= job_count) { continue; }
+        owned[k]  = jobs[j];
+        rank[k]   = 0;
+        const int count = owned[k].count;
+        for (int other = 0; other < job_count; ++other) {
+            const int other_count = jobs[other].count;
+            rank[k] += other_count > count || (other_count == count && other < j) ? 1 : 0;
+        }
+    }
+    lds_barrier();
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        if (tid + kThreads * k >= job_count) { continue; }
+        owned[k].entry  = p.expert_table[owned[k].expert];
+        jobs[rank[k]]   = owned[k];
     }
     for (int t = static_cast<int>(blockIdx.x); t < tokens; t += static_cast<int>(gridDim.x)) {
         if (mask[t] != 0) { continue; }
@@ -999,24 +1038,19 @@ __global__ void __launch_bounds__(kThreads) moe_helper_experts_kernel(const Para
             next     = static_cast<int>(atomic_add_agent(p.control, __ATOMIC_RELAXED));
             s_merges = 0;
         }
-        if (item < kGateUpTiles * job_count) {
-            const JobView view = view_job(jobs, item / kGateUpTiles);
-            if (view.f3) {
-                gate_up_item<F3Codec>(p, lds, view, item % kGateUpTiles);
-            } else {
-                gate_up_item<Nvfp4Codec>(p, lds, view, item % kGateUpTiles);
-            }
+        const bool down    = item >= kGateUpTiles * job_count;
+        const int local    = down ? item - kGateUpTiles * job_count : item;
+        const int per_job  = down ? kDownGroups : kGateUpTiles;
+        const JobView view = view_job(jobs, local / per_job);
+        if (view.f3) {
+            run_item<F3Codec>(p, lds, view, down, local % per_job, s_merges);
+        } else {
+            run_item<Nvfp4Codec>(p, lds, view, down, local % per_job, s_merges);
+        }
+        if (!down) {
             __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
             lds_barrier();
             if (tid == 0) { atomic_add_agent(p.job_done + item / kGateUpTiles, __ATOMIC_RELEASE); }
-        } else {
-            const int down     = item - kGateUpTiles * job_count;
-            const JobView view = view_job(jobs, down / kDownGroups);
-            if (view.f3) {
-                down_item<F3Codec>(p, lds, view, down % kDownGroups, s_merges);
-            } else {
-                down_item<Nvfp4Codec>(p, lds, view, down % kDownGroups, s_merges);
-            }
         }
         const int slot = (iteration + 1) & 1;
         if (tid == 0) {
@@ -1061,14 +1095,6 @@ bool overlaps(const Span& a, const Span& b) {
     const auto b0 = reinterpret_cast<std::uintptr_t>(b.begin);
     return a0 < b0 + b.bytes && b0 < a0 + a.bytes;
 }
-
-// Workgroups per workgroup processor (hipDeviceAttributeMultiprocessorCount counts WGPs on gfx12).
-// At this kernel's 213 VGPRs a SIMD32 holds seven waves, so a WGP's four SIMDs hold seven
-// four-wave workgroups. hipOccupancyMaxActiveBlocksPerMultiprocessor reports six, and an LDS
-// bound that falls to three at max_tokens 48; on the R9700 seven per WGP measured faster at every
-// extent (F3 T1 65.2 -> 61.5 us, T48 960 -> 897 us; NVFP4 T48 1279 -> 1203 us; T4..T20 unchanged).
-// The grid affects only speed: items are claimed by running workgroups, so any grid completes.
-constexpr int kWorkgroupsPerUnit = 7;
 
 // The workspace serves both routes: the persistent route's region for min(max_tokens, 48) tokens
 // from the base, then, when max_tokens exceeds 48, the grouped route's region.
@@ -1138,7 +1164,8 @@ void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorksp
         reject("max_tokens " + std::to_string(max_tokens) + " exceeds the workspace's " +
                std::to_string(workspace.max_tokens()));
     }
-    if (args.tokens == nullptr || args.routes == nullptr || args.bank.expert_table == nullptr ||
+    if (args.tokens == nullptr || args.routes.experts == nullptr ||
+        args.routes.weights == nullptr || args.bank.expert_table == nullptr ||
         args.bank.matrix_scales == nullptr || args.y == nullptr) {
         reject("null operand");
     }
@@ -1161,7 +1188,8 @@ void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorksp
         reject("invalid activation profile");
     }
     if (!aligned(args.tokens, 4) || !aligned(args.x, 16) || !aligned(args.x_e4m3.codes, 16) ||
-        !aligned(args.x_e4m3.scales, 4) || !aligned(args.routes, 8) ||
+        !aligned(args.x_e4m3.scales, 4) || !aligned(args.routes.experts, 4) ||
+        !aligned(args.routes.weights, 4) ||
         !aligned(args.bank.expert_table, 8) || !aligned(args.bank.matrix_scales, 4) ||
         !aligned(args.y, 16)) {
         reject("misaligned operand");
@@ -1185,7 +1213,8 @@ void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorksp
         a8 ? Span{args.x_e4m3.codes, rows * kMoeHidden}
            : Span{args.x, rows * kMoeHidden * sizeof(std::uint16_t)},
         {a8 ? args.x_e4m3.scales : nullptr, a8 ? rows * sizeof(float) : 0},
-        {args.routes, rows * kRoutes * sizeof(MoeHelperRoute)},
+        {args.routes.experts, rows * kRoutes * sizeof(std::int32_t)},
+        {args.routes.weights, rows * kRoutes * sizeof(float)},
         {args.bank.expert_table, kMoeHelperExperts * sizeof(std::uint64_t)},
         {args.bank.matrix_scales, kMoeHelperExperts * 3 * sizeof(float)},
     };
@@ -1208,7 +1237,8 @@ void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorksp
     Params params{};
     params.tokens        = args.tokens;
     params.x             = args.x;
-    params.routes        = args.routes;
+    params.experts       = args.routes.experts;
+    params.weights       = args.routes.weights;
     params.expert_table  = args.bank.expert_table;
     params.matrix_scales = args.bank.matrix_scales;
     params.y             = static_cast<float*>(args.y);
