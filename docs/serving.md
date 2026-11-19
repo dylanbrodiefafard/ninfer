@@ -1054,7 +1054,10 @@ For Flash-Next only, add `--expert-helper-pci 0000:13:00.0` to the usual server 
 The address must be a complete hexadecimal domain:bus:device.function (device 00–1f, function
 0–7); it is normalized to lowercase. Empty/malformed addresses, a different model identity or
 an OFF build are rejected. There is no request JSON field or per-request toggle; OpenAI and
-Anthropic schemas are unchanged. Omitting the flag keeps the ordinary CUDA path.
+Anthropic schemas are unchanged. Omitting the flag keeps the ordinary CUDA path. The server environment needs
+`ROCR_VISIBLE_DEVICES=<R9700 ROCm UUID>` and `HIP_VISIBLE_DEVICES=0`: HIP also honors
+`CUDA_VISIBLE_DEVICES` as its device filter, which hides the R9700 when it selects the NVIDIA
+primary (see [CLI](cli.md#experimental-flash-next-expert-helper)).
 
 One gfx1201 R9700 holds an immutable, compiled-profile-selected subset of routed experts for
 packed decode/verification. One RTX 5090 remains primary; prefill, shared experts, routing,
