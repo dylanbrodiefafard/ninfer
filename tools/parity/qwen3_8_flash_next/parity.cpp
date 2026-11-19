@@ -1,7 +1,8 @@
 // Qwen3.8-Flash-Next teacher-forced parity driver (milestone M1 of
 // docs/maintainer/qwen3.8-flash-next-plan.md). It runs the target's Forward on token sequences and
 // writes raw dumps for comparison against the study harness (fnstudy/forward.py, Runner with
-// last_logits / keep_residual), or checks chunked prefill against single-token steps.
+// last_logits / keep_residual), checks chunked prefill against single-token steps, or
+// teacher-forces a token panel through the decode path (decode-forced mode).
 
 #include "npy.h"
 #include "ninfer/engine.h"
@@ -63,8 +64,8 @@ Required:
 
 Options:
   --sequences S        sequences in a raw token file (default 1)
-  --mode MODE          prefill (default), split, bench, trace, lanes-check, lanes-bench,
-                       lanes-trace or dflash-acceptance
+  --mode MODE          prefill (default), split, decode-forced, bench, trace, lanes-check,
+                       lanes-bench, lanes-trace or dflash-acceptance
   --logits WHICH       last (default) or all (prefill mode)
   --residuals          also dump the residual after every layer (prefill mode)
   --split K            split mode: prefill T-K tokens, then K single-token steps (default 8)
@@ -109,6 +110,12 @@ Split mode compares the logits of positions T-K..T-1 from one teacher-forced pre
 by --chunk) with those of a prefill of T-K tokens followed by K single-token steps, and writes
 split_s<s>.json: per position the max and mean absolute logit difference, KL(prefill || steps)
 and top-1 agreement.
+Decode-forced mode writes the prefill mode's logprobs.npy (float16 [S,T-1,248320], identical
+layout and log-softmax) but produces it through the decode path the Engine uses, so an expert
+helper participates: per sequence, position 0 comes from a one-token prefill (always local on
+the primary), and positions 1..T-2 from T-2 B=1 graph-replayed decode steps whose input token is
+forced to the file's token instead of the sampled one. It needs T >= 2, --logits is ignored, and
+it writes decode_forced.json (helper, sequences, length).
 Bench mode times, per prompt length, the prefill (tok/s) and greedy decode through the B=1 decode
 graph, and reports for two windows, the first 256 timed steps and all of them (steady state):
 decode tok/s, per token the graph replay, host n-gram gather and remaining host time, and the
@@ -152,6 +159,7 @@ struct Options {
     bool split_mode             = false;
     bool bench_mode             = false;
     bool trace_mode             = false;
+    bool decode_forced_mode     = false;
     bool lanes_check_mode       = false;
     bool lanes_bench_mode       = false;
     bool dflash_acceptance_mode = false;
@@ -235,13 +243,14 @@ Options parse(std::span<char*> args) {
             options.sequences = parse_int(value(), flag);
         } else if (flag == "--mode") {
             const std::string_view mode = value();
-            if (mode != "prefill" && mode != "split" && mode != "bench" && mode != "trace" &&
-                mode != "lanes-check" && mode != "lanes-bench" && mode != "lanes-trace" &&
-                mode != "dflash-acceptance") {
+            if (mode != "prefill" && mode != "split" && mode != "decode-forced" &&
+                mode != "bench" && mode != "trace" && mode != "lanes-check" &&
+                mode != "lanes-bench" && mode != "lanes-trace" && mode != "dflash-acceptance") {
                 throw std::invalid_argument("--mode: prefill, split, bench, trace, lanes-check, "
                                             "lanes-bench, lanes-trace or dflash-acceptance");
             }
             options.split_mode             = mode == "split";
+            options.decode_forced_mode     = mode == "decode-forced";
             options.bench_mode             = mode == "bench";
             options.trace_mode             = mode == "trace";
             options.lanes_check_mode       = mode == "lanes-check";
@@ -1373,6 +1382,63 @@ int run_lanes_trace(const Options& options, std::span<const std::int32_t> stream
     return 0;
 }
 
+// Teacher-forced decode panel: writes logprobs.npy like prefill mode's --logits all, with
+// position 0 from a one-token prefill and positions 1 .. T-2 from graph-replayed B=1 decode steps
+// whose input is the file's token. Position p's logits predict token p+1.
+int run_decode_forced(const Options& options, std::span<const std::int32_t> all_tokens,
+                      std::int64_t sequences) {
+    const auto length =
+        static_cast<std::int32_t>(all_tokens.size() / static_cast<std::size_t>(sequences));
+    if (length < 2) { throw std::invalid_argument("decode-forced mode needs T >= 2"); }
+    std::filesystem::create_directories(options.out);
+    ninfer::DeviceContext device(0);
+    const ninfer::artifact::Reader reader(options.artifact);
+    const fn::LoadedModel model(reader, device);
+    const std::vector<std::uint64_t> calib_counts = options.calib_counts.empty()
+                                                        ? std::vector<std::uint64_t>{}
+                                                        : read_counts(options.calib_counts);
+    fn::Program program(model,
+                        program_options_for(options, options.context > 0 ? options.context : length,
+                                            fn::LogitColumns::Last, calib_counts),
+                        device);
+    print_plan(program);
+    fn::Forward& forward = program.forward();
+
+    const std::array<std::int64_t, 3> shape{sequences, length - 1, fn::kVocabRows};
+    fnt::NpyWriter logprobs(options.out / "logprobs.npy", "<f2", shape);
+    const auto write_position = [&](std::span<const std::uint16_t> logits) {
+        const std::vector<std::uint16_t> row = log_softmax_half(logits);
+        logprobs.write(std::as_bytes(std::span<const std::uint16_t>(row)));
+    };
+    for (std::int64_t s = 0; s < sequences; ++s) {
+        const std::span<const std::int32_t> tokens(
+            all_tokens.data() + static_cast<std::size_t>(s) * static_cast<std::size_t>(length),
+            static_cast<std::size_t>(length));
+        const fn::Lane lane = open_greedy(program, length);
+        // Program-level prefill, as lanes-check opens lanes, so decode sees the lane's committed
+        // history; its sampled token is discarded in favor of the panel's.
+        static_cast<void>(prefill_prompt(program, lane, tokens.first(1)));
+        write_position(download_bf16(forward.logits(1), device.stream));
+        for (std::int32_t p = 1; p + 1 < length; ++p) {
+            const std::int32_t input = tokens[static_cast<std::size_t>(p)];
+            std::int32_t sampled     = 0;
+            program.decode(std::span<const fn::Lane>(&lane, 1),
+                           std::span<const std::int32_t>(&input, 1),
+                           std::span<std::int32_t>(&sampled, 1));
+            write_position(download_bf16(forward.logits(1), device.stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        program.close_lane(lane);
+        std::cerr << "sequence " << s << ": " << length << " tokens\n";
+    }
+    std::ofstream report(options.out / "decode_forced.json");
+    report << "{\"expert_helper_pci\": "
+           << (options.expert_helper_pci ? "\"" + *options.expert_helper_pci + "\"" : "null")
+           << ", \"sequences\": " << sequences << ", \"length\": " << length << "}\n";
+    if (!report) { throw std::runtime_error("cannot write decode_forced.json"); }
+    return 0;
+}
+
 int run(const Options& options) {
     const TokenFile token_file                  = read_tokens(options.tokens, options.sequences);
     const std::vector<std::int32_t>& all_tokens = token_file.tokens;
@@ -1380,6 +1446,7 @@ int run(const Options& options) {
     if (sequences < 1 || all_tokens.size() % static_cast<std::size_t>(sequences) != 0) {
         throw std::invalid_argument("token count is not a multiple of the sequence count");
     }
+    if (options.decode_forced_mode) { return run_decode_forced(options, all_tokens, sequences); }
     if (options.bench_mode) { return run_bench(options, all_tokens); }
     if (options.lanes_check_mode) { return run_lanes_check(options, all_tokens); }
     if (options.lanes_bench_mode) { return run_lanes_bench(options, all_tokens); }
