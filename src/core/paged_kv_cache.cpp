@@ -261,54 +261,18 @@ void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_
     }
 }
 
-std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
-                                                  std::int32_t preferred_first) {
+std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count) {
     if (count == 0) { return {}; }
     if (count > free_page_ids_.size()) {
         throw std::logic_error("Paged KV entitlement could not be materialized");
     }
 
-    const auto run_at = [&](std::size_t begin) {
-        if (begin + count > free_page_ids_.size()) { return false; }
-        for (std::uint32_t offset = 1; offset < count; ++offset) {
-            if (free_page_ids_[begin + offset] !=
-                free_page_ids_[begin] + static_cast<std::int32_t>(offset)) {
-                return false;
-            }
-        }
-        return true;
-    };
-
-    std::size_t selected = free_page_ids_.size();
-    if (preferred_first >= 0) {
-        const auto it =
-            std::lower_bound(free_page_ids_.begin(), free_page_ids_.end(), preferred_first);
-        if (it != free_page_ids_.end() && *it == preferred_first) {
-            const auto begin = static_cast<std::size_t>(it - free_page_ids_.begin());
-            if (run_at(begin)) { selected = begin; }
-        }
-    }
-    if (selected == free_page_ids_.size()) {
-        for (std::size_t begin = 0; begin + count <= free_page_ids_.size(); ++begin) {
-            if (run_at(begin)) {
-                selected = begin;
-                break;
-            }
-        }
-    }
-
-    std::vector<std::int32_t> out;
-    out.reserve(count);
-    if (selected != free_page_ids_.size()) {
-        const auto first = free_page_ids_.begin() + static_cast<std::ptrdiff_t>(selected);
-        const auto last  = first + static_cast<std::ptrdiff_t>(count);
-        out.insert(out.end(), first, last);
-        free_page_ids_.erase(first, last);
-    } else {
-        const auto last = free_page_ids_.begin() + static_cast<std::ptrdiff_t>(count);
-        out.insert(out.end(), free_page_ids_.begin(), last);
-        free_page_ids_.erase(free_page_ids_.begin(), last);
-    }
+    // Lowest-first placement leaves the highest whole free extents available for expert slots.
+    // The same allocator serves admission, growth and tier restores; no old physical ids survive
+    // a restore, and contiguity never takes precedence over a lower free hole.
+    const auto last = free_page_ids_.begin() + static_cast<std::ptrdiff_t>(count);
+    std::vector<std::int32_t> out(free_page_ids_.begin(), last);
+    free_page_ids_.erase(free_page_ids_.begin(), last);
     mapped_pages_ += count;
     return out;
 }
@@ -412,9 +376,7 @@ void PagedKVAllocation::materialize_pages(std::uint32_t pages, cudaStream_t stre
     const std::uint32_t old_count = mapped_page_count();
     const std::uint32_t count     = pages - old_count;
     if (count == 0) { return; }
-    const std::int32_t preferred =
-        page_ids_.empty() ? -1 : static_cast<std::int32_t>(page_ids_.back() + 1);
-    std::vector<std::int32_t> acquired = pool_->take_pages(count, preferred);
+    std::vector<std::int32_t> acquired = pool_->take_pages(count);
     page_ids_.insert(page_ids_.end(), acquired.begin(), acquired.end());
     if (bound_row_ >= 0) { publish_range(old_count, count, stream); }
 }

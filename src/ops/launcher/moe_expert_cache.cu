@@ -20,6 +20,92 @@ static_assert(kMoeCacheCodecTags == 2);
 
 constexpr std::uint64_t kCodecTagMask = 1;
 
+// One 256-thread CTA strides over layer-major records and flex slots. Three shared I32 [256]
+// arrays reduce (frequency descending, record code ascending) and slot index descending. Every
+// reduction step has a block barrier; no warp-synchronous or asynchronous memory assumptions.
+// Table sizes and slot indices fit signed I32; descending scans cannot overflow their stride.
+__global__ void moe_expert_cache_refill_select_kernel(
+    const std::uint64_t* host_ptr, const std::int32_t* slot_index, const std::int32_t* counts,
+    std::int32_t records, MoeExpertSlotPoolArgs pool, std::int32_t* state, std::uint64_t* source,
+    std::uint64_t* destination, const std::uint32_t* eligible) {
+    __shared__ int codes[256];
+    __shared__ int frequencies[256];
+    __shared__ int slots[256];
+    const int t   = threadIdx.x;
+    int best      = -1;
+    int frequency = -1;
+    int slot      = -1;
+    for (int s = pool.count - 1 - t; s >= pool.fixed_count; s -= 256) {
+        if (pool.owner[s] == kMoeCacheEmptySlot) { slot = max(slot, s); }
+    }
+    for (int code = records - 1 - t; code >= 0; code -= 256) {
+        if ((host_ptr[code] & 1U) == 0 || slot_index[code] != kMoeCacheNoSlot ||
+            (eligible != nullptr && (eligible[code / 32] & (1U << (code % 32))) == 0)) {
+            continue;
+        }
+        const int value = counts[code];
+        if (value > frequency || (value == frequency && (best < 0 || code < best))) {
+            best      = code;
+            frequency = value;
+        }
+    }
+    codes[t]       = best;
+    frequencies[t] = frequency;
+    slots[t]       = slot;
+    for (int e = t; e < kMoeExperts; e += 256) {
+        source[e]      = 0;
+        destination[e] = 0;
+    }
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride /= 2) {
+        if (t < stride) {
+            const int other = codes[t + stride];
+            const int value = frequencies[t + stride];
+            if (other >= 0 && (value > frequencies[t] ||
+                               (value == frequencies[t] && (codes[t] < 0 || other < codes[t])))) {
+                codes[t]       = other;
+                frequencies[t] = value;
+            }
+            slots[t] = max(slots[t], slots[t + stride]);
+        }
+        __syncthreads();
+    }
+    if (t == 0) {
+        const int code     = codes[0];
+        const int selected = slots[0];
+        state[0]           = code >= 0 && selected >= 0 ? code : -1;
+        state[1]           = code >= 0 && selected >= 0 ? selected : -1;
+        if (state[0] >= 0) {
+            pool.owner[selected]      = kMoeCacheBorrowedSlot;
+            pool.referenced[selected] = 0;
+            source[0]                 = host_ptr[code];
+            destination[0]            = pool.flex_address[selected - pool.fixed_count];
+        }
+    }
+}
+
+// One thread publishes one completed reservation. Stream order excludes concurrent metadata
+// writers; the copy's event precedes this launch. No shared memory or synchronization is needed.
+__global__ void moe_expert_cache_refill_publish_kernel(std::uint64_t* expert_ptr,
+                                                       std::int32_t* slot_index,
+                                                       MoeExpertSlotPoolArgs pool,
+                                                       std::int32_t* state) {
+    const int code = state[0];
+    const int slot = state[1];
+    if (code < 0) { return; }
+    if (slot_index[code] == kMoeCacheNoSlot) {
+        pool.owner[slot]      = code;
+        pool.referenced[slot] = 1;
+        slot_index[code]      = slot;
+        expert_ptr[code]      = pool.flex_address[slot - pool.fixed_count] | 1U;
+    } else {
+        pool.owner[slot]      = kMoeCacheEmptySlot;
+        pool.referenced[slot] = 0;
+    }
+    state[0] = -1;
+    state[1] = -1;
+}
+
 struct AdmitShared {
     // Bit e of the 512-bit set: expert e is routed by this call.
     unsigned routed[kRoutedMaskWords];
@@ -613,6 +699,25 @@ void moe_expert_cache_admit_launch(const std::int32_t* ids, std::int32_t id_coun
     moe_expert_cache_admit_kernel<<<1, kAdmitThreads, 0, stream>>>(
         ids, id_count, expert_ptr, host_ptr, fill_ptr, slot_index, pool0, pool1, clock_hands, layer,
         policy, counters, eligible, route_counts);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void moe_expert_cache_refill_select_launch(const std::uint64_t* host_ptr,
+                                           const std::int32_t* slot_index,
+                                           const std::int32_t* counts, std::int32_t records,
+                                           MoeExpertSlotPoolArgs pool, std::int32_t* state,
+                                           std::uint64_t* source, std::uint64_t* destination,
+                                           const std::uint32_t* eligible, cudaStream_t stream) {
+    moe_expert_cache_refill_select_kernel<<<1, 256, 0, stream>>>(
+        host_ptr, slot_index, counts, records, pool, state, source, destination, eligible);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void moe_expert_cache_refill_publish_launch(std::uint64_t* expert_ptr, std::int32_t* slot_index,
+                                            MoeExpertSlotPoolArgs pool, std::int32_t* state,
+                                            cudaStream_t stream) {
+    moe_expert_cache_refill_publish_kernel<<<1, 1, 0, stream>>>(expert_ptr, slot_index, pool,
+                                                                state);
     CUDA_CHECK(cudaGetLastError());
 }
 

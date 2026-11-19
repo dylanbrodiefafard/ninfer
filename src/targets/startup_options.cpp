@@ -3,6 +3,22 @@
 #include "core/expert_helper_pci.h"
 
 namespace ninfer::targets {
+std::uint32_t resolve_kv_idle_timeout(std::optional<std::uint32_t> requested, std::size_t ram_bytes,
+                                      std::string_view model_id) {
+    const bool flash_next = model_id == "qwen3.8-flash-next";
+    if (requested.value_or(0) != 0) {
+        if (!flash_next) {
+            throw std::invalid_argument(
+                "--kv-idle-timeout applies only to qwen3.8-flash-next, not '" +
+                std::string(model_id) + "'");
+        }
+        if (ram_bytes == 0) {
+            throw std::invalid_argument("--kv-idle-timeout requires --kv-ram-capacity");
+        }
+    }
+    return requested.value_or(flash_next && ram_bytes != 0 ? 30U : 0U);
+}
+
 void validate_expert_helper_build(const std::optional<std::string>& pci) {
     if (!pci) { return; }
     static_cast<void>(normalize_helper_pci(*pci));

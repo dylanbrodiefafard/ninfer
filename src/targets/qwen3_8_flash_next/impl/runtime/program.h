@@ -283,6 +283,11 @@ public:
 
     [[nodiscard]] const RoundTiming& last_round() const noexcept { return last_round_; }
 
+    // Settled round boundary only; no prefill window may be active when allow is true. Copies
+    // also require zero local demand misses in the latest decode/verification round. Completed
+    // copies can publish while issuance is gated. Captured addresses and model state stay fixed.
+    [[nodiscard]] bool service_expert_refill(bool allow);
+
 private:
     // Runs only under exclusive Program ownership after the round transaction has settled.
     // Forced writes serve startup and destruction; I/O and CUDA failures propagate.
@@ -318,6 +323,7 @@ private:
     ExpertResidency residency_;
     Forward forward_;
     cudaStream_t stream_;
+    cudaStream_t copy_stream_;
     std::array<LaneControl, kMaxLanes> lanes_{};
     RoundTiming last_round_;
     // Pinned U32 [lanes][State::kAllowedTokenWordStride], the host image of State's eligibility

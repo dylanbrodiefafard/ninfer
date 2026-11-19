@@ -270,6 +270,23 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
         referenced_[tag] = metadata_.alloc_bytes(slots, kMetadataAlignment);
     }
 
+    refill_enabled_                    = warm_start != ExpertWarmStart::AllEligible;
+    constexpr std::size_t kColumnBytes = kRoutedExperts * sizeof(std::uint64_t);
+    constexpr std::size_t kStateOffset = 2 * kColumnBytes;
+    constexpr std::size_t kMaskOffset  = kStateOffset + kMetadataAlignment;
+    refill_storage_                    = DeviceBuffer(kMaskOffset + local_eligibility.size_bytes());
+    auto* refill_base                  = static_cast<std::byte*>(refill_storage_.p);
+    refill_source_                     = Tensor(refill_base, DType::I64, {kRoutedExperts});
+    refill_destination_ = Tensor(refill_base + kColumnBytes, DType::I64, {kRoutedExperts});
+    refill_state_       = Tensor(refill_base + kStateOffset, DType::I32, {2});
+    if (!local_eligibility.empty()) {
+        refill_eligible_ =
+            Tensor(refill_base + kMaskOffset, DType::I32, {ops::kMoeExpertMaskWords, layers_});
+        check_cuda(cudaMemcpyAsync(refill_eligible_.data, local_eligibility.data(),
+                                   local_eligibility.size_bytes(), cudaMemcpyHostToDevice, stream),
+                   "refill eligibility upload");
+    }
+
     // Every allocation precedes the first transfer. Pageable sources are staged before
     // cudaMemcpyAsync returns and warm records live in the store, so unwinding after a failed
     // call frees no host buffer a queued copy still reads.
@@ -333,6 +350,59 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
     check_cuda(cudaMemsetAsync(fill_table_.data, 0, table_bytes, stream), "fill table clear");
     // The state is complete for work on any stream once the constructor returns.
     check_cuda(cudaStreamSynchronize(stream), "initial state synchronization");
+}
+
+ExpertResidency::~ExpertResidency() {
+    // Also covers an exception between queuing a copy and recording its completion event.
+    if (refill_copy_stream_) {
+        // A sticky device fault is reported by execution; teardown cannot propagate it.
+        static_cast<void>(cudaStreamSynchronize(*refill_copy_stream_));
+    }
+}
+
+void ExpertResidency::request_refill() {
+    if (!refill_enabled_ || flex_slots_ == 0) { return; }
+    refill_requested_ = true;
+    ++refill_generation_;
+}
+
+void ExpertResidency::join_refill(cudaStream_t stream) {
+    if (!refill_pending_) { return; }
+    CUDA_CHECK(cudaStreamWaitEvent(stream, refill_done_.get(), 0));
+    Tensor table = expert_table();
+    ops::moe_expert_cache_refill_publish(table, host_table(), cache(), refill_state_, stream);
+    refill_pending_ = false;
+}
+
+bool ExpertResidency::service_refill(cudaStream_t stream, cudaStream_t copy_stream, bool allow) {
+    if (refill_pending_) {
+        const auto status = cudaEventQuery(refill_done_.get());
+        if (status == cudaErrorNotReady) { return true; }
+        CUDA_CHECK(status);
+        // Feedback belongs to this completed selection. A subsequent give_back must not be
+        // lost if this selection found no placement before those slots became available.
+        if (*static_cast<const std::int32_t*>(refill_result_.data()) < 0 &&
+            selected_generation_ == refill_generation_) {
+            refill_requested_ = false;
+        }
+        join_refill(stream);
+    }
+    if (allow && refill_requested_) {
+        ops::moe_expert_cache_refill_select(
+            host_table(), cache(), refill_state_, refill_source_, refill_destination_, stream,
+            refill_eligible_.data != nullptr ? &refill_eligible_ : nullptr);
+        CUDA_CHECK(cudaEventRecord(refill_selected_.get(), stream));
+        refill_copy_stream_ = copy_stream;
+        CUDA_CHECK(cudaStreamWaitEvent(copy_stream, refill_selected_.get(), 0));
+        ops::moe_expert_cache_fill(refill_source_, refill_destination_, 0, copy_stream,
+                                   ops::kMoeStagingFillBlocks);
+        CUDA_CHECK(cudaMemcpyAsync(refill_result_.data(), refill_state_.data, sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, copy_stream));
+        CUDA_CHECK(cudaEventRecord(refill_done_.get(), copy_stream));
+        selected_generation_ = refill_generation_;
+        refill_pending_      = true;
+    }
+    return refill_pending_ || (allow && refill_requested_);
 }
 
 ops::MoeExpertCache ExpertResidency::cache() {

@@ -252,6 +252,10 @@ bool EngineProgram::copy_hold_cancel_settled() const {
 void EngineProgram::shutdown_kv_tiers(const LoadProgress& progress) {
     if (impl_->tiers_shutdown) { return; }
     impl_->tiers_shutdown = true;
+    for (std::uint32_t lane = 0; lane < static_cast<std::uint32_t>(impl_->program.lanes());
+         ++lane) {
+        impl_->lane_activity(lane);
+    }
     while (!impl_->suspended.empty()) { discard_suspended(impl_->suspended.begin()->first); }
     if (!impl_->disk) { return; }
     cancel_disk_restore();
@@ -285,6 +289,14 @@ tier::KvDiskCopySeconds EngineProgram::harvest_kv_disk_copy_seconds() {
 }
 
 bool EngineProgram::kv_ram_copies_ready() const {
+    // A failed expiry capture can still have an asynchronous continuation snapshot in flight,
+    // without a RAM record. Admission must preserve decode overlap for that fence as well.
+    for (const auto& entry : impl_->records) {
+        if (!entry.lane) { continue; }
+        const auto status = cudaEventQuery(entry.capture_done);
+        if (status == cudaErrorNotReady) { return false; }
+        CUDA_CHECK(status);
+    }
     return !impl_->ram || impl_->ram->pending_copies_ready();
 }
 

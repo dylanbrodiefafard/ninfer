@@ -4303,6 +4303,39 @@ private:
         bool stable_decode_epoch = false;
         for (;;) {
             const bool control_changed = control_dirty_.exchange(false, std::memory_order_acquire);
+            std::optional<Clock::time_point> maintenance_deadline;
+            if constexpr (requires { instance_.program->idle_lane_deadline(); }) {
+                try {
+                    std::scoped_lock execution_lock(execution_mutex_);
+                    // Deadline wakes enter here before the ordinary scheduler body. Stop disk
+                    // idle maintenance before any expiry capture/reclaim touches the tiers.
+                    instance_.program->set_cache_idle(false);
+                    if (!copy_hold_ && !live_transfer_) {
+                        if (const auto lane = instance_.program->expire_idle_lane()) {
+                            invalidate_lane_plans(*lane);
+                            publish_runtime_stats();
+                        }
+                        maintenance_deadline = instance_.program->idle_lane_deadline();
+                    }
+                    bool pending = false;
+                    {
+                        std::scoped_lock lock(queue_mutex_);
+                        pending = !pending_.empty() || stopping_;
+                    }
+                    const bool refill = instance_.program->service_expert_refill(
+                        !pending && !prefill_lane_ && !suspended_prefill_lane_ && !copy_hold_ &&
+                        !live_transfer_);
+                    if (refill) {
+                        const auto deadline = Clock::now() + std::chrono::milliseconds(1);
+                        if (!maintenance_deadline || deadline < *maintenance_deadline) {
+                            maintenance_deadline = deadline;
+                        }
+                    }
+                } catch (...) {
+                    fail_executor(std::current_exception());
+                    return;
+                }
+            }
             if (stable_decode_epoch && !control_changed && recovery_queue_.empty()) {
                 try {
                     std::scoped_lock execution_lock(execution_mutex_);
@@ -4346,7 +4379,20 @@ private:
             {
                 std::unique_lock lock(queue_mutex_);
                 if (idle && copies_ready) {
-                    queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                    const auto wake = [&] {
+                        return stopping_ || !pending_.empty() ||
+                               control_dirty_.load(std::memory_order_acquire);
+                    };
+                    if (maintenance_deadline) {
+                        queue_cv_.wait_until(lock, *maintenance_deadline, wake);
+                    } else {
+                        queue_cv_.wait(lock, wake);
+                    }
+                    // A deadline is a control boundary even when ingress stays empty.
+                    if (maintenance_deadline && Clock::now() >= *maintenance_deadline &&
+                        !stopping_ && pending_.empty()) {
+                        continue;
+                    }
                 } else if (idle) {
                     queue_cv_.wait_for(lock, std::chrono::milliseconds(20),
                                        [&] { return stopping_ || !pending_.empty(); });

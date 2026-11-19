@@ -8,6 +8,7 @@
 #include "runtime/expert_residency.h"
 #include "runtime/kv_extents.h"
 #include "runtime/state.h"
+#include "runtime/engine/idle_lane_policy.h"
 
 #include "core/device.h"
 #include "ninfer/ops/moe_expert_cache.h"
@@ -15,6 +16,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -247,6 +250,161 @@ void test_state_machine() {
     check("every extent lent");
 }
 
+void test_idle_reclaim_refill() {
+    ninfer::DeviceContext device(0);
+    constexpr std::uint32_t kExtent = 244;
+    constexpr std::uint32_t kLow    = 40;
+    constexpr std::uint32_t kPages  = kLow + 2 * kExtent;
+    fn::State state(3, static_cast<std::int32_t>(kPages * 64), std::int64_t{kPages} * 64,
+                    ops::QsaKvFormat::NVFP4G16);
+    fn::KvExpertExtents extents(state.pool(), ops::QsaKvFormat::NVFP4G16, device.stream,
+                                device.copy_stream);
+    const std::vector<ops::MoeExpertCodec> codecs(fn::kRoutedExperts, ops::MoeExpertCodec::F3G32);
+    fn::ExpertHostStore store(codecs, std::size_t{256} << 20);
+    std::vector<std::byte> record(kF3Bytes, std::byte{0x5a});
+    for (std::int32_t e = 0; e < extents.slots_per_extent(); ++e) {
+        record[0] = static_cast<std::byte>(e);
+        store.write_record(0, e, record);
+    }
+    fn::ExpertSlotPlan plan;
+    plan.slots = {0, 4};
+    fn::ExpertResidency cache(store, plan, extents.flex_addresses(), {}, device.stream);
+    std::vector<std::int32_t> frequency(fn::kRoutedExperts);
+    std::iota(frequency.rbegin(), frequency.rend(), 1);
+    CUDA_CHECK(cudaMemcpyAsync(cache.cache().frequency.counts.data, frequency.data(),
+                               frequency.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                               device.stream));
+    extents.make_room(kPages, cache);
+    const auto exempt = state.open(std::int64_t{kLow} * 64, device.stream).value();
+    const auto first  = state.open(std::int64_t{kExtent} * 64, device.stream).value();
+    const auto second = state.open(std::int64_t{kExtent} * 64, device.stream).value();
+    expect(state.pool().free_pages() == 0 && extents.lent_extents() == 2,
+           "reclaim test fills the pool to capacity");
+    using Policy = ninfer::runtime::IdleLanePolicy;
+    Policy idle(std::chrono::seconds(30));
+    const auto start = Policy::Clock::time_point{};
+    idle.idle(static_cast<std::uint32_t>(first), false, start);
+    idle.idle(static_cast<std::uint32_t>(second), true, start + std::chrono::seconds(1));
+    idle.idle(static_cast<std::uint32_t>(exempt), false, start + std::chrono::seconds(2));
+    // RAM transport of complete originals is checked by the tier and Engine idle-timeout suites;
+    // this boundary model checks the resulting page ownership and physical refill bytes.
+    while (const auto expired = idle.expired(start + std::chrono::seconds(33))) {
+        state.close(static_cast<std::int32_t>(expired->lane), device.stream);
+        idle.activity(expired->lane);
+        extents.give_back(cache);
+    }
+    expect(state.is_open(exempt) && !state.is_open(first) && !state.is_open(second),
+           "timeout releases every nonexempt idle lane");
+    expect(extents.lent_extents() == 1 && extents.lent(0) && !extents.lent(1),
+           "timeout returns the top extent and keeps one spare");
+    while (cache.service_refill(device.stream, device.copy_stream, true)) {
+        device.synchronize_all();
+    }
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    const auto pool   = cache.cache().pools[1];
+    const auto owners = download<std::int32_t>(
+        pool.owner.data, std::size_t{4} + static_cast<std::size_t>(cache.flex_slots()));
+    const auto slots       = extents.slots_per_extent();
+    std::int32_t populated = 0;
+    for (std::int32_t j = 0; j < slots; ++j) {
+        const auto flex_slot = slots + j;
+        const auto owner     = owners[std::size_t{4} + static_cast<std::size_t>(flex_slot)];
+        expect(owner == slots - 1 - j, "hottest refill belongs in the highest flex slot");
+        if (owner >= 0) {
+            ++populated;
+            // NOLINTNEXTLINE(performance-no-int-to-ptr): the flex table stores device addresses.
+            const auto* address = reinterpret_cast<const void*>(
+                extents.flex_addresses()[static_cast<std::size_t>(flex_slot)]);
+            const auto payload  = download<std::byte>(address, kF3Bytes);
+            const auto original = store.record(0, owner);
+            expect(std::equal(payload.begin(), payload.end(), original.begin(), original.end()),
+                   "refill copies the immutable host record exactly");
+        }
+    }
+    expect(populated == slots, "returned extent must refill every eligible flex slot");
+    // Reclaim may arrive immediately after a background copy is issued; joining it is a stream
+    // event dependency, and every following KV writer must observe that dependency.
+    extents.make_room(kExtent + 1, cache);
+    extents.give_back(cache);
+    expect(cache.service_refill(device.stream, device.copy_stream, true),
+           "returned empty flex slots start a background copy");
+    extents.make_room(kExtent + 1, cache);
+    const auto restored = state.open(std::int64_t{2} * kExtent * 64, device.stream).value();
+    state.pool().zero_pages(state.pages(restored).page_ids(), device.stream);
+    device.synchronize_all();
+    // Servicing a stale unpublished reservation after KV reclaim would re-install its owner.
+    // Together with the byte check this fails if make_room omits the refill join/publication.
+    (void)cache.service_refill(device.stream, device.copy_stream, false);
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    // NOLINTNEXTLINE(performance-no-int-to-ptr): the flex table stores device addresses.
+    const auto* reserved_address = reinterpret_cast<const void*>(extents.flex_addresses().back());
+    const auto overwritten       = download<std::byte>(reserved_address, kF3Bytes);
+    expect(std::ranges::all_of(overwritten, [](std::byte value) { return value == std::byte{0}; }),
+           "refill must complete before reclaimed KV pages are zeroed");
+    const auto reclaimed_owners = download<std::int32_t>(
+        pool.owner.data, std::size_t{4} + static_cast<std::size_t>(cache.flex_slots()));
+    expect(std::all_of(reclaimed_owners.begin() + 4, reclaimed_owners.end(),
+                       [](std::int32_t owner) { return owner == ops::kMoeCacheBorrowedSlot; }),
+           "refill publication must not re-install an owner in a KV-lent extent");
+    expect(download<std::uint64_t>(cache.expert_table().data, 1).front() ==
+               store.device_addresses().front(),
+           "reclaim must leave the refilled expert on its host record");
+    expect(state.pages(restored).page_ids().front() == static_cast<std::int32_t>(kLow),
+           "a restored high lane relocates into the lowest free pages");
+    state.close(restored, device.stream);
+    state.close(exempt, device.stream);
+    extents.give_back(cache);
+    device.synchronize_all();
+}
+
+// Local eligibility can fit entirely in low slots while high flex slots remain empty. A later
+// KV borrow makes some of those records nonresident; no give_back occurs to request refill.
+void test_borrow_restarts_refill() {
+    ninfer::DeviceContext device(0);
+    fn::State state(1, 64, std::int64_t{528} * 64, ops::QsaKvFormat::NVFP4G16);
+    fn::KvExpertExtents extents(state.pool(), ops::QsaKvFormat::NVFP4G16, device.stream,
+                                device.copy_stream);
+    const std::vector<ops::MoeExpertCodec> codecs(fn::kRoutedExperts, ops::MoeExpertCodec::F3G32);
+    const fn::ExpertHostStore store(codecs, std::size_t{256} << 20);
+    fn::ExpertSlotPlan plan;
+    plan.slots = {0, 4};
+    std::array<std::uint32_t, ops::kMoeExpertMaskWords> eligibility{};
+    eligibility[0] = (1U << 10) - 1U;
+    fn::ExpertResidency cache(store, plan, extents.flex_addresses(), {}, device.stream,
+                              eligibility);
+    std::array<std::int32_t, ops::kMoeTopK> ids{};
+    std::iota(ids.begin(), ids.end(), 0);
+    ninfer::DeviceBuffer routes_storage(sizeof(ids));
+    routes_storage.copy_from_host(ids.data(), sizeof(ids));
+    const ninfer::Tensor routes(routes_storage.p, ninfer::DType::I32, {ops::kMoeTopK, 1});
+    auto table = cache.expert_table();
+    auto fills = cache.fill_table();
+    ops::moe_expert_cache_admit(routes, table, cache.host_table(), fills, cache.cache(), 0,
+                                ops::MoeCacheAdmission::EveryMiss, device.stream);
+    ops::moe_expert_cache_fill(cache.host_table(), fills, 0, device.stream);
+    ops::moe_expert_cache_commit(table, fills, 0, device.stream);
+    cache.request_refill();
+    while (cache.service_refill(device.stream, device.copy_stream, true)) {
+        device.synchronize_all();
+    }
+    const auto slots       = extents.slots_per_extent();
+    const auto high_owners = [&] {
+        const auto owners =
+            download<std::int32_t>(cache.cache().pools[1].owner.data,
+                                   std::size_t{4} + static_cast<std::size_t>(cache.flex_slots()));
+        return std::count_if(owners.begin() + 4 + slots, owners.end(),
+                             [](std::int32_t owner) { return owner >= 0; });
+    };
+    expect(high_owners() == 0, "all eligible records start resident below the empty high extent");
+    extents.make_room(state.pool().free_pages() + 1, cache);
+    expect(extents.lent_extents() == 1, "only the low extent is borrowed");
+    while (cache.service_refill(device.stream, device.copy_stream, true)) {
+        device.synchronize_all();
+    }
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    expect(high_owners() == 6, "borrowing low owners must restart refill into empty high slots");
+}
+
 } // namespace
 
 int main() {
@@ -254,6 +412,8 @@ int main() {
         test_geometry(ops::QsaKvFormat::NVFP4G16, 244, 84, 3 * 244 + 17);
         test_geometry(ops::QsaKvFormat::BF16, 122, 108, 2 * 122 + 5);
         test_state_machine();
+        test_idle_reclaim_refill();
+        test_borrow_restarts_refill();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

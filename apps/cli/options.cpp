@@ -119,6 +119,7 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--kv-capacity-headroom MiB]\n"
+           "       [--kv-idle-timeout SECONDS] (Flash-Next RAM tier: default 30; 0 disables)\n"
            "       [--kv-ram-capacity off|N] [--kv-ram-system-prompts N] [--kv-disk-capacity "
            "off|N] [--kv-disk-location PATH]\n"
            "       [--kv-disk-compress off|zstd] [--prefill-chunk N] [--max-new N]\n"
@@ -214,6 +215,8 @@ Options parse_options(int argc, char** argv) {
             options.kv_capacity = parse_kv_capacity(value(arg));
         } else if (arg == "--kv-capacity-headroom") {
             kv_capacity_headroom_mib = parse_u64(value(arg), "kv-capacity-headroom");
+        } else if (arg == "--kv-idle-timeout") {
+            options.kv_idle_timeout = parse_u32(value(arg), "kv-idle-timeout", true);
         } else if (arg == "--kv-ram-capacity") {
             options.kv_ram_capacity_bytes = parse_kv_ram_capacity_bytes(value(arg));
         } else if (arg == "--kv-ram-system-prompts") {

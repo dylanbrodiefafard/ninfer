@@ -1,5 +1,6 @@
 #include "artifact_fixture.h"
 #include "product/startup_options.h"
+#include "targets/startup_options.h"
 
 #include <exception>
 #include <iostream>
@@ -14,6 +15,31 @@ int main() {
     using test::artifact_fixture::Json;
     using test::artifact_fixture::write_fixture;
     try {
+        using targets::resolve_kv_idle_timeout;
+        if (resolve_kv_idle_timeout({}, 1024, "qwen3.8-flash-next") != 30 ||
+            resolve_kv_idle_timeout({}, 0, "qwen3.8-flash-next") != 0 ||
+            resolve_kv_idle_timeout({}, 1024, "qwen3.8-27b") != 0 ||
+            resolve_kv_idle_timeout(0, 0, "qwen3.8-27b") != 0 ||
+            resolve_kv_idle_timeout(5, 1024, "qwen3.8-flash-next") != 5) {
+            throw std::runtime_error("idle timeout defaults or explicit override are incorrect");
+        }
+        for (const auto model : {"qwen3.8-27b", "qwen3.8-flash-next"}) {
+            bool rejected = false;
+            try {
+                (void)resolve_kv_idle_timeout(5, 0, model);
+            } catch (const std::invalid_argument& error) {
+                rejected = std::string(error.what()).find("--kv-idle-timeout") != std::string::npos;
+            }
+            if (!rejected) {
+                throw std::runtime_error("idle timeout accepted unsupported startup");
+            }
+        }
+        bool wrong_identity = false;
+        try {
+            (void)resolve_kv_idle_timeout(5, 1024, "qwen3.8-27b");
+        } catch (const std::invalid_argument&) { wrong_identity = true; }
+        if (!wrong_identity) { throw std::runtime_error("27B accepted RAM-on idle timeout"); }
+
         Json directory  = {{"identity", {{"model_id", "qwen3.8-27b"}, {"weights_id", "nvfp4"}}},
                            {"objects", Json::array({{{"name", "tokenizer"},
                                                      {"kind", "resource"},

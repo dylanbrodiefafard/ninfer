@@ -216,7 +216,69 @@ detail::MoeAdmitPolicyArgs validate_policy(const MoeExpertCache& cache, std::int
     return policy;
 }
 
+// Shared checked refill views. Selection reads the live frequency table, and both phases mutate
+// only the F3 pool and the explicitly named reservation/table state.
+detail::MoeExpertSlotPoolArgs validate_refill(const Tensor& host, const MoeExpertCache& cache,
+                                              const Tensor& state, std::vector<ByteRange>& ranges) {
+    const auto layers = validate_table(host, 0, "moe_expert_cache_refill", "host_ptr");
+    (void)validate_slot_index(cache, layers, "moe_expert_cache_refill");
+    if (!contiguous_2d(state, DType::I32, sizeof(std::int32_t)) || state.ne[0] != 2 ||
+        state.ne[1] != 1) {
+        throw std::invalid_argument("moe_expert_cache_refill: state must be contiguous I32 [2]");
+    }
+    ranges = {range_of(host), range_of(cache.slot_index), range_of(state)};
+    for (const auto& pool : cache.pools) { append_pool_ranges(pool, ranges); }
+    return validate_pool(cache.pools[static_cast<int>(MoeExpertCodec::F3G32)],
+                         "moe_expert_cache_refill");
+}
+
 } // namespace
+
+void moe_expert_cache_refill_select(const Tensor& host_ptr, const MoeExpertCache& cache,
+                                    Tensor& state, Tensor& source, Tensor& destination,
+                                    cudaStream_t stream, const Tensor* eligible) {
+    std::vector<ByteRange> ranges;
+    const auto pool   = validate_refill(host_ptr, cache, state, ranges);
+    const auto layers = host_ptr.ne[1];
+    const auto policy = validate_policy(cache, layers, MoeCacheAdmission::FrequencyFilter);
+    validate_column(source, "moe_expert_cache_refill", "source");
+    validate_column(destination, "moe_expert_cache_refill", "destination");
+    ranges.push_back(range_of(source));
+    ranges.push_back(range_of(destination));
+    ranges.push_back(range_of(cache.frequency.counts));
+    ranges.push_back(range_of(cache.frequency.lookups));
+    const std::uint32_t* mask = nullptr;
+    if (eligible != nullptr) {
+        if (!contiguous_2d(*eligible, DType::I32, sizeof(std::int32_t)) ||
+            eligible->ne[0] != kMoeExpertMaskWords || eligible->ne[1] != layers) {
+            throw std::invalid_argument("moe_expert_cache_refill: eligible must be I32 [16,L]");
+        }
+        ranges.push_back(range_of(*eligible));
+        mask = static_cast<const std::uint32_t*>(eligible->data);
+    }
+    require_disjoint(ranges, "moe_expert_cache_refill: operands overlap");
+    detail::moe_expert_cache_refill_select_launch(
+        static_cast<const std::uint64_t*>(host_ptr.data),
+        static_cast<const std::int32_t*>(cache.slot_index.data), policy.counts,
+        kMoeExperts * layers, pool, static_cast<std::int32_t*>(state.data),
+        static_cast<std::uint64_t*>(source.data), static_cast<std::uint64_t*>(destination.data),
+        mask, stream);
+}
+
+void moe_expert_cache_refill_publish(Tensor& expert_ptr, const Tensor& host_ptr,
+                                     const MoeExpertCache& cache, Tensor& state,
+                                     cudaStream_t stream) {
+    std::vector<ByteRange> ranges;
+    const auto pool = validate_refill(host_ptr, cache, state, ranges);
+    (void)validate_tables(expert_ptr, host_ptr, 0, "moe_expert_cache_refill", "expert_ptr",
+                          "host_ptr");
+    ranges.push_back(range_of(expert_ptr));
+    require_disjoint(ranges, "moe_expert_cache_refill: operands overlap");
+    detail::moe_expert_cache_refill_publish_launch(
+        static_cast<std::uint64_t*>(expert_ptr.data),
+        static_cast<std::int32_t*>(cache.slot_index.data), pool,
+        static_cast<std::int32_t*>(state.data), stream);
+}
 
 void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor& host_ptr,
                             Tensor& fill_ptr, const MoeExpertCache& cache, std::int32_t layer,

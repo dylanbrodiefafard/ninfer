@@ -189,7 +189,10 @@ struct EngineOptions {
     std::uint32_t mixed_forward            = 4096;
     std::uint32_t mixed_forward_rounds     = 12;
     std::uint32_t mixed_forward_min_tokens = 4096;
-    std::size_t kv_ram_capacity_bytes      = 0;
+    // Flash-Next retained-idle eviction to RAM, in seconds. Unset selects 30 with RAM enabled,
+    // otherwise 0. Explicit nonzero values require Flash-Next and the RAM tier; 0 disables it.
+    std::optional<std::uint32_t> kv_idle_timeout;
+    std::size_t kv_ram_capacity_bytes = 0;
     // Retained system prefixes share the RAM budget; zero disables capture.
     std::uint32_t kv_ram_system_prompts = 0;
     std::size_t kv_disk_capacity_bytes  = 0;

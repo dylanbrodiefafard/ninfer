@@ -429,6 +429,7 @@ int main(int argc, char** argv) {
         engine_options.device                   = cli.device;
         engine_options.max_context              = cli.max_context;
         engine_options.kv_capacity              = cli.kv_capacity;
+        engine_options.kv_idle_timeout          = cli.kv_idle_timeout;
         engine_options.kv_ram_capacity_bytes    = cli.kv_ram_capacity_bytes;
         engine_options.kv_ram_system_prompts    = cli.kv_ram_system_prompts;
         engine_options.kv_disk_capacity_bytes   = cli.kv_disk_capacity_bytes;

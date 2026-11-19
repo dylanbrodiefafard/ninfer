@@ -46,6 +46,18 @@ void moe_expert_cache_admit_launch(const std::int32_t* ids, std::int32_t id_coun
                                    const std::uint32_t* eligible, std::uint64_t* route_counts,
                                    cudaStream_t stream);
 
+// Refill state is {layer-major record code, absolute F3 slot}, or {-1,-1}. Select reserves
+// owner -2 without publishing residency; the source/destination columns hold at most one fill.
+void moe_expert_cache_refill_select_launch(const std::uint64_t* host_ptr,
+                                           const std::int32_t* slot_index,
+                                           const std::int32_t* counts, std::int32_t records,
+                                           MoeExpertSlotPoolArgs pool, std::int32_t* state,
+                                           std::uint64_t* source, std::uint64_t* destination,
+                                           const std::uint32_t* eligible, cudaStream_t stream);
+void moe_expert_cache_refill_publish_launch(std::uint64_t* expert_ptr, std::int32_t* slot_index,
+                                            MoeExpertSlotPoolArgs pool, std::int32_t* state,
+                                            cudaStream_t stream);
+
 // Whether moe_expert_cache_lend_launch borrows (owner -2, evicting) or returns (owner -1).
 enum class MoeCacheLend : std::uint8_t { Borrow, Return };
 

@@ -3,6 +3,8 @@
 #include "config.h"
 #include "load/binder.h"
 #include "runtime/program.h"
+#include "runtime/engine/idle_lane_policy.h"
+#include "targets/startup_options.h"
 
 #include "core/device.h"
 #include "artifact/reader.h"
@@ -153,7 +155,9 @@ public:
           weights_bytes(model.materialization_stats().device_capacity_bytes),
           program_options(make_program_options(options)),
           image_slots(options.kv_ram_capacity_bytes == 0 ? 2U : 3U),
-          program(model, program_options, context) {
+          program(model, program_options, context),
+          idle_lanes(std::chrono::seconds(resolve_kv_idle_timeout(
+              options.kv_idle_timeout, options.kv_ram_capacity_bytes, Package::model_id))) {
         if (program.lanes() != static_cast<std::int32_t>(options.max_concurrency)) {
             throw std::logic_error("qwen3.8-flash-next Program lanes differ from the Engine's");
         }
@@ -402,10 +406,21 @@ public:
         }
     }
 
+    // Abandon only the expiry decision, not the completed original's optional RAM image.
+    void lane_activity(std::uint32_t lane) {
+        auto& captured = idle_capture_ids.at(lane);
+        if (captured != 0) {
+            ram->release(captured);
+            captured = 0;
+        }
+        idle_lanes.activity(lane);
+    }
+
     // Joins only this lane's tier uses before releasing pages. A pending disk destination is
     // cancelled here, so page safety does not depend on the executor draining scatter first.
     // The host-side reset precedes Program release and completes even if that release throws.
     void close(LaneRecord& entry) {
+        if (const auto index = record_index(entry)) { lane_activity(*index); }
         const std::optional<Lane> lane = entry.lane;
         if (pending_disk_owner == &entry) {
             disk->cancel_restore();
@@ -441,6 +456,14 @@ public:
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
     }
 
+    [[nodiscard]] std::optional<std::uint32_t> record_index(const LaneRecord& entry) const {
+        // Suspended request records do not own a retained-idle timer.
+        for (std::uint32_t lane = 0; lane < records.size(); ++lane) {
+            if (&records.at(lane) == &entry) { return lane; }
+        }
+        return std::nullopt;
+    }
+
     bool retain(LaneRecord& entry) {
         if (entry.phase == Phase::Retained) { return true; }
         if (!entry.lane || entry.tokens.empty() || !entry.allow_reuse) {
@@ -455,6 +478,9 @@ public:
         entry.phase          = Phase::Retained;
         entry.output         = nullptr;
         entry.reserve_tokens = static_cast<std::uint32_t>(entry.tokens.size());
+        if (const auto index = record_index(entry)) {
+            idle_lanes.idle(*index, !entry.cache_write, Clock::now());
+        }
         return true;
     }
 
@@ -462,9 +488,12 @@ public:
         return {static_cast<std::byte*>(data), program.state().continuation_bytes()};
     }
 
+    enum class CaptureSnapshot : std::uint8_t { ComputeStream, CopyStream };
+
     bool capture(LaneRecord& entry, std::uint64_t* id, bool may_block, bool* deferred,
                  std::span<const std::uint64_t> keep, bool system = false,
-                 bool complete_original = false, std::uint64_t live_owner = 0) {
+                 bool complete_original = false, std::uint64_t live_owner = 0,
+                 CaptureSnapshot snapshot_mode = CaptureSnapshot::ComputeStream) {
         if (id != nullptr) { *id = 0; }
         if (deferred != nullptr) { *deferred = false; }
         if (!ram || !entry.lane ||
@@ -472,7 +501,16 @@ public:
             return false;
         }
         try {
-            CUDA_CHECK(cudaEventSynchronize(entry.capture_done));
+            if (!may_block) {
+                const auto status = cudaEventQuery(entry.capture_done);
+                if (status == cudaErrorNotReady) {
+                    if (deferred != nullptr) { *deferred = true; }
+                    return false;
+                }
+                CUDA_CHECK(status);
+            } else {
+                CUDA_CHECK(cudaEventSynchronize(entry.capture_done));
+            }
             const bool cut = live_owner == 0 && !system && !complete_original &&
                              entry.turn_closed && entry.rewrite &&
                              entry.rewrite->kind == qwen3_6::RewriteCheckpointKind::TurnClosure &&
@@ -488,7 +526,18 @@ public:
             } else {
                 identity.truncate(ledger.size());
             }
-            if (!cut) { snapshot(entry, entry.tier_image); }
+            if (!cut) {
+                if (snapshot_mode == CaptureSnapshot::CopyStream) {
+                    // Retained state is immutable. Snapshot and page D2H can share the copy
+                    // stream without making any subsequent decode wait on either transfer.
+                    device.order_copy_after_compute();
+                    program.state().pack_continuation(*entry.lane, entry.tier_image,
+                                                      device.copy_stream);
+                    program.extents().record_tier_copy(entry.capture_done);
+                } else {
+                    snapshot(entry, entry.tier_image);
+                }
+            }
             tier::RamCaptureSource source;
             source.system_prompt             = system;
             source.live_owner                = live_owner;
@@ -695,6 +744,9 @@ public:
     LaneRecord* pending_disk_owner = nullptr;
     bool tiers_shutdown            = false;
     CudaEvent copy_cancel{cudaEventDisableTiming};
+    runtime::IdleLanePolicy idle_lanes;
+    // A two-phase expiry claims its complete RAM image until release or lane activity.
+    std::array<std::uint64_t, kMaximumConcurrency> idle_capture_ids{};
     std::uint64_t use_tick = 0;
     std::array<LaneFence, kMaximumConcurrency> lane_fences{};
     std::array<LaneRecord, kMaximumConcurrency> records{};
@@ -1073,6 +1125,7 @@ EngineProgram::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt, R
         throw std::logic_error("qwen3.8-flash-next admitted a lane the Program cannot open");
     }
     entry.sampling = std::move(sampling);
+    impl_->lane_activity(lane);
     entry.phase    = Impl::Phase::Prefill;
     auto result    = impl_->run_prefill_step(entry);
     entry.use_tick = ++impl_->use_tick;
@@ -1402,22 +1455,87 @@ void EngineProgram::fork_retained_lane(std::uint32_t destination, std::uint32_t 
         throw std::logic_error(
             "Flash-Next fork requires an independent destination and retained source");
     }
-    to.lane = impl_->program.open_lane(plan.base_.reserve_tokens_, LaneSampling{});
-    if (!to.lane) {
-        throw std::logic_error("Flash-Next admitted fork cannot allocate its destination");
+    // A fork only reads the immutable retained source, so an expiry capture already claimed for
+    // it stays valid; releasing it would make the later expiry store a duplicate entry, which
+    // the RAM tier does not deduplicate.
+    impl_->idle_lanes.activity(source);
+    try {
+        to.lane = impl_->program.open_lane(plan.base_.reserve_tokens_, LaneSampling{});
+        if (!to.lane) {
+            throw std::logic_error("Flash-Next admitted fork cannot allocate its destination");
+        }
+        impl_->program.state().copy_prefix(to.lane.value(), from.lane.value(),
+                                           static_cast<std::int32_t>(frontier),
+                                           impl_->device.stream);
+        const auto path = plan.summary().disk_reuse_path;
+        if (path != PrefixReusePath::AppendAtFrontier) {
+            impl_->program.state().unpack_continuation(*to.lane,
+                                                       path == PrefixReusePath::RestoreTurnRollback
+                                                           ? from.rollback_image
+                                                           : from.rewrite_image,
+                                                       impl_->device.stream);
+        }
+        // Completion protects the original pages and checkpoint images before the executor can
+        // admit another reader or recycle their lane.
+        CUDA_CHECK(cudaStreamSynchronize(impl_->device.stream));
+    } catch (...) {
+        impl_->idle_lanes.idle(source, !from.cache_write, Clock::now());
+        throw;
     }
-    impl_->program.state().copy_prefix(to.lane.value(), from.lane.value(),
-                                       static_cast<std::int32_t>(frontier), impl_->device.stream);
-    const auto path = plan.summary().disk_reuse_path;
-    if (path != PrefixReusePath::AppendAtFrontier) {
-        impl_->program.state().unpack_continuation(
-            *to.lane,
-            path == PrefixReusePath::RestoreTurnRollback ? from.rollback_image : from.rewrite_image,
-            impl_->device.stream);
+    impl_->idle_lanes.idle(source, !from.cache_write, Clock::now());
+}
+
+bool EngineProgram::service_expert_refill(bool allow_refill) {
+    return impl_->program.service_expert_refill(allow_refill);
+}
+
+std::optional<Clock::time_point> EngineProgram::idle_lane_deadline() const {
+    return impl_->idle_lanes.deadline();
+}
+
+std::optional<std::uint32_t> EngineProgram::expire_idle_lane() {
+    const auto now     = Clock::now();
+    const auto expired = impl_->idle_lanes.expired(now);
+    if (!expired) { return std::nullopt; }
+    const auto lane = expired->lane;
+    if (!has_retained_lane(lane)) {
+        impl_->lane_activity(lane);
+        return std::nullopt;
     }
-    // Completion protects the original pages and checkpoint images before the executor can
-    // admit another reader or recycle their lane.
-    CUDA_CHECK(cudaStreamSynchronize(impl_->device.stream));
+    auto& entry = impl_->record(lane);
+    if (!expired->disposable) {
+        if (impl_->idle_lanes.capturing(lane)) {
+            const auto status = cudaEventQuery(entry.capture_done);
+            if (status == cudaErrorNotReady) {
+                impl_->idle_lanes.await_capture(lane, now);
+                return std::nullopt;
+            }
+            CUDA_CHECK(status);
+        } else if (impl_->idle_capture_ids.at(lane) != 0) {
+            // The claimed image from an earlier expiry attempt survived a fork of this lane.
+            impl_->idle_lanes.await_capture(lane, now);
+            return std::nullopt;
+        } else {
+            // Capture the full original asynchronously, not preserve-off's rewrite cut. Both
+            // continuation and page copies complete before a later boundary licenses release.
+            std::uint64_t id    = 0;
+            bool deferred       = false;
+            const bool captured = impl_->capture(entry, &id, false, &deferred, {}, false, true, 0,
+                                                 Impl::CaptureSnapshot::CopyStream);
+            if (captured) {
+                impl_->ram->claim(id);
+                impl_->idle_capture_ids.at(lane) = id;
+                impl_->idle_lanes.await_capture(lane, now);
+            } else {
+                // Capacity failure never destroys optional idle state without admission
+                // pressure, and never promotes the lane to the newest-idle exemption.
+                impl_->idle_lanes.retry(lane, Clock::now());
+            }
+            return std::nullopt;
+        }
+    }
+    impl_->close(entry);
+    return lane;
 }
 
 #include "kv_tiers_impl.h"

@@ -99,7 +99,7 @@ bool EngineProgram::start_suspend(std::uint32_t lane, std::uint64_t owner) {
     saved.sampling_counts_offset =
         impl_->ram->live_credit_view(owner).second - Impl::kSamplingCountsBytes;
     try {
-        if (!impl_->capture(entry, &saved.image_id, false, nullptr, {}, false, true, owner)) {
+        if (!impl_->capture(entry, &saved.image_id, true, nullptr, {}, false, true, owner)) {
             impl_->suspended.erase(position);
             return false;
         }

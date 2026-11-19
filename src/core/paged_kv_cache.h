@@ -176,8 +176,7 @@ private:
 
     [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
                                                std::uint32_t new_pages) const noexcept;
-    [[nodiscard]] std::vector<std::int32_t> take_pages(std::uint32_t count,
-                                                       std::int32_t preferred_first);
+    [[nodiscard]] std::vector<std::int32_t> take_pages(std::uint32_t count);
     void return_pages(std::span<const std::int32_t> pages) noexcept;
     void add_entitlement(std::uint32_t pages) noexcept;
     void replace_entitlement(std::uint32_t old_pages, std::uint32_t new_pages) noexcept;
