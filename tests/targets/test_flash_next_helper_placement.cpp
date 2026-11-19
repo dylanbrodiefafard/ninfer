@@ -103,6 +103,20 @@ void check(std::span<const MoeExpertCodec> codecs, std::span<const std::uint64_t
             tail_routes += counts[i];
         }
     }
+    // Admission covers exactly the F3 records of T; every P record owns the next fixed slot of its
+    // codec in ascending index order, and no other record has a slot.
+    std::array<std::int32_t, 2> next_slot{};
+    std::int32_t admitted = 0;
+    require(actual.admission_mask.size() == counts.size() / 32 &&
+            actual.primary_slot.size() == counts.size());
+    for (std::size_t i = 0; i < counts.size(); ++i) {
+        const bool tail_f3 = !protected_core[i] && !helper[i] && codecs[i] == MoeExpertCodec::F3G32;
+        require(((actual.admission_mask[i / 32] >> (i % 32)) & 1U) == (tail_f3 ? 1U : 0U));
+        admitted += tail_f3 ? 1 : 0;
+        require(actual.primary_slot[i] ==
+                (protected_core[i] ? next_slot[static_cast<std::size_t>(codecs[i])]++ : -1));
+    }
+    require(actual.admission_count == admitted);
     require(actual.primary_counts == primary_counts && actual.tail_counts == tail_counts);
     require(actual.primary_bytes == primary_bytes && actual.tail_bytes == tail_bytes);
     require(actual.primary_routes == primary_routes && actual.tail_routes == tail_routes);

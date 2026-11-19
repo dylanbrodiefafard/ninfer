@@ -69,6 +69,9 @@ struct ExpertHelper::Impl {
         const auto eligibility =
             cuda_storage.alloc_bytes(placement.local_eligibility.size() * sizeof(std::uint32_t));
         cuda.local_eligibility = static_cast<const std::uint32_t*>(eligibility.data);
+        const auto admission =
+            cuda_storage.alloc_bytes(placement.admission_mask.size() * sizeof(std::uint32_t));
+        cuda.admission_eligibility = static_cast<const std::uint32_t*>(admission.data);
         cuda.local_partial =
             static_cast<float*>(cuda_storage.alloc_bytes(max_t * kExpertPartialBytes).data);
         cuda.remote_partial =
@@ -87,6 +90,9 @@ struct ExpertHelper::Impl {
                                    static_cast<cudaStream_t>(cuda_stream)));
         CUDA_CHECK(cudaMemcpyAsync(eligibility.data, placement.local_eligibility.data(),
                                    placement.local_eligibility.size() * sizeof(std::uint32_t),
+                                   cudaMemcpyHostToDevice, static_cast<cudaStream_t>(cuda_stream)));
+        CUDA_CHECK(cudaMemcpyAsync(admission.data, placement.admission_mask.data(),
+                                   placement.admission_mask.size() * sizeof(std::uint32_t),
                                    cudaMemcpyHostToDevice, static_cast<cudaStream_t>(cuda_stream)));
         CUDA_CHECK(cudaStreamSynchronize(static_cast<cudaStream_t>(cuda_stream)));
 
@@ -167,16 +173,22 @@ struct ExpertHelper::Impl {
             initial.pci.c_str(), initial.name.c_str(), initial.architecture.c_str(),
             initial.runtime_version, initial.free_bytes, kHelperReserveBytes, used, records.size(),
             nonrecords, memory.cuda_device_bytes, mailbox.bytes(), upload.seconds);
+        // P, H and T per codec (NVFP4/F3): counts, bytes and CALIB route share. P fills the fixed
+        // slots; only the F3 records of T are admitted, into the flex slots.
         std::fprintf(
             stderr,
-            "expert-helper fixed=%d/%d local=%d/%d helper=%d/%d codec-bytes=%zu/%zu "
-            "calib=%llu/%llu zero-flex-full=%d tail=%d/%d tail-bytes=%zu/%zu tail-calib=%llu\n",
-            fixed.slots[0], fixed.slots[1], primary.slots[0], primary.slots[1],
+            "expert-helper tiers P=%d/%d (%zu/%zu B, %llu routes) H=%d/%d (%zu/%zu B, %llu) "
+            "T=%d/%d (%zu/%zu B, %llu) of %llu routes; fixed-slots=%d/%d flex-slots-F3=%zu "
+            "admit-F3=%d full-coverage=%d\n",
+            placement.primary_counts[0], placement.primary_counts[1], placement.primary_bytes[0],
+            placement.primary_bytes[1], static_cast<unsigned long long>(placement.primary_routes),
             placement.helper_counts[0], placement.helper_counts[1], placement.helper_bytes[0],
             placement.helper_bytes[1], static_cast<unsigned long long>(placement.helper_routes),
-            static_cast<unsigned long long>(placement.total_routes), placement.full_coverage,
             placement.tail_counts[0], placement.tail_counts[1], placement.tail_bytes[0],
-            placement.tail_bytes[1], static_cast<unsigned long long>(placement.tail_routes));
+            placement.tail_bytes[1], static_cast<unsigned long long>(placement.tail_routes),
+            static_cast<unsigned long long>(placement.total_routes), primary.slots[0],
+            primary.slots[1], primary_flex_slots, placement.admission_count,
+            placement.full_coverage);
         const auto toolchain = expert_helper_toolchain();
         std::fprintf(stderr,
                      "expert-helper HIP-clang=%.*s primary-flex-F3=%zu remaining-codecs=%d/%d\n",
@@ -212,7 +224,7 @@ std::size_t ExpertHelper::cuda_device_bytes(std::uint32_t max_tokens) {
     if (max_tokens == 0 || max_tokens > 48) {
         throw std::invalid_argument("expert helper CUDA capacity must be [1,48]");
     }
-    return 48 * 16 * sizeof(std::uint32_t) + 2 * aligned(max_tokens * kExpertPartialBytes) +
+    return 2 * 48 * 16 * sizeof(std::uint32_t) + 2 * aligned(max_tokens * kExpertPartialBytes) +
            aligned(max_tokens * kExpertActivationBytes) +
            2 * aligned(max_tokens * (kExpertMetadataBytes / 2)) +
            aligned(max_tokens * sizeof(std::int32_t)) + aligned(sizeof(std::uint32_t));

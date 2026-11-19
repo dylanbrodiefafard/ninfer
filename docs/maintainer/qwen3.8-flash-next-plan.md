@@ -31,7 +31,12 @@ exclusive decode placement, immutable original record bytes, partial arithmetic,
 mailboxes and failure drains. Prefill/shared experts/drafting remain local; Engine scheduling
 and continuation formats do not change. Helper memory is reported separately from CUDA KV/cache.
 
-Startup logs selected hardware/toolchain, memory and record inventory, CALIB share, upload
+In helper mode the primary's fixed expert slots hold the pinned hot set P (written once, never
+evicted), its flex slots hold only the F3 tail records that admission and refill place, and prefill
+streams no windows: every other record is read through mapped host memory
+([three-tier placement](qwen3.8-flash-next-expert-helper.md#111-three-tier-placement)).
+
+Startup logs selected hardware/toolchain, memory and record inventory, the P/H/T tiers, CALIB share, upload
 checksums and the exchange nonce. Invalid selection or exchange fails before readiness, never
 falls back. Runtime JSON profile loading is not supported; the served `--expert-route-profile`
 file is output-only. Helper-enabled same-column numerical, graph/eager, Engine/tier and HTTP
@@ -1604,6 +1609,9 @@ design serves. The Op takes any geometry, so the target chooses.
   by value and never need re-capture: lending changes only owner state.
 - Lending and reclaiming are ordinary borrows and returns. Lent slots are protected (owner -2), so
   CLOCK skips them, and `moe_experts` never reads them through the tables.
+- `MoeExpertSlotPool::clock_first` limits admit's CLOCK to the slots [clock_first, N): 0 without
+  the helper, F with the pinned tier, so the hand never visits pinned fixed slots. A range whose
+  every slot is protected ends the call's admission after one lap of the range.
 
 **Invariants for the target.**
 - Every page id is in exactly one state: KV-free, KV-mapped, or cache extent.
@@ -1656,8 +1664,8 @@ frequency count (ties to the lower layer-major code), and reserves the highest e
 The demand gate reads admit's existing counters before the round's existing completion fence;
 there is no additional host synchronization. It uses the cache's device frequency state, not an
 OFF-build compiled profile. Helper builds pass
-the local-eligibility mask, so helper-owned records never refill; full fixed local coverage needs
-no refill. The reservation has owner -2 but no resident table or inverse-index entry, so demand
+the admission mask (F3 records of the tail), so pinned and helper-owned records never refill; full
+coverage (empty tail) needs no refill. The reservation has owner -2 but no resident table or inverse-index entry, so demand
 continues to read the host record and can admit it elsewhere.
 
 One immutable record copies on `DeviceContext::copy_stream`, using the existing exact fill Op.

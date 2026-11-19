@@ -17,10 +17,12 @@ struct FlexDemand {
 };
 
 // slots = max(0, admittable_f3_records - fixed_f3_slots): the admission domain is the set of F3
-// records the residency may admit (every F3 record, or the helper placement's local subset), and
-// NVFP4 records never use flex slots. extents = ceil(slots / slots_per_extent), capped at the
-// region's `region_extents`, since a demand beyond the region is not satisfiable by KV;
-// tokens = extents * extent_tokens. A region without slots (slots_per_extent == 0) has no demand.
+// records the residency may admit (every F3 record, or the helper placement's admitted tail);
+// fixed_f3_slots counts the fixed F3 slots those records may occupy (zero when the fixed slots hold
+// a pinned tier); NVFP4 records never use flex slots. extents = ceil(slots / slots_per_extent),
+// capped at the region's `region_extents`, since a demand beyond the region is not satisfiable by
+// KV; tokens = extents * extent_tokens. A region without slots (slots_per_extent == 0) has no
+// demand.
 [[nodiscard]] constexpr FlexDemand plan_flex_demand(std::int64_t admittable_f3_records,
                                                     std::int64_t fixed_f3_slots,
                                                     std::int64_t slots_per_extent,

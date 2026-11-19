@@ -8,11 +8,17 @@
 // small enough that every
 // slot is protected (exhaustion), pools wider than one 1024-slot scan window, an empty pool, pools
 // with flex slots at scattered addresses (with and without fixed slots, lent in extents while a
-// fixed run is lent as well), and a captured multi-layer graph with a flex lend replayed with
-// fresh routes. The lookup and miss counters are compared exactly after every admit that takes
-// them (they accumulate from a random start; admits without them must leave them alone). After
-// each exact comparison the model, and so the device state, is checked against the cache's
-// consistency invariant; the host checks of the lend regions are exercised as well.
+// fixed run is lent as well), CLOCK ranges that start inside or past the fixed slots, and a
+// captured multi-layer graph with a flex lend replayed with fresh routes. A pinned case (also the
+// `--pinned` sanitizer case) puts the CLOCK range of each pool past fixed slots that hold pinned
+// (owner -2) and cold unprotected records, so only flex slots are admittable: the hand starts
+// near the end of the range and wraps to its first slot, admits exhaust the flex slots within one
+// call, every flex extent is lent while misses arrive (nothing admitted, counters exact, hands
+// unchanged), and no slot below the range ever changes owner. The lookup and miss counters are
+// compared exactly after every admit that takes them (they accumulate from a random start; admits
+// without them must leave them alone). After each exact comparison the model, and so the device
+// state, is checked against the cache's consistency invariant; the host checks of the lend regions
+// are exercised as well.
 
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -52,6 +58,8 @@ struct PoolModel {
     std::uint64_t base         = 0;
     std::uint64_t record_bytes = 0;
     std::int32_t fixed         = 0;
+    // CLOCK visits only slots [clock_first, N).
+    std::int32_t clock_first = 0;
     std::vector<std::uint64_t> flex;
     std::vector<std::int32_t> owner;
     std::vector<std::uint8_t> referenced;
@@ -86,7 +94,8 @@ std::size_t counter_index(ops::MoeCacheCounter kind, std::size_t tag) {
 // The contract's sequential policy, written from its text: hits raise the reference counter of
 // the slot the expert owns up to the limit; the frequency state counts the routed set and halves
 // at its period; misses in ascending id run CLOCK one slot at a time after checking that an
-// unprotected slot exists, and with the filter a miss whose count does not exceed its victim
+// unprotected slot of the pool's CLOCK range exists, the hand wrapping within that range, and
+// with the filter a miss whose count does not exceed its victim
 // owner's is not admitted. With count_events, every distinct routed expert adds one lookup of its
 // codec and, when its entry names the host record on entry, one miss. Route counts include the
 // full routed set; eligibility restricts only cache events, frequency and admission.
@@ -146,10 +155,11 @@ void model_admit(CacheModel& m, const std::vector<std::int32_t>& ids, std::int32
     for (std::int32_t e = 0; e < kExperts; ++e) {
         const auto entry = static_cast<std::size_t>(layer) * kExperts + e;
         if (!routed[e] || m.expert[entry] != m.host[entry]) { continue; }
-        const std::size_t tag = m.host[entry] & 1U;
-        PoolModel& pool       = m.pools[tag];
-        const auto slots      = static_cast<std::int32_t>(pool.owner.size());
-        if (std::none_of(pool.owner.begin(), pool.owner.end(),
+        const std::size_t tag    = m.host[entry] & 1U;
+        PoolModel& pool          = m.pools[tag];
+        const std::int32_t first = pool.clock_first;
+        const auto range         = static_cast<std::int32_t>(pool.owner.size()) - first;
+        if (std::none_of(pool.owner.begin() + first, pool.owner.end(),
                          [&](std::int32_t o) { return !is_protected(o); })) {
             continue;
         }
@@ -157,7 +167,7 @@ void model_admit(CacheModel& m, const std::vector<std::int32_t>& ids, std::int32
         std::int32_t victim = -1;
         while (victim < 0) {
             const std::int32_t s = hand;
-            hand                 = (hand + 1) % slots;
+            hand                 = first + (hand - first + 1) % range;
             if (is_protected(pool.owner[s])) { continue; }
             if (pool.referenced[s] != 0) {
                 --pool.referenced[s];
@@ -217,12 +227,14 @@ void model_commit(CacheModel& m, std::int32_t layer) {
     }
 }
 
-// A pool of `slots` fixed slots and `flex` flex slots (lent in extents of extent_slots).
+// A pool of `slots` fixed slots and `flex` flex slots (lent in extents of extent_slots), with the
+// CLOCK range [clock_first, slots + flex).
 struct PoolConfig {
     std::int32_t slots;
     std::uint64_t record_bytes;
     std::int32_t flex         = 0;
     std::int32_t extent_slots = 1;
+    std::int32_t clock_first  = 0;
 };
 
 struct DevicePool {
@@ -252,6 +264,7 @@ public:
             PoolModel& pool   = model.pools[p];
             pool.record_bytes = record;
             pool.fixed        = config[p].slots;
+            pool.clock_first  = config[p].clock_first;
             pool.owner.assign(fixed + flex, ops::kMoeCacheEmptySlot);
             pool.referenced.assign(fixed + flex, 0);
             if (slots == 0) { continue; }
@@ -262,6 +275,7 @@ public:
             DevicePool& device           = *pools_[p];
             ops::MoeExpertSlotPool& view = cache_.pools[p];
             view.record_bytes            = record;
+            view.clock_first             = config[p].clock_first;
             if (fixed != 0) {
                 device.slots = std::make_unique<DeviceBuffer>(fixed * record);
                 pool.base    = reinterpret_cast<std::uint64_t>(device.slots->p);
@@ -431,7 +445,8 @@ private:
 
 // Consistent random initial state: host addresses with random codecs (a fraction nvfp4_share of
 // codec 0), a random fill of each pool by distinct experts of its codec, random reference bits and
-// hands. Requires DeviceCache to have set the pool bases and sizes.
+// hands (in each CLOCK range; the first slot of an empty range). Requires DeviceCache to have set
+// the pool bases, sizes and ranges.
 void randomize_state(CacheModel& m, double nvfp4_share, double occupancy, double referenced,
                      std::mt19937& rng) {
     std::uniform_real_distribution<double> unit(0.0, 1.0);
@@ -462,10 +477,11 @@ void randomize_state(CacheModel& m, double nvfp4_share, double occupancy, double
                     pool.address(s) | static_cast<std::uint64_t>(p);
             }
         }
-        m.hands[p] = pool.owner.empty()
-                         ? 0
-                         : std::uniform_int_distribution<std::int32_t>(
-                               0, static_cast<std::int32_t>(pool.owner.size()) - 1)(rng);
+        const auto slots = static_cast<std::int32_t>(pool.owner.size());
+        m.hands[p] =
+            pool.clock_first == slots
+                ? pool.clock_first
+                : std::uniform_int_distribution<std::int32_t>(pool.clock_first, slots - 1)(rng);
     }
     // Counters start at random nonzero values, the first just below 2^32, so the comparison sees
     // accumulation rather than assignment and carries past 32 bits.
@@ -915,6 +931,149 @@ int run_refill(cudaStream_t stream) {
     return failures;
 }
 
+// The expert-helper residency shape: each pool's CLOCK range starts past its fixed slots, which
+// hold pinned slots (owner -2) and a few cold, unreferenced records that a whole-pool CLOCK would
+// evict first. Pool 0 has no flex slots (an empty range: nothing is admitted); pool 1 has two flex
+// extents behind more than one scan window of fixed slots. Phases, each admit compared exactly
+// against the model after admit and commit: (1) the hand starts three slots before the end and
+// must wrap to the range's first slot; (2) with both extents lent every miss stays mapped, the
+// counters still count it and the hands do not move; (3) with one extent back, wide calls have
+// more misses than the extent has slots, so CLOCK exhausts the range within the call and stops;
+// (4) both extents back. No slot below a range ever changes owner, on the device or in the model.
+int run_pinned(std::uint32_t seed, cudaStream_t stream) {
+    constexpr std::int32_t kLayers = 3;
+    constexpr std::int32_t kExtent = 36;
+    constexpr auto kFlex           = ops::MoeCacheSlotRegion::Flex;
+    const std::array<PoolConfig, kPools> pools{
+        {{40, 512, 0, 1, 40}, {1100, 256, 2 * kExtent, kExtent, 1100}}};
+    std::mt19937 rng(seed);
+    CacheModel model;
+    model.layers          = kLayers;
+    model.reference_limit = 8;
+    model.halving_lookups = 2000;
+    DeviceCache device(model, pools, rng);
+    randomize_state(model, 0.2, 0.8, 0.5, rng);
+    // Pin nine of every ten fixed slots; the rest keep their record with a cleared counter.
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    for (PoolModel& pool : model.pools) {
+        for (std::int32_t s = 0; s < pool.clock_first; ++s) {
+            const auto slot      = static_cast<std::size_t>(s);
+            const std::int32_t o = pool.owner[slot];
+            if (unit(rng) < 0.9) {
+                if (o >= 0) {
+                    model.expert[static_cast<std::size_t>(o)] =
+                        model.host[static_cast<std::size_t>(o)];
+                }
+                pool.owner[slot] = ops::kMoeCacheBorrowedSlot;
+            }
+            pool.referenced[slot] = 0;
+        }
+    }
+    model.hands[0] = model.pools[0].clock_first;
+    model.hands[1] = static_cast<std::int32_t>(model.pools[1].owner.size()) - 3;
+    device.upload(model);
+    std::array<std::vector<std::int32_t>, kPools> below;
+    for (std::int32_t p = 0; p < kPools; ++p) {
+        const PoolModel& pool = model.pools[p];
+        below[p].assign(pool.owner.begin(), pool.owner.begin() + pool.clock_first);
+    }
+    int failures = check_consistency(model, "pinned initial");
+
+    // One admit and commit of layer `step % kLayers` with counters, compared after each; returns
+    // the call's pool-1 misses and how many of them it admitted. Odd steps filter by frequency
+    // unless every miss is to be admitted while a slot remains.
+    struct F3Misses {
+        std::int64_t misses   = 0;
+        std::int64_t admitted = 0;
+    };
+
+    const auto f3_misses = [&] {
+        return model.counters[counter_index(ops::MoeCacheCounter::Misses, 1)];
+    };
+    std::int32_t step = 0;
+    const auto admit  = [&](std::int32_t tokens, const std::string& phase, bool every_miss) {
+        const std::int32_t layer = step % kLayers;
+        const bool filter        = !every_miss && step % 2 == 1;
+        ++step;
+        const auto ids = random_ids(tokens, layer, rng);
+        GuardedDeviceBuffer ids_storage(ids.size() * sizeof(std::int32_t));
+        ids_storage.copy_from_host(ids.data(), ids_storage.bytes());
+        const std::string label          = "pinned " + phase + " step " + std::to_string(step);
+        const std::int64_t misses_before = f3_misses();
+        device.admit(Tensor(ids_storage.data(), DType::I32, {kTopK, tokens}), layer, true, filter,
+                     stream);
+        cuda_synchronize(stream);
+        model_admit(model, ids, layer, true, filter);
+        failures += device.compare(model, label + " admit");
+        F3Misses result{f3_misses() - misses_before, 0};
+        for (std::size_t entry = 0; entry < model.fill.size(); ++entry) {
+            if (model.fill[entry] != 0 && (model.host[entry] & 1U) == 1) { ++result.admitted; }
+        }
+        device.commit(layer, stream);
+        cuda_synchronize(stream);
+        model_commit(model, layer);
+        failures += device.compare(model, label + " commit");
+        failures += check_consistency(model, label);
+        for (std::int32_t p = 0; p < kPools; ++p) {
+            const PoolModel& pool = model.pools[p];
+            if (!std::equal(below[p].begin(), below[p].end(), pool.owner.begin())) {
+                std::cerr << label << ": a slot below the CLOCK range of pool " << p
+                          << " changed owner\n";
+                ++failures;
+            }
+        }
+        return result;
+    };
+    const auto lend = [&](std::int32_t extent, bool borrow) {
+        device.lend(1, kFlex, extent * kExtent, kExtent, borrow, stream);
+        model_lend(model, 1, kFlex, extent * kExtent, kExtent, borrow);
+        cuda_synchronize(stream);
+        failures += device.compare(model, std::string("pinned ") + (borrow ? "borrow" : "return"));
+    };
+
+    // (1) Hands lie in [clock_first, N), so a pool-1 hand below its start has wrapped.
+    const std::int32_t start = model.hands[1];
+    bool wrapped             = false;
+    for (std::int32_t i = 0; i < 6 && failures == 0; ++i) {
+        admit(16, "wrap", false);
+        wrapped = wrapped || model.hands[1] < start;
+    }
+    if (!wrapped || model.hands[1] < model.pools[1].clock_first) {
+        std::cerr << "pinned: the hand must wrap to the first slot of its range\n";
+        ++failures;
+    }
+    // (2) Flex exhausted by lending.
+    lend(0, true);
+    lend(1, true);
+    const std::array<std::int32_t, kPools> lent_hands = model.hands;
+    F3Misses lent;
+    for (std::int32_t i = 0; i < 6 && failures == 0; ++i) {
+        const F3Misses call = admit(64, "lent", false);
+        lent.misses += call.misses;
+        lent.admitted += call.admitted;
+    }
+    if (model.hands != lent_hands || lent.misses == 0 || lent.admitted != 0) {
+        std::cerr << "pinned: lent extents must leave the hands and admit no miss\n";
+        ++failures;
+    }
+    // (3) One extent: wide calls without the filter exhaust its 36 slots, so the rest of their
+    // misses stay mapped.
+    lend(1, false);
+    bool exhausted = false;
+    for (std::int32_t i = 0; i < 6 && failures == 0; ++i) {
+        const F3Misses call = admit(64, "one extent", true);
+        exhausted           = exhausted || call.admitted < call.misses;
+    }
+    if (!exhausted) {
+        std::cerr << "pinned: no call exhausted the range\n";
+        ++failures;
+    }
+    // (4) Both extents back.
+    lend(0, false);
+    for (std::int32_t i = 0; i < 6 && failures == 0; ++i) { admit(4, "returned", false); }
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -924,13 +1083,21 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--refill") {
             return run_refill(context.stream) == 0 ? 0 : 1;
         }
-        if (argc != 1) { throw std::invalid_argument("expected no arguments or --refill"); }
+        if (argc == 2 && std::string_view(argv[1]) == "--pinned") {
+            return run_pinned(5, context.stream) == 0 ? 0 : 1;
+        }
+        if (argc != 1) {
+            throw std::invalid_argument("expected no arguments, --refill or --pinned");
+        }
         // Pool sizes: tiny pools are exhausted by one wide call (every slot protected), medium
         // pools churn, and pools above 1024 slots span several scan windows and wrap.
         // A saturated pool (every slot owned and referenced) makes its first miss sweep a whole
         // lap: more than one window, clearing every unprotected bit across the wrap. Flex pools
         // use the target's F3 extent widths (36 and 84 slots) and an NVFP4 pool of flex slots.
-        const std::array<Scenario, 15> scenarios{{
+        // CLOCK ranges: pool 0's starts past its fixed slots (flex only), pool 1's inside its
+        // fixed slots and beyond one scan window, so the hand wraps to a nonzero first slot while
+        // lent runs fall on both sides of it.
+        const std::array<Scenario, 16> scenarios{{
             {"tiny", 3, {{{3, 512}, {7, 256}}}, 0.25, 0.8, 0.5, 30},
             {"medium", 6, {{{40, 2764800}, {300, 1996800}}}, 0.1, 0.5, 0.5, 40},
             {"wide", 3, {{{1100, 256}, {2500, 512}}}, 0.15, 0.7, 0.5, 25},
@@ -977,6 +1144,17 @@ int main(int argc, char** argv) {
              255,
              4000,
              true},
+            {"clock range",
+             4,
+             {{{60, 512, 24, 12, 60}, {1300, 256, 252, 36, 200}}},
+             0.2,
+             0.8,
+             0.6,
+             25,
+             8,
+             1500,
+             true,
+             true},
         }};
         int failures       = 0;
         std::uint32_t seed = 11;
@@ -986,6 +1164,7 @@ int main(int argc, char** argv) {
         failures += run_graph(seed++, context.stream);
         failures += run_region_checks(seed, context.stream);
         failures += run_refill(context.stream);
+        failures += run_pinned(seed + 1, context.stream);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " moe_expert_cache\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

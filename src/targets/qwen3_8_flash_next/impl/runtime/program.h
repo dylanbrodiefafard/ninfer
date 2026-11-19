@@ -286,7 +286,8 @@ public:
 
     // The expert cache's demand for flex slots, in the KV extents that would hold them. Static
     // for the Program: the admission domain of the F3 pool (ExpertResidency::admittable_f3_records,
-    // which a helper placement narrows to its local records) minus the fixed F3 slots, over the
+    // which a helper placement narrows to its admitted tail) minus the fixed F3 slots admitted
+    // records may occupy (ExpertResidency::admit_fixed_f3_slots, none with a pinned tier), over the
     // extent geometry. It is met when extents().lendable_extents() reaches flex_demand().extents.
     [[nodiscard]] const FlexDemand& flex_demand() const noexcept { return flex_demand_; }
 

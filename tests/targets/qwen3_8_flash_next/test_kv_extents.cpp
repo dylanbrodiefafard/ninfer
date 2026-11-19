@@ -3,7 +3,9 @@
 // inside their extent's run of one plane), and the CacheHeld / KvLent state machine against an
 // independent model: pool page states, the lanes' mapped pages, and the cache's device state
 // (borrowed and returned flex owners, evicted table entries and slot index) after make_room and
-// give_back, including the one-extent spare that give_back keeps free.
+// give_back, including the one-extent spare that give_back keeps free; and the same transitions
+// next to the expert-helper's pinned fixed slots (tail misses with every extent taken back, then
+// refill reservation and publication beside the pinned slots), which never change.
 
 #include "runtime/expert_residency.h"
 #include "runtime/kv_extents.h"
@@ -357,7 +359,7 @@ void test_idle_reclaim_refill() {
     device.synchronize_all();
 }
 
-// Local eligibility can fit entirely in low slots while high flex slots remain empty. A later
+// Admission eligibility can fit entirely in low slots while high flex slots remain empty. A later
 // KV borrow makes some of those records nonresident; no give_back occurs to request refill.
 void test_borrow_restarts_refill() {
     ninfer::DeviceContext device(0);
@@ -370,8 +372,11 @@ void test_borrow_restarts_refill() {
     plan.slots = {0, 4};
     std::array<std::uint32_t, ops::kMoeExpertMaskWords> eligibility{};
     eligibility[0] = (1U << 10) - 1U;
+    // Records 100 to 103 are pinned in the four fixed slots; the tail is records 0 to 9.
+    std::vector<std::int32_t> primary_slots(fn::kRoutedExperts, -1);
+    std::iota(primary_slots.begin() + 100, primary_slots.begin() + 104, 0);
     fn::ExpertResidency cache(store, plan, extents.flex_addresses(), {}, device.stream,
-                              eligibility);
+                              {primary_slots, eligibility});
     std::array<std::int32_t, ops::kMoeTopK> ids{};
     std::iota(ids.begin(), ids.end(), 0);
     ninfer::DeviceBuffer routes_storage(sizeof(ids));
@@ -396,13 +401,147 @@ void test_borrow_restarts_refill() {
                              [](std::int32_t owner) { return owner >= 0; });
     };
     expect(high_owners() == 0, "all eligible records start resident below the empty high extent");
+    constexpr std::int64_t kTail = 10;
     extents.make_room(state.pool().free_pages() + 1, cache);
     expect(extents.lent_extents() == 1, "only the low extent is borrowed");
     while (cache.service_refill(device.stream, device.copy_stream, true)) {
         device.synchronize_all();
     }
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
-    expect(high_owners() == 6, "borrowing low owners must restart refill into empty high slots");
+    // The pinned records hold the fixed slots, so the whole tail was resident in the lent low
+    // extent and the refill the borrow requests restores every record into the high extent.
+    expect(high_owners() == kTail,
+           "borrowing low owners must restart refill into empty high slots");
+}
+
+// The expert-helper tiers over the extents: records 100 to 103 pinned in the four fixed F3 slots,
+// the tail (records 0 to 9, warm in the highest flex slots) the only admittable records. After
+// every step the pinned owners stay -2, their table entries keep naming the fixed slots, and their
+// slot index stays -1. With every extent taken back, tail misses stay mapped (no fill, the hands
+// stay at the first flex slot) and are counted; give_back then returns the top extent, and refill
+// reserves and publishes the tail into its highest slots by live frequency (equal counts, so
+// ascending record order), never into a fixed slot.
+void test_pinned_extents() {
+    ninfer::DeviceContext device(0);
+    constexpr std::uint32_t kExtent = 244;
+    constexpr std::uint32_t kPages  = 40 + 2 * kExtent;
+    constexpr std::int32_t kFixed   = 4;
+    constexpr std::int32_t kTail    = 10;
+    fn::State state(1, 64, std::int64_t{kPages} * 64, ops::QsaKvFormat::NVFP4G16);
+    fn::KvExpertExtents extents(state.pool(), ops::QsaKvFormat::NVFP4G16, device.stream,
+                                device.copy_stream);
+    const std::vector<ops::MoeExpertCodec> codecs(fn::kRoutedExperts, ops::MoeExpertCodec::F3G32);
+    fn::ExpertHostStore store(codecs, std::size_t{256} << 20);
+    std::vector<std::byte> record(kF3Bytes, std::byte{0x3c});
+    for (std::int32_t e = 0; e < kTail; ++e) {
+        record[0] = static_cast<std::byte>(e);
+        store.write_record(0, e, record);
+    }
+    std::array<std::uint32_t, ops::kMoeExpertMaskWords> eligibility{};
+    eligibility[0] = (1U << kTail) - 1U;
+    std::vector<std::int32_t> primary_slots(fn::kRoutedExperts, -1);
+    std::iota(primary_slots.begin() + 100, primary_slots.begin() + 100 + kFixed, 0);
+    std::vector<std::uint64_t> calibration(fn::kRoutedExperts, 0);
+    std::fill(calibration.begin(), calibration.begin() + kTail, 1);
+    fn::ExpertSlotPlan plan;
+    plan.slots = {0, kFixed};
+    fn::ExpertResidency cache(store, plan, extents.flex_addresses(), calibration, device.stream,
+                              {primary_slots, eligibility});
+    const std::span<const std::uint64_t> host = store.device_addresses();
+    const std::size_t total =
+        static_cast<std::size_t>(kFixed) + static_cast<std::size_t>(cache.flex_slots());
+    const auto fixed_base = reinterpret_cast<std::uint64_t>(cache.cache().pools[1].slots.data);
+    const auto owners     = [&] {
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        return download<std::int32_t>(cache.cache().pools[1].owner.data, total);
+    };
+    const auto pinned_intact = [&](const std::string& step) {
+        const auto slot_owners = owners();
+        const auto table = download<std::uint64_t>(cache.expert_table().data, fn::kRoutedExperts);
+        const auto index =
+            download<std::int32_t>(cache.cache().slot_index.data, fn::kRoutedExperts);
+        for (std::int32_t s = 0; s < kFixed; ++s) {
+            const std::size_t code = 100 + static_cast<std::size_t>(s);
+            expect(slot_owners[static_cast<std::size_t>(s)] == ops::kMoeCacheBorrowedSlot &&
+                       table[code] ==
+                           ((fixed_base + static_cast<std::uint64_t>(s) * kF3Bytes) | 1U) &&
+                       index[code] == ops::kMoeCacheNoSlot,
+                   step + ": pinned slot " + std::to_string(s) + " unchanged");
+        }
+    };
+    pinned_intact("warm start");
+    expect(cache.cache().pools[1].clock_first == kFixed,
+           "the CLOCK range starts at the flex slots");
+
+    // Every extent taken back: the warm tail is evicted, and its misses find no admittable slot.
+    extents.make_room(kPages, cache);
+    expect(extents.lent_extents() == 2, "every extent is lent to KV");
+    pinned_intact("every extent lent");
+    std::array<std::int32_t, ops::kMoeTopK> ids{};
+    std::iota(ids.begin(), ids.end(), 0);
+    ninfer::DeviceBuffer routes_storage(sizeof(ids));
+    routes_storage.copy_from_host(ids.data(), sizeof(ids));
+    const ninfer::Tensor routes(routes_storage.p, ninfer::DType::I32, {ops::kMoeTopK, 1});
+    ninfer::DeviceBuffer mask_storage(sizeof(eligibility));
+    mask_storage.copy_from_host(eligibility.data(), sizeof(eligibility));
+    const ninfer::Tensor mask(mask_storage.p, ninfer::DType::I32, {ops::kMoeExpertMaskWords});
+    ninfer::DeviceBuffer counters(4 * sizeof(std::int64_t));
+    counters.fill(0);
+    ninfer::Tensor counter_view(counters.p, ninfer::DType::I64, {2, 2});
+    auto table = cache.expert_table();
+    auto fills = cache.fill_table();
+    ops::moe_expert_cache_admit(routes, table, cache.host_table(), fills, cache.cache(), 0,
+                                ops::MoeCacheAdmission::FrequencyFilter, device.stream,
+                                &counter_view, &mask);
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    const auto pending = download<std::uint64_t>(fills.data, fn::kRoutedExperts);
+    expect(std::ranges::all_of(pending, [](std::uint64_t v) { return v == 0; }),
+           "tail misses with every extent lent admit nothing");
+    expect(download<std::int64_t>(counters.p, 4) == std::vector<std::int64_t>{0, 0, kTail, kTail},
+           "tail misses with every extent lent are counted");
+    expect(download<std::int32_t>(cache.cache().clock_hands.data, 2) ==
+               std::vector<std::int32_t>{0, kFixed},
+           "an exhausted range leaves the hand at the first flex slot");
+    const auto lent_table = download<std::uint64_t>(table.data, kTail);
+    expect(std::equal(lent_table.begin(), lent_table.end(), host.begin()),
+           "tail misses stay mapped host reads");
+    ops::moe_expert_cache_commit(table, fills, 0, device.stream);
+    pinned_intact("tail admit with every extent lent");
+
+    // The top extent returns; refill reserves its highest empty slots one record at a time and
+    // publishes each after its copy.
+    extents.give_back(cache);
+    expect(extents.lent_extents() == 1 && extents.lent(0), "give_back returns the top extent");
+    pinned_intact("give_back");
+    while (cache.service_refill(device.stream, device.copy_stream, true)) {
+        device.synchronize_all();
+    }
+    const auto refilled = owners();
+    const auto slots    = extents.slots_per_extent();
+    for (std::int32_t j = 0; j < slots; ++j) {
+        const std::size_t slot = static_cast<std::size_t>(kFixed) +
+                                 static_cast<std::size_t>(slots) + static_cast<std::size_t>(j);
+        const std::int32_t expected =
+            slots - 1 - j < kTail ? slots - 1 - j : ops::kMoeCacheEmptySlot;
+        expect(refilled[slot] == expected,
+               "refill places the tail in the top slots in record order");
+    }
+    const auto published = download<std::uint64_t>(cache.expert_table().data, kTail);
+    for (std::int32_t e = 0; e < kTail; ++e) {
+        const auto flex_slot = static_cast<std::size_t>(2 * slots - 1 - e);
+        expect(published[static_cast<std::size_t>(e)] == (extents.flex_addresses()[flex_slot] | 1U),
+               "refill publishes each tail record at its reserved slot");
+    }
+    pinned_intact("refill");
+
+    // Taking the top extent back again evicts the refilled tail and nothing pinned.
+    extents.make_room(kPages, cache);
+    pinned_intact("second make_room");
+    const auto relent = owners();
+    expect(std::all_of(relent.begin() + kFixed, relent.end(),
+                       [](std::int32_t o) { return o == ops::kMoeCacheBorrowedSlot; }),
+           "every flex slot is lent again");
+    device.synchronize_all();
 }
 
 } // namespace
@@ -414,6 +553,7 @@ int main() {
         test_state_machine();
         test_idle_reclaim_refill();
         test_borrow_restarts_refill();
+        test_pinned_extents();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

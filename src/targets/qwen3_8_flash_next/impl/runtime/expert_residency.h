@@ -116,9 +116,20 @@ plan_expert_slots(std::size_t budget_bytes,
 inline constexpr std::int32_t kExpertReferenceLimit  = 8;
 inline constexpr std::int64_t kFrequencyHalvingSlots = 8;
 
-// AllEligible warms zero-count eligible records into fixed slots only; it requires every
-// eligible record of each codec to fit. Calibrated preserves ordinary fixed+flex warm ordering.
-enum class ExpertWarmStart : std::uint8_t { Calibrated, AllEligible };
+// The static tiers of the expert-helper placement as the 5090 cache sees them
+// (docs/maintainer/qwen3.8-flash-next-expert-helper.md, "Three-tier placement"). Both spans are
+// empty (CUDA-only) or both are complete.
+//
+//   primary_slots     I32 [L * 512], layer-major: the fixed slot of each pinned record P in its
+//                     codec's pool, -1 for every other record. The pinned records of each codec
+//                     fill that pool's fixed slots exactly, each slot once.
+//   admit_eligibility U32 [L,16] bitsets (bit e % 32 of word e / 32 of layer l's row): the records
+//                     the cache may admit, which are F3 records outside P and outside the helper's
+//                     bank. Only flex slots hold them.
+struct ExpertTiers {
+    std::span<const std::int32_t> primary_slots;
+    std::span<const std::uint32_t> admit_eligibility;
+};
 
 /**
  * The device expert cache over an ExpertHostStore of L layers: the slot pools of plan, their CLOCK
@@ -132,27 +143,44 @@ enum class ExpertWarmStart : std::uint8_t { Calibrated, AllEligible };
  *
  * Each table starts 4096-byte aligned, so every layer column (4096 bytes) is too. cache() carries
  * the slot index I32 [512,L] (the inverse of the owners, which the Ops maintain),
- * reference_limit kExpertReferenceLimit and the frequency state (counts I32 [512,L], zeroed,
- * halved every kFrequencyHalvingSlots x (total slots) lookups).
+ * reference_limit kExpertReferenceLimit, each pool's CLOCK range and the frequency state (counts
+ * I32 [512,L], zeroed, halved every kFrequencyHalvingSlots x (admittable slots) lookups, below).
  *
  * The F3 pool has plan.slots[F3] fixed slots in its own allocation and, after them, one flex slot
  * per entry of flex_addresses (ops::MoeExpertSlotPool): device addresses of F3-record-sized,
  * 256-byte aligned, pairwise disjoint memory that another owner lends (KvExpertExtents, pages of
  * the shared QSA pool). The memory must be idle during construction and stay valid for this
  * object's lifetime; its owner borrows and returns the flex slots through the Ops. The NVFP4 pool
- * has fixed slots only. The frequency halving period counts every slot, fixed and flex.
+ * has fixed slots only.
  *
  * calib_counts is empty or holds one calibration routing count per expert, layer-major. Warm
  * start: each pool receives its codec's experts with nonzero count in descending count order
  * (ties to the lower layer-major index), as many as it has slots, fixed and flex. The hottest
  * takes the last slot (the highest flex slot, which KvExpertExtents takes back last) and the
- * coldest admitted one follows the empty slots. A nonempty local_eligibility U32 [L,16]
- * excludes zero bits from warm start. AllEligible instead warms every eligible record, including
- * zero counts, into fixed slots (not reclaimable flex); every eligible codec must fit its fixed
- * pool. Every reference bit and hand is 0, so CLOCK first
- * reclaims empty slots, then the coldest records. Without counts every slot starts empty and every
+ * coldest admitted one follows the empty slots. Every reference counter is 0 and each hand starts
+ * at the first slot of its pool's CLOCK range (slot 0 without tiers), so CLOCK first reclaims empty
+ * slots, then the coldest records. Without counts every slot starts empty and every
  * entry names the host record. The constructor copies the warm records on stream and synchronizes
  * it; it throws std::invalid_argument for invalid arguments and propagates CUDA failures.
+ *
+ * With tiers, the pinned records P are written once into their fixed slots and are never a
+ * victim (the Op's pinning, ops::MoeExpertSlotPool): each such slot has owner
+ * kMoeCacheBorrowedSlot for the object's lifetime, its expert_table entry names the slot
+ * permanently, its slot_index stays -1 because no owner code names the slot, and each pool's
+ * CLOCK range starts past its fixed slots (clock_first = F), so admit visits only the F3 flex
+ * slots and the NVFP4 pool admits nothing. P records lie outside every admit_eligibility domain,
+ * so the Ops that read the eligibility (admit, stage, refill select) never look at them: that
+ * exclusion, not the slot state, keeps the Op domain's "table names the slot iff slot_index >= 0"
+ * invariant true for every record those Ops touch. Callers must pass tiers.admit_eligibility to
+ * every admit and stage, and must never borrow or return a fixed slot (the streaming windows);
+ * only flex slots are lent. Warm start and refill consider only admit-eligible records, so a
+ * nonempty calib_counts warms the hottest eligible F3 records into flex slots. Refill is off when
+ * no record is admit-eligible.
+ *
+ * The frequency halving period counts the slots of the CLOCK ranges, which are the slots that can
+ * hold admitted records (fixed and flex without tiers, flex with them). Without any, the period
+ * is ops::kMoeCacheMaxHalvingLookups: the counts then decide nothing, and no halving pass runs in
+ * practice.
  *
  * The store must outlive this object. The views stay valid for its lifetime; the Program passes
  * them to the moe_expert_cache Ops and moe_experts, which own every later state change.
@@ -162,8 +190,7 @@ public:
     ExpertResidency(const ExpertHostStore& store, const ExpertSlotPlan& plan,
                     std::span<const std::uint64_t> flex_addresses,
                     std::span<const std::uint64_t> calib_counts, cudaStream_t stream,
-                    std::span<const std::uint32_t> local_eligibility = {},
-                    ExpertWarmStart warm_start                       = ExpertWarmStart::Calibrated);
+                    const ExpertTiers& tiers = {});
 
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;
@@ -192,11 +219,17 @@ public:
     // The F3 pool's flex slots.
     [[nodiscard]] std::int32_t flex_slots() const noexcept { return flex_slots_; }
 
-    // F3 records the residency may admit: every F3 record, or those set in local_eligibility.
-    // The F3 records beyond plan().slots of F3 can be resident only in flex slots, and NVFP4
-    // records never use them.
+    // F3 records the residency may admit: every F3 record, or those set in the tiers' admission
+    // eligibility. The admitted F3 records beyond admit_fixed_f3_slots() can be resident only in
+    // flex slots, and NVFP4 records never use them.
     [[nodiscard]] std::int64_t admittable_f3_records() const noexcept {
         return admittable_f3_records_;
+    }
+
+    // F3 fixed slots that admitted records may occupy: plan().slots of F3, or none when the fixed
+    // slots hold the pinned tier.
+    [[nodiscard]] std::int32_t admit_fixed_f3_slots() const noexcept {
+        return pinned_ ? 0 : plan_.slots[static_cast<std::size_t>(ops::MoeExpertCodec::F3G32)];
     }
 
 private:
@@ -204,6 +237,7 @@ private:
     ExpertSlotPlan plan_;
     std::int32_t flex_slots_            = 0;
     std::int64_t admittable_f3_records_ = 0;
+    bool pinned_                        = false; // fixed slots hold the pinned tier
     std::array<DeviceBuffer, ops::kMoeCacheCodecTags> slots_;
     // Tables (each layer column 4096-byte aligned), the slot index, hands, the flex address table,
     // and per-pool owner and reference arrays (fixed and flex slots), carved once from metadata_.

@@ -16,6 +16,11 @@ constexpr std::size_t kCodecs = ops::kMoeCacheCodecTags;
 
 constexpr std::size_t tag_of(MoeExpertCodec codec) { return static_cast<std::size_t>(codec); }
 
+// First slot of each pool's CLOCK range: past the fixed slots when they hold the pinned tier.
+std::array<std::int32_t, kCodecs> clock_firsts(const ExpertSlotPlan& plan, bool pinned) {
+    return pinned ? plan.slots : std::array<std::int32_t, kCodecs>{};
+}
+
 std::size_t record_bytes(MoeExpertCodec codec) {
     return static_cast<std::size_t>(ops::moe_expert_record_bytes(codec));
 }
@@ -186,21 +191,22 @@ ExpertSlotPlan plan_expert_slots(std::size_t budget_bytes,
 ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotPlan& plan,
                                  std::span<const std::uint64_t> flex_addresses,
                                  std::span<const std::uint64_t> calib_counts, cudaStream_t stream,
-                                 std::span<const std::uint32_t> local_eligibility,
-                                 ExpertWarmStart warm_start)
+                                 const ExpertTiers& tiers)
     : layers_(store.layers()), plan_(plan),
       metadata_(metadata_capacity(layers_, plan_, flex_addresses.size())) {
     const std::size_t experts = static_cast<std::size_t>(layers_) * kRoutedExperts;
     if (!calib_counts.empty() && calib_counts.size() != experts) {
         throw std::invalid_argument("ExpertResidency: calib_counts must be empty or [L * 512]");
     }
-    if (!local_eligibility.empty() && local_eligibility.size() != experts / 32) {
+    const bool tiered = !tiers.primary_slots.empty() || !tiers.admit_eligibility.empty();
+    if (tiered &&
+        (tiers.primary_slots.size() != experts || tiers.admit_eligibility.size() != experts / 32)) {
         throw std::invalid_argument(
-            "ExpertResidency: local_eligibility must be empty or U32[L,16]");
+            "ExpertResidency: tiers must give I32[L*512] primary slots and U32[L,16] eligibility");
     }
-    const auto eligible = [&](std::size_t entry) {
-        return local_eligibility.empty() ||
-               (local_eligibility[entry / 32] & (std::uint32_t{1} << (entry % 32))) != 0;
+    const std::span<const std::uint32_t> admit_eligibility = tiers.admit_eligibility;
+    const auto eligible                                    = [&](std::size_t entry) {
+        return !tiered || (admit_eligibility[entry / 32] & (std::uint32_t{1} << (entry % 32))) != 0;
     };
     constexpr auto kFlexTag = tag_of(MoeExpertCodec::F3G32);
     if (flex_addresses.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() -
@@ -220,34 +226,54 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
             ++admittable_f3_records_;
         }
     }
+    pinned_ = tiered;
 
-    // Ordinary calibration retains its fixed+flex ordering; full eligible coverage is warmed
-    // into fixed storage so later KV reservation cannot evict it from initially idle extents.
+    // Calibration warms fixed+flex slots in rank order; with tiers only flex slots take admitted
+    // records, because the fixed slots hold the pinned records.
     const std::span<const std::uint64_t> host = store.device_addresses();
     std::array<std::vector<std::int32_t>, kCodecs> warm;
-    if (!calib_counts.empty() || warm_start == ExpertWarmStart::AllEligible) {
+    if (!calib_counts.empty()) {
         std::vector<std::int32_t> order(experts);
         std::iota(order.begin(), order.end(), 0);
         std::stable_sort(order.begin(), order.end(), [&](std::int32_t a, std::int32_t b) {
-            if (calib_counts.empty()) { return a < b; }
             return calib_counts[static_cast<std::size_t>(a)] >
                    calib_counts[static_cast<std::size_t>(b)];
         });
         for (const std::int32_t code : order) {
             const auto entry = static_cast<std::size_t>(code);
-            if (warm_start == ExpertWarmStart::Calibrated && calib_counts[entry] == 0) { break; }
+            if (calib_counts[entry] == 0) { break; }
             if (!eligible(entry)) { continue; }
             const std::size_t tag           = host[entry] & 1U;
             std::vector<std::int32_t>& list = warm[tag];
-            const auto capacity             = warm_start == ExpertWarmStart::AllEligible
-                                                  ? static_cast<std::size_t>(plan_.slots[tag])
-                                                  : pool_slots(plan_, flex_addresses.size(), tag);
-            if (list.size() < capacity) {
-                list.push_back(code);
-            } else if (warm_start == ExpertWarmStart::AllEligible) {
+            const std::size_t capacity = tiered ? (tag == kFlexTag ? flex_addresses.size() : 0)
+                                                : pool_slots(plan_, flex_addresses.size(), tag);
+            if (list.size() < capacity) { list.push_back(code); }
+        }
+    }
+    // Pinned records: the pool slot of each, checked against the fixed capacity before any
+    // allocation.
+    std::array<std::int32_t, kCodecs> pinned_counts{};
+    if (tiered) {
+        std::array<std::vector<bool>, kCodecs> taken;
+        for (std::size_t tag = 0; tag < kCodecs; ++tag) {
+            taken[tag].assign(static_cast<std::size_t>(plan_.slots[tag]), false);
+        }
+        for (std::size_t entry = 0; entry < experts; ++entry) {
+            const std::int32_t slot = tiers.primary_slots[entry];
+            if (slot < 0) { continue; }
+            const std::size_t tag = host[entry] & 1U;
+            const auto position   = static_cast<std::size_t>(slot);
+            if (position >= taken[tag].size() || taken[tag][position] ||
+                (admit_eligibility[entry / 32] >> (entry % 32) & 1U) != 0) {
                 throw std::invalid_argument(
-                    "ExpertResidency: eligible records exceed fixed capacity");
+                    "ExpertResidency: a pinned record needs its own fixed slot and no admission");
             }
+            taken[tag][position] = true;
+            ++pinned_counts[tag];
+        }
+        if (pinned_counts != plan_.slots) {
+            throw std::invalid_argument(
+                "ExpertResidency: the pinned records must fill every fixed slot");
         }
     }
 
@@ -276,20 +302,22 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
         referenced_[tag] = metadata_.alloc_bytes(slots, kMetadataAlignment);
     }
 
-    refill_enabled_                    = warm_start != ExpertWarmStart::AllEligible;
+    const bool any_admitted =
+        !tiered || std::ranges::any_of(admit_eligibility, [](std::uint32_t w) { return w != 0; });
+    refill_enabled_                    = any_admitted;
     constexpr std::size_t kColumnBytes = kRoutedExperts * sizeof(std::uint64_t);
     constexpr std::size_t kStateOffset = 2 * kColumnBytes;
     constexpr std::size_t kMaskOffset  = kStateOffset + kMetadataAlignment;
-    refill_storage_                    = DeviceBuffer(kMaskOffset + local_eligibility.size_bytes());
+    refill_storage_                    = DeviceBuffer(kMaskOffset + admit_eligibility.size_bytes());
     auto* refill_base                  = static_cast<std::byte*>(refill_storage_.p);
     refill_source_                     = Tensor(refill_base, DType::I64, {kRoutedExperts});
     refill_destination_ = Tensor(refill_base + kColumnBytes, DType::I64, {kRoutedExperts});
     refill_state_       = Tensor(refill_base + kStateOffset, DType::I32, {2});
-    if (!local_eligibility.empty()) {
+    if (tiered) {
         refill_eligible_ =
             Tensor(refill_base + kMaskOffset, DType::I32, {ops::kMoeExpertMaskWords, layers_});
-        check_cuda(cudaMemcpyAsync(refill_eligible_.data, local_eligibility.data(),
-                                   local_eligibility.size_bytes(), cudaMemcpyHostToDevice, stream),
+        check_cuda(cudaMemcpyAsync(refill_eligible_.data, admit_eligibility.data(),
+                                   admit_eligibility.size_bytes(), cudaMemcpyHostToDevice, stream),
                    "refill eligibility upload");
     }
 
@@ -298,6 +326,7 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
     // call frees no host buffer a queued copy still reads.
     std::vector<std::uint64_t> expert_table(host.begin(), host.end());
     std::vector<std::int32_t> slot_index(experts, ops::kMoeCacheNoSlot);
+    const std::array<std::int32_t, kCodecs> hands = clock_firsts(plan_, pinned_);
     std::array<std::vector<std::int32_t>, kCodecs> owners;
     for (std::size_t tag = 0; tag < kCodecs; ++tag) {
         const auto fixed        = static_cast<std::size_t>(plan_.slots[tag]);
@@ -312,10 +341,24 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
         // Empty slots first, then the warm experts from coldest to hottest.
         std::vector<std::int32_t>& owner = owners[tag];
         owner.assign(slots, ops::kMoeCacheEmptySlot);
+        for (std::size_t entry = 0; tiered && entry < experts; ++entry) {
+            const std::int32_t pinned_slot = tiers.primary_slots[entry];
+            if (pinned_slot < 0 || (host[entry] & 1U) != tag) { continue; }
+            const std::uint64_t address = slot_address(static_cast<std::size_t>(pinned_slot));
+            owner[static_cast<std::size_t>(pinned_slot)] = ops::kMoeCacheBorrowedSlot;
+            // NOLINTNEXTLINE(performance-no-int-to-ptr): a device address as the Op tables hold it.
+            void* const destination = reinterpret_cast<void*>(address);
+            const auto code         = static_cast<std::int32_t>(entry);
+            check_cuda(
+                cudaMemcpyAsync(destination,
+                                store.record(code / kRoutedExperts, code % kRoutedExperts).data(),
+                                record, cudaMemcpyHostToDevice, stream),
+                "pinned record copy");
+            expert_table[entry] = address | tag;
+        }
         for (std::size_t rank = 0; rank < warm[tag].size(); ++rank) {
-            const std::int32_t code = warm[tag][rank];
-            const std::size_t slot =
-                (warm_start == ExpertWarmStart::AllEligible ? fixed : slots) - 1 - rank;
+            const std::int32_t code                    = warm[tag][rank];
+            const std::size_t slot                     = slots - 1 - rank;
             const std::uint64_t address                = slot_address(slot);
             owner[slot]                                = code;
             slot_index[static_cast<std::size_t>(code)] = static_cast<std::int32_t>(slot);
@@ -342,7 +385,10 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
                                    cudaMemcpyHostToDevice, stream),
                    "flex address upload");
     }
-    check_cuda(cudaMemsetAsync(clock_hands_.data, 0, clock_hands_.bytes, stream), "hand clear");
+    // Each hand starts at its range's first slot (a pool with an empty range never reads it).
+    check_cuda(cudaMemcpyAsync(clock_hands_.data, hands.data(), clock_hands_.bytes,
+                               cudaMemcpyHostToDevice, stream),
+               "hand upload");
     check_cuda(cudaMemsetAsync(frequency_counts_.data, 0, frequency_counts_.bytes, stream),
                "frequency clear");
     check_cuda(cudaMemsetAsync(frequency_lookups_.data, 0, frequency_lookups_.bytes, stream),
@@ -413,12 +459,14 @@ bool ExpertResidency::service_refill(cudaStream_t stream, cudaStream_t copy_stre
 
 ops::MoeExpertCache ExpertResidency::cache() {
     ops::MoeExpertCache cache;
-    constexpr auto kFlexTag  = tag_of(MoeExpertCodec::F3G32);
-    std::int64_t total_slots = 0;
+    constexpr auto kFlexTag                             = tag_of(MoeExpertCodec::F3G32);
+    const std::array<std::int32_t, kCodecs> clock_first = clock_firsts(plan_, pinned_);
+    // Slots that can hold an admitted record: the CLOCK ranges.
+    std::int64_t admittable_slots = 0;
     for (std::size_t tag = 0; tag < kCodecs; ++tag) {
         const auto slots = static_cast<std::int32_t>(
             pool_slots(plan_, static_cast<std::size_t>(flex_slots_), tag));
-        total_slots += slots;
+        admittable_slots += slots - clock_first[tag];
         if (slots == 0) { continue; }
         ops::MoeExpertSlotPool& view = cache.pools[tag];
         view.slots                   = {slots_[tag].p, slots_[tag].bytes};
@@ -426,17 +474,23 @@ ops::MoeExpertCache ExpertResidency::cache() {
         if (tag == kFlexTag && flex_slots_ != 0) {
             view.flex_address = Tensor(flex_address_.data, DType::I64, {flex_slots_});
         }
-        view.owner      = Tensor(owner_[tag].data, DType::I32, {slots});
-        view.referenced = Tensor(referenced_[tag].data, DType::U8, {slots});
+        view.owner       = Tensor(owner_[tag].data, DType::I32, {slots});
+        view.referenced  = Tensor(referenced_[tag].data, DType::U8, {slots});
+        view.clock_first = clock_first[tag];
     }
     cache.slot_index      = Tensor(slot_index_.data, DType::I32, {kRoutedExperts, layers_});
     cache.clock_hands     = Tensor(clock_hands_.data, DType::I32, {ops::kMoeCacheCodecTags});
     cache.reference_limit = kExpertReferenceLimit;
     cache.frequency       = ops::MoeExpertFrequency{
-        .counts          = Tensor(frequency_counts_.data, DType::I32, {kRoutedExperts, layers_}),
-        .lookups         = Tensor(frequency_lookups_.data, DType::I32, {1}),
-        .halving_lookups = static_cast<std::int32_t>(
-            std::max<std::int64_t>(1, kFrequencyHalvingSlots * total_slots)),
+        .counts  = Tensor(frequency_counts_.data, DType::I32, {kRoutedExperts, layers_}),
+        .lookups = Tensor(frequency_lookups_.data, DType::I32, {1}),
+        // Without an admittable slot the counts decide nothing (no admit has a victim and refill
+        // is off), so the longest period the Op accepts spares the admits a halving pass over
+        // every count; the clamp keeps the narrowing exact for any pool size.
+        .halving_lookups = admittable_slots == 0 ? ops::kMoeCacheMaxHalvingLookups
+                                                 : static_cast<std::int32_t>(std::min<std::int64_t>(
+                                                       ops::kMoeCacheMaxHalvingLookups,
+                                                       kFrequencyHalvingSlots * admittable_slots)),
     };
     return cache;
 }

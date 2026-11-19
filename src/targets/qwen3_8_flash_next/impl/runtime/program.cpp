@@ -129,6 +129,14 @@ ForwardOptions forward_options(const LoadedModel& model, const ProgramOptions& o
     forward.expert_window_bytes =
         static_cast<std::size_t>(options.expert_window_layers * static_cast<double>(largest)) /
         kAlignment * kAlignment;
+#ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
+    if (options.expert_helper_pci) {
+        // The fixed F3 slots are the pinned tier, which a streaming window must never borrow, and
+        // flex slots are not contiguous. Helper mode therefore streams no windows: prefill reads
+        // every record outside P and the resident tail through mapped host memory.
+        forward.expert_window_bytes = 0;
+    }
+#endif
     return forward;
 }
 
@@ -213,19 +221,17 @@ Program::Program(const LoadedModel& model, const ProgramOptions& options, Device
           extents_.flex_addresses(),
           helper_ ? std::span<const std::uint64_t>(kExpertHelperCalibCounts) : options.calib_counts,
           device.stream,
-          helper_ ? std::span<const std::uint32_t>(helper_->placement().local_eligibility)
-                  : std::span<const std::uint32_t>{},
-          helper_ && helper_->placement().full_coverage ? ExpertWarmStart::AllEligible
-                                                        : ExpertWarmStart::Calibrated),
+          helper_ ? ExpertTiers{.primary_slots     = helper_->placement().primary_slot,
+                                .admit_eligibility = helper_->placement().admission_mask}
+                  : ExpertTiers{}),
 #else
       residency_(model.experts(), slot_plan(model, options, state_), extents_.flex_addresses(),
                  options.calib_counts, device.stream),
 #endif
-      flex_demand_(plan_flex_demand(
-          residency_.admittable_f3_records(),
-          residency_.plan().slots[static_cast<std::size_t>(ops::MoeExpertCodec::F3G32)],
-          extents_.slots_per_extent(), extents_.extents(),
-          std::int64_t{extents_.extent_pages()} * ops::kQsaPageTokens)),
+      flex_demand_(plan_flex_demand(residency_.admittable_f3_records(),
+                                    residency_.admit_fixed_f3_slots(), extents_.slots_per_extent(),
+                                    extents_.extents(),
+                                    std::int64_t{extents_.extent_pages()} * ops::kQsaPageTokens)),
       forward_(model.view(), state_, feeder_, residency_, forward_options(model, options),
                device.stream, dflash_.get()
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER

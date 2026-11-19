@@ -43,6 +43,8 @@ ExpertHelperPlacement plan_expert_helper(std::span<const ops::MoeExpertCodec> co
     result.budget_bytes = (free_bytes - kHelperReserveBytes) / 256 * 256;
     result.local_eligibility.assign(kEntries / 32, ~std::uint32_t{0});
     result.primary_mask.assign(kEntries / 32, 0);
+    result.admission_mask.assign(kEntries / 32, 0);
+    result.primary_slot.assign(kEntries, -1);
     std::array<std::vector<std::size_t>, 2> by_codec;
     for (std::size_t i = 0; i < kEntries; ++i) {
         const auto tag = static_cast<std::size_t>(codecs[i]);
@@ -72,6 +74,12 @@ ExpertHelperPlacement plan_expert_helper(std::span<const ops::MoeExpertCodec> co
         complement.insert(complement.end(), order.begin() + fixed[tag], order.end());
         result.remaining_counts[tag] = static_cast<std::int32_t>(order.size());
     }
+    std::array<std::int32_t, 2> next_slot{};
+    for (std::size_t i = 0; i < kEntries; ++i) {
+        if ((result.primary_mask[i / 32] >> (i % 32) & 1U) != 0) {
+            result.primary_slot[i] = next_slot[static_cast<std::size_t>(codecs[i])]++;
+        }
+    }
     std::sort(complement.begin(), complement.end(), [&](std::size_t a, std::size_t b) {
         const auto lhs = static_cast<unsigned __int128>(counts[a]) * record_bytes(codecs[b]);
         const auto rhs = static_cast<unsigned __int128>(counts[b]) * record_bytes(codecs[a]);
@@ -85,6 +93,10 @@ ExpertHelperPlacement plan_expert_helper(std::span<const ops::MoeExpertCodec> co
             ++result.tail_counts[tag];
             result.tail_bytes[tag] += bytes;
             result.tail_routes += counts[i];
+            if (codecs[i] == ops::MoeExpertCodec::F3G32) {
+                result.admission_mask[i / 32] |= std::uint32_t{1} << (i % 32);
+                ++result.admission_count;
+            }
             continue;
         }
         left -= bytes;

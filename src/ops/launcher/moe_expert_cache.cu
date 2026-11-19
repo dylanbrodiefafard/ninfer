@@ -160,43 +160,56 @@ __device__ int block_exclusive_rank(bool flag, AdmitShared& shared, int lane, in
     return shared.scan_offset[warp] + __popc(ballot & lanes_below(lane));
 }
 
-// Admits the misses of one pool by CLOCK, `window` = min(1024, N) consecutive hand positions at a
-// time. Thread i examines position hand + i (mod N), so a window visits each slot at most once.
-// Within a window only the visited slot itself changes its candidacy (not protected and a zero
-// reference counter), so the window's first `need` candidates in hand order are exactly the
-// victims a one-slot-at-a-time CLOCK takes, and the counters it decrements are those of the
+// Admits the misses of one pool by CLOCK over its range [clock_first, count) of M slots, `window`
+// = min(1024, M) consecutive hand positions at a time. Thread i examines position hand + i,
+// wrapped into the range, so a window visits each slot at most once and never a slot below
+// clock_first. Within a window only the visited slot itself changes its candidacy (not protected
+// and a zero reference counter), so the window's first `need` candidates in hand order are exactly
+// the victims a one-slot-at-a-time CLOCK takes, and the counters it decrements are those of the
 // unprotected slots before the last victim (the whole window when it takes fewer than `need`).
 // The frequency filter pairs the k-th miss with the k-th candidate, as the sequential policy
-// does, and decides each pair independently; a rejected pair leaves its slot unchanged. Protection
-// only grows during the call and a counter reaches zero within reference_limit visits, so
-// (reference_limit + 1) N consecutive positions without a victim prove that every slot is
-// protected: the remaining misses are not admitted and the hand returns to the position after the
-// last victim, where the sequential policy, which checks for an unprotected slot before each miss,
-// leaves it. Global writes of one window are visible to the next after its final barrier. The
-// slot_index entries a window writes are distinct: each evicted owner holds one victim slot of
-// the window, each admitted miss is a distinct non-resident expert, and the two sets are disjoint.
+// does, and decides each pair independently; a rejected pair leaves its slot unchanged.
+// Termination: every window that holds an unprotected slot either pairs a miss with a candidate
+// or decrements a counter, and both are bounded (misses, and K per slot since a victim's counter
+// restarts only on a slot that is protected from then on). A window without an unprotected slot
+// changes nothing. Protection only grows during the call, so M consecutive positions without an
+// unprotected slot (one lap, `blocked`) prove that every slot of the range is protected: the
+// remaining misses are not admitted and the hand returns to the position after the last victim,
+// where the sequential policy, which checks for an unprotected slot before each miss, leaves it.
+// A range that lent or reserved slots fill therefore costs one lap per call, not K + 1 laps of
+// the whole pool. Global writes of one window are visible to the next after its final barrier (the
+// __syncthreads_or that also tells every thread whether the window held an unprotected slot). The
+// slot_index entries a window writes are distinct: each evicted owner holds one victim slot of the
+// window, each admitted miss is a distinct non-resident expert, and the two sets are disjoint.
 __device__ void admit_pool(AdmitShared& shared, int tag, const MoeExpertSlotPoolArgs& pool,
                            std::uint64_t* expert_ptr, const std::uint64_t* host_ptr,
                            std::uint64_t* fill_ptr, std::int32_t* slot_index,
                            std::int32_t* clock_hands, int layer, const MoeAdmitPolicyArgs& policy) {
     const int misses = shared.miss_count[tag];
-    const int slots  = pool.count;
-    if (misses == 0 || slots == 0) { return; }
+    const int first  = pool.clock_first;
+    const int range  = pool.count - first;
+    if (misses == 0 || range == 0) { return; }
     const int thread       = static_cast<int>(threadIdx.x);
     const int lane         = thread % kWarpSize;
     const int warp         = thread / kWarpSize;
-    const int window       = slots < kAdmitThreads ? slots : kAdmitThreads;
+    const int window       = range < kAdmitThreads ? range : kAdmitThreads;
     const int layer_base   = layer * kMoeExperts;
-    const std::int64_t lap = static_cast<std::int64_t>(slots);
+    const std::int64_t lap = static_cast<std::int64_t>(range);
+    // The slot `steps` <= window positions after `slot` within the range: slot - first + steps <
+    // 2 M, which needs 64 bits for M near 2^31, and one modulo wraps it.
+    const auto advance = [first, lap](int slot, std::int64_t steps) {
+        return first + static_cast<int>((slot - first + steps) % lap);
+    };
 
-    int hand               = clock_hands[tag];
-    int resume             = hand;
-    int assigned           = 0;
-    std::int64_t fruitless = 0;
+    int hand     = clock_hands[tag];
+    int resume   = hand;
+    int assigned = 0;
+    // Positions, in whole windows, since the last window that held an unprotected slot.
+    std::int64_t blocked = 0;
     while (assigned < misses) {
         const bool active     = thread < window;
         std::int64_t position = static_cast<std::int64_t>(hand) + thread;
-        if (position >= lap) { position -= lap; }
+        if (position >= pool.count) { position -= lap; }
         int owner        = kMoeCacheEmptySlot;
         bool unprotected = false;
         int reference    = 0;
@@ -238,18 +251,14 @@ __device__ void admit_pool(AdmitShared& shared, int tag, const MoeExpertSlotPool
             }
         }
         // Every thread derives the same loop state from shared values.
-        if (found > 0) {
-            resume    = static_cast<int>((static_cast<std::int64_t>(hand) + last + 1) % lap);
-            fruitless = window - 1 - last;
-        } else {
-            fruitless += window;
-        }
+        if (found > 0) { resume = advance(hand, last + 1); }
         assigned += found;
-        hand = static_cast<int>((static_cast<std::int64_t>(hand) + window) % lap);
+        hand = advance(hand, window);
         if (assigned == misses) { hand = resume; }
-        // Ends the window: its writes become visible and its shared values may be reused.
-        __syncthreads();
-        if (fruitless >= (policy.reference_limit + 1) * lap) {
+        // Ends the window: its writes become visible, its shared values may be reused, and every
+        // thread learns whether it held an unprotected slot.
+        blocked = __syncthreads_or(unprotected ? 1 : 0) != 0 ? 0 : blocked + window;
+        if (blocked >= lap) {
             hand = resume;
             break;
         }

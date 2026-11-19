@@ -113,9 +113,10 @@ detail::MoeExpertSlotPoolArgs validate_pool(const MoeExpertSlotPool& pool, const
     const bool no_fixed = pool.slots.data == nullptr && pool.slots.bytes == 0;
     const bool no_flex  = pool.flex_address.data == nullptr;
     if (no_fixed && no_flex) {
-        if (pool.owner.data != nullptr || pool.referenced.data != nullptr) {
-            throw std::invalid_argument(op +
-                                        ": a pool without slots has null owner and referenced");
+        if (pool.owner.data != nullptr || pool.referenced.data != nullptr ||
+            pool.clock_first != 0) {
+            throw std::invalid_argument(
+                op + ": a pool without slots has null owner and referenced and clock_first 0");
         }
         return {};
     }
@@ -154,13 +155,17 @@ detail::MoeExpertSlotPoolArgs validate_pool(const MoeExpertSlotPool& pool, const
                                     ": pool owner and referenced must be contiguous I32 [N] and "
                                     "U8 [N], N = slots.bytes / record_bytes + X");
     }
+    if (pool.clock_first < 0 || pool.clock_first > slots) {
+        throw std::invalid_argument(op + ": pool clock_first must lie in [0, N]");
+    }
     return {reinterpret_cast<std::uint64_t>(pool.slots.data),
             pool.record_bytes,
             static_cast<const std::uint64_t*>(pool.flex_address.data),
             static_cast<std::int32_t*>(pool.owner.data),
             static_cast<std::uint8_t*>(pool.referenced.data),
             static_cast<std::int32_t>(fixed),
-            slots};
+            slots,
+            pool.clock_first};
 }
 
 // The pool's metadata ranges for the disjointness check: owner, referenced, flex_address and the
@@ -198,7 +203,7 @@ detail::MoeAdmitPolicyArgs validate_policy(const MoeExpertCache& cache, std::int
         if (!table_of(freq.counts, DType::I32, layers) ||
             !contiguous_2d(freq.lookups, DType::I32, sizeof(std::int32_t)) ||
             freq.lookups.ne[0] != 1 || freq.lookups.ne[1] != 1 || freq.halving_lookups < 1 ||
-            freq.halving_lookups > std::numeric_limits<std::int32_t>::max() - kMoeExperts) {
+            freq.halving_lookups > kMoeCacheMaxHalvingLookups) {
             throw std::invalid_argument(
                 "moe_expert_cache_admit: frequency counts must be contiguous I32 [512,L], "
                 "lookups I32 [1] and halving_lookups in [1, 2^31 - 513]");

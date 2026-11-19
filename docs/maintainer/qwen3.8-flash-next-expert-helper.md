@@ -12,9 +12,10 @@ experts. It consumes the artifact's original F3G32/E2M1G16 records and returns o
 partial per participating token. The 5090 retains the router, shared expert, all non-MoE work,
 remaining expert cache/misses, proposal network and sampler. No CPU expert execution, peer access,
 requantization, runtime repacking, helper prefill, ownership swaps or new Engine scheduler.
-Prefill may temporarily copy helper-owned records into the existing 5090 streaming windows;
+Prefill computes helper-owned records on the 5090 from their mapped host records (§11.1: the
+streaming windows are off in helper mode, because they would borrow pinned P slots);
 exclusive placement means persistent routed-expert residency and decode execution, not those
-necessary local-prefill copies or the immutable host backing store.
+local-prefill reads or the immutable host backing store.
 
 Use CUDA-owned mapped pinned mailboxes registered with HIP, separate request/response cache
 lines, and system-scope release/acquire. **Prequeue a HIP graph containing all 48 layer programs
@@ -140,7 +141,7 @@ execution. Keep the profile out of OFF builds and do not change the flag-off cac
    frequency filter. Flex slots retain fixed addresses/counts and ordinary borrow/return rules.
 
 Helper experts are excluded from warm start, admit lookups/frequency/counters and decode
-lookahead staging. Extend `moe_expert_cache_admit` with an optional per-layer eligibility bitset;
+lookahead staging; §11.1 narrows the same eligibility further to the tail's F3 records. Extend `moe_expert_cache_admit` with an optional per-layer eligibility bitset;
 its routed set U is intersected with that bitset **before all hit, protection, frequency and
 miss processing**. Extend `_stage` candidate eligibility likewise. Existing callers omit the
 bitset and retain their exact semantics. `_fill`, `_commit` and `_defer` consume already-filtered
@@ -263,7 +264,8 @@ step-down do not alter ownership or wire geometry.
 helper execution merely because `streamed == false`, which also covers small prefill chunks.
 For `run_super_chunk`, `enqueue_layers`, `enqueue_window`, `score`, all sub-chunk widths and
 16,384-token interruption boundaries, execution stays local. Only the persistent admission mask
-changes in helper-enabled prefill; normal layer-major window fill/deferral/return remains intact.
+changes in helper-enabled prefill; the windows are off there (§11.1), and every non-resident
+record is read through its mapped host address.
 
 ## 5. Mailbox, helper scheduling and failures
 
@@ -598,7 +600,7 @@ workspace and helper reservations. Counts come from the compiled profile, genera
 served route-profile JSON.
 
 - **P, pinned on the 5090:** the highest-count records filling every fixed slot of both codec
-  pools (the 11% NVFP4 split is unchanged). Admission never evicts P.
+  pools (the 11% NVFP4 split is unchanged). P is written once at startup and never evicted.
 - **H, on the R9700:** as in §3, taken outside P in descending `count / record_bytes` until the
   31 GiB budget is full.
 - **T, the tail:** everything else. It lives in a pinned, device-mapped **host residue** that
@@ -615,9 +617,42 @@ and 0.14% of route assignments in the VM profile. The startup log reports the ac
 (`primary_*`, `helper_*`, `tail_*` of `ExpertHelperPlacement`); `local_eligibility` keeps its
 meaning, P union T.
 
-`ExpertResidency` owns a pinned fixed region (P, written once at load and never a victim) and the
-flex pool (T only). Admission, staging and frequency state cover only T. The P and H masks are
-uploaded once, next to the existing helper eligibility bitset.
+`ExpertResidency` (cache side, implemented) owns the fixed slots holding P and the flex pool
+holding T. Mechanism:
+
+- **Admission domain.** `ExpertHelperPlacement::admission_mask` marks the F3 records of T. It is the
+  `eligible` bitset of `moe_expert_cache_admit` and `_stage` and of the refill select, uploaded
+  once next to `local_eligibility` (P union T, which still selects the 5090's routes and the
+  partition). P is outside the domain like H, and NVFP4 records of T are too: the NVFP4 pool has no
+  flex slots, so they stay mapped reads. Frequency counts, lookups and the hit counters therefore
+  cover the F3 tail only; the global route profile is unchanged.
+- **Pinning.** Each P record takes the next fixed slot of its codec in ascending layer-major order
+  (`ExpertHelperPlacement::primary_slot`). Its slot has owner `kMoeCacheBorrowedSlot`, the state
+  admit treats as protected, for the Program's lifetime. Its `expert_table` entry names the slot
+  permanently, its `slot_index` is -1, and it is never in an Op's eligible domain, so the cache
+  invariant (table names the slot iff `slot_index >= 0`) holds for every record an Op examines.
+- **CLOCK range.** Each pool's `MoeExpertSlotPool::clock_first` is its fixed slot count, so admit's
+  CLOCK visits only the F3 flex slots and the NVFP4 pool admits nothing; the hands start there.
+  Without the range the hand would also sweep the roughly 9,000 pinned fixed slots, and when KV
+  takes every extent back a miss would spin K + 1 = 9 laps of the whole pool per layer call.
+  Admit gives up its remaining misses after one lap of its range in which every slot is protected,
+  so tail misses with all flex slots lent cost one pass over the flex slots and stay mapped reads.
+- **Flex only.** Warm start (compiled profile counts) and refill place only admission-eligible
+  records, and only flex slots are free, so T occupies flex slots alone. The frequency halving
+  period counts flex slots only (the longest period the Op accepts when there are none). Refill
+  is off when T has no F3 record.
+- **Windows.** In helper mode `expert_window_bytes` is 0: the windows are borrowed *fixed* F3
+  slots (a window must be one contiguous run, which flex slots are not), and fixed slots are P.
+  Prefill therefore borrows nothing and evicts nothing; records outside P and the resident tail
+  (H, NVFP4 tail, non-resident F3 tail) are read through mapped host memory, which is what a window
+  copy read anyway but without the overlapped bulk copy. This is the interim state until §11.2
+  removes the local H reads.
+- **Full coverage** (T empty): the admission mask is empty, refill is off, P fills the fixed slots,
+  and decode is the former full-coverage path.
+
+The startup log's `expert-helper tiers` line reports per-codec P/H/T counts, bytes and CALIB routes,
+the fixed slots, the F3 flex slots and the admission-eligible count. The host still holds the full
+pinned store; the residue-only store waits for package 9.
 
 ### 11.2 Prefill on both cards
 
@@ -672,7 +707,7 @@ Peak extra host memory is 256 MiB plus the residue.
 
 | Package | Deliverable | Verification |
 |---|---|---|
-| 8. Placement v2 and residue | P/H/T placement, pinned P region, T-only admission/flex, residue store; AGENTS.md and plan contract wording | CPU placement oracle (exact masks/bytes at small KV and 1M/8 lanes); admission never evicts P; full-coverage case has no residue; decode exact versus §8's qualified helper build when T is empty |
+| 8. Placement v2 and residue | P/H/T placement, pinned P region, T-only admission/flex (cache side done; windows off in helper mode), residue store (pending, with 9); AGENTS.md and plan contract wording | CPU placement oracle (exact masks/bytes at small KV and 1M/8 lanes); admission never evicts P; full-coverage case has no residue; decode exact versus §8's qualified helper build when T is empty |
 | 9. Streaming loader | `O_DIRECT` bounce-buffer reader for all tensors, direct dispatch to P/H/residue/store | Exact record checksums on every destination; peak RSS and load time on the host |
 | 10. Both-card prefill | Forward prefill rounds, mailbox prefill transport, BF16-return variant of the grouped Op (owner: Op/kernel owner), window removal in helper mode | FP64 Op oracle for the BF16-return route; frozen OFF-versus-ON panel gate; prefill/decode state exactness, interruption and tiers; prefill tok/s at 1.7K, 16K and 64K tokens, ON versus OFF |
 
