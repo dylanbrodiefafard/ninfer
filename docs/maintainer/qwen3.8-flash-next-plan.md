@@ -1015,7 +1015,7 @@ not taken: one of its C5 repetitions dropped 5%.
 `ops::moe_experts` (`include/ninfer/ops/moe_experts.h` is the authority: signature, record byte
 layout, precision and graph invariants). y = sum_j w_j down_e(silu(gate_e x) * up_e x)
 + shared_scale * shared(x) for H 2560, I 640, 512 routed experts, top-10 distinct ids per token, a
-shared expert given as one VRAM NVFP4 record in the routed layout, T 1..8192; experts are read through a per-layer I64 [512] pointer table (VRAM
+shared expert given as one VRAM NVFP4 record in the routed layout, T 1..16384; experts are read through a per-layer I64 [512] pointer table (VRAM
 slot or mapped host record, codec in bit 0) with FP32 [512,3] matrix scales and per-layer F3
 books.
 
@@ -1091,10 +1091,30 @@ books.
   expert staging" below) or by pipelining two lane groups so one group's dense work overlaps the
   other's transfers: on this trace a 2 + 3 split routes 11% more distinct experts per layer
   (123.3 against 111.3) against up to 13.5 ms per round of dense work to hide.
-- **Precision.** A16 only for now. A8 for F3 experts in prefill (one G32 scale per
-  `kind::f8f6f4` m16n8k32 step) is the planned compute lever once its study KL and the needle
-  battery are measured; A4 is deferred because PCIe, not compute, bounds prefill while experts
-  stream.
+- **Precision.** The caller selects `MoeActivationProfile`: A16 (BF16 activations; the Program
+  uses it everywhere) or A8, the prefill profile shared with the R9700 helper. A8 encodes every
+  gate|up input row (`moe_activation_quantize`: FP32 scale max|x|/448, E4M3 codes by IEEE FP32
+  division and RNE satfinite, zero row +0) and every assignment's BF16 gate/up product with the
+  same codec, expands weight codes exactly to E4M3 and runs one E4M3 MMA per weight block (F3:
+  `kind::f8f6f4` m16n8k32 per G32 unit; NVFP4: m16n8k16 per G16 group, the BF16 rate), the block
+  scale fused into the FP32 accumulation; the record's lane-owned units are transposed across each
+  quad with four shuffles per row and chunk. One 64-token tile; 255 registers, no spills. The
+  FP64-oracle suite (both codecs, mixed host/VRAM, skewed/distinct/concentrated routing,
+  subnormal/narrow scales, outlier activations, deferral, graph replay, local partial, T up to
+  16384) measures relative L2 4.2-4.5e-2 against the 7e-2 bound derived from u = 2^-4 (expected
+  4.5e-2), and 1.7e-3 against the oracle on the represented A8 activations (the partial: 1e-7);
+  the codec is bit-exact against an independent host encoder. A8 model quality (study KL, needle
+  battery) is not measured; the Program does not select it yet. A4 is deferred because PCIe, not
+  compute, bounds prefill while experts stream.
+- **A8 against A16 (2026-11-18, RTX 5090, `ninfer_moe_experts_bench --suite placement --config 0
+  --activations both`, VRAM records, uniform routing, 32 NVFP4 + 480 F3, cold-L2 graph replay,
+  median of 20).** T = 1,024 / 4,096 / 16,384: A16 954 / 3,003 / 11,297 us (116 / 148 / 157
+  TFLOP/s), A8 907 / 2,422 / 9,165 us (122 / 183 / 193 TFLOP/s), 1.05x / 1.24x / 1.23x. Kernel
+  split at T = 16,384 (ncu, base clocks): gate|up 7.63 -> 4.95 ms (1.54x of an ideal 1.74x for
+  this codec mix), down 6.68 -> 5.66 ms, merge 1.38 ms and grouping 0.41 ms unchanged, the two
+  A8 encoders 0.07 + 0.22 ms. Down (five K chunks per item, a 32 KiB FP32 contribution store per
+  item) and the merge over the FP32 contributions workspace bound the layer, so the next lever is
+  removing that workspace, not more MMA rate.
 - **Measured (RTX 5090, cold L2, graph replay, median per layer, 32 NVFP4 + 480 F3 records).**
   FP64-oracle suite (T 1..8192, subnormal and narrow scales, graph replay with changed tables)
   passes at 0.37-0.50 of its bound; memcheck/racecheck clean; pi Sol and Fable
@@ -1116,7 +1136,7 @@ books.
   than one tile reads its record once per job, so host-resident experts at large T need the
   prefill streaming window or a single-reader schedule. Prefill at 57% of the BF16 MMA roof is
   limited by activation re-reads across row-tile CTAs; then the FP32 contributions workspace
-  (1.04 GB at T=8192) and A8 for F3 experts.
+  (1.04 GB at T=8192, 1.85 GB at 16384), which with the down launch bounds the A8 profile.
 
 ## Program measurements (2026-11-14, f3-fp8-nvfp4)
 

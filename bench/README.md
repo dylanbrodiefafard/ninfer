@@ -225,13 +225,15 @@ cmake --build build --parallel 4 --target ninfer_lane_batched_state_bench
 `ninfer_moe_experts_bench` measures `moe_experts` at the Qwen3.8-Flash-Next geometry (2560 hidden,
 512 routed experts top-10, intermediate 640, NVFP4 shared-expert record) with 32 NVFP4 and 480 F3
 expert records. Configurations: 0 all records in VRAM with uniform routing, 1 all records in mapped
-pinned host memory (PCIe), 2 odd experts on the host with skewed routing. Each call is a captured graph replayed cold; it reports microseconds, DRAM or PCIe
+pinned host memory (PCIe), 2 odd experts on the host with skewed routing. Each placement point runs
+the A16 and A8 activation profiles (`--activations a16|a8|both`). Each call is a captured graph replayed cold; it reports microseconds, DRAM or PCIe
 GB/s against `1674.5` and `26.8 GB/s`, and TFLOP/s.
 
 ```bash
 cmake --build build --parallel 4 --target ninfer_moe_experts_bench
 ./build/bench/ninfer_moe_experts_bench --tokens 1 --config 0
 ./build/bench/ninfer_moe_experts_bench --tokens 4096 --config 2
+./build/bench/ninfer_moe_experts_bench --suite placement --config 0 --tokens 16384 --activations both
 ```
 
 ## Hyper-connection read Op benchmark

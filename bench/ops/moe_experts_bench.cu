@@ -9,7 +9,8 @@
 //   placement  ten distinct uniformly random experts per token, or skewed (per-expert bias, so
 //              fewer distinct experts and some with more tokens than one tile), with every record
 //              in VRAM, in device-mapped pinned host memory, or mixed (odd experts on the host);
-//              no deferral.
+//              no deferral. Each point runs the activation profiles --activations selects (A16,
+//              A8, or both, the default).
 //   decode     the decode and verification band as the Program runs it: L lanes of D consecutive
 //              tokens with recorded-trace expert reuse (see make_lane_routes) and records in VRAM.
 //              Each point runs five cache states: no deferral; a deferral with nothing deferred (a
@@ -204,6 +205,7 @@ std::vector<std::int32_t> make_lane_routes(int lanes, int lane_tokens, std::uint
 
 // One layer call: routes, where each routed expert's record is read from, and the deferral.
 struct Point {
+    ops::MoeActivationProfile profile = ops::MoeActivationProfile::A16;
     std::vector<std::int32_t> ids;
     std::vector<bool> host;        // [512]: record read through mapped host memory
     std::vector<bool> deferred;    // [512]: record read from its VRAM slot after `ready`
@@ -292,7 +294,7 @@ Timing measure(const Point& point, const Stores& stores) {
     shared_d.copy_from_host(shared_scale.data(), shared_d.bytes);
     table_d.copy_from_host(table.data(), table_d.bytes);
     slots_d.copy_from_host(slots.data(), slots_d.bytes);
-    WorkspaceArena workspace(ops::moe_experts_workspace_capacity_bytes(tokens));
+    WorkspaceArena workspace(ops::moe_experts_workspace_capacity_bytes(tokens, point.profile));
 
     ops::MoeExpertBank bank;
     bank.expert_table         = Tensor(table_d.p, DType::I64, {ops::kMoeExperts});
@@ -324,7 +326,7 @@ Timing measure(const Point& point, const Stores& stores) {
             if (point.fill) { ops::moe_expert_cache_fill(host_t, fill_t, 0, side.get()); }
             CUDA_CHECK(cudaEventRecord(ready.get(), side.get()));
         }
-        ops::moe_experts(x_t, ids_t, weights_t, shared_t, bank, y_t, workspace, s,
+        ops::moe_experts(x_t, ids_t, weights_t, shared_t, bank, point.profile, y_t, workspace, s,
                          point.with_deferral ? &deferral : nullptr);
     };
     call(stream.get()); // configures kernel attributes outside capture
@@ -343,19 +345,21 @@ Timing measure(const Point& point, const Stores& stores) {
 void print(const Point& point, const std::string& state, const Timing& t) {
     const double seconds = t.cold.median_us * 1.0e-6;
     const auto tokens    = point.ids.size() / ops::kMoeTopK;
-    std::printf("%-5s %-9s %-10s T=%-5zu experts=%-3zu max/expert=%-4zu deferred=%-3zu host=%-3zu "
-                "median=%9.1f us min=%9.1f us  DRAM %7.1f MB %7.1f GB/s (%5.1f%%)  PCIe %7.1f MB "
-                "floor %7.1f us  %6.1f TFLOP/s\n",
-                point.placement.c_str(), point.routing.c_str(), state.c_str(), tokens, t.experts,
-                t.max_tokens, t.deferred, t.host, t.cold.median_us, t.cold.min_us,
-                t.dram_bytes / 1.0e6, t.dram_bytes / seconds / 1.0e9,
-                100.0 * t.dram_bytes / seconds / 1.0e9 / kRtx5090SustainedReadGBs,
-                t.pcie_bytes / 1.0e6, t.pcie_bytes / (kPcieMappedReadGBs * 1.0e3),
-                t.tflop_per_second);
+    std::printf(
+        "%-3s %-5s %-9s %-10s T=%-5zu experts=%-3zu max/expert=%-4zu deferred=%-3zu "
+        "host=%-3zu median=%9.1f us min=%9.1f us  DRAM %7.1f MB %7.1f GB/s (%5.1f%%)  PCIe "
+        "%7.1f MB floor %7.1f us  %6.1f TFLOP/s\n",
+        point.profile == ops::MoeActivationProfile::A8 ? "a8" : "a16", point.placement.c_str(),
+        point.routing.c_str(), state.c_str(), tokens, t.experts, t.max_tokens, t.deferred, t.host,
+        t.cold.median_us, t.cold.min_us, t.dram_bytes / 1.0e6, t.dram_bytes / seconds / 1.0e9,
+        100.0 * t.dram_bytes / seconds / 1.0e9 / kRtx5090SustainedReadGBs, t.pcie_bytes / 1.0e6,
+        t.pcie_bytes / (kPcieMappedReadGBs * 1.0e3), t.tflop_per_second);
 }
 
-void run_placement_point(int tokens, const PlacementConfig& config, const Stores& stores) {
+void run_placement_point(int tokens, const PlacementConfig& config,
+                         ops::MoeActivationProfile profile, const Stores& stores) {
     Point point;
+    point.profile  = profile;
     point.ids      = make_routes(tokens, config.routing, 7U + static_cast<std::uint32_t>(tokens));
     point.host     = std::vector<bool>(ops::kMoeExperts, false);
     point.deferred = point.host;
@@ -414,14 +418,16 @@ void run_decode_point(int tokens, const Stores& stores) {
 int main(int argc, char** argv) {
     try {
         enum class Suite : std::uint8_t { All, Placement, Decode };
-        Suite suite                          = Suite::All;
-        std::vector<int> placement_tokens    = {1, 12, 512, 4096};
-        std::vector<int> decode_tokens       = {1, 4, 8, 16, 20, 48};
-        std::vector<PlacementConfig> configs = {{Placement::Vram, Routing::Uniform},
-                                                {Placement::Host, Routing::Uniform},
-                                                {Placement::Mixed, Routing::Skewed}};
-        int warmup                           = 3;
-        int repeat                           = 20;
+        Suite suite                                     = Suite::All;
+        std::vector<int> placement_tokens               = {1, 12, 512, 4096};
+        std::vector<int> decode_tokens                  = {1, 4, 8, 16, 20, 48};
+        std::vector<PlacementConfig> configs            = {{Placement::Vram, Routing::Uniform},
+                                                           {Placement::Host, Routing::Uniform},
+                                                           {Placement::Mixed, Routing::Skewed}};
+        std::vector<ops::MoeActivationProfile> profiles = {ops::MoeActivationProfile::A16,
+                                                           ops::MoeActivationProfile::A8};
+        int warmup                                      = 3;
+        int repeat                                      = 20;
         for (int i = 1; i < argc; ++i) {
             const std::string_view arg(argv[i]);
             if (arg == "--tokens" && i + 1 < argc) {
@@ -439,6 +445,15 @@ int main(int argc, char** argv) {
                 } else {
                     throw std::invalid_argument("--suite is placement or decode");
                 }
+            } else if (arg == "--activations" && i + 1 < argc) {
+                const std::string_view name(argv[++i]);
+                if (name == "a16") {
+                    profiles = {ops::MoeActivationProfile::A16};
+                } else if (name == "a8") {
+                    profiles = {ops::MoeActivationProfile::A8};
+                } else if (name != "both") {
+                    throw std::invalid_argument("--activations is a16, a8 or both");
+                }
             } else if (arg == "--config" && i + 1 < argc) {
                 const std::string_view name(argv[++i]);
                 const auto index = parse_number<std::size_t>(name, "--config");
@@ -447,9 +462,10 @@ int main(int argc, char** argv) {
             } else {
                 throw std::invalid_argument(
                     "usage: ninfer_moe_experts_bench [--suite placement|decode] [--tokens T] "
-                    "[--config 0..2] [--repeat N] (placement configs: 0 vram uniform, 1 host "
-                    "uniform, 2 mixed skewed; decode T is 1..12 lanes x 1 token, or 4..48 as "
-                    "lanes x 4 tokens)");
+                    "[--config 0..2] [--activations a16|a8|both] [--repeat N] (placement configs: "
+                    "0 vram uniform, 1 host uniform, 2 mixed skewed; activations apply to the "
+                    "placement suite; decode T is 1..12 lanes x 1 token, or 4..48 as lanes x 4 "
+                    "tokens)");
             }
         }
         if (suite != Suite::Placement) {
@@ -485,7 +501,9 @@ int main(int argc, char** argv) {
         if (suite != Suite::Decode) {
             for (const PlacementConfig& config : configs) {
                 for (const int tokens : placement_tokens) {
-                    run_placement_point(tokens, config, stores);
+                    for (const ops::MoeActivationProfile profile : profiles) {
+                        run_placement_point(tokens, config, profile, stores);
+                    }
                 }
             }
         }

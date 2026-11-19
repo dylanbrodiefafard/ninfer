@@ -290,7 +290,8 @@ std::size_t plan_work_bytes(const ModelView& model, const ForwardOptions& option
     {
         auto scope = builder.scope();
         static_cast<void>(allocate_moe(builder, max_tokens));
-        reserve(builder, ops::moe_experts_workspace_capacity_bytes(max_tokens));
+        reserve(builder, ops::moe_experts_workspace_capacity_bytes(max_tokens,
+                                                                   ops::MoeActivationProfile::A16));
     }
     {
         auto scope = builder.scope();
@@ -1492,8 +1493,8 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
             .slots = chunk_.window_columns.slice(1, layer % 2, 1).view({ops::kMoeExperts}),
             .ready = window_ready_[b].get()};
         Tensor y = columns(chunk_.block_output, kHidden, tokens);
-        ops::moe_experts(x, s.expert_ids, s.route_weights, s.shared_scale, bank, y, work_, stream_,
-                         &deferral);
+        ops::moe_experts(x, s.expert_ids, s.route_weights, s.shared_scale, bank,
+                         ops::MoeActivationProfile::A16, y, work_, stream_, &deferral);
         if (last && layer + 2 < kLayers) {
             CUDA_CHECK(cudaEventRecord(window_free_[b].get(), stream_));
             CUDA_CHECK(cudaStreamWaitEvent(fill_stream_.get(), window_free_[b].get(), 0));
@@ -1600,12 +1601,13 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
     if (helper_round) {
         Tensor partial(helper_view_.local_partial, DType::FP32, {kHidden, tokens});
         ops::moe_experts_local_partial(x, s.expert_ids, s.route_weights, s.shared_scale, bank,
-                                       eligible, partial, work_, stream_, &deferral);
+                                       ops::MoeActivationProfile::A16, eligible, partial, work_,
+                                       stream_, &deferral);
     } else
 #endif
     {
-        ops::moe_experts(x, s.expert_ids, s.route_weights, s.shared_scale, bank, y, work_, stream_,
-                         &deferral);
+        ops::moe_experts(x, s.expert_ids, s.route_weights, s.shared_scale, bank,
+                         ops::MoeActivationProfile::A16, y, work_, stream_, &deferral);
     }
     if (next) {
         // The span's last readers (this moe_experts and, earlier on the fill stream, the admitted

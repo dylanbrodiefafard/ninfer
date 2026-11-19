@@ -468,9 +468,9 @@ void moe_expert_cache_stage(const Tensor& predicted, std::int32_t candidates,
     const std::string op("moe_expert_cache_stage");
     validate_tables(expert_ptr, host_ptr, layer, op, "expert_ptr", "host_ptr");
     if (!contiguous_2d(predicted, DType::I32, sizeof(std::int32_t)) ||
-        predicted.ne[0] != kMoeTopK || predicted.ne[1] > kMoeMaxTokens) {
+        predicted.ne[0] != kMoeTopK || predicted.ne[1] > kMoeStageMaxTokens) {
         throw std::invalid_argument(op + ": predicted must be contiguous I32 [10,T], 1 <= T <= " +
-                                    std::to_string(kMoeMaxTokens));
+                                    std::to_string(kMoeStageMaxTokens));
     }
     if (candidates < 1 || candidates > kMoeStageMaxCandidates) {
         throw std::invalid_argument(op + ": candidates must lie in [1,10]");

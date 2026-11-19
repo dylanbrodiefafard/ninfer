@@ -544,8 +544,8 @@ __global__ void __launch_bounds__(kWindowThreads)
 constexpr int kStageThreads = kMoeExperts;
 // W_j = kStageWeightScale / (4 + j): 1 / (4 + j) scaled by lcm(4..13), exact for j in [0,10).
 constexpr unsigned kStageWeightScale = 360360;
-// The largest score: kMoeMaxTokens tokens each giving one expert all ten weights.
-static_assert(static_cast<unsigned long long>(kMoeMaxTokens) *
+// The largest score: kMoeStageMaxTokens tokens each giving one expert all ten weights.
+static_assert(static_cast<unsigned long long>(kMoeStageMaxTokens) *
                       (kStageWeightScale / 4 + kStageWeightScale / 5 + kStageWeightScale / 6 +
                        kStageWeightScale / 7 + kStageWeightScale / 8 + kStageWeightScale / 9 +
                        kStageWeightScale / 10 + kStageWeightScale / 11 + kStageWeightScale / 12 +

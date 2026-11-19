@@ -401,6 +401,9 @@ void moe_expert_cache_window(const Tensor& expert_ptr, const Tensor& host_ptr, s
 
 // Candidates per token moe_expert_cache_stage accepts: a prefix of moe_route's ten ranked ids.
 inline constexpr std::int32_t kMoeStageMaxCandidates = kMoeTopK;
+// Predicted tokens moe_expert_cache_stage accepts: its U32 expert scores cannot overflow up to
+// this extent, which covers every decode and verification round.
+inline constexpr std::int32_t kMoeStageMaxTokens = 8192;
 
 /**
  * Op: moe_expert_cache_stage
@@ -441,7 +444,7 @@ inline constexpr std::int32_t kMoeStageMaxCandidates = kMoeTopK;
  *   without staging. stage_ptr, source and the staging bytes stay unchanged until those consumers
  *   complete.
  *
- * Logical shapes: predicted I32 [10,T], 1 <= T <= 8192 (kMoeMaxTokens), contiguous;
+ * Logical shapes: predicted I32 [10,T], 1 <= T <= 8192 (kMoeStageMaxTokens), contiguous;
  * 1 <= candidates <= kMoeStageMaxCandidates; expert_ptr and host_ptr I64 [512,L] as for
  * moe_expert_cache_admit, 0 <= layer < L; stage_ptr and source contiguous I64 [512], 8-byte
  * aligned; staging.data 256-byte aligned with budget_bytes <= staging.bytes, or null with

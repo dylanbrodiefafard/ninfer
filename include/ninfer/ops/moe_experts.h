@@ -14,8 +14,23 @@
 namespace ninfer::ops {
 
 // The token extent one moe_experts call admits (the expert geometry and record sizes are in
-// ninfer/ops/moe_expert_record.h).
-inline constexpr std::int32_t kMoeMaxTokens = 8192;
+// ninfer/ops/moe_expert_record.h): a whole 16,384-token prefill super-chunk.
+inline constexpr std::int32_t kMoeMaxTokens = 16384;
+
+/**
+ * Activation precision profile of one moe_experts call, chosen by the caller. Both profiles
+ * evaluate the same mathematical formula and are checked against the same FP64 oracle; they differ
+ * only in how activations enter the tensor-core products (see "Numeric" in moe_experts).
+ *
+ *   A16  BF16 activations: the decode, verification and default prefill profile.
+ *   A8   E4M3 activations with one FP32 scale per row (moe_activation_quantize's codec): the
+ *        prefill profile shared with the R9700 expert helper, which applies the same codec, so an
+ *        expert's products agree across the two cards up to FP32 accumulation order. It doubles
+ *        the tensor-core rate of F3G32 experts (one E4M3 block scale per 32 K fits one m16n8k32
+ *        step) and keeps that of NVFP4G16 experts (a scale per 16 K needs m16n8k16 steps). Valid
+ *        for every T; its single 64-token tile is sized for prefill sub-chunks.
+ */
+enum class MoeActivationProfile : std::uint8_t { A16, A8 };
 
 /**
  * Routed-expert record
@@ -104,8 +119,38 @@ struct MoeExpertsDeferral {
     cudaEvent_t ready = nullptr;
 };
 
-/** Workspace bytes of moe_experts for every T in [1, max_tokens]; max_tokens in [1,8192]. */
-[[nodiscard]] std::size_t moe_experts_workspace_capacity_bytes(std::int32_t max_tokens);
+/**
+ * Workspace bytes of moe_experts and moe_experts_local_partial under `profile` for every T in
+ * [1, max_tokens]; max_tokens in [1,16384], else std::invalid_argument.
+ */
+[[nodiscard]] std::size_t moe_experts_workspace_capacity_bytes(std::int32_t max_tokens,
+                                                               MoeActivationProfile profile);
+
+/**
+ * Op: moe_activation_quantize
+ *
+ * The A8 activation codec of moe_experts (MoeActivationProfile::A8) and of the R9700 expert
+ * helper's prefill, one row at a time. For each token t with the represented BF16 row x[:,t] of
+ * K = 2560 values (all in FP32, IEEE round-to-nearest-even):
+ *
+ *   scale[t]   = max_k |x[k,t]| / 448                  (a single FP32 division)
+ *   codes[k,t] = E4M3FN_satfinite_rn(x[k,t] / scale[t]) (FP32 division, then round to nearest
+ *                                                        even, saturating to +-448; never NaN)
+ *
+ * except that an all-zero row (max 0, including -0 values) has scale +0 and every code +0. The
+ * represented value is decode(codes[k,t]) * scale[t]. Within a nonzero row a value that rounds to
+ * zero keeps its sign (0x80 for a negative one), and E4M3 subnormal codes are produced. This is the
+ * cross-card contract: codes and scales are bit-exact functions of the BF16 bits. It differs from
+ * A8Activation's codec (ninfer/ops/a8_activation.h), which multiplies by the FP32 reciprocal of the
+ * scale and so can round differently.
+ *
+ * Shapes: x BF16 [2560,T], codes FP8_E4M3FN [2560,T], scales FP32 [T], 1 <= T <= 16384; all
+ * contiguous and 16-byte aligned, the outputs disjoint from x and from each other. x must be
+ * finite. Asynchronous on stream, one warp per row, graph-capturable for fixed views, no workspace.
+ * Invalid shapes, dtypes, alignment or aliasing throw std::invalid_argument before any work is
+ * queued.
+ */
+void moe_activation_quantize(const Tensor& x, Tensor& codes, Tensor& scales, cudaStream_t stream);
 
 /**
  * Op: moe_experts
@@ -119,7 +164,7 @@ struct MoeExpertsDeferral {
  * "Routed-expert record" describes (the shared expert with shared_matrix_scales).
  *
  * Logical shapes: x BF16 [2560,T]; expert_ids I32 [10,T] and route_weights FP32 [10,T] (moe_route's
- * outputs); shared_scale FP32 [T]; y BF16 [2560,T]; 1 <= T <= 8192. All are contiguous, 16-byte
+ * outputs); shared_scale FP32 [T]; y BF16 [2560,T]; 1 <= T <= 16384. All are contiguous, 16-byte
  * aligned, and y is disjoint from every input. The ten ids of a token are distinct and in [0,512),
  * as moe_route produces them; violating this is a precondition violation whose result is
  * unspecified (an id outside [0,512) is clamped, so the Op still touches only its documented
@@ -127,12 +172,26 @@ struct MoeExpertsDeferral {
  *
  * Numeric: the oracle evaluates the formula in FP64 from the represented BF16 x, the decoded
  * weights (codes through the book or E2M1 code, exact E4M3 and FP32 scales) and the FP32 route
- * weights and shared scale. Implementation profile (A16): decoded code times E4M3 scale is exact in
- * BF16 and feeds BF16 tensor-core products with FP32 accumulation; the matrix scales, SiLU and the
- * gate/up product are FP32; that product enters the down projection rounded once to BF16; each
- * scaled down output is FP32, and the eleven per-token contributions are summed in slot order (j =
- * 0..9, then the shared expert) and rounded once to BF16. No float atomics: y is bit-identical for
- * identical inputs and T; the accumulation association may differ between extents.
+ * weights and shared scale. The two implementation profiles (`profile`) share every step except
+ * how activations enter the products:
+ *
+ *   A16  decoded code times E4M3 scale is exact in BF16 and feeds BF16 tensor-core products of BF16
+ *        activations with FP32 accumulation.
+ *   A8   every gate|up input row x[:,t] and every down input row (the BF16 gate/up product of one
+ *        assignment, shared expert included) is encoded by moe_activation_quantize's codec (FP32
+ *        row scale, E4M3 codes). Weight codes expand exactly to E4M3 (every E2M1 value is one) and
+ *        multiply the activation codes in E4M3 tensor-core products with FP32 accumulation, one
+ *        product per weight block (an m16n8k32 step per F3G32 unit of 32 K, an m16n8k16 step per
+ *        NVFP4G16 group of 16 K); each block's FP32 partial times its E4M3 block scale is added
+ *        to the FP32 accumulator in one fused multiply-add, in ascending K order, and the
+ *        activation row scale multiplies the accumulated sum. Block scales are never folded into
+ *        codes.
+ *
+ * In both, the matrix scales, SiLU and the gate/up product are FP32; that product enters the down
+ * projection rounded once to BF16; each scaled down output is FP32, and the eleven per-token
+ * contributions are summed in slot order (j = 0..9, then the shared expert) and rounded once to
+ * BF16. No float atomics: y is bit-identical for identical inputs, profile and T; the accumulation
+ * association may differ between extents.
  *
  * Records are immutable while enqueued work may read them; the Op writes only y and its workspace.
  *
@@ -142,8 +201,8 @@ struct MoeExpertsDeferral {
  * computes the deferred experts. y is bit-identical to the call without a deferral on the same
  * record bytes, since every assignment's contribution and the merge order are unchanged.
  *
- * Workspace: moe_experts_workspace_capacity_bytes(T) bytes from a 256-byte aligned arena cursor;
- * the allocations are released on return.
+ * Workspace: moe_experts_workspace_capacity_bytes(T, profile) bytes from a 256-byte aligned arena
+ * cursor; the allocations are released on return.
  *
  * Execution: asynchronous on stream with no host synchronization or readback. The tables, scales
  * and records are read on the device at execution, so a captured CUDA Graph is valid for a fixed T
@@ -153,9 +212,9 @@ struct MoeExpertsDeferral {
  * queued.
  */
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& route_weights,
-                 const Tensor& shared_scale, const MoeExpertBank& bank, Tensor& y,
-                 WorkspaceArena& workspace, cudaStream_t stream,
-                 const MoeExpertsDeferral* deferral = nullptr);
+                 const Tensor& shared_scale, const MoeExpertBank& bank,
+                 MoeActivationProfile profile, Tensor& y, WorkspaceArena& workspace,
+                 cudaStream_t stream, const MoeExpertsDeferral* deferral = nullptr);
 
 /**
  * Op: moe_experts_local_partial
@@ -174,20 +233,22 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& route_
  * the remaining assignments gives moe_experts' sum (moe_expert_partial_join); only the reduction
  * association differs.
  *
- * Shapes, operands, deferral, workspace (moe_experts_workspace_capacity_bytes) and execution are
- * as for moe_experts, with partial FP32 [2560,T] in place of y: contiguous, 16-byte aligned and
- * disjoint from every input. local_experts is contiguous I32 [16], 16-byte aligned, read on the
- * device when the call executes (a captured graph stays valid while it changes between calls); it
- * must not change while the call runs, since the grouping and the final sum each read it.
+ * Shapes, operands, profile, deferral, workspace (moe_experts_workspace_capacity_bytes) and
+ * execution are as for moe_experts, with partial FP32 [2560,T] in place of y: contiguous, 16-byte
+ * aligned and disjoint from every input. local_experts is contiguous I32 [16], 16-byte aligned,
+ * read on the device when the call executes (a captured graph stays valid while it changes between
+ * calls); it must not change while the call runs, since the grouping and the final sum each read
+ * it.
  *
- * Numeric: moe_experts' implementation profile, except that each token's sum over its included
+ * Numeric: moe_experts' implementation profiles, except that each token's sum over its included
  * slots in slot order (local routed j ascending, then the shared expert) is stored as FP32, not
  * rounded to BF16. Deterministic for identical inputs and T.
  */
 void moe_experts_local_partial(const Tensor& x, const Tensor& expert_ids,
                                const Tensor& route_weights, const Tensor& shared_scale,
-                               const MoeExpertBank& bank, const Tensor& local_experts,
-                               Tensor& partial, WorkspaceArena& workspace, cudaStream_t stream,
+                               const MoeExpertBank& bank, MoeActivationProfile profile,
+                               const Tensor& local_experts, Tensor& partial,
+                               WorkspaceArena& workspace, cudaStream_t stream,
                                const MoeExpertsDeferral* deferral = nullptr);
 
 } // namespace ninfer::ops

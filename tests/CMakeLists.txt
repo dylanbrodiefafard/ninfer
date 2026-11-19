@@ -512,6 +512,7 @@ set(ninfer_op_tests
   moe_expert_cache_stage
   moe_expert_cache_window
   moe_experts
+  moe_activation_quantize
   moe_expert_partition
   ple)
 foreach(op IN LISTS ninfer_op_tests)
@@ -536,6 +537,8 @@ ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_fill_test)
 ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_stage_test)
 ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_window_test)
 ninfer_add_sanitizer_cases(ninfer_moe_expert_partition_test)
+ninfer_add_sanitizer_cases(ninfer_moe_experts_test)
+ninfer_add_sanitizer_cases(ninfer_moe_activation_quantize_test)
 ninfer_add_op_test(ninfer_gqa_xattn_sort_test
   SOURCES ops/test_gqa_xattn_sort.cu
   LIBRARIES ninfer_ops)

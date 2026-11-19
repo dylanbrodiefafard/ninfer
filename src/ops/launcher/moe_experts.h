@@ -19,17 +19,20 @@ inline constexpr std::int32_t kMoeSharedExpert = kMoeExperts;
 // sets the shared-memory staging and how many jobs a popular expert splits into. An expert with
 // more tokens than the tile has several jobs, and each reads its record (over PCIe when it is
 // host-resident); since a token's ten ids are distinct an expert holds at most T tokens, so
-// every expert has a single job up to T = 16, the decode and verification range.
-[[nodiscard]] constexpr std::int32_t moe_experts_token_tile(std::int32_t tokens) {
+// every A16 expert has a single job up to T = 16, the decode and verification range. The A8
+// profile serves prefill and has only the 64-token tile.
+[[nodiscard]] constexpr std::int32_t moe_experts_token_tile(std::int32_t tokens,
+                                                            MoeActivationProfile profile) {
+    if (profile == MoeActivationProfile::A8) { return 64; }
     if (tokens <= 256) { return 16; }
     if (tokens <= 1024) { return 32; }
     return 64;
 }
 
-// Upper bound of the job count for T tokens: sum over experts of ceil(n_e / C), with at most
-// min(512, 10T) routed experts holding the 10T routed assignments, plus ceil(T / C) shared jobs.
-[[nodiscard]] constexpr std::int32_t moe_experts_max_jobs(std::int32_t tokens) {
-    const std::int32_t tile    = moe_experts_token_tile(tokens);
+// Upper bound of the job count for T tokens and token tile C: sum over experts of ceil(n_e / C),
+// with at most min(512, 10T) routed experts holding the 10T routed assignments, plus ceil(T / C)
+// shared jobs. Every term stays below 2^31 for T <= 16384.
+[[nodiscard]] constexpr std::int32_t moe_experts_max_jobs(std::int32_t tokens, std::int32_t tile) {
     const std::int32_t experts = std::min(kMoeExperts, kMoeTopK * tokens);
     return (kMoeTopK * tokens + experts * (tile - 1)) / tile + (tokens + tile - 1) / tile;
 }
@@ -55,26 +58,35 @@ struct MoeJobSchedule {
     std::int32_t next_item[kMoeMatmulLaunches];
 };
 
-// Workspace of one call, for T tokens:
-//   jobs           [moe_experts_max_jobs(T)]: the shared expert's jobs, then the routed jobs read
-//                  before the deferral wait, then the deferred experts' jobs
+// Workspace of one call, for T tokens and token tile C:
+//   jobs           [moe_experts_max_jobs(T, C)]: the shared expert's jobs, then the routed jobs
+//                  read before the deferral wait, then the deferred experts' jobs
 //   schedule       the job counts and work-item counters (MoeJobSchedule)
 //   sorted         I32 [11T]: assignment ids a = 11 t + slot, the shared expert's T assignments
 //                  first in token order, then the routed ones grouped by ascending expert and in
 //                  ascending a within an expert
 //   gated          BF16 [11T][640]: SiLU(G x) * U x of the assignment at each sorted position
 //   contributions  FP32 [11T][2560]: weight * E(x) of assignment a at row a
+// and for the A8 profile only (null for A16), the moe_activation_quantize encodings of
+//   x_codes, x_scales          E4M3 [T][2560] and FP32 [T]: x, one row per token
+//   gated_codes, gated_scales  E4M3 [11T][640] and FP32 [11T]: gated, one row per sorted position
+//                              (written for the positions the call's jobs cover)
 struct MoeExpertsWorkspace {
-    MoeJob* jobs             = nullptr;
-    MoeJobSchedule* schedule = nullptr;
-    std::int32_t* sorted     = nullptr;
-    std::uint16_t* gated     = nullptr;
-    float* contributions     = nullptr;
+    MoeJob* jobs              = nullptr;
+    MoeJobSchedule* schedule  = nullptr;
+    std::int32_t* sorted      = nullptr;
+    std::uint16_t* gated      = nullptr;
+    float* contributions      = nullptr;
+    std::uint8_t* x_codes     = nullptr;
+    float* x_scales           = nullptr;
+    std::uint8_t* gated_codes = nullptr;
+    float* gated_scales       = nullptr;
 };
 
 // Raw device operands of one call. The launcher trusts the wrapper's validation: shapes, dtypes,
-// 16-byte alignment, 1 <= tokens <= 8192, and disjointness.
+// 16-byte alignment, 1 <= tokens <= 16384, and disjointness.
 struct MoeExpertsOperands {
+    MoeActivationProfile profile          = MoeActivationProfile::A16;
     const std::uint16_t* x                = nullptr;
     const std::int32_t* expert_ids        = nullptr;
     const float* route_weights            = nullptr;
@@ -96,5 +108,10 @@ struct MoeExpertsOperands {
 
 void moe_experts_launch(const MoeExpertsOperands& operands, const MoeExpertsWorkspace& workspace,
                         cudaStream_t stream);
+
+// moe_activation_quantize of x BF16 [tokens][2560] into codes E4M3 [tokens][2560] and scales FP32
+// [tokens]; 1 <= tokens <= 16384, buffers 16-byte aligned (validated by the wrapper).
+void moe_activation_quantize_launch(const std::uint16_t* x, std::uint8_t* codes, float* scales,
+                                    std::int32_t tokens, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail
