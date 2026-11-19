@@ -88,6 +88,14 @@ std::int32_t KvExpertExtents::lent_extents() const noexcept {
     return static_cast<std::int32_t>(std::count(lent_.begin(), lent_.end(), true));
 }
 
+std::int32_t KvExpertExtents::lendable_extents() const noexcept {
+    std::int32_t count = 0;
+    for (std::size_t x = 0; x < lent_.size(); ++x) {
+        if (!lent_[x] || pool_.pages_free(extent_first_page(x), extent_pages_)) { ++count; }
+    }
+    return count;
+}
+
 void KvExpertExtents::make_room(std::uint32_t pages, ExpertResidency& cache) {
     bool borrowed = false;
     for (std::size_t x = 0; x < lent_.size() && pool_.free_pages() < pages; ++x) {

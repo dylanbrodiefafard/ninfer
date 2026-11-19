@@ -221,6 +221,11 @@ Program::Program(const LoadedModel& model, const ProgramOptions& options, Device
       residency_(model.experts(), slot_plan(model, options, state_), extents_.flex_addresses(),
                  options.calib_counts, device.stream),
 #endif
+      flex_demand_(plan_flex_demand(
+          residency_.admittable_f3_records(),
+          residency_.plan().slots[static_cast<std::size_t>(ops::MoeExpertCodec::F3G32)],
+          extents_.slots_per_extent(), extents_.extents(),
+          std::int64_t{extents_.extent_pages()} * ops::kQsaPageTokens)),
       forward_(model.view(), state_, feeder_, residency_, forward_options(model, options),
                device.stream, dflash_.get()
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER

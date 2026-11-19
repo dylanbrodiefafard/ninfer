@@ -36,6 +36,7 @@
 #include <fstream>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -867,6 +868,68 @@ void idle_timeout_suite(const Inputs& inputs) {
     std::cout << "idle timeout: no-ingress wake, latest-idle exemption and exact RAM restore\n";
 }
 
+// Idle expiry stops once the extents the expert cache can hold cover its flex demand. The pool is
+// five NVFP4 extents (244 pages) plus 100 pages, so with headroom 0 and a flex demand of the whole
+// five-extent region (checked below) the condition is five lendable extents: free pages >= 1,220
+// with every one of them in the region.
+void idle_headroom_suite(const Inputs& inputs) {
+    constexpr std::uint32_t kPoolTokens   = (5 * 244 + 100) * 64;
+    constexpr std::uint32_t kRegionTokens = 5 * 244 * 64;
+    const auto make_engine                = [&] {
+        auto options                  = engine_options(inputs, 3, 4096, kPoolTokens);
+        options.kv_ram_capacity_bytes = std::size_t{512} << 20;
+        options.kv_idle_timeout       = 1;
+        options.kv_idle_headroom      = 0;
+        return std::make_unique<ninfer::Engine>(options);
+    };
+    const auto settle = [](ninfer::Engine& engine, std::chrono::seconds window) {
+        std::this_thread::sleep_for(window);
+        return engine.runtime_stats();
+    };
+    {
+        // Three short retained lanes stay below the flex region, so all five extents are
+        // lendable: every timer expires, yet no lane is captured or released.
+        const auto engine = make_engine();
+        const auto memory = engine->memory_summary();
+        require(memory.expert_flex_region_extents == 5 && memory.expert_flex_demand_extents == 5,
+                "idle-headroom suite needs the flex demand to cover its five-extent region");
+        for (std::uint32_t seed = 281; seed < 284; ++seed) {
+            (void)reusable(*engine, prompt_tokens(512, seed));
+        }
+        const auto before = engine->runtime_stats();
+        const auto after  = settle(*engine, std::chrono::seconds(4));
+        require(after.kv_ram_captures == 0 &&
+                    after.gpu_kv_main_mapped_pages == before.gpu_kv_main_mapped_pages,
+                "idle expiry evicted although free KV covered the flex demand");
+    }
+    {
+        // Three 41-page retained lanes (123 pages) overflow the 100 pages below the region into
+        // its lowest extent, which is then not lendable. Evicting the oldest lane frees pages 0-40
+        // only; the middle lane may also have to go, but the newest (exempt) lane stays, so
+        // expiry stops with one or two captures and then no longer evicts.
+        const auto engine = make_engine();
+        const auto prompt = prompt_tokens(2560, 291);
+        (void)reusable(*engine, prompt);
+        (void)reusable(*engine, prompt_tokens(2560, 292));
+        (void)reusable(*engine, prompt_tokens(2560, 293));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (engine->runtime_stats().kv_ram_captures == 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        const auto settled = settle(*engine, std::chrono::seconds(3));
+        const auto stats   = settle(*engine, std::chrono::seconds(3));
+        require(stats.kv_ram_captures >= 1 && stats.kv_ram_captures <= 2 &&
+                    stats.kv_ram_captures == settled.kv_ram_captures &&
+                    std::uint64_t{stats.gpu_kv_main_free_pages} * 64 >= kRegionTokens,
+                "idle expiry did not stop once the cache's flex demand was covered");
+        const auto restored = reusable(*engine, prompt);
+        require(restored.prefix_reuse_source == ninfer::PrefixReuseSource::HostRam,
+                "the oldest lane was not the one evicted to RAM");
+    }
+    std::cout << "idle headroom: no eviction while demand is covered, eviction stops once it is\n";
+}
+
 void retained_suite(const Inputs& inputs) {
     std::size_t cold_token_mismatches = 0;
     ninfer::Engine engine(engine_options(inputs, 4, 55000, 55000));
@@ -1601,6 +1664,8 @@ int main(int argc, char** argv) {
             helper_smoke(inputs, pci);
         } else if (mode == "--idle-timeout") {
             idle_timeout_suite(inputs);
+        } else if (mode == "--idle-headroom") {
+            idle_headroom_suite(inputs);
         } else if (mode == "--flex-refill") {
             flex_refill_parity(inputs);
         } else if (mode == "--program-parity") {
@@ -1649,7 +1714,7 @@ int main(int argc, char** argv) {
                    "--dflash-engine|--retained|--dflash-retained|--ram-tiers|--disk-tiers|"
                    "--live-tiers|--dflash-ram-tiers|--dflash-disk-tiers|--dflash-live-tiers|"
                    "--conversation-bench|--conversation-ram-bench|--mixer-split-diagnostic|--flex-"
-                   "refill|--idle-timeout]\n";
+                   "refill|--idle-timeout|--idle-headroom]\n";
             return 2;
         }
         return 0;

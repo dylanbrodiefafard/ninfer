@@ -25,6 +25,7 @@ struct Options {
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::automatic();
     std::optional<std::uint32_t> kv_idle_timeout;
+    std::optional<std::uint32_t> kv_idle_headroom;
     std::size_t kv_ram_capacity_bytes   = 0;
     std::uint32_t kv_ram_system_prompts = 0;
     std::size_t kv_disk_capacity_bytes  = 0;

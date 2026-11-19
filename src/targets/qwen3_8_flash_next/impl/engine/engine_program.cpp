@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <limits>
 #include <fstream>
+#include <iostream>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -157,9 +158,24 @@ public:
           image_slots(options.kv_ram_capacity_bytes == 0 ? 2U : 3U),
           program(model, program_options, context),
           idle_lanes(std::chrono::seconds(resolve_kv_idle_timeout(
-              options.kv_idle_timeout, options.kv_ram_capacity_bytes, Package::model_id))) {
+              options.kv_idle_timeout, options.kv_ram_capacity_bytes, Package::model_id))),
+          idle_headroom_tokens(
+              resolve_kv_idle_headroom(options.kv_idle_headroom, options.kv_idle_timeout,
+                                       options.kv_ram_capacity_bytes, Package::model_id)),
+          idle_headroom_extents(0) {
         if (program.lanes() != static_cast<std::int32_t>(options.max_concurrency)) {
             throw std::logic_error("qwen3.8-flash-next Program lanes differ from the Engine's");
+        }
+        const std::int64_t extent_tokens =
+            std::int64_t{program.extents().extent_pages()} * ops::kQsaPageTokens;
+        idle_headroom_extents = (idle_headroom_tokens + extent_tokens - 1) / extent_tokens;
+        if (idle_lanes.enabled()) {
+            const FlexDemand& demand = program.flex_demand();
+            std::clog << "idle KV eviction: expert cache flex demand " << demand.slots
+                      << " F3 records = " << demand.extents << " extents = " << demand.tokens
+                      << " KV tokens, headroom " << idle_headroom_tokens
+                      << " tokens = " << idle_headroom_extents << " extents of " << extent_tokens
+                      << " tokens, flex region " << program.extents().extents() << " extents\n";
         }
         const std::size_t image_bytes = program.state().continuation_bytes();
         const std::size_t slab_bytes =
@@ -745,6 +761,11 @@ public:
     bool tiers_shutdown            = false;
     CudaEvent copy_cancel{cudaEventDisableTiming};
     runtime::IdleLanePolicy idle_lanes;
+    // Idle expiry runs only while the extents the expert cache can hold are fewer than its flex
+    // demand plus this headroom, the option's tokens rounded up to whole extents
+    // (runtime::idle_eviction_needed).
+    std::int64_t idle_headroom_tokens;
+    std::int64_t idle_headroom_extents;
     // A two-phase expiry claims its complete RAM image until release or lane activity.
     std::array<std::uint64_t, kMaximumConcurrency> idle_capture_ids{};
     std::uint64_t use_tick = 0;
@@ -1494,8 +1515,11 @@ std::optional<Clock::time_point> EngineProgram::idle_lane_deadline() const {
 }
 
 std::optional<std::uint32_t> EngineProgram::expire_idle_lane() {
-    const auto now     = Clock::now();
-    const auto expired = impl_->idle_lanes.expired(now);
+    const auto now             = Clock::now();
+    const bool eviction_needed = runtime::idle_eviction_needed(
+        impl_->program.extents().lendable_extents(), impl_->program.flex_demand().extents,
+        impl_->idle_headroom_extents);
+    const auto expired = impl_->idle_lanes.due(now, eviction_needed);
     if (!expired) { return std::nullopt; }
     const auto lane = expired->lane;
     if (!has_retained_lane(lane)) {
@@ -1577,11 +1601,14 @@ MemorySummary EngineProgram::memory_summary() const noexcept {
     out.sequence = ArenaMemorySummary{memory.state_bytes, memory.state_bytes, memory.state_bytes};
     // The prefill streaming windows borrow expert-cache slots (ProgramMemory::window_bytes lies
     // inside expert_cache_bytes), so they are not workspace.
-    const std::size_t workspace = memory.activation_bytes + memory.workspace_bytes;
-    out.workspace               = ArenaMemorySummary{workspace, workspace, workspace};
-    out.kv_payload_bytes        = memory.state_bytes;
-    out.expert_cache_bytes      = memory.expert_cache_bytes;
-    out.expert_cache_flex_bytes = memory.flex_cache_bytes;
+    const std::size_t workspace    = memory.activation_bytes + memory.workspace_bytes;
+    out.workspace                  = ArenaMemorySummary{workspace, workspace, workspace};
+    out.kv_payload_bytes           = memory.state_bytes;
+    out.expert_cache_bytes         = memory.expert_cache_bytes;
+    out.expert_cache_flex_bytes    = memory.flex_cache_bytes;
+    out.expert_flex_region_extents = static_cast<std::uint32_t>(impl_->program.extents().extents());
+    out.expert_flex_demand_extents =
+        static_cast<std::uint32_t>(impl_->program.flex_demand().extents);
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
     if (memory.helper) {
         const auto& helper = *memory.helper;

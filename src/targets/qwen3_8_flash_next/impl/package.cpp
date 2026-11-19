@@ -52,6 +52,8 @@ void Package::validate_options(const EngineOptions& options) {
     validate_expert_helper_option(options.expert_helper_pci, model_id);
     validate_speculative_options(options.speculative);
     (void)resolve_kv_idle_timeout(options.kv_idle_timeout, options.kv_ram_capacity_bytes, model_id);
+    (void)resolve_kv_idle_headroom(options.kv_idle_headroom, options.kv_idle_timeout,
+                                   options.kv_ram_capacity_bytes, model_id);
     if (options.kv_ram_system_prompts != 0 && options.kv_ram_capacity_bytes == 0) {
         throw std::invalid_argument("--kv-ram-system-prompts requires --kv-ram-capacity");
     }

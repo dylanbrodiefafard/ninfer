@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 int main() {
     using namespace ninfer;
@@ -39,6 +40,31 @@ int main() {
             (void)resolve_kv_idle_timeout(5, 1024, "qwen3.8-27b");
         } catch (const std::invalid_argument&) { wrong_identity = true; }
         if (!wrong_identity) { throw std::runtime_error("27B accepted RAM-on idle timeout"); }
+
+        using targets::resolve_kv_idle_headroom;
+        if (resolve_kv_idle_headroom({}, {}, 1024, "qwen3.8-flash-next") != 200000 ||
+            resolve_kv_idle_headroom({}, {}, 0, "qwen3.8-27b") != 200000 ||
+            resolve_kv_idle_headroom(0, {}, 1024, "qwen3.8-flash-next") != 0 ||
+            resolve_kv_idle_headroom(5, 7, 1024, "qwen3.8-flash-next") != 5) {
+            throw std::runtime_error("idle headroom default or explicit value is incorrect");
+        }
+        for (const auto& startup :
+             {std::tuple<const char*, std::optional<std::uint32_t>, std::size_t>{
+                  "qwen3.8-flash-next", std::nullopt, 0}, // RAM off: no timeout
+              {"qwen3.8-flash-next", 0U, 1024},           // timeout disabled
+              {"qwen3.8-27b", std::nullopt, 0}}) {
+            bool rejected = false;
+            try {
+                (void)resolve_kv_idle_headroom(5, std::get<1>(startup), std::get<2>(startup),
+                                               std::get<0>(startup));
+            } catch (const std::invalid_argument& error) {
+                rejected =
+                    std::string(error.what()).find("--kv-idle-headroom") != std::string::npos;
+            }
+            if (!rejected) {
+                throw std::runtime_error("idle headroom accepted unsupported startup");
+            }
+        }
 
         Json directory  = {{"identity", {{"model_id", "qwen3.8-27b"}, {"weights_id", "nvfp4"}}},
                            {"objects", Json::array({{{"name", "tokenizer"},

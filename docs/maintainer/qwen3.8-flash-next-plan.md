@@ -1583,6 +1583,17 @@ design serves. The Op takes any geometry, so the target chooses.
   timeout without promoting idle recency. Admission preservation does not reset idle timers.
   Deadline maintenance clears cache-idle before tier work. The executor waits even without
   ingress, rather than requiring admission pressure.
+- Expiry is useful only while it frees KV the expert cache needs. Flex demand is
+  `ceil(max(0, admittable F3 records - fixed F3 slots) / S)` extents, bounded by the X flex-region
+  extents, times the extent tokens (NVFP4 244 pages = 15,616 tokens, S = 84; BF16 122 pages =
+  7,808 tokens, S = 108). It is computed once at startup from the admission domain (all F3 records,
+  or the helper placement's local set, which later tail pinning narrows) and the fixed F3 slots
+  that domain may use, and logged with the headroom. A non-capturing expired lane is evicted only
+  while no lane is capturing and `lendable_extents < demand extents + ceil(headroom / extent
+  tokens)` (headroom default 200,000 tokens). Lendable extents are the cache-held extents plus
+  lent-back extents whose pages are all free, so free pages below the region and in partly
+  mapped extents do not count; otherwise the lane stays retained and the condition is rechecked
+  at every boundary and at least once per second.
 - Once all nonexempt idle originals successfully migrate and disposable state is released,
   only active lanes and the exempt lane can pin top-region pages. RAM funding failures retain
   older idle owners until a successful retry or admission-pressure eviction. This is an owner bound, not a claim that

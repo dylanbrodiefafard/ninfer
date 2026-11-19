@@ -111,7 +111,8 @@ answers:
 - **Lanes.** Executor lanes map to the Program lanes `open_lane` returns. Completed reusable
   state remains bound to its idle executor lane at an exact current or saved rewrite/occupy
   frontier. RAM-on retention has `--kv-idle-timeout` (default 30 seconds; 0 disables), exempting
-  the most recently idle retained lane. Expiry saves complete ordinary originals to RAM and
+  the most recently idle retained lane, and expires lanes only while demand requires it (§6.4).
+  Expiry saves complete ordinary originals to RAM and
   releases disposable state at a safe boundary; active requests keep their state unchanged.
 - **Prefill.** One prefill step appends one super-chunk (16,384 tokens, layer-major over
   `--prefill-chunk` sub-chunks); it is the target's only interruption unit. Shared pace (§7.3)
@@ -1173,6 +1174,22 @@ prefill/decode schedule and compact batch formation.
 the request settles and its lane becomes retained-idle, never at admission. Any reattachment or
 disposable fork cancels it; becoming idle again starts a fresh timer and recency sequence. The
 most recently idle currently retained lane is always exempt, including equal clock ticks.
+
+Expiry is demand-based, in whole KV extents. `Program::flex_demand()` is static: the F3 records
+the residency may admit (`ExpertResidency::admittable_f3_records`), minus the fixed F3 slots,
+rounded up to extents (NVFP4: 84 slots per 244-page, 15,616-token extent) and bounded by the flex
+region; NVFP4 records cannot use flex slots, and a helper placement changes only the admittable
+set. At every boundary `KvExpertExtents::lendable_extents()` counts the extents the cache can
+hold now: cache-held ones and lent-back ones whose pages are all free. Free pages below the
+region or in partly mapped extents (`kv_free_tokens` counts them) are not lendable. A lane that
+is not yet capturing starts an expiry only while no lane is capturing and
+`lendable_extents < flex_demand.extents + ceil(--kv-idle-headroom / extent tokens)` (default
+200000 tokens; 0 stops once the demand is covered; an explicit value requires an enabled
+timeout). Otherwise it stays retained with its timer expired, no capture or close is issued, and
+the policy pushes its wake-up out by one second instead of spinning (a lane becoming idle or
+active clears that push); any later boundary where the condition holds evicts the oldest expired
+lane. A lane already in its capture phase is processed first and closes regardless of the
+condition.
 
 At each safe scheduler boundary, expiry migrates an ordinary original through the complete-state
 RAM preservation path, bypassing preserve-off rewrite cutting, or releases disposable idle state.

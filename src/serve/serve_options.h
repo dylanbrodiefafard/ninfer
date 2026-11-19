@@ -39,6 +39,7 @@ struct ServeOptions {
     std::uint32_t mixed_forward_rounds     = 12;
     std::uint32_t mixed_forward_min_tokens = 4096;
     std::optional<std::uint32_t> kv_idle_timeout;
+    std::optional<std::uint32_t> kv_idle_headroom;
     std::size_t kv_ram_capacity_bytes   = 0;
     std::uint32_t kv_ram_system_prompts = 0;
     std::size_t kv_disk_capacity_bytes  = 0;

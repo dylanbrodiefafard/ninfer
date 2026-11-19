@@ -572,8 +572,10 @@ disposable state. The most recently idle retained lane is exempt; activity cance
 becoming idle restarts it. Ordinary expiry captures continuation and pages on the copy stream,
 retaining the source and claiming its RAM image until a later boundary observes completion.
 Other decoding lanes never wait on that D2H. A failed capture keeps its source resident and retries
-after a full timeout, without changing idle recency. Once all nonexempt idle originals migrate
-successfully and disposable state is released, only active lanes and the exempt lane can pin
+after a full timeout, without changing idle recency. Expiry starts only while
+the lendable extents (`KvExpertExtents::lendable_extents`) are fewer than the expert cache's flex
+demand plus `--kv-idle-headroom` in extents (concurrent-inference-architecture.md, §6.4). Once
+all nonexempt idle originals migrate successfully and disposable state is released, only active lanes and the exempt lane can pin
 pages in the top extent region; failed RAM funding can keep older idle owners resident.
 Whole free extents return highest first, retaining one spare extent of free KV pages as hysteresis.
 The bound is on owners, not one contiguous run or one fragmented extent per lane. Active lanes

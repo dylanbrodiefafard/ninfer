@@ -94,6 +94,9 @@ ninfer_add_test(ninfer_flash_next_ple_feeder_test
 ninfer_add_test(ninfer_flash_next_speculative_policy_test
   SOURCES targets/qwen3_8_flash_next/test_speculative_policy.cpp
   LIBRARIES ninfer_qwen3_8_flash_next)
+ninfer_add_test(ninfer_flash_next_flex_demand_test
+  SOURCES targets/qwen3_8_flash_next/test_flex_demand.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next)
 ninfer_add_test(ninfer_flash_next_state_test
   SOURCES targets/qwen3_8_flash_next/test_state.cpp
   LIBRARIES ninfer_qwen3_8_flash_next)
@@ -124,7 +127,7 @@ add_test(NAME ninfer_qwen3_8_flash_next_program_parity_real_test
     $<TARGET_FILE:ninfer_qwen3_8_flash_next_engine_real_test> --program-parity)
 set_tests_properties(ninfer_qwen3_8_flash_next_program_parity_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
-foreach(mode IN ITEMS retained reuse-parity ram-tiers disk-tiers live-tiers idle-timeout flex-refill)
+foreach(mode IN ITEMS retained reuse-parity ram-tiers disk-tiers live-tiers idle-timeout idle-headroom flex-refill)
   string(REPLACE "-" "_" test_mode "${mode}")
   add_test(NAME ninfer_qwen3_8_flash_next_${test_mode}_real_test
     COMMAND ${NINFER_TEST_LAUNCHER}

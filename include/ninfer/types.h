@@ -192,6 +192,11 @@ struct EngineOptions {
     // Flash-Next retained-idle eviction to RAM, in seconds. Unset selects 30 with RAM enabled,
     // otherwise 0. Explicit nonzero values require Flash-Next and the RAM tier; 0 disables it.
     std::optional<std::uint32_t> kv_idle_timeout;
+    // Flash-Next idle expiry stops once the KV extents the expert cache can hold cover its flex
+    // demand plus this headroom in tokens, rounded up to whole extents. Unset selects 200000; 0
+    // evicts only to cover the demand.
+    // An explicit value requires Flash-Next and an enabled idle timeout.
+    std::optional<std::uint32_t> kv_idle_headroom;
     std::size_t kv_ram_capacity_bytes = 0;
     // Retained system prefixes share the RAM budget; zero disables capture.
     std::uint32_t kv_ram_system_prompts = 0;
@@ -839,6 +844,11 @@ struct MemorySummary {
     // second lies inside kv_payload_bytes and is an upper bound, not the current holding.
     std::size_t expert_cache_bytes      = 0;
     std::size_t expert_cache_flex_bytes = 0;
+    // Flash-Next flex region of the KV pool and the cache's static demand for it, in extents
+    // (0 otherwise): the extents the pool can lend, and those that hold the admittable F3
+    // records beyond the fixed slots, bounded by the region.
+    std::uint32_t expert_flex_region_extents = 0;
+    std::uint32_t expert_flex_demand_extents = 0;
     // Absent when the helper is disabled, in either build configuration.
     std::optional<ExpertHelperMemorySummary> expert_helper;
     // Pinned host memory for checkpoint images (per-lane rewrite images plus the

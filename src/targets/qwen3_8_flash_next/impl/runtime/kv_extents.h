@@ -89,6 +89,10 @@ public:
     [[nodiscard]] bool lent(std::int32_t extent) const;
     [[nodiscard]] std::int32_t lent_extents() const noexcept;
 
+    // Extents the cache can hold now: CacheHeld ones, and KvLent ones whose pages are all free.
+    // Free pages below the flex region and in partly mapped extents are not lendable.
+    [[nodiscard]] std::int32_t lendable_extents() const noexcept;
+
     // Takes CacheHeld extents back, lowest first (the one nearest the KV frontier), until the pool
     // has at least `pages` free pages or every extent is lent. Free plus withheld pages cover
     // every materialization the pool's entitlement admits, so a shortfall remains only for growth

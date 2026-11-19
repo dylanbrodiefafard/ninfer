@@ -214,6 +214,12 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
                                     "aligned");
     }
     flex_slots_ = static_cast<std::int32_t>(flex_addresses.size());
+    for (std::size_t entry = 0; entry < experts; ++entry) {
+        // Bit 0 of a host address is the record's codec tag.
+        if (eligible(entry) && (store.device_addresses()[entry] & 1U) == kFlexTag) {
+            ++admittable_f3_records_;
+        }
+    }
 
     // Ordinary calibration retains its fixed+flex ordering; full eligible coverage is warmed
     // into fixed storage so later KV reservation cannot evict it from initially idle extents.

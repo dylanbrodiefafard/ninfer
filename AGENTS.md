@@ -89,7 +89,10 @@ them. It serves one to twelve requests under the same Engine scheduling, interru
 at 16,384-token super-chunk boundaries, and retains idle lanes for exact-prefix reuse at the current
 frontier or a complete saved rewrite/occupy checkpoint. With RAM enabled, Flash-Next evicts idle
 retention to complete-state RAM after `--kv-idle-timeout` seconds (default 30; 0 disables), exempting
-the most recently idle lane; disposable idle state is released without persistence. Ordinary
+the most recently idle lane, and only while the KV extents the expert cache can hold (lendable)
+are fewer than its flex demand (admittable F3 records beyond the fixed F3 slots, in whole
+extents) plus `--kv-idle-headroom` tokens (default 200000, rounded up to extents); disposable
+idle state is released without persistence. Ordinary
 expiry retains its source through asynchronous complete-state D2H and releases it only at a later
 completed-copy boundary. Failed RAM captures keep the lane and retry after a full timeout without
 changing idle recency. Lowest-free page allocation leaves whole top extents lendable, and returned

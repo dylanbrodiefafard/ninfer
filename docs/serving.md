@@ -887,6 +887,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or automatic sizing from remaining GPU memory | `auto` |
 | `--kv-ram-capacity off\|N` | pinned host capacity in MiB for prefixes and live suspension; enables output windows up to 8192 tokens | `off` |
 | `--kv-idle-timeout SECONDS` | Flash-Next RAM tier: timeout retained idle lanes except the most recently idle lane; ordinary state migrates complete to RAM and disposable state is released; `0` disables | `30` with Flash-Next RAM enabled; otherwise `0` |
+| `--kv-idle-headroom TOKENS` | Flash-Next idle expiry continues only while the expert cache's lendable KV extents are fewer than its flex demand plus this headroom (rounded up to extents); `0` evicts only to cover the demand; requires an enabled idle timeout | `200000` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache pack-file capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
 | `--kv-disk-compress off\|zstd` | zstd-1 on new GDN/hidden/cyclic writes; KV pages stay uncompressed | `off` |
@@ -1295,6 +1296,10 @@ or spilled to disk. A joint completion guarantee or image credit funds every adm
 finite RAM can still limit concurrency. RAM off retains full-lifetime GPU reservation.
 
 `--kv-idle-timeout SECONDS` requires Flash-Next and a RAM tier for any explicit nonzero value.
+Expiry runs only while the extents the expert cache can hold (lendable: held by the cache or
+fully free) are fewer than its flex demand plus `--kv-idle-headroom` rounded up to extents
+(default 200000 tokens; an explicit value requires an enabled timeout). Lanes held back stay
+retained and are rechecked at every boundary, and one expiry captures at a time.
 Its timer starts at request settlement, is cancelled by lane reuse or a disposable fork, and
 restarts when the lane becomes idle again. The most recently idle retained lane is exempt.
 Deadline wake-ups work without ingress and never interrupt a GPU unit. Complete-original RAM

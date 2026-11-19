@@ -192,10 +192,18 @@ public:
     // The F3 pool's flex slots.
     [[nodiscard]] std::int32_t flex_slots() const noexcept { return flex_slots_; }
 
+    // F3 records the residency may admit: every F3 record, or those set in local_eligibility.
+    // The F3 records beyond plan().slots of F3 can be resident only in flex slots, and NVFP4
+    // records never use them.
+    [[nodiscard]] std::int64_t admittable_f3_records() const noexcept {
+        return admittable_f3_records_;
+    }
+
 private:
     std::int32_t layers_ = 0;
     ExpertSlotPlan plan_;
-    std::int32_t flex_slots_ = 0;
+    std::int32_t flex_slots_            = 0;
+    std::int64_t admittable_f3_records_ = 0;
     std::array<DeviceBuffer, ops::kMoeCacheCodecTags> slots_;
     // Tables (each layer column 4096-byte aligned), the slot index, hands, the flex address table,
     // and per-pool owner and reference arrays (fixed and flex slots), carved once from metadata_.

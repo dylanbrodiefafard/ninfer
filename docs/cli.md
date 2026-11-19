@@ -160,6 +160,7 @@ The RTX 5090 tree investigation is in
 | `--kv-capacity-headroom MiB` | device memory `--kv-capacity auto` leaves free; requires `auto` | `32` |
 | `--kv-ram-capacity off\|N` | pinned host capacity in MiB for prefixes and live suspension; enables output windows up to 8192 tokens | `off` |
 | `--kv-idle-timeout SECONDS` | Flash-Next RAM tier: evict retained idle lanes after this many seconds, except the most recently idle lane; `0` disables | `30` with Flash-Next RAM enabled; otherwise `0` |
+| `--kv-idle-headroom TOKENS` | Flash-Next idle expiry stops once the expert cache can hold its flex demand plus this many tokens of KV extents (rounded up to whole extents); `0` evicts only to cover the demand; requires an enabled idle timeout | `200000` |
 | `--kv-ram-system-prompts N` | Retain up to N rendered system prefixes inside the RAM budget; nonzero requires RAM capacity | `0` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache pack-file capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
@@ -374,6 +375,16 @@ until a later boundary observes the complete copy, without stalling decoding lan
 Failed/deferred captures keep the source and retry after a full timeout without changing idle
 recency; admission preservation is not lane activity. `0` disables timeout
 eviction. Explicit nonzero values require both Flash-Next and `--kv-ram-capacity`.
+Expiry is demand-based and counted in whole KV extents. The flex demand is the number of
+admittable F3 expert records beyond the fixed F3 slots, rounded up to extents (NVFP4: 84 records
+per 15,616-token extent) and bounded by the flex region. An expired lane is captured only while
+the lendable extents (those the expert cache holds, or whose pages are all free) are fewer than
+the demand plus `--kv-idle-headroom TOKENS` rounded up to extents (default 200000; `0` stops as
+soon as the demand is covered). Free pages below the region or inside partly mapped extents do
+not count. Otherwise expired lanes stay retained, and they become evictable again at any
+boundary where the condition holds; one expiry captures at a time. An explicit
+`--kv-idle-headroom` requires Flash-Next and an enabled idle timeout. Startup logs the demand
+(records, extents, tokens), the headroom and the flex region.
 `cache_write: false` forks into independent allocations without consuming the source;
 without a spare lane or secured RAM that can preserve the original, admission reports overload.
 Disposable retained state is evicted before ordinary state. `--kv-ram-capacity` and the inclusive
