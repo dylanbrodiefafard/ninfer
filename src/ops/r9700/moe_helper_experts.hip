@@ -1138,12 +1138,30 @@ void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorksp
         reject("max_tokens " + std::to_string(max_tokens) + " exceeds the workspace's " +
                std::to_string(workspace.max_tokens()));
     }
-    if (args.tokens == nullptr || args.x == nullptr || args.routes == nullptr ||
-        args.bank.expert_table == nullptr || args.bank.matrix_scales == nullptr ||
-        args.y == nullptr) {
+    if (args.tokens == nullptr || args.routes == nullptr || args.bank.expert_table == nullptr ||
+        args.bank.matrix_scales == nullptr || args.y == nullptr) {
         reject("null operand");
     }
-    if (!aligned(args.tokens, 4) || !aligned(args.x, 16) || !aligned(args.routes, 8) ||
+    const bool a8 = args.activation == MoeHelperActivationProfile::A8;
+    switch (args.activation) {
+    case MoeHelperActivationProfile::A16:
+        if (args.x == nullptr) { reject("A16 requires x"); }
+        if (args.x_e4m3.codes != nullptr || args.x_e4m3.scales != nullptr) {
+            reject("A16 takes no x_e4m3");
+        }
+        break;
+    case MoeHelperActivationProfile::A8:
+        if (max_tokens <= kMoeHelperMaxTokens) { reject("A8 requires max_tokens > 48"); }
+        if (args.x_e4m3.codes == nullptr || args.x_e4m3.scales == nullptr) {
+            reject("A8 requires x_e4m3 codes and scales");
+        }
+        if (args.x != nullptr) { reject("A8 takes no x"); }
+        break;
+    default:
+        reject("invalid activation profile");
+    }
+    if (!aligned(args.tokens, 4) || !aligned(args.x, 16) || !aligned(args.x_e4m3.codes, 16) ||
+        !aligned(args.x_e4m3.scales, 4) || !aligned(args.routes, 8) ||
         !aligned(args.bank.expert_table, 8) || !aligned(args.bank.matrix_scales, 4) ||
         !aligned(args.y, 16)) {
         reject("misaligned operand");
@@ -1164,7 +1182,9 @@ void moe_helper_experts(const MoeHelperExpertsArgs& args, MoeHelperExpertsWorksp
     const Span y{args.y, rows * kMoeHidden * output_bytes};
     const Span inputs[] = {
         {args.tokens, sizeof(std::int32_t)},
-        {args.x, rows * kMoeHidden * sizeof(std::uint16_t)},
+        a8 ? Span{args.x_e4m3.codes, rows * kMoeHidden}
+           : Span{args.x, rows * kMoeHidden * sizeof(std::uint16_t)},
+        {a8 ? args.x_e4m3.scales : nullptr, a8 ? rows * sizeof(float) : 0},
         {args.routes, rows * kRoutes * sizeof(MoeHelperRoute)},
         {args.bank.expert_table, kMoeHelperExperts * sizeof(std::uint64_t)},
         {args.bank.matrix_scales, kMoeHelperExperts * 3 * sizeof(float)},

@@ -29,4 +29,17 @@ namespace ninfer::ops::detail {
 void moe_helper_experts_grouped(const MoeHelperExpertsArgs& args, std::byte* region,
                                 std::int32_t capacity, int device, hipStream_t stream);
 
+/**
+ * The A8 profile's quantization of the down-projection input, as the route enqueues it: for each
+ * row r < min(*rows, capacity), capacity in [1, 10 kMoeHelperExpertsMaxTokens] (the route's
+ * entries; 32-bit element offsets), of x (BF16 bits [capacity][640], 8-byte aligned), writes the
+ * row's E4M3 codes to codes[r][0..640) (4-byte aligned) and its FP32 scale to scales[r] by the rule
+ * MoeHelperE4m3Rows documents. `rows` (U32 [1]) is read on the device when the kernel executes;
+ * rows at or past it are not written. Enqueued on `stream` of `device` (current); throws
+ * std::runtime_error when the launch fails. The buffers must be disjoint.
+ */
+void moe_helper_quantize_rows(const std::uint16_t* x, const std::uint32_t* rows,
+                              std::int32_t capacity, std::uint8_t* codes, float* scales, int device,
+                              hipStream_t stream);
+
 } // namespace ninfer::ops::detail

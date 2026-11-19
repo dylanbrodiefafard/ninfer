@@ -2,8 +2,8 @@
 
 // Private gfx1201 primitives shared by the moe_helper_experts routes
 // (ninfer/ops/moe_helper_experts.h): LDS and wave synchronization, record loads, the exact E4M3
-// decode, BF16 rounding, SiLU, the wave32 BF16 WMMA, and launch-error reporting. Included only by
-// HIP translation units of src/ops/r9700.
+// decode, the A8 profile's E4M3 encode, BF16 rounding, SiLU, the wave32 BF16 and FP8 WMMA, and
+// launch-error reporting. Included only by HIP translation units of src/ops/r9700.
 
 #include <hip/hip_runtime.h>
 
@@ -65,6 +65,26 @@ using WmmaF32  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
 __device__ __forceinline__ WmmaF32 wmma(const WmmaBf16& a, const WmmaBf16& b, const WmmaF32& c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+}
+
+// gfx12 wave32 WMMA 16x16x16 E4M3 x E4M3 -> FP32. Lane l holds A row l % 16 and B column l % 16
+// at eight K (eight bytes) of K half l / 16, and D is laid out as for BF16. Every lane's byte i of
+// A and of B covers the same K, so any K permutation applied to both operands gives the same sum.
+using WmmaFp8 = int __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ WmmaF32 wmma_fp8(const WmmaFp8& a, const WmmaFp8& b, const WmmaF32& c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c);
+}
+
+// The A8 profile's code of a finite quotient v = x / s: E4M3FN round to nearest even, saturating
+// to +-448. fmed3 clamps |v| to 448 (exact in E4M3), so v_cvt_pk_fp8_f32's RNE never reaches the
+// NaN encoding; the sign of zero and of underflow to zero is kept (0x80 for negative). Byte 0 of
+// the result holds the code of `low`, byte 1 that of `high`.
+__device__ __forceinline__ std::uint32_t e4m3_pair(float low, float high) {
+    return static_cast<std::uint32_t>(__builtin_amdgcn_cvt_pk_fp8_f32(
+               __builtin_amdgcn_fmed3f(low, 448.0F, -448.0F),
+               __builtin_amdgcn_fmed3f(high, 448.0F, -448.0F), 0, false)) &
+           0xFFFFU;
 }
 
 // Round to nearest even; the inputs are finite.
