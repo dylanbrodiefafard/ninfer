@@ -14,9 +14,13 @@
 //                 token (about 2.2 active entries per token), drawn without repetition in the
 //                 token by log-normal expert popularity (sigma 0.5); other slots are inactive.
 //   skewed        helper with popularity sigma 1.5: a few experts receive hundreds of tokens.
+// --activation a8 times the A8 profile (prefill extents only), whose x is E4M3 rows; a16 (the
+// default) BF16 x. Before timing, every route set runs kWarmupRounds times, so the timed calls see
+// warm clocks and touched workspace pages also at large T.
 //
 //   ninfer_moe_helper_experts_bench [--codec f3|nvfp4|mixed]
-//       [--routing all|concentrated|helper|skewed] [--output fp32|bf16] [--tokens T ...]
+//       [--routing all|concentrated|helper|skewed] [--output fp32|bf16] [--activation a16|a8]
+//       [--tokens T ...]
 #include "ninfer/ops/moe_helper_experts.h"
 
 #include <hip/hip_runtime.h>
@@ -38,8 +42,9 @@ namespace {
 
 using namespace ninfer::ops;
 
-constexpr int kRouteSets  = 8;
-constexpr int kIterations = 40; // timed calls per route set up to T = 256, fewer above
+constexpr int kRouteSets    = 8;
+constexpr int kIterations   = 40; // timed calls per route set up to T = 256, fewer above
+constexpr int kWarmupRounds = 3;
 
 void hip_check(hipError_t status, const char* what) {
     if (status != hipSuccess) {
@@ -112,6 +117,7 @@ int main_impl(int argc, char** argv) {
     std::string codec_mode            = "f3";
     std::string routing               = "all";
     MoeHelperOutputDtype output_dtype = MoeHelperOutputDtype::Fp32;
+    MoeHelperActivationProfile profile = MoeHelperActivationProfile::A16;
     std::vector<int> extents;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -126,12 +132,18 @@ int main_impl(int argc, char** argv) {
             }
             output_dtype =
                 dtype == "bf16" ? MoeHelperOutputDtype::Bf16 : MoeHelperOutputDtype::Fp32;
+        } else if (arg == "--activation" && i + 1 < argc) {
+            const std::string name = argv[++i];
+            if (name != "a16" && name != "a8") {
+                throw std::invalid_argument("activation must be a16 or a8");
+            }
+            profile = name == "a8" ? MoeHelperActivationProfile::A8 : MoeHelperActivationProfile::A16;
         } else if (arg == "--tokens" && i + 1 < argc) {
             extents.push_back(std::stoi(argv[++i]));
         } else {
             std::cerr << "usage: " << argv[0]
                       << " [--codec f3|nvfp4|mixed] [--routing all|concentrated|helper|skewed]"
-                         " [--output fp32|bf16] [--tokens T ...]\n";
+                         " [--output fp32|bf16] [--activation a16|a8] [--tokens T ...]\n";
             return 2;
         }
     }
@@ -193,12 +205,20 @@ int main_impl(int argc, char** argv) {
     const DeviceArray<std::uint16_t> x_buffer(rows * kMoeHidden);
     const DeviceArray<float> y_buffer(rows * kMoeHidden);
     const DeviceArray<std::int32_t> n_buffer(1);
+    const DeviceArray<std::uint8_t> codes_buffer(rows * kMoeHidden);
+    const DeviceArray<float> x_scales_buffer(rows);
     std::uint16_t* x = x_buffer.get();
     float* y         = y_buffer.get();
     std::int32_t* n  = n_buffer.get();
     {
-        std::vector<std::uint16_t> host(static_cast<std::size_t>(max_extent) * kMoeHidden, 0x3F00);
+        // x = 0.5 in both forms: BF16 0x3F00, or E4M3 0x30 with row scale 1.
+        std::vector<std::uint16_t> host(rows * kMoeHidden, 0x3F00);
         hip_check(hipMemcpy(x, host.data(), host.size() * 2, hipMemcpyHostToDevice), "x");
+        hip_check(hipMemset(codes_buffer.get(), 0x30, rows * kMoeHidden), "x codes");
+        const std::vector<float> ones(rows, 1.0F);
+        hip_check(hipMemcpy(x_scales_buffer.get(), ones.data(), rows * sizeof(float),
+                            hipMemcpyHostToDevice),
+                  "x scales");
     }
     const DeviceArray<MoeHelperRoute> routes_buffer(kRouteSets * rows * kMoeHelperRoutesPerToken);
     MoeHelperRoute* routes = routes_buffer.get();
@@ -217,8 +237,9 @@ int main_impl(int argc, char** argv) {
     hip_check(hipGetDeviceProperties(&properties, device), "properties");
     const int read_grid = properties.multiProcessorCount * 16;
 
-    std::printf("codec=%s routing=%s output=%s\n", codec_mode.c_str(), routing.c_str(),
-                output_dtype == MoeHelperOutputDtype::Bf16 ? "bf16" : "fp32");
+    std::printf("codec=%s routing=%s output=%s activation=%s\n", codec_mode.c_str(),
+                routing.c_str(), output_dtype == MoeHelperOutputDtype::Bf16 ? "bf16" : "fp32",
+                profile == MoeHelperActivationProfile::A8 ? "a8" : "a16");
     std::printf("%5s %8s %9s %10s %10s %9s %9s %10s %7s %9s\n", "T", "entries", "distinct",
                 "MB/call", "op_us", "TFLOP/s", "op_GB/s", "read_us", "of_roof", "N0_us");
     for (const int tokens : extents) {
@@ -326,7 +347,12 @@ int main_impl(int argc, char** argv) {
             MoeHelperExpertsArgs args;
             args.tokens     = n;
             args.max_tokens = tokens;
-            args.x          = x;
+            args.activation = profile;
+            if (profile == MoeHelperActivationProfile::A8) {
+                args.x_e4m3 = {codes_buffer.get(), x_scales_buffer.get()};
+            } else {
+                args.x = x;
+            }
             args.routes =
                 routes + static_cast<std::size_t>(s) * max_extent * kMoeHelperRoutesPerToken;
             args.bank.expert_table  = table_device;
@@ -344,7 +370,7 @@ int main_impl(int argc, char** argv) {
         };
         const int iterations = std::max(5, kIterations * 256 / std::max(tokens, 256));
         const auto time_us   = [&](const auto& call) {
-            for (int s = 0; s < kRouteSets; ++s) { call(s); }
+            for (int s = 0; s < kWarmupRounds * kRouteSets; ++s) { call(s % kRouteSets); }
             hip_check(hipDeviceSynchronize(), "warmup");
             hip_check(hipEventRecord(start, nullptr), "record");
             for (int i = 0; i < iterations * kRouteSets; ++i) { call(i % kRouteSets); }
