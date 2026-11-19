@@ -618,7 +618,7 @@ and 0.14% of route assignments in the VM profile. The startup log reports the ac
 meaning, P union T.
 
 `ExpertResidency` (cache side, implemented) owns the fixed slots holding P and the flex pool
-holding T. Mechanism, without new Op code:
+holding T. Mechanism:
 
 - **Admission domain.** `ExpertHelperPlacement::admission_mask` marks the F3 records of T. It is the
   `eligible` bitset of `moe_expert_cache_admit` and `_stage` and of the refill select, uploaded
@@ -628,13 +628,19 @@ holding T. Mechanism, without new Op code:
   cover the F3 tail only; the global route profile is unchanged.
 - **Pinning.** Each P record takes the next fixed slot of its codec in ascending layer-major order
   (`ExpertHelperPlacement::primary_slot`). Its slot has owner `kMoeCacheBorrowedSlot`, the state
-  admit already treats as protected, for the Program's lifetime, so no CLOCK pass takes it. Its
-  `expert_table` entry names the slot permanently, its `slot_index` is -1, and it is never in an
-  Op's eligible domain, so the cache invariant (table names the slot iff `slot_index >= 0`) holds
-  for every record an Op examines.
+  admit treats as protected, for the Program's lifetime. Its `expert_table` entry names the slot
+  permanently, its `slot_index` is -1, and it is never in an Op's eligible domain, so the cache
+  invariant (table names the slot iff `slot_index >= 0`) holds for every record an Op examines.
+- **CLOCK range.** Each pool's `MoeExpertSlotPool::clock_first` is its fixed slot count, so admit's
+  CLOCK visits only the F3 flex slots and the NVFP4 pool admits nothing; the hands start there.
+  Without the range the hand would also sweep the roughly 9,000 pinned fixed slots, and when KV
+  takes every extent back a miss would spin K + 1 = 9 laps of the whole pool per layer call.
+  Admit gives up its remaining misses after one lap of its range in which every slot is protected,
+  so tail misses with all flex slots lent cost one pass over the flex slots and stay mapped reads.
 - **Flex only.** Warm start (compiled profile counts) and refill place only admission-eligible
   records, and only flex slots are free, so T occupies flex slots alone. The frequency halving
-  period counts flex slots only. Refill is off when T has no F3 record.
+  period counts flex slots only (the longest period the Op accepts when there are none). Refill
+  is off when T has no F3 record.
 - **Windows.** In helper mode `expert_window_bytes` is 0: the windows are borrowed *fixed* F3
   slots (a window must be one contiguous run, which flex slots are not), and fixed slots are P.
   Prefill therefore borrows nothing and evicts nothing; records outside P and the resident tail

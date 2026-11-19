@@ -9,7 +9,7 @@ namespace ninfer::ops::detail {
 // One slot pool as the kernels see it: fixed slot s < fixed_count lives at base + s *
 // record_bytes, flex slot s >= fixed_count at flex_address[s - fixed_count]. count (fixed plus
 // flex) == 0 marks a pool without slots, whose pointers are null; flex_address is null when
-// count == fixed_count.
+// count == fixed_count. Admit's CLOCK visits only [clock_first, count), 0 <= clock_first <= count.
 struct MoeExpertSlotPoolArgs {
     std::uint64_t base                = 0;
     std::uint64_t record_bytes        = 0;
@@ -18,6 +18,7 @@ struct MoeExpertSlotPoolArgs {
     std::uint8_t* referenced          = nullptr;
     std::int32_t fixed_count          = 0;
     std::int32_t count                = 0;
+    std::int32_t clock_first          = 0;
 };
 
 // The replacement policy of one admit: reference counters capped at reference_limit (1 = CLOCK

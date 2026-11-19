@@ -1565,6 +1565,9 @@ design serves. The Op takes any geometry, so the target chooses.
   by value and never need re-capture: lending changes only owner state.
 - Lending and reclaiming are ordinary borrows and returns. Lent slots are protected (owner -2), so
   CLOCK skips them, and `moe_experts` never reads them through the tables.
+- `MoeExpertSlotPool::clock_first` limits admit's CLOCK to the slots [clock_first, N): 0 without
+  the helper, F with the pinned tier, so the hand never visits pinned fixed slots. A range whose
+  every slot is protected ends the call's admission after one lap of the range.
 
 **Invariants for the target.**
 - Every page id is in exactly one state: KV-free, KV-mapped, or cache extent.

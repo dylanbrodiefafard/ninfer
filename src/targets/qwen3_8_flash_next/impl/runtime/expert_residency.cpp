@@ -16,6 +16,11 @@ constexpr std::size_t kCodecs = ops::kMoeCacheCodecTags;
 
 constexpr std::size_t tag_of(MoeExpertCodec codec) { return static_cast<std::size_t>(codec); }
 
+// First slot of each pool's CLOCK range: past the fixed slots when they hold the pinned tier.
+std::array<std::int32_t, kCodecs> clock_firsts(const ExpertSlotPlan& plan, bool pinned) {
+    return pinned ? plan.slots : std::array<std::int32_t, kCodecs>{};
+}
+
 std::size_t record_bytes(MoeExpertCodec codec) {
     return static_cast<std::size_t>(ops::moe_expert_record_bytes(codec));
 }
@@ -315,6 +320,7 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
     // call frees no host buffer a queued copy still reads.
     std::vector<std::uint64_t> expert_table(host.begin(), host.end());
     std::vector<std::int32_t> slot_index(experts, ops::kMoeCacheNoSlot);
+    const std::array<std::int32_t, kCodecs> hands = clock_firsts(plan_, pinned_);
     std::array<std::vector<std::int32_t>, kCodecs> owners;
     for (std::size_t tag = 0; tag < kCodecs; ++tag) {
         const auto fixed        = static_cast<std::size_t>(plan_.slots[tag]);
@@ -373,7 +379,10 @@ ExpertResidency::ExpertResidency(const ExpertHostStore& store, const ExpertSlotP
                                    cudaMemcpyHostToDevice, stream),
                    "flex address upload");
     }
-    check_cuda(cudaMemsetAsync(clock_hands_.data, 0, clock_hands_.bytes, stream), "hand clear");
+    // Each hand starts at its range's first slot (a pool with an empty range never reads it).
+    check_cuda(cudaMemcpyAsync(clock_hands_.data, hands.data(), clock_hands_.bytes,
+                               cudaMemcpyHostToDevice, stream),
+               "hand upload");
     check_cuda(cudaMemsetAsync(frequency_counts_.data, 0, frequency_counts_.bytes, stream),
                "frequency clear");
     check_cuda(cudaMemsetAsync(frequency_lookups_.data, 0, frequency_lookups_.bytes, stream),
@@ -444,12 +453,14 @@ bool ExpertResidency::service_refill(cudaStream_t stream, cudaStream_t copy_stre
 
 ops::MoeExpertCache ExpertResidency::cache() {
     ops::MoeExpertCache cache;
-    constexpr auto kFlexTag  = tag_of(MoeExpertCodec::F3G32);
-    std::int64_t total_slots = 0;
+    constexpr auto kFlexTag                             = tag_of(MoeExpertCodec::F3G32);
+    const std::array<std::int32_t, kCodecs> clock_first = clock_firsts(plan_, pinned_);
+    // Slots that can hold an admitted record: the CLOCK ranges.
+    std::int64_t admittable_slots = 0;
     for (std::size_t tag = 0; tag < kCodecs; ++tag) {
         const auto slots = static_cast<std::int32_t>(
             pool_slots(plan_, static_cast<std::size_t>(flex_slots_), tag));
-        total_slots += pinned_ ? slots - plan_.slots[tag] : slots;
+        admittable_slots += slots - clock_first[tag];
         if (slots == 0) { continue; }
         ops::MoeExpertSlotPool& view = cache.pools[tag];
         view.slots                   = {slots_[tag].p, slots_[tag].bytes};
@@ -457,17 +468,23 @@ ops::MoeExpertCache ExpertResidency::cache() {
         if (tag == kFlexTag && flex_slots_ != 0) {
             view.flex_address = Tensor(flex_address_.data, DType::I64, {flex_slots_});
         }
-        view.owner      = Tensor(owner_[tag].data, DType::I32, {slots});
-        view.referenced = Tensor(referenced_[tag].data, DType::U8, {slots});
+        view.owner       = Tensor(owner_[tag].data, DType::I32, {slots});
+        view.referenced  = Tensor(referenced_[tag].data, DType::U8, {slots});
+        view.clock_first = clock_first[tag];
     }
     cache.slot_index      = Tensor(slot_index_.data, DType::I32, {kRoutedExperts, layers_});
     cache.clock_hands     = Tensor(clock_hands_.data, DType::I32, {ops::kMoeCacheCodecTags});
     cache.reference_limit = kExpertReferenceLimit;
     cache.frequency       = ops::MoeExpertFrequency{
-        .counts          = Tensor(frequency_counts_.data, DType::I32, {kRoutedExperts, layers_}),
-        .lookups         = Tensor(frequency_lookups_.data, DType::I32, {1}),
-        .halving_lookups = static_cast<std::int32_t>(
-            std::max<std::int64_t>(1, kFrequencyHalvingSlots * total_slots)),
+        .counts  = Tensor(frequency_counts_.data, DType::I32, {kRoutedExperts, layers_}),
+        .lookups = Tensor(frequency_lookups_.data, DType::I32, {1}),
+        // Without an admittable slot the counts decide nothing (no admit has a victim and refill
+        // is off), so the longest period the Op accepts spares the admits a halving pass over
+        // every count; the clamp keeps the narrowing exact for any pool size.
+        .halving_lookups = admittable_slots == 0 ? ops::kMoeCacheMaxHalvingLookups
+                                                 : static_cast<std::int32_t>(std::min<std::int64_t>(
+                                                       ops::kMoeCacheMaxHalvingLookups,
+                                                       kFrequencyHalvingSlots * admittable_slots)),
     };
     return cache;
 }

@@ -529,6 +529,9 @@ ninfer_add_sanitizer_cases(ninfer_a4_activation_test)
 add_test(NAME ninfer_moe_expert_cache_refill_test
   COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_moe_expert_cache_test> --refill)
 set_tests_properties(ninfer_moe_expert_cache_refill_test PROPERTIES LABELS "kernel;sanitizer;racecheck")
+add_test(NAME ninfer_moe_expert_cache_pinned_test
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_moe_expert_cache_test> --pinned)
+set_tests_properties(ninfer_moe_expert_cache_pinned_test PROPERTIES LABELS "kernel;sanitizer;racecheck")
 ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_fill_test)
 ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_stage_test)
 ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_window_test)

@@ -17,12 +17,16 @@ namespace ninfer::ops {
 // One slot pool per record codec, indexed by MoeExpertCodec (bit 0 of a record address).
 inline constexpr std::int32_t kMoeCacheCodecTags = 2;
 inline constexpr std::int32_t kMoeCacheEmptySlot = -1;
-// Owner of a slot lent out by moe_expert_cache_borrow: never a CLOCK victim until returned.
+// Owner of a protected slot that holds no admitted record and is never a CLOCK victim: a slot
+// lent out by moe_expert_cache_borrow (until returned), a refill reservation (until published),
+// or a slot whose record the cache's owner pins there permanently (MoeExpertSlotPool).
 inline constexpr std::int32_t kMoeCacheBorrowedSlot = -2;
 // MoeExpertCache::slot_index entry of an expert that no slot holds.
 inline constexpr std::int32_t kMoeCacheNoSlot = -1;
 // Largest reference_limit (the reference counters are U8).
 inline constexpr std::int32_t kMoeCacheMaxReferenceLimit = 255;
+// Largest MoeExpertFrequency::halving_lookups: lookups plus one call's routed set fits I32.
+inline constexpr std::int32_t kMoeCacheMaxHalvingLookups = 0x7fffffff - kMoeExperts;
 static_assert(static_cast<int>(MoeExpertCodec::Nvfp4G16) == 0 &&
               static_cast<int>(MoeExpertCodec::F3G32) == 1);
 
@@ -41,8 +45,18 @@ inline constexpr std::int32_t kMoeCacheCounterKinds = 2;
  *              cache while it holds nothing of its own, such as paged-KV pages without live KV;
  *   owner      I32 [N]: the owner code l * 512 + e of the record (expert e of layer l) held in
  *              slot s, -1 (kMoeCacheEmptySlot) when the slot is empty, or -2
- *              (kMoeCacheBorrowedSlot) while moe_expert_cache_borrow lends it out;
- *   referenced U8  [N]: the slot's CLOCK reference counter, in [0, reference_limit].
+ *              (kMoeCacheBorrowedSlot) while moe_expert_cache_borrow lends it out, while a refill
+ *              reserves it, or for as long as the cache's owner pins a record there (below);
+ *   referenced U8  [N]: the slot's CLOCK reference counter, in [0, reference_limit];
+ *   clock_first: the first slot of the CLOCK range [clock_first, N), 0 <= clock_first <= N: the
+ *              only slots moe_expert_cache_admit visits for a victim. 0 is the whole pool;
+ *              clock_first = N admits nothing. Only admit reads it.
+ *
+ * Pinning: a cache whose owner keeps records in fixed slots for good gives each such slot owner -2
+ * for its lifetime and names the slot in the record's expert_ptr entry, with no owner code and so
+ * no slot_index entry naming it; the owner keeps those records outside the eligible domain of
+ * every admit and stage. Owner -2 already makes the slot protected; clock_first = F also keeps
+ * CLOCK from visiting the pinned slots at all, so a hand never spends windows on them.
  *
  * Slot order is the CLOCK order, and moe_expert_cache_borrow lends runs of it within one region;
  * it does not follow addresses. record_bytes is a nonzero multiple of 256 (kMoeRecordAlignment),
@@ -65,6 +79,7 @@ struct MoeExpertSlotPool {
     Tensor flex_address;
     Tensor owner;
     Tensor referenced;
+    std::int32_t clock_first = 0;
 };
 
 /** The slots of a pool that moe_expert_cache_borrow and moe_expert_cache_return address. */
@@ -83,8 +98,8 @@ enum class MoeCacheSlotRegion : std::uint8_t {
  *   lookups  I32 [1]: lookups (routed-set elements, every layer) since the last halving.
  *
  * Every counts value is in [0, 2^31 - 1] and lookups in [0, halving_lookups). A halving happens
- * when lookups reaches halving_lookups, in [1, 2^31 - 513] so that lookups plus one call's routed
- * set fits I32: every count is shifted right by one and lookups
+ * when lookups reaches halving_lookups, in [1, kMoeCacheMaxHalvingLookups] (2^31 - 513, so that
+ * lookups plus one call's routed set fits I32): every count is shifted right by one and lookups
  * restarts at 0. The caller zeroes both tensors before the first admit.
  */
 struct MoeExpertFrequency {
@@ -98,7 +113,8 @@ struct MoeExpertFrequency {
  * of codec c; slot_index I32 [512,L] (contiguous, column l = layer l) is the inverse of the
  * owners: slot_index[e,l] = s when slot s of pool tag(host_ptr[e,l]) has owner l * 512 + e, and
  * kMoeCacheNoSlot (-1) when no slot does; clock_hands I32 [2] is the next CLOCK position of each
- * pool (0 <= hand < N, 0 for a pool without slots); reference_limit in
+ * pool, an absolute slot index in its CLOCK range [clock_first, N) when that range is nonempty
+ * (admit neither reads nor writes the hand of a pool with an empty range); reference_limit in
  * [1, kMoeCacheMaxReferenceLimit] caps the reference counters (1 is CLOCK's reference bit, K > 1
  * GCLOCK with counters up to K); frequency, when its counts are present (data not null), counts
  * every admit's lookups and enables MoeCacheAdmission::FrequencyFilter.
@@ -133,19 +149,22 @@ enum class MoeCacheAdmission : std::uint8_t {
  *     fill_ptr   [512,L]  the untagged slot address moe_expert_cache_fill copies the record to,
  *                         or 0 for no fill.
  *   With R the set of ids in ids [10,T], U = R intersected with the eligible experts when
- *   eligible is given (otherwise U = R), and l = layer, a slot of a pool is "protected" when it is
- *   borrowed (owner -2) or its owner is l * 512 + u for some u in U (slots taken below become
- *   protected), and K = cache.reference_limit. Then:
+ *   eligible is given (otherwise U = R), and l = layer, a slot of a pool is "protected" when its
+ *   owner is -2 (lent, reserved or pinned) or l * 512 + u for some u in U (slots taken below
+ *   become protected), and K = cache.reference_limit. Then:
  *   1. Hit: each u in U with expert_ptr[u,l] != host_ptr[u,l] sets referenced[s] =
  *      min(referenced[s] + 1, K) for the slot s = slot_index[u,l] that holds it (1 when K = 1).
  *   2. Frequency (when cache.frequency is present): counts[u,l] = min(counts[u,l] + 1, 2^31 - 1)
  *      for every u in U, then lookups += |U|; when lookups >= halving_lookups, every count of
  *      every layer is halved (floor) and lookups = 0.
  *   3. Miss: each u in U with expert_ptr[u,l] == host_ptr[u,l], in ascending u, in pool c =
- *      tag(host_ptr[u,l]) with N slots: if N = 0 or every slot is protected, u is not admitted
- *      and the pool is unchanged. Otherwise CLOCK picks a victim: repeat { s = hand; hand =
- *      (hand + 1) mod N; if s is protected continue; if referenced[s] > 0 { referenced[s] -= 1;
- *      continue } stop }. With MoeCacheAdmission::FrequencyFilter, when owner[s] = o >= 0 and
+ *      tag(host_ptr[u,l]) with CLOCK range [b, N) (b = clock_first) of M = N - b slots: if M = 0
+ *      or every slot of the range is protected, u is not admitted and the pool is unchanged.
+ *      Otherwise CLOCK picks a victim: repeat { s = hand; hand = b + (hand - b + 1) mod M; if s is
+ *      protected continue; if referenced[s] > 0 { referenced[s] -= 1; continue } stop }; with
+ *      b = 0 this is CLOCK over the whole pool. A slot below b is never visited, so it is never a
+ *      victim and its counter changes only through hits. With
+ *      MoeCacheAdmission::FrequencyFilter, when owner[s] = o >= 0 and
  *      counts[u,l] <= counts[o mod 512, o / 512] (after step 2), u is not admitted and slot s is
  *      left unchanged (the hand stays advanced). Otherwise, when owner[s] = o >= 0,
  *      expert_ptr[o mod 512, o / 512] = host_ptr[o mod 512, o / 512] and slot_index[o mod 512,
@@ -179,11 +198,13 @@ enum class MoeCacheAdmission : std::uint8_t {
  *
  * Supported domain:
  *   Exact integer and address arithmetic. On entry the state is consistent: every fill_ptr entry
- *   is 0; every referenced value is in [0, K]; every owner code occurs in at most one slot, of
- *   pool c = tag(host_ptr[e,l]) for owner code l * 512 + e, and slot_index is the inverse of the
- *   owners (MoeExpertCache); expert_ptr[e,l] is address(slot_index[e,l]) | c when slot_index[e,l]
- *   >= 0 and host_ptr[e,l] otherwise; host records lie outside every pool. Violations (device
- *   values the Op cannot check on the host) are undefined behavior.
+ *   is 0; every referenced value is in [0, K]; each hand lies in its pool's CLOCK range when that
+ *   range is nonempty (the host checks only 0 <= clock_first <= N); every owner code occurs in at
+ *   most one slot, of pool c = tag(host_ptr[e,l]) for owner code l * 512 + e, and slot_index is
+ *   the inverse of the owners (MoeExpertCache); expert_ptr[e,l] is address(slot_index[e,l]) | c
+ *   when slot_index[e,l] >= 0 and host_ptr[e,l] otherwise, except for pinned records
+ *   (MoeExpertSlotPool), which no call's eligible bitset includes; host records lie outside every
+ *   pool. Violations (device values the Op cannot check on the host) are undefined behavior.
  *
  * Effects:
  *   Writes expert_ptr only for evicted owners (any layer), slot_index only for evicted owners and
@@ -215,6 +236,9 @@ enum class MoeCacheAdmission : std::uint8_t {
  * Execution:
  *   Asynchronous on stream with a fixed launch shape and no host round trip; graph-capturable
  *   for fixed T, layer and views. Deterministic. Invalid arguments throw std::invalid_argument.
+ *   A pool's CLOCK work scales with its range M, not with N: once every slot of the range is
+ *   protected (lent and reserved slots fill it, or the call's own misses take the rest), the call
+ *   gives up its remaining misses after visiting each slot of the range once more.
  */
 void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor& host_ptr,
                             Tensor& fill_ptr, const MoeExpertCache& cache, std::int32_t layer,

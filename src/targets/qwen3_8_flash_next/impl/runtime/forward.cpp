@@ -1520,7 +1520,8 @@ void Forward::moe(std::int32_t layer, const SubChunk& chunk, bool streamed, bool
                              static_cast<std::size_t>(layer) * ops::kMoeExpertMaskWords,
                          DType::I32, {ops::kMoeExpertMaskWords})
                 : Tensor{};
-    // Admission covers only the F3 records of T: P is pinned and H is remote.
+    // Admission covers only the F3 records of T: P is pinned (outside this domain and the CLOCK
+    // ranges of cache_, ExpertResidency) and H is remote.
     const Tensor admit_eligible =
         helper_ ? Tensor(const_cast<std::uint32_t*>(helper_view_.admission_eligibility) +
                              static_cast<std::size_t>(layer) * ops::kMoeExpertMaskWords,
