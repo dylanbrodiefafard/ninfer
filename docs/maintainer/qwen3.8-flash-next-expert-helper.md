@@ -239,7 +239,10 @@ mathematics in the target:
    expert, routing, n-gram data or intermediate gate/up traffic. Return FP32 even if internal
    matmul operands/intermediates follow the HIP Op's qualified private precision profile.
 4. **Join.** After local expert work and cache commit, core's captured CUDA wait acquires the
-   matching response once per layer, then vector-loads the partial into CUDA scratch. A
+   matching response and vector-loads the partial into CUDA scratch with one CTA per four
+   compact columns: each CTA's leader acquires the sequence, only the first CTA's leader records
+   failures, and every lane of a CTA issues all of its (up to ten) 16-byte mapped loads before storing
+   them, so the loads overlap their PCIe latency instead of serializing in 4 KiB steps. A
    `moe_expert_partial_join` Op scatters compact rows and computes
    `BF16(local_fp32[t,c] + helper_fp32[compact(t),c])`, rounding once at this observable MoE
    boundary. No intermediate local BF16 output/add, and no repeated system acquire by every

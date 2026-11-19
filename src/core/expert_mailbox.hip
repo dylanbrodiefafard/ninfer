@@ -47,13 +47,37 @@ __device__ bool cancelled(ExpertMailboxView view) {
     return load(&view.cancellation->sequence) == view.control->sequence || failed(view);
 }
 
+constexpr std::uint32_t kCopyThreads = 256;
+
+// One CTA of kCopyThreads copies `units` uint4 units: thread i owns units i + k * kCopyThreads.
+// Every batch issues its kBatch loads before any of their stores, so a latency-bound mapped
+// source keeps kBatch x 4 KiB in flight per CTA instead of the 4 KiB of a load-store loop.
+template <std::uint32_t kBatch>
+__device__ void copy_units(uint4* __restrict__ destination, const uint4* __restrict__ source,
+                           std::uint32_t units) {
+    for (std::uint32_t base = threadIdx.x; base < units; base += kBatch * kCopyThreads) {
+        uint4 staged[kBatch]{};
+#pragma unroll
+        for (std::uint32_t k = 0; k < kBatch; ++k) {
+            const auto i = base + k * kCopyThreads;
+            if (i < units) { staged[k] = source[i]; }
+        }
+#pragma unroll
+        for (std::uint32_t k = 0; k < kBatch; ++k) {
+            const auto i = base + k * kCopyThreads;
+            if (i < units) { destination[i] = staged[k]; }
+        }
+    }
+}
+
+// uint4 units cover the aligned prefix; the final two I32/FP32 metadata elements of an odd
+// compact count (40 N bytes) use scalar copies. Bases are 16-byte aligned; shape products
+// <= 48 * 10240 bytes.
 __device__ void copy_bytes(void* destination, const void* source, std::uint32_t bytes) {
-    auto* dst       = static_cast<uint4*>(destination);
-    const auto* src = static_cast<const uint4*>(source);
-    for (std::uint32_t i = threadIdx.x; i < bytes / 16; i += blockDim.x) { dst[i] = src[i]; }
+    copy_units<16>(static_cast<uint4*>(destination), static_cast<const uint4*>(source), bytes / 16);
     auto* tail_dst       = static_cast<std::uint32_t*>(destination);
     const auto* tail_src = static_cast<const std::uint32_t*>(source);
-    for (std::uint32_t i = (bytes / 16) * 4 + threadIdx.x; i < bytes / 4; i += blockDim.x) {
+    for (std::uint32_t i = (bytes / 16) * 4 + threadIdx.x; i < bytes / 4; i += kCopyThreads) {
         tail_dst[i] = tail_src[i];
     }
 }
@@ -90,9 +114,10 @@ __device__ void publish_response(ExpertMailboxView view, std::uint32_t layer, st
 // system acquire of this layer's request; a shared count and barrier transfer acquisition to all
 // payload readers. No mapped payload access on SKIP/error. The wall clock has the constant
 // frequency queried by the host (not the variable shader clock).
-__global__ void import_packet(ExpertMailboxView view, std::uint32_t layer, std::uint32_t respond,
-                              void* x, void* ids, void* weights, std::uint32_t* count,
-                              std::uint32_t tokens, std::uint64_t deadline_ticks) {
+__global__ void __launch_bounds__(kCopyThreads)
+    import_packet(ExpertMailboxView view, std::uint32_t layer, std::uint32_t respond, void* x,
+                  void* ids, void* weights, std::uint32_t* count, std::uint32_t tokens,
+                  std::uint64_t deadline_ticks) {
     __shared__ std::uint32_t n;
     if (threadIdx.x == 0) {
         if (respond != kNoResponse) { publish_response(view, respond, *count, tokens); }
@@ -163,8 +188,9 @@ __global__ void respond_packet(ExpertMailboxView view, std::uint32_t layer,
 
 // One 256-thread CTA writes rows [0, *count) of a VRAM partial into the slot's response payload
 // through the HIP alias with plain stores, as the helper Op writes it (startup qualification).
-__global__ void store_partial(ExpertMailboxView view, std::uint32_t layer, const void* partial,
-                              const std::uint32_t* count) {
+__global__ void __launch_bounds__(kCopyThreads)
+    store_partial(ExpertMailboxView view, std::uint32_t layer, const void* partial,
+                  const std::uint32_t* count) {
     copy_bytes(view.slots[layer].partial, partial, *count * kExpertPartialBytes);
 }
 
@@ -217,7 +243,7 @@ void expert_mailbox_hip_import(ExpertMailboxView view, std::uint32_t layer,
     check(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device), "wall clock rate");
     if (khz <= 0) { throw HipError("expert helper has no constant wall clock"); }
     const auto ticks = static_cast<std::uint64_t>(khz) * (kExpertLayerDeadlineNs / 1'000'000);
-    import_packet<<<1, 256, 0, static_cast<hipStream_t>(stream.get())>>>(
+    import_packet<<<1, kCopyThreads, 0, static_cast<hipStream_t>(stream.get())>>>(
         view, layer, respond.value_or(kNoResponse), x, ids, weights, count, tokens, ticks);
     check(hipGetLastError(), "import launch");
     if (tokens == 48) {
@@ -245,8 +271,8 @@ void expert_mailbox_hip_store_partial(ExpertMailboxView view, std::uint32_t laye
                                       std::uint32_t tokens, const HipStream& stream) {
     stream.bind();
     validate(layer, tokens, view);
-    store_partial<<<1, 256, 0, static_cast<hipStream_t>(stream.get())>>>(view, layer, partial,
-                                                                         count);
+    store_partial<<<1, kCopyThreads, 0, static_cast<hipStream_t>(stream.get())>>>(view, layer,
+                                                                                  partial, count);
     check(hipGetLastError(), "partial store launch");
 }
 

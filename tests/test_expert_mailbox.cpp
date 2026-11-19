@@ -187,7 +187,10 @@ void failure_case(const std::string& mode, std::uint32_t t = 1) {
     Panels panels;
     panels.initialize(hip);
     ExpertMailbox box(t);
-    panels.input(mode == "invalid" ? t + 1 : 1, 0xabcdef01U);
+    // At T48, nine compact tokens make three acquiring CTAs (the last partial), so every failure
+    // mode also covers the observing CTAs' exit without a payload read.
+    const std::uint32_t n = t == 48 ? 9 : 1;
+    panels.input(mode == "invalid" ? t + 1 : n, 0xabcdef01U);
     const auto start = std::chrono::steady_clock::now();
     static_cast<void>(box.begin(t, cuda.value, hip));
     if (mode == "failed") { mailbox_test_fail(box.hip_view(), hip); }
@@ -226,7 +229,7 @@ void failure_case(const std::string& mode, std::uint32_t t = 1) {
     const bool delayed = mode == "delayed";
     require(threw != delayed, "failure/normal completion contract");
     if (delayed) {
-        panels.output(1, 0xabcdef01U, hip);
+        panels.output(n, 0xabcdef01U, hip);
     } else {
         require(box.failure().code != ExpertWireError::None, "failure was not latched");
         if (mode == "seal-timeout") {

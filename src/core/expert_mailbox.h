@@ -48,7 +48,9 @@ private:
 void qualify_expert_mailbox(ExpertMailbox& mailbox, void* cuda_stream, const HipStream& hip_stream);
 
 // Capturable raw transfers. These own no expert semantics. Input/output are CUDA VRAM planes.
-// acquire/copy skips N=0 without polling/reading a response. Publish uses current ingress sequence.
+// Publish is one CTA and uses the current ingress sequence. Acquire spreads the response copy
+// over ceil(capacity / 4) CTAs of four columns, each acquiring the sequence before it reads; it
+// skips N=0 without polling/reading a response.
 void expert_mailbox_cuda_publish(ExpertMailboxView view, std::uint32_t layer, const void* x,
                                  const void* ids, const void* weights, const std::uint32_t* count,
                                  void* stream);
