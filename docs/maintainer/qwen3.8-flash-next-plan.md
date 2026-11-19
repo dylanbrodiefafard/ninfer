@@ -417,9 +417,10 @@ root-local. Budget masks can force the native reasoning close at a hypothetical 
 exclude a repeated close in its descendants, without changing committed budget state.
 The per-column eligibility is exact relative to ordinary root mask filling; it does not change
 the cross-width model arithmetic qualification below. `--dflash-masks` on the real Engine test
-checks greedy K3 against `SpeculativeBackend::None` for tools, budgets 2–6, and their combination;
-it requires accepted tool drafts and budget-sweep acceptance, schema-valid calls and exact
-forced-close accounting. `--dflash-mask-program` runs mixed session/one-shot/unmasked rows in
+runs greedy K3 and `SpeculativeBackend::None` for tools, budgets 2–6, and their combination;
+it requires drafting, accepted tool drafts and budget-sweep acceptance, schema-valid calls and
+exact forced-close accounting, and reports the identical token prefix only, because cross-width
+greedy identity is not a contract. `--dflash-mask-program` runs mixed session/one-shot/unmasked rows in
 non-lane-order compact batches with different extents, greedy and positive-temperature p-less
 acceptance, committed non-root binding masks, exact published token counts, and zero-publication
 rollback beside a healthy row. Its rejected-probe replay fixes a cap one token ahead of an
