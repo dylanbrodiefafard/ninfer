@@ -1,11 +1,13 @@
 #include "artifact_fixture.h"
 #include "product/startup_options.h"
+#include "targets/startup_options.h"
 
 #include <exception>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 int main() {
     using namespace ninfer;
@@ -14,6 +16,56 @@ int main() {
     using test::artifact_fixture::Json;
     using test::artifact_fixture::write_fixture;
     try {
+        using targets::resolve_kv_idle_timeout;
+        if (resolve_kv_idle_timeout({}, 1024, "qwen3.8-flash-next") != 30 ||
+            resolve_kv_idle_timeout({}, 0, "qwen3.8-flash-next") != 0 ||
+            resolve_kv_idle_timeout({}, 1024, "qwen3.8-27b") != 0 ||
+            resolve_kv_idle_timeout(0, 0, "qwen3.8-27b") != 0 ||
+            resolve_kv_idle_timeout(5, 1024, "qwen3.8-flash-next") != 5) {
+            throw std::runtime_error("idle timeout defaults or explicit override are incorrect");
+        }
+        for (const auto model : {"qwen3.8-27b", "qwen3.8-flash-next"}) {
+            bool rejected = false;
+            try {
+                (void)resolve_kv_idle_timeout(5, 0, model);
+            } catch (const std::invalid_argument& error) {
+                rejected = std::string(error.what()).find("--kv-idle-timeout") != std::string::npos;
+            }
+            if (!rejected) {
+                throw std::runtime_error("idle timeout accepted unsupported startup");
+            }
+        }
+        bool wrong_identity = false;
+        try {
+            (void)resolve_kv_idle_timeout(5, 1024, "qwen3.8-27b");
+        } catch (const std::invalid_argument&) { wrong_identity = true; }
+        if (!wrong_identity) { throw std::runtime_error("27B accepted RAM-on idle timeout"); }
+
+        using targets::resolve_kv_idle_headroom;
+        if (resolve_kv_idle_headroom({}, {}, 1024, "qwen3.8-flash-next") != 200000 ||
+            resolve_kv_idle_headroom({}, {}, 0, "qwen3.8-27b") != 200000 ||
+            resolve_kv_idle_headroom(0, {}, 1024, "qwen3.8-flash-next") != 0 ||
+            resolve_kv_idle_headroom(5, 7, 1024, "qwen3.8-flash-next") != 5) {
+            throw std::runtime_error("idle headroom default or explicit value is incorrect");
+        }
+        for (const auto& startup :
+             {std::tuple<const char*, std::optional<std::uint32_t>, std::size_t>{
+                  "qwen3.8-flash-next", std::nullopt, 0}, // RAM off: no timeout
+              {"qwen3.8-flash-next", 0U, 1024},           // timeout disabled
+              {"qwen3.8-27b", std::nullopt, 0}}) {
+            bool rejected = false;
+            try {
+                (void)resolve_kv_idle_headroom(5, std::get<1>(startup), std::get<2>(startup),
+                                               std::get<0>(startup));
+            } catch (const std::invalid_argument& error) {
+                rejected =
+                    std::string(error.what()).find("--kv-idle-headroom") != std::string::npos;
+            }
+            if (!rejected) {
+                throw std::runtime_error("idle headroom accepted unsupported startup");
+            }
+        }
+
         Json directory  = {{"identity", {{"model_id", "qwen3.8-27b"}, {"weights_id", "nvfp4"}}},
                            {"objects", Json::array({{{"name", "tokenizer"},
                                                      {"kind", "resource"},

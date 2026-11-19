@@ -49,18 +49,19 @@ namespace ninfer::targets::qwen3_8_flash_next {
  * it allocates no device memory. Invariants: a CacheHeld extent has no mapped page, so no lane's
  * block table names it, and a KvLent extent's slots are never admitted or read through the tables.
  *
- * Ordering. All device work is enqueued on the compute stream in call order. make_room enqueues
- * an extent's borrow before the caller maps its pages, so the borrow follows every enqueued reader
- * of the evicted records and precedes every write of the pages as KV, on this stream and on the
- * copy stream after DeviceContext::order_copy_after_compute. No fill may be pending: the caller
- * runs between Forward calls, whose fills the compute stream has joined. Tier producers record
- * each lane's last submitted copy with record_tier_copy. Before closing or shrinking that lane,
- * the adapter calls wait_tier_copy for its fence, not the copy stream's later work. The adapter
- * also cancels and drains any disk restore owned by that lane, including scatter on the disk
- * cache's separate stream. give_back then enqueues the extent's return after those joins and the
- * block-table unmap of State::close or State::resize. Every later fill follows the return on the
- * compute stream; an unrelated lane's later tier restore does not delay it.
- * Not thread-safe; the pool and the residency must outlive this object.
+ * Ordering. Extent transitions run on the compute stream in call order. make_room joins the
+ * one outstanding background refill copy through its event and publishes its protected slot,
+ * then enqueues an extent's borrow before the caller maps its pages. The borrow follows every
+ * reader of the evicted records and precedes every write of the pages as KV, on this stream and on
+ * the copy stream after DeviceContext::order_copy_after_compute. No demand fill may be pending: the
+ * caller runs between Forward calls, whose fills the compute stream has joined. Tier producers
+ * record each lane's last submitted copy with record_tier_copy. Before closing or shrinking that
+ * lane, the adapter calls wait_tier_copy for its fence, not the copy stream's later work. The
+ * adapter also cancels and drains any disk restore owned by that lane, including scatter on the
+ * disk cache's separate stream. give_back then enqueues the extent's return after those joins and
+ * the block-table unmap of State::close or State::resize. Every later fill follows the return on
+ * the compute stream; an unrelated lane's later tier restore does not delay it. Not thread-safe;
+ * the pool and the residency must outlive this object.
  */
 class KvExpertExtents {
 public:
@@ -87,6 +88,10 @@ public:
 
     [[nodiscard]] bool lent(std::int32_t extent) const;
     [[nodiscard]] std::int32_t lent_extents() const noexcept;
+
+    // Extents the cache can hold now: CacheHeld ones, and KvLent ones whose pages are all free.
+    // Free pages below the flex region and in partly mapped extents are not lendable.
+    [[nodiscard]] std::int32_t lendable_extents() const noexcept;
 
     // Takes CacheHeld extents back, lowest first (the one nearest the KV frontier), until the pool
     // has at least `pages` free pages or every extent is lent. Free plus withheld pages cover

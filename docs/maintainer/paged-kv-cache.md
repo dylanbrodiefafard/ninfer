@@ -527,10 +527,10 @@ positions. For `P=64`, the maximum tail-page slack of 8 active allocations in on
 504 / 131072 = 0.38% of a 128 Ki pool
 ```
 
-The allocator should preferentially assign contiguous page IDs to the same sequence, so that adjacent
-logical pages are as contiguous as possible in the plane slab; however, a contiguous run is not an
-admission condition. When no contiguous run can be found, any free pages are used, and the request must
-not be rejected for that reason. Active pages are not relocated.
+Every materialization takes the lowest free physical page IDs, in order, for admission, growth,
+forks and RAM/SSD restores. A higher contiguous run never takes precedence over a lower hole.
+Restores allocate fresh mappings rather than recovering old physical IDs, so a continuation that
+occupied the top region can relocate into low holes. Existing live pages are never relocated.
 
 ### 5.5 Withheld pages
 
@@ -561,7 +561,28 @@ Its ordering contract: a run is restored, and the cache's slots over it borrowed
 before any lane maps its pages; a run is withheld only when every page is free, after the compute
 stream has waited for the transfer fence of each lane that last owned those pages and after the
 block-table unmap of its last owner. A lane's fence covers every host-tier transfer submitted for it
-(including detached rollback-image copies); returning a run never waits on other lanes' transfers.
+(including detached rollback-image copies); returning a run never waits on other lanes' transfers. A background expert refill reserves an
+unpublished flex slot until its copy completes. Before reclaiming cache-held extents, the compute
+stream joins that one refill copy event and publishes or discards its reservation, then borrows
+the slots; there is no host synchronization or whole-copy-stream drain on the reclaim path.
+
+With Flash-Next RAM enabled, `--kv-idle-timeout` (default 30 seconds, 0 disables) releases expired
+idle retention at a scheduler boundary, saving complete ordinary originals to RAM and releasing
+disposable state. The most recently idle retained lane is exempt; activity cancels its timer and
+becoming idle restarts it. Ordinary expiry captures continuation and pages on the copy stream,
+retaining the source and claiming its RAM image until a later boundary observes completion.
+Other decoding lanes never wait on that D2H. A failed capture keeps its source resident and retries
+after a full timeout, without changing idle recency. Expiry starts only while
+the lendable extents (`KvExpertExtents::lendable_extents`) are fewer than the expert cache's flex
+demand plus `--kv-idle-headroom` in extents (concurrent-inference-architecture.md, §6.4). Once
+all nonexempt idle originals migrate successfully and disposable state is released, only active lanes and the exempt lane can pin
+pages in the top extent region; failed RAM funding can keep older idle owners resident.
+Whole free extents return highest first, retaining one spare extent of free KV pages as hysteresis.
+The bound is on owners, not one contiguous run or one fragmented extent per lane. Active lanes
+can keep high pages until they retire; there is no live defragmentation. Returned flex slots
+refill from live frequency counts, hottest into the highest empty slot, one copy at a time,
+with zero local demand misses in the latest decode/verification round and no prefill window.
+Completed copies publish even when issuance is gated, without changing captured table addresses.
 
 ---
 

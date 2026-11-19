@@ -109,6 +109,10 @@ decltype(auto) with_automatic_headroom_hint(const KvCapacityPolicy& policy, Fn&&
 // Engine options only qwen3.8-flash-next implements.
 void reject_flash_next_options(const EngineOptions& options, std::string_view target_key) {
     validate_expert_helper_option(options.expert_helper_pci, target_key);
+    (void)resolve_kv_idle_timeout(options.kv_idle_timeout, options.kv_ram_capacity_bytes,
+                                  target_key);
+    (void)resolve_kv_idle_headroom(options.kv_idle_headroom, options.kv_idle_timeout,
+                                   options.kv_ram_capacity_bytes, target_key);
     if (!options.expert_route_profile_path.empty()) {
         throw std::invalid_argument("--expert-route-profile applies only to qwen3.8-flash-next, "
                                     "not to target '" +

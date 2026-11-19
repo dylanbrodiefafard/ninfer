@@ -221,6 +221,11 @@ Program::Program(const LoadedModel& model, const ProgramOptions& options, Device
       residency_(model.experts(), slot_plan(model, options, state_), extents_.flex_addresses(),
                  options.calib_counts, device.stream),
 #endif
+      flex_demand_(plan_flex_demand(
+          residency_.admittable_f3_records(),
+          residency_.plan().slots[static_cast<std::size_t>(ops::MoeExpertCodec::F3G32)],
+          extents_.slots_per_extent(), extents_.extents(),
+          std::int64_t{extents_.extent_pages()} * ops::kQsaPageTokens)),
       forward_(model.view(), state_, feeder_, residency_, forward_options(model, options),
                device.stream, dflash_.get()
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
@@ -228,8 +233,9 @@ Program::Program(const LoadedModel& model, const ProgramOptions& options, Device
                helper_.get()
 #endif
                    ),
-      stream_(device.stream), mask_staging_(static_cast<std::size_t>(options.lanes) *
-                                            State::kAllowedTokenWordStride * sizeof(std::uint32_t)),
+      stream_(device.stream), copy_stream_(device.copy_stream),
+      mask_staging_(static_cast<std::size_t>(options.lanes) * State::kAllowedTokenWordStride *
+                    sizeof(std::uint32_t)),
       speculative_options_(options.speculative), forced_adaptive_k_(options.forced_adaptive_k),
       expert_route_profile_path_(options.expert_route_profile_path) {
     write_route_profile(true);
@@ -242,6 +248,16 @@ Program::~Program() {
         // Destruction cannot propagate; a failed final diagnostic write is visible to the user.
         std::cerr << "expert route profile final write failed: " << error.what() << '\n';
     }
+}
+
+bool Program::service_expert_refill(bool allow) {
+    if (pending_batch_ || pending_speculative_) {
+        throw std::logic_error("expert refill requires a settled round");
+    }
+    // Each boundary consumes the demand state of the round that just ended, so a boundary that
+    // ran no decode round (idle, prefill-only) never inherits an older round's misses.
+    const bool demand_misses = forward_.take_round_demand_misses();
+    return residency_.service_refill(stream_, copy_stream_, allow && !demand_misses);
 }
 
 void Program::write_route_profile(bool force) {
@@ -438,6 +454,9 @@ PrefillStep Program::prefill_step(Lane lane, std::span<const std::int32_t> remai
         const std::array lanes{lane};
         dflash_->flush(lanes);
     }
+    // Refill yields before a prefill window owns PCIe traffic. This joins at most one copy;
+    // the compute stream waits on its event rather than synchronizing the host.
+    residency_.join_refill(stream_);
     PrefillStep step;
     step.consumed =
         forward_.prefill_step(lane, remaining, LogitsSink{}, nullptr, token_limit, tail);
@@ -454,6 +473,7 @@ PrefillStep Program::finish_prompt(Lane lane) {
     if (control.phase != LanePhase::Prompt || state_.committed(lane) == 0) {
         throw std::logic_error("Flash-Next finalization requires a complete prompt frontier");
     }
+    residency_.join_refill(stream_);
     PrefillStep step;
     step.complete = true;
     upload_masks();
@@ -523,6 +543,7 @@ std::vector<float> Program::score(std::span<const std::int32_t> tokens) {
                                  " tokens, or they exceed one lane's context");
     }
     try {
+        residency_.join_refill(stream_);
         std::vector<float> scores = forward_.score(*lane, tokens);
         close_lane(*lane);
         return scores;

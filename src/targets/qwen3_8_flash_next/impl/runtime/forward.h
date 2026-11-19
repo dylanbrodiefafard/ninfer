@@ -35,6 +35,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_8_flash_next {
@@ -387,6 +388,19 @@ public:
     // Zeroes the expert-cache counters, which every admit (decode rounds and super-chunks narrower
     // than window_min_tokens) accumulates from construction on; synchronizes the stream.
     void clear_expert_cache_counts();
+
+    // Whether the latest completed decode/verification round had local demand misses, derived
+    // from admit's existing cumulative counters before that round's completion fence. No extra
+    // wait.
+    [[nodiscard]] bool last_round_had_demand_misses() const noexcept {
+        return last_round_demand_misses_;
+    }
+
+    // Returns and clears that state, so a boundary that ran no round afterwards reads false.
+    [[nodiscard]] bool take_round_demand_misses() noexcept {
+        return std::exchange(last_round_demand_misses_, false);
+    }
+
     // Lifetime decode-only totals; never reset by the diagnostic counter clear. Exclusive
     // Forward ownership is required; synchronizes the compute stream before returning.
     [[nodiscard]] ExpertRouteProfile expert_route_profile();
@@ -605,6 +619,8 @@ private:
     void enqueue_spec_b(std::int32_t width, std::int32_t rows, bool exchange_masks);
     void capture_spec_graphs();
     void require_resolved() const;
+    void enqueue_round_cache_counts();
+    void settle_round_cache_counts();
 
     // Run against a WorkspaceLayoutBuilder (planning) and the DeviceArena (binding) so both share
     // every size, alignment and order.
@@ -725,8 +741,11 @@ private:
     std::int32_t pending_verify_rows_    = 0;
     std::uint64_t decode_profile_rounds_ = 0;
     std::array<std::uint64_t, 4> diagnostic_decode_baseline_{};
-    std::int32_t feature_offset_  = 0;
-    std::int32_t feature_columns_ = 0;
+    std::array<std::uint64_t, 4> previous_round_cache_counts_{};
+    PinnedHostBuffer round_cache_counts_{sizeof(previous_round_cache_counts_)};
+    bool last_round_demand_misses_ = false;
+    std::int32_t feature_offset_   = 0;
+    std::int32_t feature_columns_  = 0;
     // Pinned mirror of ChunkInputs at the same offsets from the activation arena base.
     PinnedHostBuffer input_staging_;
     // Recorded after each chunk's input upload; the host waits on it before rewriting the staging.

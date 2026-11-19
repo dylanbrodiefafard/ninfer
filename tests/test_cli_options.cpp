@@ -73,6 +73,34 @@ int main() {
     failures += check(mtp_rejected, "MTP execution was accepted");
 
 
+    failures += check(!parse({"ninfer", "model.ninfer", "--prompt", "hi"}).kv_idle_timeout,
+                      "idle timeout default must be target-resolved");
+    for (const char* seconds : {"0", "15"}) {
+        failures +=
+            check(parse({"ninfer", "model.ninfer", "--prompt", "hi", "--kv-idle-timeout", seconds})
+                          .kv_idle_timeout == static_cast<std::uint32_t>(std::stoul(seconds)),
+                  "CLI lost idle timeout seconds");
+    }
+    bool negative_idle_timeout = false;
+    try {
+        (void)parse({"ninfer", "model.ninfer", "--prompt", "hi", "--kv-idle-timeout", "-1"});
+    } catch (const std::invalid_argument&) { negative_idle_timeout = true; }
+    failures += check(negative_idle_timeout, "CLI accepted negative idle timeout");
+
+    failures += check(!parse({"ninfer", "model.ninfer", "--prompt", "hi"}).kv_idle_headroom,
+                      "idle headroom default must be target-resolved");
+    for (const char* tokens : {"0", "123456"}) {
+        failures +=
+            check(parse({"ninfer", "model.ninfer", "--prompt", "hi", "--kv-idle-headroom", tokens})
+                          .kv_idle_headroom == static_cast<std::uint32_t>(std::stoul(tokens)),
+                  "CLI lost idle headroom tokens");
+    }
+    bool negative_idle_headroom = false;
+    try {
+        (void)parse({"ninfer", "model.ninfer", "--prompt", "hi", "--kv-idle-headroom", "-1"});
+    } catch (const std::invalid_argument&) { negative_idle_headroom = true; }
+    failures += check(negative_idle_headroom, "CLI accepted negative idle headroom");
+
     const auto system_cache = parse({"ninfer", "model.ninfer", "--prompt", "hi",
                                      "--kv-ram-capacity", "1024", "--kv-ram-system-prompts", "3"});
     failures += check(system_cache.kv_ram_system_prompts == 3 &&

@@ -223,6 +223,41 @@ void moe_expert_cache_admit(const Tensor& ids, Tensor& expert_ptr, const Tensor&
                             Tensor* route_counts = nullptr);
 
 /**
+ * Op: moe_expert_cache_refill_select / moe_expert_cache_refill_publish
+ *
+ * Select reserves one empty F3 flex slot, the highest absolute slot index, for the eligible
+ * nonresident F3 record with greatest live frequency count (ties to the lower layer-major code).
+ * A record is nonresident when slot_index is -1. Eligibility is all records without eligible,
+ * otherwise bit code % 32 of eligible[code / 32]. Zero-count records are candidates too.
+ * If either set is empty, state = {-1,-1}; otherwise state = {code,slot}, owner[slot] = -2 and
+ * referenced[slot] = 0. No expert table or slot_index entry changes: demand may independently
+ * admit this record while the copy is pending. source and destination are zeroed I64 [512]
+ * columns except entry 0, which holds host_ptr[code] and the selected slot's untagged address.
+ * moe_expert_cache_fill(source, destination, 0) copies that one immutable record exactly.
+ *
+ * Publish follows that copy and all prior cache operations. For a nonempty state, if the record
+ * is still nonresident, owner[slot] = code, referenced[slot] = 1, slot_index[code] = slot and
+ * expert_ptr[code] = address(slot) | 1. If demand admitted it meanwhile, the reserved slot is
+ * returned empty instead. In both cases state becomes {-1,-1}. Empty state is a no-op.
+ * Counts and hands do not change. This is independent of demand's fill_ptr and commit columns.
+ *
+ * Shapes/domain: expert_ptr, host_ptr, cache and its frequency state as for admit; state
+ * contiguous I32 [2]; source, destination contiguous I64 [512]; optional eligible contiguous I32
+ * [16,L] holding U32 bits. All operands and pool metadata are pairwise disjoint. Select requires
+ * settled demand fills, no outstanding refill reservation, and consistent cache state; publish
+ * requires the reservation still protected (owner -2) and its copy complete. No borrow/return
+ * touches that slot between select and publish. Other demand admissions may run between them.
+ * All views and slot addresses stay stable. Exact; no workspace; asynchronous, deterministic,
+ * graph-capturable. Invalid host-visible arguments throw std::invalid_argument.
+ */
+void moe_expert_cache_refill_select(const Tensor& host_ptr, const MoeExpertCache& cache,
+                                    Tensor& state, Tensor& source, Tensor& destination,
+                                    cudaStream_t stream, const Tensor* eligible = nullptr);
+void moe_expert_cache_refill_publish(Tensor& expert_ptr, const Tensor& host_ptr,
+                                     const MoeExpertCache& cache, Tensor& state,
+                                     cudaStream_t stream);
+
+/**
  * Op: moe_expert_cache_borrow / moe_expert_cache_return
  *
  * Lends the slots s0 + [first, first + count) of pool c = tag(codec) out of the cache, where s0 =

@@ -159,6 +159,8 @@ The RTX 5090 tree investigation is in
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or automatic sizing from remaining GPU memory | `auto` |
 | `--kv-capacity-headroom MiB` | device memory `--kv-capacity auto` leaves free; requires `auto` | `32` |
 | `--kv-ram-capacity off\|N` | pinned host capacity in MiB for prefixes and live suspension; enables output windows up to 8192 tokens | `off` |
+| `--kv-idle-timeout SECONDS` | Flash-Next RAM tier: evict retained idle lanes after this many seconds, except the most recently idle lane; `0` disables | `30` with Flash-Next RAM enabled; otherwise `0` |
+| `--kv-idle-headroom TOKENS` | Flash-Next idle expiry stops once the expert cache can hold its flex demand plus this many tokens of KV extents (rounded up to whole extents); `0` evicts only to cover the demand; requires an enabled idle timeout | `200000` |
 | `--kv-ram-system-prompts N` | Retain up to N rendered system prefixes inside the RAM budget; nonzero requires RAM capacity | `0` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache pack-file capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
@@ -339,7 +341,11 @@ streaming windows borrow cache slots for each windowed super-chunk), so `--kv-ca
 does not apply. On top of that, the pool lends the cache its unreserved pages in extents of 244
 NVFP4 pages (15,616 tokens, 84 expert records) or 122 BF16 pages, and takes an extent back before a
 request maps its pages, so an `auto` pool sized for every lane's whole context costs the cache only
-what requests actually reserve. Serve prints both parts on its KV capacity line as
+what requests actually reserve. Allocation, growth and tier restores take the lowest free page IDs;
+active pages are never compacted. Returned flex slots refill one record at a time from live cache
+frequencies at settled round boundaries, hottest into the highest empty flex slot. Copies yield to
+prefill and the latest decode/verification round's local demand misses: a nonzero miss count
+blocks new refill copies. Their addresses become visible only after completion. Serve prints both parts on its KV capacity line as
 `expert-cache=<own slots>+kv-lendable=<lendable pool bytes>`, the CLI as `gpu expert cache`. A prompt is processed in 16,384-token super-chunks of `--prefill-chunk`-token
 steps; the super-chunk is the unit between which other requests decode and a short prompt may
 start. A complete DFlash2 companion enables adaptive K0..3 automatically, with a full shared
@@ -360,7 +366,26 @@ matching current prefixes prefill only the suffix, and matching saved frontend r
 boundaries restore exact GDN/PLE state before suffix prefill. Other common-prefix positions are
 misses, even inside a retained QSA page. The last sampled output token is not yet appended and is
 therefore not part of the reusable current frontier. `--no-prefix-reuse` disables retention and
-reuse. `cache_write: false` forks into independent allocations without consuming the source;
+reuse. With RAM enabled, `--kv-idle-timeout SECONDS` defaults to 30. A retained lane's timer starts
+when its request settles, not at admission; reuse or a disposable fork cancels the timer, and the
+next idle transition restarts it. The most recently idle retained lane is exempt. Expired ordinary
+lanes migrate their complete original continuation to RAM at a safe scheduler boundary, including
+while the Engine has no requests; disposable idle state is released. The original stays resident
+until a later boundary observes the complete copy, without stalling decoding lanes on D2H.
+Failed/deferred captures keep the source and retry after a full timeout without changing idle
+recency; admission preservation is not lane activity. `0` disables timeout
+eviction. Explicit nonzero values require both Flash-Next and `--kv-ram-capacity`.
+Expiry is demand-based and counted in whole KV extents. The flex demand is the number of
+admittable F3 expert records beyond the fixed F3 slots, rounded up to extents (NVFP4: 84 records
+per 15,616-token extent) and bounded by the flex region. An expired lane is captured only while
+the lendable extents (those the expert cache holds, or whose pages are all free) are fewer than
+the demand plus `--kv-idle-headroom TOKENS` rounded up to extents (default 200000; `0` stops as
+soon as the demand is covered). Free pages below the region or inside partly mapped extents do
+not count. Otherwise expired lanes stay retained, and they become evictable again at any
+boundary where the condition holds; one expiry captures at a time. An explicit
+`--kv-idle-headroom` requires Flash-Next and an enabled idle timeout. Startup logs the demand
+(records, extents, tokens), the headroom and the flex region.
+`cache_write: false` forks into independent allocations without consuming the source;
 without a spare lane or secured RAM that can preserve the original, admission reports overload.
 Disposable retained state is evicted before ordinary state. `--kv-ram-capacity` and the inclusive
 `--kv-disk-capacity` tier retain complete QSA/GDN/PLE/tail-logit state, including active DFlash2

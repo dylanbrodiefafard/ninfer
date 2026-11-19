@@ -94,6 +94,9 @@ ninfer_add_test(ninfer_flash_next_ple_feeder_test
 ninfer_add_test(ninfer_flash_next_speculative_policy_test
   SOURCES targets/qwen3_8_flash_next/test_speculative_policy.cpp
   LIBRARIES ninfer_qwen3_8_flash_next)
+ninfer_add_test(ninfer_flash_next_flex_demand_test
+  SOURCES targets/qwen3_8_flash_next/test_flex_demand.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next)
 ninfer_add_test(ninfer_flash_next_state_test
   SOURCES targets/qwen3_8_flash_next/test_state.cpp
   LIBRARIES ninfer_qwen3_8_flash_next)
@@ -124,7 +127,7 @@ add_test(NAME ninfer_qwen3_8_flash_next_program_parity_real_test
     $<TARGET_FILE:ninfer_qwen3_8_flash_next_engine_real_test> --program-parity)
 set_tests_properties(ninfer_qwen3_8_flash_next_program_parity_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
-foreach(mode IN ITEMS retained reuse-parity ram-tiers disk-tiers live-tiers dflash-masks dflash-mask-program)
+foreach(mode IN ITEMS retained reuse-parity ram-tiers disk-tiers live-tiers dflash-masks dflash-mask-program idle-timeout idle-headroom flex-refill)
   string(REPLACE "-" "_" test_mode "${mode}")
   add_test(NAME ninfer_qwen3_8_flash_next_${test_mode}_real_test
     COMMAND ${NINFER_TEST_LAUNCHER}
@@ -159,6 +162,7 @@ set_property(TEST ninfer_qwen3_6_panel_copy_test APPEND PROPERTY LABELS sanitize
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
+ninfer_add_test(ninfer_idle_lane_policy_test SOURCES test_idle_lane_policy.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 ninfer_add_test(ninfer_typical_cycle_test SOURCES test_typical_cycle.cpp)
@@ -518,6 +522,9 @@ ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_sanitizer_cases(ninfer_a4_activation_test)
+add_test(NAME ninfer_moe_expert_cache_refill_test
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_moe_expert_cache_test> --refill)
+set_tests_properties(ninfer_moe_expert_cache_refill_test PROPERTIES LABELS "kernel;sanitizer;racecheck")
 ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_fill_test)
 ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_stage_test)
 ninfer_add_sanitizer_cases(ninfer_moe_expert_cache_window_test)

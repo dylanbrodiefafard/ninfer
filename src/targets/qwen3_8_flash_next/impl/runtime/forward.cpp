@@ -615,6 +615,21 @@ ExpertRouteProfile Forward::expert_route_profile() {
     return out;
 }
 
+void Forward::enqueue_round_cache_counts() {
+    CUDA_CHECK(cudaMemcpyAsync(round_cache_counts_.data(), chunk_.decode_cache_counters.data,
+                               round_cache_counts_.size(), cudaMemcpyDeviceToHost, stream_));
+}
+
+void Forward::settle_round_cache_counts() {
+    const auto* counts        = static_cast<const std::uint64_t*>(round_cache_counts_.data());
+    last_round_demand_misses_ = false;
+    for (std::size_t codec = 0; codec < ops::kMoeCacheCodecTags; ++codec) {
+        const auto miss = 2 * codec + static_cast<std::size_t>(ops::MoeCacheCounter::Misses);
+        last_round_demand_misses_ |= counts[miss] != previous_round_cache_counts_[miss];
+    }
+    std::copy_n(counts, previous_round_cache_counts_.size(), previous_round_cache_counts_.begin());
+}
+
 ExpertCacheCounts Forward::expert_cache_counts() {
     std::array<std::int64_t,
                static_cast<std::size_t>(ops::kMoeCacheCounterKinds) * ops::kMoeCacheCodecTags>
@@ -1164,6 +1179,7 @@ SampledRows Forward::decode(std::span<const std::int32_t> lanes,
             CUDA_CHECK(cudaMemcpyAsync(tail.data, source, tail.bytes(), cudaMemcpyDeviceToDevice,
                                        stream_));
         }
+        enqueue_round_cache_counts();
         CUDA_CHECK(cudaEventRecord(replay_stop_.get(), stream_));
         CUDA_CHECK(cudaEventSynchronize(replay_stop_.get()));
         CUDA_CHECK(cudaEventElapsedTime(&last_replay_ms_, replay_start_.get(), replay_stop_.get()));
@@ -1183,6 +1199,7 @@ SampledRows Forward::decode(std::span<const std::int32_t> lanes,
         CUDA_CHECK(cudaStreamSynchronize(fill_stream_.get()));
         throw;
     }
+    settle_round_cache_counts();
     ++decode_profile_rounds_;
     for (const std::int32_t lane : lanes) { state_.advance(lane, 1); }
     return sampled_rows(batch);

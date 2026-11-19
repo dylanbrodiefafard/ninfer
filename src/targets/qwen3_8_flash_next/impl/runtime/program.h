@@ -9,6 +9,7 @@
 #include "ngram_table.h"
 #include "runtime/expert_residency.h"
 #include "runtime/forward.h"
+#include "runtime/flex_demand.h"
 #include "runtime/kv_extents.h"
 #include "runtime/ple_feeder.h"
 #include "runtime/dflash.h"
@@ -283,7 +284,18 @@ public:
 
     [[nodiscard]] const KvExpertExtents& extents() const noexcept { return extents_; }
 
+    // The expert cache's demand for flex slots, in the KV extents that would hold them. Static
+    // for the Program: the admission domain of the F3 pool (ExpertResidency::admittable_f3_records,
+    // which a helper placement narrows to its local records) minus the fixed F3 slots, over the
+    // extent geometry. It is met when extents().lendable_extents() reaches flex_demand().extents.
+    [[nodiscard]] const FlexDemand& flex_demand() const noexcept { return flex_demand_; }
+
     [[nodiscard]] const RoundTiming& last_round() const noexcept { return last_round_; }
+
+    // Settled round boundary only; no prefill window may be active when allow is true. Copies
+    // also require zero local demand misses in the latest decode/verification round. Completed
+    // copies can publish while issuance is gated. Captured addresses and model state stay fixed.
+    [[nodiscard]] bool service_expert_refill(bool allow);
 
 private:
     // Runs only under exclusive Program ownership after the round transaction has settled.
@@ -319,8 +331,10 @@ private:
     std::unique_ptr<ExpertHelper> helper_;
 #endif
     ExpertResidency residency_;
+    FlexDemand flex_demand_;
     Forward forward_;
     cudaStream_t stream_;
+    cudaStream_t copy_stream_;
     std::array<LaneControl, kMaxLanes> lanes_{};
     RoundTiming last_round_;
     // Pinned U32 [lanes][State::kAllowedTokenWordStride], the host image of State's eligibility

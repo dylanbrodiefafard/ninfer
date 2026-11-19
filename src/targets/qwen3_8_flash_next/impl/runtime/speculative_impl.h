@@ -272,6 +272,7 @@ SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
         last_gather_seconds_ =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - gather_start).count();
         spec_b_graphs_.at(2 * index + static_cast<std::size_t>(exchange_masks)).launch(stream_);
+        enqueue_round_cache_counts();
         CUDA_CHECK(cudaEventRecord(replay_stop_.get(), stream_));
         CUDA_CHECK(cudaEventSynchronize(replay_stop_.get()));
         if (exchange_masks) { mask_results = token_masks_->results(); }
@@ -298,6 +299,7 @@ SpeculativeRows Forward::speculate(std::span<const std::int32_t> lanes,
         throw std::logic_error(
             "Flash-Next CPU n-gram packet differs from its GPU verification IDs");
     }
+    settle_round_cache_counts();
     ++decode_profile_rounds_;
     pending_verify_width_ = width;
     pending_verify_rows_  = rows;

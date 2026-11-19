@@ -195,10 +195,12 @@ Tensor Forward::verify(std::span<const std::int32_t> lanes, std::span<const std:
                                    cudaMemcpyHostToDevice, stream_));
         enqueue_layer_loop(batch, false, RowSource::Resident, {}, nullptr, kPleLayer, kLayers);
         head(0, chunk.tokens());
+        enqueue_round_cache_counts();
         CUDA_CHECK(cudaStreamSynchronize(stream_));
 #ifdef NINFER_ENABLE_HIP_EXPERT_HELPER
         if (helper_) { helper_->finish_round(); }
 #endif
+        settle_round_cache_counts();
         ++decode_profile_rounds_;
         pending_verify_width_ = width;
         pending_verify_rows_  = chunk.rows;

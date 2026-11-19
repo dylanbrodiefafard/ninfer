@@ -1583,11 +1583,12 @@ BF16 pages are 1,876,992 bytes.
 
 The 244-page extent is preferred for NVFP4. Lending or reclaiming an extent costs one small
 kernel and no copy at either size, because a reclaim only evicts and reused QSA pages need no
-clearing (`State`). The larger extent's cost is granularity. Extents are taken back nearest the
-low, never-lent pages first, so about one partly used extent sits at the KV frontier: on average
-half an extent, 91 MB at 244 pages against 46 MB at 122 (the allocator prefers a lane's own
-continuation and the first contiguous free run, so fragmented holes can place a lane elsewhere). Holes left by closed lanes return to the
-cache only as whole aligned extents. The 13.2-point byte-use gain is worth more than that
+clearing (`State`). Extents are taken back nearest the low, never-lent pages first. Every
+allocation, growth and RAM/SSD restore takes the lowest free page IDs, even if a higher
+contiguous run exists. A restore creates fresh mappings and can relocate a former high-region
+lane into lower holes. No live page moves. Holes return to the cache only as whole aligned
+extents; an active lane's existing high pages can still fragment that region. The 13.2-point
+byte-use gain is worth more than that
 granularity loss whenever more than about 0.7 GB of the pool is idle, which is the case this
 design serves. The Op takes any geometry, so the target chooses.
 
@@ -1615,6 +1616,60 @@ design serves. The Op takes any geometry, so the target chooses.
   while the warm start places the hottest records at the high end.
 - The transient window uses only fixed slots. `Forward::borrow_windows` already sizes its run from
   `slots.bytes`.
+- With RAM enabled, retained idle lanes expire after `--kv-idle-timeout` seconds (default 30,
+  0 disables), except the most recently idle retained lane. The timer starts at settlement;
+  reattachment or a disposable fork cancels it and the next idle transition restarts it. At a
+  safe boundary, ordinary originals use complete-state RAM migration, without preserve-off
+  rewrite cutting; disposable state is released. Ordinary capture is two-phase: continuation and
+  page D2H run on the copy stream, with the original retained and its complete RAM image claimed.
+  A later boundary closes only after the lane's completion event is ready, so decode does not
+  wait on either D2H transfer. Failed/deferred captures keep VRAM retention and re-arm a full
+  timeout without promoting idle recency. Admission preservation does not reset idle timers.
+  Deadline maintenance clears cache-idle before tier work. The executor waits even without
+  ingress, rather than requiring admission pressure.
+- Expiry is useful only while it frees KV the expert cache needs. Flex demand is
+  `ceil(max(0, admittable F3 records - fixed F3 slots) / S)` extents, bounded by the X flex-region
+  extents, times the extent tokens (NVFP4 244 pages = 15,616 tokens, S = 84; BF16 122 pages =
+  7,808 tokens, S = 108). It is computed once at startup from the admission domain (all F3 records,
+  or the helper placement's local set, which later tail pinning narrows) and the fixed F3 slots
+  that domain may use, and logged with the headroom. A non-capturing expired lane is evicted only
+  while no lane is capturing and `lendable_extents < demand extents + ceil(headroom / extent
+  tokens)` (headroom default 200,000 tokens). Lendable extents are the cache-held extents plus
+  lent-back extents whose pages are all free, so free pages below the region and in partly
+  mapped extents do not count; otherwise the lane stays retained and the condition is rechecked
+  at every boundary and at least once per second.
+- Once all nonexempt idle originals successfully migrate and disposable state is released,
+  only active lanes and the exempt lane can pin top-region pages. RAM funding failures retain
+  older idle owners until a successful retry or admission-pressure eviction. This is an owner bound, not a claim that
+  each owner occupies one contiguous run. Whole free extents return highest first with the
+  one-spare-extent hysteresis; no live defragmentation is needed for this bound.
+
+**Background flex refill.** Each `give_back` requests refill until no eligible empty placement
+remains. Completion feedback stops empty scans without losing a later returned extent; duplicate
+demand admissions do not exhaust an attempt budget and leave slots permanently empty.
+Borrowing a low extent also re-requests refill when another cache-held extent remains: eviction
+can create eligible nonresident records after an earlier scan stopped with high slots still empty.
+At a settled round boundary without prefill, restore or admission traffic and with zero local
+demand misses in the latest completed decode/verification round,
+`moe_expert_cache_refill_select` chooses the eligible nonresident F3 record with the greatest live
+frequency count (ties to the lower layer-major code), and reserves the highest empty flex slot.
+The demand gate reads admit's existing counters before the round's existing completion fence;
+there is no additional host synchronization. It uses the cache's device frequency state, not an
+OFF-build compiled profile. Helper builds pass
+the local-eligibility mask, so helper-owned records never refill; full fixed local coverage needs
+no refill. The reservation has owner -2 but no resident table or inverse-index entry, so demand
+continues to read the host record and can admit it elsewhere.
+
+One immutable record copies on `DeviceContext::copy_stream`, using the existing exact fill Op.
+At most one refill is in flight. At a later boundary, only after its event is ready,
+`moe_expert_cache_refill_publish` installs the owner, reference counter, inverse index and expert
+table entry. If demand admitted that record meanwhile, publication releases the redundant slot
+instead. Refill uses separate startup-allocated source/destination columns, never demand's
+fill/commit columns; every captured address remains stable. Hotter candidates occupy higher
+extents, reclaimed last. Prefill, scoring and KV reclaim join at most that one copy through a stream-event
+wait before using its memory; neither drains the copy stream on the host. Idle refill progresses
+through deadline-driven control boundaries, with no polling thread. GPU correctness, sanitizer
+and performance qualification of idle reclaim and background refill remain pending.
 
 Verification of the Op change (RTX 5090, CUDA 13.1). `ninfer_moe_expert_cache_test` compares the
 complete state exactly against an independent sequential model after every admit, commit, borrow
@@ -1650,9 +1705,9 @@ report zero errors.
   lane's fence before releasing pages, so `give_back` never waits behind another lane's large tier
   restore. Closing the destination lane of a pending disk ticket cancels and drains that ticket's
   workers, state transfers and scatter events before unmapping; closing any other lane neither
-  cancels that restore nor depends on its later copy-stream work. The borrow needs no join: every
-  restore orders its copy stream after the compute stream (`order_copy_after_compute`) once the
-  lane is open.
+  cancels that restore nor depends on its later copy-stream work. A borrow joins only the
+  outstanding refill record before changing its protected reservation. Every restore orders its
+  copy stream after the compute stream (`order_copy_after_compute`) once the lane is open.
 - Pages stay mapped eagerly: `State::open` and `State::resize` map the whole reservation, as before,
   and only unreserved pages are lent. Lazy materialization ahead of the frontier was considered and
   not adopted. A lane's unwritten reservation is its output budget: at most the request's

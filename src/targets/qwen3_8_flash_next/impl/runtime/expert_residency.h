@@ -6,6 +6,8 @@
 // and ops::moe_experts read. Replacement runs on the device inside those Ops; this file owns the
 // storage, its sizing and the initial state.
 
+#include "runtime/cuda_event.h"
+
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/moe_expert_cache.h"
@@ -165,14 +167,24 @@ public:
 
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;
-    ExpertResidency(ExpertResidency&&) noexcept        = default;
-    ExpertResidency& operator=(ExpertResidency&&)      = default;
-    ~ExpertResidency()                                 = default;
+    ExpertResidency(ExpertResidency&&)                 = delete;
+    ExpertResidency& operator=(ExpertResidency&&)      = delete;
+    ~ExpertResidency();
 
     [[nodiscard]] ops::MoeExpertCache cache();
     [[nodiscard]] Tensor expert_table();
     [[nodiscard]] Tensor host_table();
     [[nodiscard]] Tensor fill_table();
+
+    // A returned empty flex run requests refill until no empty eligible placement remains.
+    // At a settled boundary service publishes only completed copies, then optionally reserves
+    // and copies one live-frequency candidate on copy_stream. Demand can run meanwhile; the slot
+    // remains protected until publication. join_refill orders just that copy and its publication
+    // before a KV reclaim or a prefill window, without a host wait. Streams must outlive this
+    // object.
+    void request_refill();
+    [[nodiscard]] bool service_refill(cudaStream_t stream, cudaStream_t copy_stream, bool allow);
+    void join_refill(cudaStream_t stream);
 
     // The fixed slots of each pool.
     [[nodiscard]] const ExpertSlotPlan& plan() const noexcept { return plan_; }
@@ -180,10 +192,18 @@ public:
     // The F3 pool's flex slots.
     [[nodiscard]] std::int32_t flex_slots() const noexcept { return flex_slots_; }
 
+    // F3 records the residency may admit: every F3 record, or those set in local_eligibility.
+    // The F3 records beyond plan().slots of F3 can be resident only in flex slots, and NVFP4
+    // records never use them.
+    [[nodiscard]] std::int64_t admittable_f3_records() const noexcept {
+        return admittable_f3_records_;
+    }
+
 private:
     std::int32_t layers_ = 0;
     ExpertSlotPlan plan_;
-    std::int32_t flex_slots_ = 0;
+    std::int32_t flex_slots_            = 0;
+    std::int64_t admittable_f3_records_ = 0;
     std::array<DeviceBuffer, ops::kMoeCacheCodecTags> slots_;
     // Tables (each layer column 4096-byte aligned), the slot index, hands, the flex address table,
     // and per-pool owner and reference arrays (fixed and flex slots), carved once from metadata_.
@@ -198,6 +218,22 @@ private:
     DeviceSpan flex_address_;
     std::array<DeviceSpan, ops::kMoeCacheCodecTags> owner_;
     std::array<DeviceSpan, ops::kMoeCacheCodecTags> referenced_;
+    // Separate from demand fill columns and every graph-captured address; allocated at startup.
+    DeviceBuffer refill_storage_;
+    Tensor refill_state_;
+    Tensor refill_source_;
+    Tensor refill_destination_;
+    Tensor refill_eligible_;
+    // Selection completion feedback stops empty scans, but does not publish device residency.
+    PinnedHostBuffer refill_result_{sizeof(std::int32_t)};
+    CudaEvent refill_selected_{cudaEventDisableTiming};
+    CudaEvent refill_done_{cudaEventDisableTiming};
+    std::optional<cudaStream_t> refill_copy_stream_;
+    std::uint64_t refill_generation_   = 0;
+    std::uint64_t selected_generation_ = 0;
+    bool refill_requested_             = false;
+    bool refill_pending_               = false;
+    bool refill_enabled_               = true;
 };
 
 } // namespace ninfer::targets::qwen3_8_flash_next
