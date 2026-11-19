@@ -6,11 +6,14 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
+#include <new>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -189,7 +192,7 @@ public:
     explicit MappedFile(const std::filesystem::path& path) {
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (fd < 0) {
-            throw std::system_error(errno, std::generic_category(), "open " + path.string());
+            throw ArtifactError("open O_DIRECT " + path.string() + ": " + std::strerror(errno));
         }
 
         struct stat status{};
@@ -197,7 +200,7 @@ public:
         if (::fstat(fd, &status) != 0) {
             const int error = errno;
             ::close(fd);
-            throw std::system_error(error, std::generic_category(), "fstat " + path.string());
+            throw ArtifactError("fstat " + path.string() + ": " + std::strerror(error));
         }
         if (status.st_size < 0 ||
             static_cast<std::uintmax_t>(status.st_size) > std::numeric_limits<std::size_t>::max()) {
@@ -215,6 +218,7 @@ public:
                 throw std::system_error(error, std::generic_category(), "mmap " + path.string());
             }
         }
+        path_ = path.string();
         fd_   = fd;
         data_ = static_cast<const std::byte*>(mapping);
         size_ = size;
@@ -236,25 +240,41 @@ public:
         constexpr std::size_t alignment = Reader::direct_io_alignment;
         if (absolute_offset % alignment != 0 || destination.size() % alignment != 0 ||
             reinterpret_cast<std::uintptr_t>(destination.data()) % alignment != 0) {
-            throw ArtifactError("direct artifact read is not 4096-byte aligned");
+            throw ArtifactError("direct read " + path_ + " at " + std::to_string(absolute_offset) +
+                                " is not 4096-byte aligned");
         }
         if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
             destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
             throw ArtifactError("direct artifact read exceeds platform I/O limits");
         }
 
-        ssize_t bytes = -1;
-        do {
-            bytes = ::pread(fd_, destination.data(), destination.size(),
-                            static_cast<off_t>(absolute_offset));
-        } while (bytes < 0 && errno == EINTR);
-        if (bytes < 0) {
-            throw std::system_error(errno, std::generic_category(), "direct artifact read");
+        // A direct read may return fewer bytes than requested without being at end of file
+        // (some filesystems split large requests), so continue until the request is full or the
+        // file ends. A continuation that is no longer block-aligned fails with EINVAL below.
+        std::size_t total = 0;
+        while (total < destination.size()) {
+            const auto position = absolute_offset + total;
+            if (position > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+                throw ArtifactError("direct artifact read exceeds platform I/O limits");
+            }
+            ssize_t bytes = -1;
+            do {
+                bytes = ::pread(fd_, destination.data() + total, destination.size() - total,
+                                static_cast<off_t>(position));
+            } while (bytes < 0 && errno == EINTR);
+            if (bytes < 0) {
+                throw ArtifactError("pread O_DIRECT " + path_ + " at " + std::to_string(position) +
+                                    " for " + std::to_string(destination.size() - total) +
+                                    " bytes: " + std::strerror(errno));
+            }
+            if (bytes == 0) { break; }
+            total += static_cast<std::size_t>(bytes);
         }
-        return static_cast<std::size_t>(bytes);
+        return total;
     }
 
 private:
+    std::string path_;
     int fd_                = -1;
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
@@ -492,9 +512,16 @@ Reader::tensor_content_identity(std::span<const TensorContentSelection> selectio
                                                     layout_name(tensor.layout), encoded_ranges})
                                            .dump();
         update(descriptor.data(), descriptor.size());
-        const auto data = payload(name).data;
+        std::vector<std::byte> window(std::size_t{8} << 20);
         for (const auto range : merged) {
-            update(data.data() + range.offset, static_cast<std::size_t>(range.bytes));
+            for (std::uint64_t offset = 0; offset < range.bytes;) {
+                const auto bytes = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(window.size(), range.bytes - offset));
+                (void)read_bytes(payload_offset() + tensor.offset + range.offset + offset,
+                                 std::span(window).first(bytes));
+                update(window.data(), bytes);
+                offset += bytes;
+            }
         }
     }
     std::array<unsigned char, 32> digest{};
@@ -543,6 +570,104 @@ PayloadSpan Reader::payload(std::string_view name) const {
 std::size_t Reader::read_direct(std::uint64_t absolute_offset,
                                 std::span<std::byte> destination) const {
     return impl_->file.read_direct(absolute_offset, destination);
+}
+
+std::uint64_t Reader::read_bytes(std::uint64_t absolute_offset,
+                                 std::span<std::byte> destination) const {
+    if (absolute_offset > file_bytes() || destination.size() > file_bytes() - absolute_offset) {
+        throw ArtifactError("direct artifact byte range at " + std::to_string(absolute_offset) +
+                            " exceeds file size " + std::to_string(file_bytes()));
+    }
+    // Scratch covers the whole request up to 16 MiB, so large reads issue large preads.
+    constexpr std::size_t max_scratch = std::size_t{16} << 20;
+    const auto scratch_bytes          = static_cast<std::size_t>(
+        std::min<std::uint64_t>(max_scratch, align_up(destination.size() + direct_io_alignment,
+                                                      direct_io_alignment, "direct read scratch")));
+    const std::unique_ptr<std::byte, decltype(&std::free)> scratch(
+        static_cast<std::byte*>(std::aligned_alloc(direct_io_alignment, scratch_bytes)),
+        &std::free);
+    if (!scratch) { throw std::bad_alloc(); }
+    std::uint64_t physical_bytes = 0;
+    while (!destination.empty()) {
+        const auto source  = absolute_offset / direct_io_alignment * direct_io_alignment;
+        const auto prefix  = static_cast<std::size_t>(absolute_offset - source);
+        const auto bytes   = std::min(destination.size(), scratch_bytes - prefix);
+        const auto request = static_cast<std::size_t>(
+            align_up(prefix + bytes, direct_io_alignment, "direct read request"));
+        const auto read = read_direct(source, std::span(scratch.get(), request));
+        if (read < prefix + bytes) {
+            throw ArtifactError("short direct artifact read at " + std::to_string(source) +
+                                ": required " + std::to_string(prefix + bytes) + " bytes, got " +
+                                std::to_string(read));
+        }
+        physical_bytes += read;
+        std::memcpy(destination.data(), scratch.get() + prefix, bytes);
+        absolute_offset += bytes;
+        destination = destination.subspan(bytes);
+    }
+    return physical_bytes;
+}
+
+std::uint64_t Reader::stream(FileRange range, const StreamBuffers& buffers, const Consumer& consume,
+                             std::size_t unit_bytes) const {
+    const std::size_t buffer_bytes = buffers[0].size();
+    if (!consume || unit_bytes == 0 || buffer_bytes % direct_io_alignment != 0 ||
+        buffer_bytes < 2 * direct_io_alignment || unit_bytes > buffer_bytes - direct_io_alignment ||
+        range.bytes % unit_bytes != 0 || range.offset > file_bytes() ||
+        range.bytes > file_bytes() - range.offset) {
+        throw ArtifactError("invalid direct stream range at " + std::to_string(range.offset) +
+                            " for " + std::to_string(range.bytes) + " bytes");
+    }
+    for (std::size_t i = 0; i < buffers.size(); ++i) {
+        const auto begin = reinterpret_cast<std::uintptr_t>(buffers[i].data());
+        if (begin % direct_io_alignment != 0 || buffers[i].size() != buffer_bytes) {
+            throw ArtifactError("direct stream buffer " + std::to_string(i) +
+                                " must be 4096-aligned and equal in size to buffer 0");
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            const auto other = reinterpret_cast<std::uintptr_t>(buffers[j].data());
+            if (begin < other + buffer_bytes && other < begin + buffer_bytes) {
+                throw ArtifactError("direct stream buffers overlap");
+            }
+        }
+    }
+    std::array<Completion, stream_buffer_count> pending;
+    std::exception_ptr failure;
+    std::uint64_t physical_bytes = 0;
+    try {
+        std::size_t next = 0;
+        const auto end   = range.offset + range.bytes;
+        while (range.offset < end) {
+            const auto slot = next++ % buffers.size();
+            if (pending[slot]) { std::exchange(pending[slot], {})(); }
+            const auto source   = range.offset / direct_io_alignment * direct_io_alignment;
+            const auto prefix   = static_cast<std::size_t>(range.offset - source);
+            const auto capacity = (buffer_bytes - prefix) / unit_bytes * unit_bytes;
+            const auto bytes =
+                static_cast<std::size_t>(std::min<std::uint64_t>(end - range.offset, capacity));
+            const auto request = static_cast<std::size_t>(
+                align_up(prefix + bytes, direct_io_alignment, "direct stream request"));
+            const auto read = read_direct(source, buffers[slot].first(request));
+            if (read < prefix + bytes) {
+                throw ArtifactError("short direct stream read at " + std::to_string(source) +
+                                    ": required " + std::to_string(prefix + bytes) + ", got " +
+                                    std::to_string(read));
+            }
+            physical_bytes = checked_add(physical_bytes, read, "direct stream read bytes");
+            pending[slot]  = consume({range.offset, buffers[slot].subspan(prefix, bytes)}, slot);
+            range.offset += bytes;
+        }
+    } catch (...) { failure = std::current_exception(); }
+    for (auto& completion : pending) {
+        if (!completion) { continue; }
+        try {
+            completion();
+        } catch (...) {
+            if (!failure) { failure = std::current_exception(); }
+        }
+    }
+    if (failure) { std::rethrow_exception(failure); }
+    return physical_bytes;
 }
 
 } // namespace ninfer::artifact

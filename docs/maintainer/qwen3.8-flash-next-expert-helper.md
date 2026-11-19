@@ -101,7 +101,8 @@ profile in `expert_helper_profile.h`, generated offline from the explicit study 
 `/home/battlefront/ai/study/calib/routing_counts.npy`. A small target-private generation tool
 checks shape, nonnegativity and integer range. Record the source/recipe in the generated header;
 no installed Python dependency or absolute path is used at startup. The generator also accepts
-served decode-route JSON v1 as an explicit offline input for this same compiled header; selecting
+served decode-route JSON v1 as an explicit offline input for this same compiled header (the
+current header is generated from the served route profile of the final VM run); selecting
 that profile requires generation and rebuild, never a runtime flag, sidecar or hot reload.
 The artifact remains the
 only product weight artifact, its directory and record bytes unchanged. Counts influence
@@ -610,6 +611,9 @@ When P and H together cover all 24,576 records, T is empty: no host residue and 
 Small KV configurations reach this (§3, capacity table). At `--kv-capacity 1000000` with 8
 lanes, the planning estimate is P about 12 GB, H 33.3 GB and T about 5 GB, about 2,400 records
 and 0.14% of route assignments in the VM profile. The startup log reports the actual values.
+`plan_expert_helper` computes the three tiers with exact byte totals per tier and codec
+(`primary_*`, `helper_*`, `tail_*` of `ExpertHelperPlacement`); `local_eligibility` keeps its
+meaning, P union T.
 
 `ExpertResidency` owns a pinned fixed region (P, written once at load and never a victim) and the
 flex pool (T only). Admission, staging and frequency state cover only T. The P and H masks are
@@ -641,17 +645,24 @@ mailbox's DMA path. The R9700 returns a **BF16** partial for prefill (FP32 stays
 
 ### 11.3 Streaming load
 
-No artifact page cache and no 50 GB temporary. The two codec record tensors are read
-sequentially with `O_DIRECT` into four reusable pinned bounce buffers of 64 MiB. Each record goes
-straight to its destination: a P slot (CUDA H2D on the copy stream), an H bank (HIP H2D), or the
-host residue (CPU copy). A buffer is reused only after the events of all copies from it
-complete. Non-expert tensors use the same reader. Peak extra host memory is 256 MiB plus the
-residue.
+No artifact page cache and no 50 GB temporary. `artifact::Reader::stream` reads a file range
+sequentially with `O_DIRECT` through four reusable pinned bounce buffers of 64 MiB
+(`PinnedReadBuffers`), one stream at a time (the host's single-stream `O_DIRECT` rate is 5.3 GB/s).
+Unaligned range edges are read as whole 4096-byte blocks and trimmed, so a consumer sees exactly
+the requested bytes, in order, in chunks that are a whole number of records. A buffer is refilled
+only after the completion its consumer returned has run: a device copy completes on a CUDA event
+recorded after its copies, a CPU copy on its future. The target decides each chunk's destination:
+a P slot (CUDA H2D on the copy stream), an H bank (HIP H2D), or the host residue (CPU copy).
+Peak extra host memory is 256 MiB plus the residue.
 
-- The CUDA-only configuration streams into its pinned store the same way, which removes the page
-  cache copy of 55 GB but keeps the 50.3 GB store.
+- Non-expert tensors (`artifact::materialize`) use the same reader for device tensors, the mapped
+  host embedding and retained resources; only the small directory is read through the mapping.
+- The CUDA-only configuration streams into its pinned store the same way
+  (`fill_expert_store`: each chunk's records are copied by a worker thread while the reader fills
+  the next buffer), which removes the page-cache copy of 55 GB but keeps the 50.3 GB store.
 - Verification: the existing bounded per-record checksum readback, extended to P slots and the
-  residue, against CPU checksums of the read file bytes.
+  residue, against CPU checksums of the read file bytes. The reader itself is checked bytewise
+  against a buffered `pread` of both record tensors (`ninfer_artifact_direct_stream_real_test`).
 - Load time: measure the host's native sequential read rate of the artifact. The VM's 2-minute
   read is a virtio `cache=none` figure, not a host one.
 

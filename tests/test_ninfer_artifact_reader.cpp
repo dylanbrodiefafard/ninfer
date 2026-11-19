@@ -3,7 +3,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <future>
+#include <memory>
 #include <cstdint>
 #include <chrono>
 #include <iostream>
@@ -430,6 +437,218 @@ void test_tensor_content_identity() {
     }
 }
 
+// Direct-stream tests. The streamed object is 300,000 bytes of position-dependent data read
+// through four 16 KiB buffers, so every range crosses many buffer recycles and unaligned edges.
+constexpr std::size_t kStreamBuffer = 16384;
+constexpr std::size_t kStreamBytes  = 300000;
+
+std::uint8_t pattern(std::uint64_t index) { return static_cast<std::uint8_t>(index * 131 + 7); }
+
+struct StreamFixture {
+    ninfer::test::artifact_fixture::TemporaryArtifact artifact;
+    std::unique_ptr<Reader> reader;
+    std::uint64_t base = 0; // absolute file offset of the streamed object
+
+    StreamFixture() : artifact(write_stream_artifact()) {
+        reader = std::make_unique<Reader>(artifact.path);
+        base   = reader->payload("stream").absolute_offset;
+        std::fstream file(artifact.path, std::ios::in | std::ios::out | std::ios::binary);
+        file.seekp(static_cast<std::streamoff>(base));
+        for (std::uint64_t i = 0; i < kStreamBytes; ++i) {
+            file.put(static_cast<char>(pattern(i)));
+        }
+        if (!file) { throw std::runtime_error("failed to fill stream fixture"); }
+    }
+
+    static ninfer::test::artifact_fixture::TemporaryArtifact write_stream_artifact() {
+        const Json directory = {
+            {"identity", {{"model_id", "fixture-model"}, {"weights_id", "fixture-weights"}}},
+            {"objects", Json::array({{{"name", "stream"},
+                                      {"kind", "resource"},
+                                      {"encoding", "raw-bytes-v1"},
+                                      {"offset", 0},
+                                      {"bytes", kStreamBytes}}})},
+        };
+        return write_fixture(directory, "stream");
+    }
+};
+
+struct FreeDeleter {
+    void operator()(std::byte* pointer) const noexcept { std::free(pointer); }
+};
+
+struct AlignedBuffers {
+    std::array<std::unique_ptr<std::byte, FreeDeleter>, Reader::stream_buffer_count> owners;
+    Reader::StreamBuffers views;
+
+    explicit AlignedBuffers(std::size_t bytes = kStreamBuffer, std::size_t misalign = 0) {
+        for (std::size_t i = 0; i < owners.size(); ++i) {
+            owners[i].reset(static_cast<std::byte*>(std::aligned_alloc(
+                Reader::direct_io_alignment, bytes + Reader::direct_io_alignment)));
+            views[i] = std::span(owners[i].get() + misalign, bytes);
+        }
+    }
+};
+
+// Streams [offset, offset + bytes) of the object and checks the delivered bytes, their order and
+// that a buffer is never handed to the reader before its previous completion ran.
+void check_stream(const StreamFixture& fixture, std::uint64_t offset, std::uint64_t bytes,
+                  std::size_t unit) {
+    AlignedBuffers buffers;
+    std::array<bool, Reader::stream_buffer_count> busy{};
+    std::uint64_t expected = fixture.base + offset;
+    std::size_t chunks = 0, completions = 0;
+    const auto physical = fixture.reader->stream(
+        {fixture.base + offset, bytes}, buffers.views,
+        [&](ninfer::artifact::PayloadSpan chunk, std::size_t slot) -> Reader::Completion {
+            if (busy.at(slot) || chunk.absolute_offset != expected || chunk.data.empty() ||
+                chunk.data.size() % unit != 0 || chunk.data.size() > kStreamBuffer) {
+                throw std::runtime_error("stream chunk order, size or buffer reuse is wrong");
+            }
+            for (std::size_t i = 0; i < chunk.data.size(); ++i) {
+                if (std::to_integer<std::uint8_t>(chunk.data[i]) !=
+                    pattern(expected - fixture.base + i)) {
+                    throw std::runtime_error("stream chunk bytes differ from the file");
+                }
+            }
+            expected += chunk.data.size();
+            busy.at(slot) = true;
+            ++chunks;
+            return [&, slot] {
+                busy.at(slot) = false;
+                ++completions;
+            };
+        },
+        unit);
+    if (expected != fixture.base + offset + bytes || completions != chunks ||
+        std::ranges::any_of(busy, [](bool b) { return b; }) || (bytes != 0 && chunks < 2) ||
+        physical < bytes) {
+        throw std::runtime_error("stream did not deliver the whole range and join every buffer");
+    }
+}
+
+void test_direct_stream() {
+    const StreamFixture fixture;
+    check_stream(fixture, 0, kStreamBytes, 1);
+    check_stream(fixture, 13, kStreamBytes - 13 - 37, 1);
+    check_stream(fixture, 4096 - 1, 70000, 1);
+    check_stream(fixture, 4096 + 5, 60 * 1000, 1000);
+    check_stream(fixture, 777, 100 * 1500, 1500);
+    check_stream(fixture, 100, 0, 1);
+
+    // A consumer that throws, and a completion that throws, still join every earlier completion.
+    for (const bool throw_in_completion : {false, true}) {
+        AlignedBuffers buffers;
+        std::size_t consumed = 0, joined = 0;
+        expect_artifact_error(
+            [&] {
+                try {
+                    (void)fixture.reader->stream(
+                        {fixture.base, kStreamBytes}, buffers.views,
+                        [&](ninfer::artifact::PayloadSpan, std::size_t) -> Reader::Completion {
+                            if (++consumed == 6 && !throw_in_completion) {
+                                throw ninfer::artifact::ArtifactError("consumer failed");
+                            }
+                            return [&, index = consumed] {
+                                ++joined;
+                                if (throw_in_completion && index == 3) {
+                                    throw ninfer::artifact::ArtifactError("completion failed");
+                                }
+                            };
+                        });
+                } catch (...) {
+                    if (joined != consumed - (throw_in_completion ? 0 : 1)) {
+                        throw std::runtime_error("failed stream left a completion unjoined");
+                    }
+                    throw;
+                }
+            },
+            "consumer or completion failure");
+    }
+
+    // The consumer contract for asynchronous work: a consumer that throws after starting work
+    // for its own chunk settles that work itself and returns no completion, so the stream never
+    // calls a completion for that slot, and no work is still running when stream() unwinds.
+    {
+        AlignedBuffers buffers;
+        std::vector<std::future<void>> running;
+        std::size_t consumed = 0, completions_run = 0;
+        bool threw = false;
+        try {
+            (void)fixture.reader->stream(
+                {fixture.base, kStreamBytes}, buffers.views,
+                [&](ninfer::artifact::PayloadSpan, std::size_t) -> Reader::Completion {
+                    running.push_back(std::async(std::launch::async, [] {}));
+                    if (++consumed == 7) {
+                        running.back().get(); // settles its own work before throwing
+                        throw ninfer::artifact::ArtifactError("consumer failed after enqueue");
+                    }
+                    return [&, index = running.size() - 1] {
+                        running[index].get();
+                        ++completions_run;
+                    };
+                });
+        } catch (const ninfer::artifact::ArtifactError&) { threw = true; }
+        const bool all_settled =
+            std::ranges::none_of(running, [](const std::future<void>& f) { return f.valid(); });
+        if (!threw || !all_settled || completions_run != consumed - 1) {
+            throw std::runtime_error("failed consumer left asynchronous work or ran a completion");
+        }
+    }
+
+    // Invalid buffers, ranges and units.
+    const auto noop = [](ninfer::artifact::PayloadSpan, std::size_t) {
+        return Reader::Completion{};
+    };
+    AlignedBuffers good;
+    AlignedBuffers misaligned(kStreamBuffer, 1);
+    expect_artifact_error(
+        [&] { (void)fixture.reader->stream({fixture.base, 100}, misaligned.views, noop); },
+        "misaligned buffer");
+    auto overlapping = good.views;
+    overlapping[1]   = overlapping[0];
+    expect_artifact_error(
+        [&] { (void)fixture.reader->stream({fixture.base, 100}, overlapping, noop); },
+        "overlapping buffers");
+    expect_artifact_error(
+        [&] { (void)fixture.reader->stream({fixture.base, 1000}, good.views, noop, 300); },
+        "range not a whole number of units");
+    expect_artifact_error(
+        [&] { (void)fixture.reader->stream({fixture.base, 100}, good.views, nullptr); },
+        "missing consumer");
+    expect_artifact_error(
+        [&] {
+            (void)fixture.reader->stream({fixture.reader->file_bytes() - 10, 11}, good.views, noop);
+        },
+        "range past the end of the file");
+
+    // Exact edges through read_bytes.
+    std::array<std::byte, 5000> window{};
+    (void)fixture.reader->read_bytes(fixture.base + 4093, window);
+    for (std::size_t i = 0; i < window.size(); ++i) {
+        if (std::to_integer<std::uint8_t>(window[i]) != pattern(4093 + i)) {
+            throw std::runtime_error("read_bytes returned the wrong bytes");
+        }
+    }
+    expect_artifact_error(
+        [&] { (void)fixture.reader->read_bytes(fixture.reader->file_bytes() - 4, window); },
+        "read_bytes past the end");
+}
+
+// The file shrinks after the Reader recorded its size: the direct read ends early.
+void test_direct_stream_short_read() {
+    const StreamFixture fixture;
+    AlignedBuffers buffers;
+    std::filesystem::resize_file(fixture.artifact.path, fixture.base + 100000);
+    expect_artifact_error(
+        [&] {
+            (void)fixture.reader->stream(
+                {fixture.base, kStreamBytes}, buffers.views,
+                [](ninfer::artifact::PayloadSpan, std::size_t) { return Reader::Completion{}; });
+        },
+        "short direct read");
+}
+
 } // namespace
 
 int main() {
@@ -441,6 +660,8 @@ int main() {
         test_common_validation();
         test_selected_row_identity();
         test_tensor_content_identity();
+        test_direct_stream();
+        test_direct_stream_short_read();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

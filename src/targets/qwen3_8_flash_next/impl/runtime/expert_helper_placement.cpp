@@ -15,11 +15,19 @@ std::size_t record_bytes(ops::MoeExpertCodec codec) {
 }
 } // namespace
 
-bool ExpertHelperPlacement::helper_owns(std::size_t index) const {
-    if (index >= kEntries || local_eligibility.size() != kEntries / 32) {
+ExpertPlacementTier ExpertHelperPlacement::tier(std::size_t index) const {
+    if (index >= kEntries || local_eligibility.size() != kEntries / 32 ||
+        primary_mask.size() != kEntries / 32) {
         throw std::out_of_range("helper ownership index");
     }
-    return (local_eligibility[index / 32] & (std::uint32_t{1} << (index % 32))) == 0;
+    const auto bit = std::uint32_t{1} << (index % 32);
+    if ((primary_mask[index / 32] & bit) != 0) { return ExpertPlacementTier::Primary; }
+    return (local_eligibility[index / 32] & bit) == 0 ? ExpertPlacementTier::Helper
+                                                      : ExpertPlacementTier::Tail;
+}
+
+bool ExpertHelperPlacement::helper_owns(std::size_t index) const {
+    return tier(index) == ExpertPlacementTier::Helper;
 }
 
 ExpertHelperPlacement plan_expert_helper(std::span<const ops::MoeExpertCodec> codecs,
@@ -34,6 +42,7 @@ ExpertHelperPlacement plan_expert_helper(std::span<const ops::MoeExpertCodec> co
     ExpertHelperPlacement result;
     result.budget_bytes = (free_bytes - kHelperReserveBytes) / 256 * 256;
     result.local_eligibility.assign(kEntries / 32, ~std::uint32_t{0});
+    result.primary_mask.assign(kEntries / 32, 0);
     std::array<std::vector<std::size_t>, 2> by_codec;
     for (std::size_t i = 0; i < kEntries; ++i) {
         const auto tag = static_cast<std::size_t>(codecs[i]);
@@ -53,6 +62,13 @@ ExpertHelperPlacement plan_expert_helper(std::span<const ops::MoeExpertCodec> co
         std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
             return counts[a] != counts[b] ? counts[a] > counts[b] : a < b;
         });
+        for (std::int32_t slot = 0; slot < fixed[tag]; ++slot) {
+            const auto i = order[static_cast<std::size_t>(slot)];
+            result.primary_mask[i / 32] |= std::uint32_t{1} << (i % 32);
+            ++result.primary_counts[tag];
+            result.primary_bytes[tag] += record_bytes(codecs[i]);
+            result.primary_routes += counts[i];
+        }
         complement.insert(complement.end(), order.begin() + fixed[tag], order.end());
         result.remaining_counts[tag] = static_cast<std::int32_t>(order.size());
     }
@@ -64,9 +80,14 @@ ExpertHelperPlacement plan_expert_helper(std::span<const ops::MoeExpertCodec> co
     std::size_t left = result.budget_bytes;
     for (const auto i : complement) {
         const auto bytes = record_bytes(codecs[i]);
-        if (bytes > left) { continue; }
+        const auto tag   = static_cast<std::size_t>(codecs[i]);
+        if (bytes > left) {
+            ++result.tail_counts[tag];
+            result.tail_bytes[tag] += bytes;
+            result.tail_routes += counts[i];
+            continue;
+        }
         left -= bytes;
-        const auto tag = static_cast<std::size_t>(codecs[i]);
         result.local_eligibility[i / 32] &= ~(std::uint32_t{1} << (i % 32));
         ++result.helper_counts[tag];
         --result.remaining_counts[tag];
@@ -75,7 +96,7 @@ ExpertHelperPlacement plan_expert_helper(std::span<const ops::MoeExpertCodec> co
         ++result.layer_counts[i / 512][tag];
         result.helper_routes += counts[i];
     }
-    result.full_coverage = result.remaining_counts == fixed;
+    result.full_coverage = result.tail_counts == std::array<std::int32_t, 2>{};
     return result;
 }
 

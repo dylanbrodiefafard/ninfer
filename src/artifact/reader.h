@@ -1,8 +1,10 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -159,9 +161,19 @@ struct TensorContentSelection {
     std::optional<TensorRowRange> rows;
 };
 
+struct FileRange {
+    std::uint64_t offset = 0;
+    std::uint64_t bytes  = 0;
+};
+
 class Reader {
 public:
     static constexpr std::size_t direct_io_alignment = 4096;
+    static constexpr std::size_t stream_buffer_bytes = std::size_t{64} << 20;
+    static constexpr std::size_t stream_buffer_count = 4;
+    using StreamBuffers = std::array<std::span<std::byte>, stream_buffer_count>;
+    using Completion    = std::function<void()>;
+    using Consumer      = std::function<Completion(PayloadSpan, std::size_t)>;
 
     explicit Reader(const std::filesystem::path& path);
     ~Reader();
@@ -187,6 +199,21 @@ public:
     PayloadSpan payload(const ObjectDescriptor& object) const;
     PayloadSpan payload(std::string_view name) const;
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const;
+    // Direct I/O with exact unaligned edges for metadata, resources and hashing windows; no
+    // page-cache reads. Returns the physical bytes read, including edge padding.
+    [[nodiscard]] std::uint64_t read_bytes(std::uint64_t absolute_offset,
+                                           std::span<std::byte> destination) const;
+    // Sequential O_DIRECT reads through four caller-owned, disjoint, 4096-aligned buffers of one
+    // equal size, a multiple of 4096 (stream_buffer_bytes in production; pinned for device
+    // copies). The consumer sees only the requested bytes, in order.
+    // Its optional completion must settle all accesses even when it throws. Before reuse and
+    // on every exit, completions are joined; a throwing consumer must itself settle accesses
+    // it has not returned a completion for. Buffers and captured completion owners must outlive
+    // this call. unit_bytes keeps each delivered chunk a whole number of logical records;
+    // the range must contain whole units. Returns physical bytes read, including edge padding.
+    // Read, range, alignment and short-read failures throw ArtifactError.
+    [[nodiscard]] std::uint64_t stream(FileRange range, const StreamBuffers& buffers,
+                                       const Consumer& consume, std::size_t unit_bytes = 1) const;
 
 private:
     struct Impl;

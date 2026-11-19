@@ -170,11 +170,13 @@ struct ExpertHelper::Impl {
         std::fprintf(
             stderr,
             "expert-helper fixed=%d/%d local=%d/%d helper=%d/%d codec-bytes=%zu/%zu "
-            "calib=%llu/%llu zero-flex-full=%d\n",
+            "calib=%llu/%llu zero-flex-full=%d tail=%d/%d tail-bytes=%zu/%zu tail-calib=%llu\n",
             fixed.slots[0], fixed.slots[1], primary.slots[0], primary.slots[1],
             placement.helper_counts[0], placement.helper_counts[1], placement.helper_bytes[0],
             placement.helper_bytes[1], static_cast<unsigned long long>(placement.helper_routes),
-            static_cast<unsigned long long>(placement.total_routes), placement.full_coverage);
+            static_cast<unsigned long long>(placement.total_routes), placement.full_coverage,
+            placement.tail_counts[0], placement.tail_counts[1], placement.tail_bytes[0],
+            placement.tail_bytes[1], static_cast<unsigned long long>(placement.tail_routes));
         const auto toolchain = expert_helper_toolchain();
         std::fprintf(stderr,
                      "expert-helper HIP-clang=%.*s primary-flex-F3=%zu remaining-codecs=%d/%d\n",

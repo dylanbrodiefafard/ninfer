@@ -4,205 +4,61 @@
 
 #include <algorithm>
 #include <chrono>
-#include <condition_variable>
 #include <cstring>
 #include <cstdint>
-#include <deque>
-#include <exception>
-#include <future>
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <stdexcept>
-#include <string>
-#include <thread>
-#include <utility>
 #include <vector>
 
 namespace ninfer::artifact {
 namespace {
-
-constexpr std::size_t kSlotBytes        = 64ULL * 1024ULL * 1024ULL;
-constexpr std::size_t kMaximumSlotCount = 8;
 
 std::uint64_t checked_add(std::uint64_t a, std::uint64_t b, const char* label) {
     if (b > std::numeric_limits<std::uint64_t>::max() - a) { throw ArtifactError(label); }
     return a + b;
 }
 
-std::uint64_t align_down(std::uint64_t value, std::uint64_t alignment) {
-    return value / alignment * alignment;
-}
-
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char* label) {
-    return checked_add(value, alignment - 1, label) / alignment * alignment;
-}
-
-class Slot {
-public:
-    explicit Slot(std::size_t bytes) : buffer(bytes + Reader::direct_io_alignment - 1) {
-        const auto address = reinterpret_cast<std::uintptr_t>(buffer.data());
-        const auto aligned = (address + Reader::direct_io_alignment - 1) /
-                             Reader::direct_io_alignment * Reader::direct_io_alignment;
-        // Offsetting the owned pointer keeps its provenance; the padding is at most the
-        // direct_io_alignment - 1 extra bytes the buffer reserves.
-        data_ = static_cast<std::byte*>(buffer.data()) + (aligned - address);
-        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-    }
-
-    ~Slot() {
-        if (pending) { (void)cudaEventSynchronize(event); }
-        if (event != nullptr) { (void)cudaEventDestroy(event); }
-    }
-
-    void wait() {
-        if (pending) {
-            CUDA_CHECK(cudaEventSynchronize(event));
-            pending = false;
-        }
-    }
-
-    [[nodiscard]] std::byte* data() const noexcept { return data_; }
-
-    PinnedHostBuffer buffer;
-    cudaEvent_t event = nullptr;
-    bool pending      = false;
-
-private:
-    std::byte* data_ = nullptr;
-};
-
-class DirectReadPool {
-public:
-    explicit DirectReadPool(std::size_t worker_count) {
-        workers_.reserve(worker_count);
-        try {
-            for (std::size_t i = 0; i < worker_count; ++i) {
-                workers_.emplace_back([this] { worker_loop(); });
-            }
-        } catch (...) {
-            {
-                std::lock_guard lock(mutex_);
-                stopping_ = true;
-            }
-            ready_.notify_all();
-            for (std::thread& worker : workers_) { worker.join(); }
-            throw;
-        }
-    }
-
-    ~DirectReadPool() {
-        {
-            std::lock_guard lock(mutex_);
-            stopping_ = true;
-        }
-        ready_.notify_all();
-        for (std::thread& worker : workers_) { worker.join(); }
-    }
-
-    DirectReadPool(const DirectReadPool&)            = delete;
-    DirectReadPool& operator=(const DirectReadPool&) = delete;
-
-    std::future<std::size_t> submit(const Reader& reader, std::uint64_t source,
-                                    std::span<std::byte> destination,
-                                    cudaEvent_t reusable_after = nullptr) {
-        Task task{
-            .reader         = &reader,
-            .source         = source,
-            .destination    = destination,
-            .reusable_after = reusable_after,
-        };
-        std::future<std::size_t> result = task.result.get_future();
-        {
-            std::lock_guard lock(mutex_);
-            tasks_.push_back(std::move(task));
-        }
-        ready_.notify_one();
-        return result;
-    }
-
-private:
-    struct Task {
-        const Reader* reader = nullptr;
-        std::uint64_t source = 0;
-        std::span<std::byte> destination;
-        cudaEvent_t reusable_after = nullptr;
-        std::promise<std::size_t> result;
-    };
-
-    void worker_loop() {
-        while (true) {
-            Task task;
-            {
-                std::unique_lock lock(mutex_);
-                ready_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
-                if (tasks_.empty()) { return; }
-                task = std::move(tasks_.front());
-                tasks_.pop_front();
-            }
-
-            try {
-                if (task.reusable_after != nullptr) {
-                    CUDA_CHECK(cudaEventSynchronize(task.reusable_after));
-                }
-                task.result.set_value(task.reader->read_direct(task.source, task.destination));
-            } catch (...) { task.result.set_exception(std::current_exception()); }
-        }
-    }
-
-    std::mutex mutex_;
-    std::condition_variable ready_;
-    std::deque<Task> tasks_;
-    std::vector<std::thread> workers_;
-    bool stopping_ = false;
-};
-
+// One object payload copied out of a streamed file span, to the device arena or to the pinned
+// mapped-host backing.
 struct CopyRange {
     std::uint64_t source_begin = 0;
     std::uint64_t source_end   = 0;
     std::byte* destination     = nullptr;
+    bool host                  = false;
 };
-
-struct ReadSpan {
-    std::uint64_t begin = 0;
-    std::uint64_t end   = 0;
-};
-
-struct ReadChunk {
-    std::uint64_t source   = 0;
-    std::size_t request    = 0;
-    std::uint64_t required = 0;
-};
-
-// Pinned host tensors are copied from the mapped artifact on a worker thread while device
-// tensors stream through the staging slots. cudaMallocHost memory is device-addressable at
-// the same pointer under unified addressing.
-std::future<void> materialize_mapped_host(const Reader& reader, const MaterializationPlan& plan,
-                                          PinnedHostBuffer& backing,
-                                          std::vector<void*>& destinations) {
-    destinations.resize(plan.mapped_host_objects.size());
-    std::vector<std::pair<std::span<const std::byte>, std::byte*>> copies;
-    copies.reserve(plan.mapped_host_objects.size());
-    auto* base = static_cast<std::byte*>(backing.data());
-    for (std::size_t i = 0; i < plan.mapped_host_objects.size(); ++i) {
-        const DeviceMaterialization& placement = plan.mapped_host_objects[i];
-        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
-        if (payload.data.size() != placement.bytes ||
-            placement.offset > backing.size() - placement.bytes ||
-            placement.offset % placement.alignment != 0) {
-            throw ArtifactError("mapped host materialization plan does not match artifact payload");
-        }
-        destinations[i] = base + placement.offset;
-        copies.emplace_back(payload.data, base + placement.offset);
-    }
-    return std::async(std::launch::async, [copies = std::move(copies)] {
-        for (const auto& [source, destination] : copies) {
-            std::memcpy(destination, source.data(), source.size());
-        }
-    });
-}
 
 } // namespace
+
+struct PinnedReadBuffers::EventDestroyer {
+    void operator()(cudaEvent_t event) const noexcept { (void)cudaEventDestroy(event); }
+};
+
+PinnedReadBuffers::PinnedReadBuffers() {
+    buffers_.reserve(Reader::stream_buffer_count);
+    events_.reserve(Reader::stream_buffer_count);
+    for (std::size_t i = 0; i < Reader::stream_buffer_count; ++i) {
+        buffers_.emplace_back(Reader::stream_buffer_bytes, Reader::direct_io_alignment);
+        cudaEvent_t event = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        events_.emplace_back(event);
+    }
+}
+
+PinnedReadBuffers::~PinnedReadBuffers() = default;
+
+Reader::StreamBuffers PinnedReadBuffers::views() const {
+    Reader::StreamBuffers result;
+    for (std::size_t i = 0; i < result.size(); ++i) {
+        result[i] = std::span(static_cast<std::byte*>(buffers_[i].data()), buffers_[i].size());
+    }
+    return result;
+}
+
+Reader::Completion PinnedReadBuffers::release_after_copies(std::size_t slot, cudaStream_t stream) {
+    cudaEvent_t event = events_.at(slot).get();
+    CUDA_CHECK(cudaEventRecord(event, stream));
+    return [event] { CUDA_CHECK(cudaEventSynchronize(event)); };
+}
 
 void* MaterializedArtifact::device_data(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
@@ -242,39 +98,52 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     }
     out.device_arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
     out.stats_.device_capacity_bytes = capacity;
-    out.stats_.tensor_count          = plan.device_objects.size();
+    out.stats_.tensor_count          = plan.device_objects.size() + plan.mapped_host_objects.size();
     out.stats_.resource_count        = plan.host_objects.size();
 
-    std::future<void> mapped_host_copy;
+    std::vector<CopyRange> ranges;
+    ranges.reserve(plan.device_objects.size() + plan.mapped_host_objects.size());
+    std::uint64_t total = 0;
     if (plan.mapped_host_capacity_bytes != 0) {
         if (plan.mapped_host_capacity_bytes > static_cast<std::uint64_t>(SIZE_MAX)) {
             throw ArtifactError("artifact mapped host backing size is invalid");
         }
         out.mapped_host_ = std::make_unique<PinnedHostBuffer>(
             static_cast<std::size_t>(plan.mapped_host_capacity_bytes), 4096);
-        std::vector<void*> destinations;
-        mapped_host_copy = materialize_mapped_host(reader, plan, *out.mapped_host_, destinations);
-        for (std::size_t i = 0; i < plan.mapped_host_objects.size(); ++i) {
-            out.objects_.at(plan.mapped_host_objects[i].object.index).device = destinations[i];
-            out.stats_.mapped_host_bytes += plan.mapped_host_objects[i].bytes;
+        auto* base = static_cast<std::byte*>(out.mapped_host_->data());
+        for (const DeviceMaterialization& placement : plan.mapped_host_objects) {
+            const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+            if (payload.data.size() != placement.bytes ||
+                placement.offset > out.mapped_host_->size() - placement.bytes ||
+                placement.offset % placement.alignment != 0) {
+                throw ArtifactError(
+                    "mapped host materialization plan does not match artifact payload");
+            }
+            // Pinned host memory is device-addressable at the same pointer under unified
+            // addressing.
+            out.objects_.at(placement.object.index).device = base + placement.offset;
+            out.stats_.mapped_host_bytes += placement.bytes;
+            ranges.push_back(CopyRange{
+                .source_begin = payload.absolute_offset,
+                .source_end   = checked_add(payload.absolute_offset, placement.bytes,
+                                            "artifact tensor source range overflows u64"),
+                .destination  = base + placement.offset,
+                .host         = true,
+            });
+            total = checked_add(total, placement.bytes, "artifact tensor byte count overflows u64");
         }
-        out.stats_.tensor_count += plan.mapped_host_objects.size();
     }
 
     for (const HostMaterialization& placement : plan.host_objects) {
         auto& resource            = out.objects_.at(placement.object.index).resource;
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
-        resource.assign(payload.data.begin(), payload.data.end());
-        out.stats_.retained_resource_bytes += resource.size();
+        resource.resize(payload.data.size());
         out.stats_.file_bytes =
-            checked_add(out.stats_.file_bytes, resource.size(), "artifact read bytes overflow u64");
+            checked_add(out.stats_.file_bytes, reader.read_bytes(payload.absolute_offset, resource),
+                        "artifact read bytes overflow u64");
+        out.stats_.retained_resource_bytes += resource.size();
     }
 
-    std::vector<CopyRange> ranges;
-    ranges.reserve(plan.device_objects.size());
-    std::uint64_t copied         = 0;
-    std::uint64_t last_published = 0;
-    std::uint64_t total          = 0;
     for (const DeviceMaterialization& placement : plan.device_objects) {
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
         DeviceSpan storage =
@@ -295,7 +164,9 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         });
         total = checked_add(total, placement.bytes, "artifact tensor byte count overflows u64");
     }
-    if (ranges.empty()) { throw ArtifactError("materialization plan has no device tensors"); }
+    if (plan.device_objects.empty()) {
+        throw ArtifactError("materialization plan has no device tensors");
+    }
     std::sort(ranges.begin(), ranges.end(), [](const CopyRange& a, const CopyRange& b) {
         return a.source_begin < b.source_begin;
     });
@@ -305,125 +176,73 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         }
     }
 
-    constexpr std::uint64_t alignment = Reader::direct_io_alignment;
-    std::vector<ReadSpan> read_spans;
-    read_spans.reserve(ranges.size());
-    std::uint64_t aligned_read_bytes = 0;
-    for (const CopyRange& range : ranges) {
-        const std::uint64_t begin = align_down(range.source_begin, alignment);
-        if (read_spans.empty() || begin > align_up(read_spans.back().end, alignment,
-                                                   "artifact direct I/O span overflows u64")) {
-            read_spans.push_back(ReadSpan{begin, range.source_end});
-        } else {
-            read_spans.back().end = std::max(read_spans.back().end, range.source_end);
-        }
-    }
-    for (const ReadSpan& span : read_spans) {
-        aligned_read_bytes = checked_add(
-            aligned_read_bytes,
-            align_up(span.end - span.begin, alignment, "artifact direct I/O span overflows u64"),
-            "artifact direct I/O byte count overflows u64");
-    }
-    const std::size_t chunk_bytes =
-        static_cast<std::size_t>(std::min<std::uint64_t>(kSlotBytes, aligned_read_bytes));
-    std::vector<ReadChunk> chunks;
-    chunks.reserve(static_cast<std::size_t>(1 + (aligned_read_bytes - 1) /
-                                                    static_cast<std::uint64_t>(chunk_bytes)));
-    std::size_t largest_request = 0;
-    for (const ReadSpan& span : read_spans) {
-        for (std::uint64_t source = span.begin; source < span.end; source += chunk_bytes) {
-            const std::uint64_t remaining = span.end - source;
-            const std::size_t request     = static_cast<std::size_t>(std::min<std::uint64_t>(
-                chunk_bytes,
-                align_up(remaining, alignment, "artifact direct I/O request overflows u64")));
-            chunks.push_back(ReadChunk{
-                .source   = source,
-                .request  = request,
-                .required = std::min<std::uint64_t>(request, remaining),
-            });
-            largest_request = std::max(largest_request, request);
-        }
-    }
-    const std::size_t slot_count = std::min(kMaximumSlotCount, chunks.size());
-    std::vector<std::unique_ptr<Slot>> slots;
-    slots.reserve(slot_count);
-    for (std::size_t i = 0; i < slot_count; ++i) {
-        slots.push_back(std::make_unique<Slot>(largest_request));
-    }
-    out.stats_.peak_staging_bytes = static_cast<std::uint64_t>(largest_request) * slot_count;
-
-    DirectReadPool read_pool(slot_count);
-    std::vector<std::future<std::size_t>> reads(slot_count);
-    const auto submit_read = [&](std::size_t chunk_index, cudaEvent_t reusable_after = nullptr) {
-        Slot& slot             = *slots[chunk_index % slot_count];
-        const ReadChunk& chunk = chunks[chunk_index];
-        auto destination       = std::span<std::byte>(slot.data(), chunk.request);
-        reads[chunk_index % slot_count] =
-            read_pool.submit(reader, chunk.source, destination, reusable_after);
-    };
-    std::size_t next_range = 0;
-    const auto start       = std::chrono::steady_clock::now();
+    // Ranges closer than one direct-I/O block share a streamed span; larger gaps are skipped.
+    PinnedReadBuffers staging;
+    out.stats_.peak_staging_bytes = Reader::stream_buffer_count * Reader::stream_buffer_bytes;
+    std::uint64_t copied          = 0;
+    std::uint64_t last_published  = 0;
+    const auto start              = std::chrono::steady_clock::now();
     if (progress != nullptr && progress->callback) { progress->callback("weights", 0, total); }
-    for (std::size_t i = 0; i < slot_count; ++i) { submit_read(i); }
-
-    for (std::size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
-        const ReadChunk& chunk       = chunks[chunk_index];
-        Slot& slot                   = *slots[chunk_index % slot_count];
-        const std::size_t bytes_read = reads[chunk_index % slot_count].get();
-        if (bytes_read < chunk.required) {
-            throw ArtifactError("direct artifact read ended before the planned tensor range");
+    for (std::size_t first = 0; first < ranges.size();) {
+        std::size_t last = first + 1;
+        while (last < ranges.size() && ranges[last].source_begin - ranges[last - 1].source_end <
+                                           Reader::direct_io_alignment) {
+            ++last;
         }
-        out.stats_.file_bytes =
-            checked_add(out.stats_.file_bytes, bytes_read, "artifact read bytes overflow u64");
-        const std::uint64_t chunk_end =
-            checked_add(chunk.source, bytes_read, "artifact direct I/O result overflows u64");
-
-        while (next_range < ranges.size() && ranges[next_range].source_end <= chunk.source) {
-            ++next_range;
-        }
-        std::size_t range_index = next_range;
-        while (range_index < ranges.size() && ranges[range_index].source_begin < chunk_end) {
-            const CopyRange& range         = ranges[range_index];
-            const std::uint64_t copy_begin = std::max(chunk.source, range.source_begin);
-            const std::uint64_t copy_end   = std::min(chunk_end, range.source_end);
-            if (copy_begin < copy_end) {
-                const auto amount = static_cast<std::size_t>(copy_end - copy_begin);
-                CUDA_CHECK(cudaMemcpyAsync(
-                    range.destination + static_cast<std::size_t>(copy_begin - range.source_begin),
-                    slot.data() + static_cast<std::size_t>(copy_begin - chunk.source), amount,
-                    cudaMemcpyHostToDevice, device.load_stream));
-                copied = checked_add(copied, amount, "artifact copied byte count overflows u64");
+        const auto span_begin = ranges[first].source_begin;
+        const auto span_end   = ranges[last - 1].source_end;
+        std::size_t next      = first;
+        const auto consume    = [&](PayloadSpan chunk, std::size_t slot) -> Reader::Completion {
+            const auto chunk_end = chunk.absolute_offset + chunk.data.size();
+            bool device_copies   = false;
+            try {
+                while (next < last && ranges[next].source_end <= chunk.absolute_offset) { ++next; }
+                for (std::size_t i = next; i < last && ranges[i].source_begin < chunk_end; ++i) {
+                    const CopyRange& range = ranges[i];
+                    const auto begin       = std::max(chunk.absolute_offset, range.source_begin);
+                    const auto end         = std::min(chunk_end, range.source_end);
+                    const auto amount      = static_cast<std::size_t>(end - begin);
+                    std::byte* destination =
+                        range.destination + static_cast<std::size_t>(begin - range.source_begin);
+                    const std::byte* source =
+                        chunk.data.data() + static_cast<std::size_t>(begin - chunk.absolute_offset);
+                    if (range.host) {
+                        std::memcpy(destination, source, amount);
+                    } else {
+                        CUDA_CHECK(cudaMemcpyAsync(destination, source, amount,
+                                                   cudaMemcpyHostToDevice, device.load_stream));
+                        device_copies = true;
+                    }
+                    copied =
+                        checked_add(copied, amount, "artifact copied byte count overflows u64");
+                }
+                Reader::Completion completion;
+                if (device_copies) {
+                    completion = staging.release_after_copies(slot, device.load_stream);
+                }
+                if (progress != nullptr && progress->callback && copied != last_published &&
+                    copied < total) {
+                    last_published = copied;
+                    progress->callback("weights", copied, total);
+                }
+                return completion;
+            } catch (...) {
+                // A consumer that throws has no completion: it must settle its own copies.
+                (void)cudaStreamSynchronize(device.load_stream);
+                throw;
             }
-            if (range.source_end <= chunk_end) {
-                ++range_index;
-            } else {
-                break;
-            }
-        }
-        next_range = range_index;
-        CUDA_CHECK(cudaEventRecord(slot.event, device.load_stream));
-        slot.pending = true;
-
-        const std::size_t next_chunk = chunk_index + slot_count;
-        if (next_chunk < chunks.size()) { submit_read(next_chunk, slot.event); }
-
-        if (progress != nullptr && progress->callback && copied != last_published &&
-            copied < total) {
-            last_published = copied;
-            progress->callback("weights", copied, total);
-        }
+        };
+        out.stats_.file_bytes = checked_add(
+            out.stats_.file_bytes,
+            reader.stream({span_begin, span_end - span_begin}, staging.views(), consume),
+            "artifact read bytes overflow u64");
+        first = last;
     }
-    for (const auto& slot : slots) { slot->wait(); }
     CUDA_CHECK(cudaStreamSynchronize(device.load_stream));
-    if (copied != total || next_range != ranges.size()) {
+    if (copied != total) {
         throw ArtifactError("direct materialization did not cover every tensor byte");
     }
-    if (mapped_host_copy.valid()) {
-        mapped_host_copy.get();
-        out.stats_.file_bytes = checked_add(out.stats_.file_bytes, out.stats_.mapped_host_bytes,
-                                            "artifact read bytes overflow u64");
-    }
-    out.stats_.h2d_bytes = copied;
+    out.stats_.h2d_bytes = copied - out.stats_.mapped_host_bytes;
     out.stats_.upload_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     if (progress != nullptr && progress->callback) { progress->callback("weights", copied, total); }
