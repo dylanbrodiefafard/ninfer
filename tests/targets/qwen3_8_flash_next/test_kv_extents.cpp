@@ -401,13 +401,17 @@ void test_borrow_restarts_refill() {
                              [](std::int32_t owner) { return owner >= 0; });
     };
     expect(high_owners() == 0, "all eligible records start resident below the empty high extent");
+    constexpr std::int64_t kTail = 10;
     extents.make_room(state.pool().free_pages() + 1, cache);
     expect(extents.lent_extents() == 1, "only the low extent is borrowed");
     while (cache.service_refill(device.stream, device.copy_stream, true)) {
         device.synchronize_all();
     }
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
-    expect(high_owners() == 6, "borrowing low owners must restart refill into empty high slots");
+    // The pinned records hold the fixed slots, so the whole tail was resident in the lent low
+    // extent and the refill the borrow requests restores every record into the high extent.
+    expect(high_owners() == kTail,
+           "borrowing low owners must restart refill into empty high slots");
 }
 
 // The expert-helper tiers over the extents: records 100 to 103 pinned in the four fixed F3 slots,
