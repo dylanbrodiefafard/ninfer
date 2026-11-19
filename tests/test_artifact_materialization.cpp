@@ -172,13 +172,17 @@ int main() {
         require(std::equal(retained.begin(), retained.end(), kResource.begin(), kResource.end()),
                 "retained resource payload differs from the artifact");
 
+        // file_bytes counts physical O_DIRECT bytes. The payload starts on a 4096-byte boundary,
+        // so the resource read and the span holding the tensor at payload offset 256 each cost one
+        // aligned block; the two spans are further apart than one block and stay separate. The
+        // second tensor starts on a block boundary at the end of the file, so its block read
+        // returns only the tensor's own bytes.
         const auto& stats = materialized.stats();
         require(stats.tensor_count == 2 && stats.resource_count == 1 &&
                     stats.h2d_bytes == kTensor.size() + kSecondTensor.size() &&
                     stats.retained_resource_bytes == kResource.size() &&
-                    stats.file_bytes == kResource.size() +
-                                            ninfer::artifact::Reader::direct_io_alignment +
-                                            kSecondTensor.size(),
+                    stats.file_bytes ==
+                        2 * ninfer::artifact::Reader::direct_io_alignment + kSecondTensor.size(),
                 "materialization statistics are incomplete");
         require(materialized.device_arena().capacity() == plan.device_capacity_bytes &&
                     materialized.device_arena().used() == plan.device_capacity_bytes,
