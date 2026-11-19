@@ -1,5 +1,6 @@
 // moe_helper_experts Op test on the R9700 (gfx1201) against an independent FP64 oracle at the
-// Qwen3.8-Flash-Next record geometry.
+// Qwen3.8-Flash-Next record geometry, for decode-round extents (max_tokens <= 48) and prefill
+// extents up to the Op's capacity.
 //
 // Test experts are canonical codes and E4M3 scales written into the documented record layout by
 // the test-side packer and read back exactly by an independent reader
@@ -39,19 +40,39 @@ constexpr int kInter   = ops::kMoeIntermediate;
 constexpr int kExperts = ops::kMoeHelperExperts;
 constexpr int kRoutes  = ops::kMoeHelperRoutesPerToken;
 constexpr int kSkip    = 77;
+// The prefill workspace of most prefill cases: one 4096-token chunk.
+constexpr int kPrefillCapacity = 4096;
 
 // Criterion. Against the FP64 oracle, one rounding dominates: the gate/up product enters the down
 // projection rounded to BF16 (8 significant bits; relative RMS error about 2^-7 / sqrt(12) / 1.5
 // ~= 1.5e-3 for values spread over a binade). Its independent element errors pass through the
 // down matrix with the same gain as the product itself, so each route's contribution carries
-// about 1.5e-3 relative RMS error, and so does their weighted sum. The output is FP32 (no output
-// rounding); FP32 sums over K = 2560 and 640, the per-group E4M3 scaling and the FP32 SiLU stay
+// about 1.5e-3 relative RMS error, and so does their weighted sum. An FP32 output adds no output
+// rounding; FP32 sums over K = 2560 and 640, the per-group E4M3 scaling and the FP32 SiLU stay
 // below 1e-5. Expected relative L2 is about 1.5e-3; the bound allows 3e-3. Pointwise, the error
 // is Gaussian-like with RMS near 1.5e-3 rms(y) ~= 4e-4 max|y| (rms/max ~ 1/4 for these sums), so
 // six deviations stay under 2.5e-3 max|y|; the gross cap is 4e-3 of the largest reference
 // magnitude of the case, an absolute bound that elements cancelling to near zero also meet.
 constexpr test::ReductionCriterion kCriterion{/*relative_l2*/ 3.0e-3, /*gross_absolute*/ 0.0,
                                               /*gross_relative_to_max_reference*/ 4.0e-3};
+
+// BF16 output criterion, derived from one BF16 rounding of the FP32 partial z that kCriterion
+// bounds against the FP64 oracle r. Round to nearest even with 8 significant bits gives
+// |bf16(z) - z| <= u |z| per element, u = 2^-8 (BF16 has FP32's exponent range, so only FP32
+// subnormals, 2^-126 and below, could exceed it, by at most 2^-134 absolute). With
+// ||z - r|| <= e ||r|| and so ||z|| <= (1 + e) ||r||, the triangle inequality gives
+// ||bf16(z) - r|| <= (e + u (1 + e)) ||r||: in the L2 norm for relative_l2, and per element with
+// |z_i| <= (1 + g) max|r| for the gross cap g. The BF16 route is checked against the same
+// unrounded oracle with these bounds, and every element it writes must equal the RNE BF16 of the
+// FP32 route's element bit for bit.
+constexpr double kBf16UnitRoundoff = 0x1p-8;
+constexpr test::ReductionCriterion kBf16Criterion{
+    /*relative_l2*/ kCriterion.relative_l2 + kBf16UnitRoundoff * (1.0 + kCriterion.relative_l2),
+    /*gross_absolute*/ 0.0,
+    /*gross_relative_to_max_reference*/ kCriterion.gross_relative_to_max_reference +
+        kBf16UnitRoundoff * (1.0 + kCriterion.gross_relative_to_max_reference)};
+
+using OutputDtype = ops::MoeHelperOutputDtype;
 
 void hip_check(hipError_t status, const char* what) {
     if (status != hipSuccess) {
@@ -302,10 +323,12 @@ bool has_active(const Inputs& inputs, int t) {
 // Device bank, inputs and one Op invocation.
 class Run {
 public:
-    Run(const Fixture& fixture, const DeviceArray<std::uint8_t>& store, const Inputs& inputs)
-        : fixture_(fixture), store_(store), inputs_(inputs),
+    Run(const Fixture& fixture, const DeviceArray<std::uint8_t>& store, const Inputs& inputs,
+        OutputDtype dtype = OutputDtype::Fp32)
+        : fixture_(fixture), store_(store), inputs_(inputs), dtype_(dtype),
           rows_(static_cast<std::size_t>(inputs.max_tokens)), tokens_(1), x_(rows_ * kHidden),
-          routes_(rows_ * kRoutes), table_(kExperts), scales_(kExperts * 3), y_(rows_ * kHidden) {
+          routes_(rows_ * kRoutes), table_(kExperts), scales_(kExperts * 3),
+          y_(rows_ * kHidden * (dtype == OutputDtype::Bf16 ? 1 : 2)) {
         std::vector<std::uint16_t> x_bits(inputs.x.size());
         for (std::size_t i = 0; i < x_bits.size(); ++i) { x_bits[i] = bf16_bits(inputs.x[i]); }
         x_.upload(x_bits);
@@ -337,6 +360,7 @@ public:
         args.bank.matrix_scales = scales_.data();
         args.bank.f3_books      = fixture_.books;
         args.y                  = y_.data();
+        args.output_dtype       = dtype_;
         return args;
     }
 
@@ -355,9 +379,15 @@ public:
     }
 
     [[nodiscard]] std::vector<std::uint32_t> output() const {
-        const std::vector<float> y = y_.download();
-        std::vector<std::uint32_t> bits(y.size());
-        std::memcpy(bits.data(), y.data(), y.size() * sizeof(float));
+        const std::vector<std::uint16_t> y = y_.download();
+        std::vector<std::uint32_t> bits(rows_ * kHidden);
+        if (dtype_ == OutputDtype::Bf16) {
+            for (std::size_t i = 0; i < y.size(); ++i) {
+                bits[i] = static_cast<std::uint32_t>(y[i]) << 16;
+            }
+        } else {
+            std::memcpy(bits.data(), y.data(), bits.size() * sizeof(std::uint32_t));
+        }
         return bits;
     }
 
@@ -365,13 +395,14 @@ private:
     const Fixture& fixture_;
     const DeviceArray<std::uint8_t>& store_;
     const Inputs& inputs_;
+    OutputDtype dtype_;
     std::size_t rows_;
     DeviceArray<std::int32_t> tokens_;
     DeviceArray<std::uint16_t> x_;
     DeviceArray<ops::MoeHelperRoute> routes_;
     DeviceArray<std::uint64_t> table_;
     DeviceArray<float> scales_;
-    DeviceArray<float> y_;
+    DeviceArray<std::uint16_t> y_;
 };
 
 float bits_float(std::uint32_t bits) {
@@ -380,15 +411,32 @@ float bits_float(std::uint32_t bits) {
     return value;
 }
 
+// Tokens whose rows the oracle checks: every routed token up to kOracleTokens, else
+// kOracleTokens of them evenly spaced (the FP64 oracle costs about 5M multiply-adds per entry).
+constexpr std::size_t kOracleTokens = 512;
+
 // Checks y (bits [max_tokens][2560]): rows of tokens with active routes against the oracle, rows
 // of tokens without one exactly +0, rows at or past N untouched.
 int verify(const std::string& label, const Fixture& fixture, const BankState& bank,
-           const Inputs& inputs, const std::vector<std::uint32_t>& bits) {
+           const Inputs& inputs, const std::vector<std::uint32_t>& bits,
+           const std::vector<std::uint32_t>& bf16 = {}) {
     int failures = 0;
-    std::vector<int> routed;
+    // Expanded BF16 bits preserve exact comparison, including +0 and the unwritten poison.
+    for (std::size_t i = 0; i < bf16.size(); ++i) {
+        const auto expected =
+            i < static_cast<std::size_t>(inputs.tokens) * kHidden
+                ? static_cast<std::uint32_t>(bf16_bits(bf16_round(bits_float(bits[i])))) << 16
+                : 0xFFFF0000U;
+        if (bf16[i] != expected) {
+            std::cerr << label << ": BF16 differs from one RNE of FP32 at " << i << '\n';
+            ++failures;
+            break;
+        }
+    }
+    std::vector<int> all_routed;
     for (int t = 0; t < inputs.tokens; ++t) {
         if (has_active(inputs, t)) {
-            routed.push_back(t);
+            all_routed.push_back(t);
             continue;
         }
         for (int n = 0; n < kHidden; ++n) {
@@ -406,12 +454,28 @@ int verify(const std::string& label, const Fixture& fixture, const BankState& ba
             break;
         }
     }
-    if (routed.empty()) { return failures; }
+    if (all_routed.empty()) { return failures; }
+    // Rows the oracle samples out are still checked as written and finite.
+    for (const int t : all_routed) {
+        for (int n = 0; n < kHidden; ++n) {
+            if (!std::isfinite(bits_float(bits[static_cast<std::size_t>(t) * kHidden + n]))) {
+                std::cerr << label << ": token " << t << " has a non-finite or unwritten y\n";
+                ++failures;
+                break;
+            }
+        }
+    }
+    std::vector<int> routed;
+    for (std::size_t i = 0; i < kOracleTokens && i < all_routed.size(); ++i) {
+        routed.push_back(
+            all_routed[i * all_routed.size() / std::min(all_routed.size(), kOracleTokens)]);
+    }
 
     std::vector<std::vector<double>> expected(routed.size());
     {
         constexpr std::size_t kOracleThreads = 8;
         std::vector<std::jthread> workers;
+        workers.reserve(kOracleThreads);
         for (std::size_t w = 0; w < kOracleThreads; ++w) {
             workers.emplace_back([&, w] {
                 for (std::size_t i = w; i < routed.size(); i += kOracleThreads) {
@@ -433,15 +497,31 @@ int verify(const std::string& label, const Fixture& fixture, const BankState& ba
                                                      static_cast<std::int64_t>(got.size()));
     const bool pass =
         test::reduction_passes(stats, static_cast<std::int64_t>(got.size()), kCriterion);
-    std::printf("%-34s tokens=%zu rel_l2=%.3e (limit %.1e) max_abs=%.3e (limit %.3e) %s\n",
-                label.c_str(), routed.size(), stats.relative_l2, kCriterion.relative_l2,
-                stats.maximum_absolute_error, test::gross_error_limit(stats, kCriterion),
-                pass ? "ok" : "FAIL");
+    std::printf("%-38s tokens=%zu/%zu rel_l2=%.3e (limit %.1e) max_abs=%.3e (limit %.3e) %s\n",
+                label.c_str(), routed.size(), all_routed.size(), stats.relative_l2,
+                kCriterion.relative_l2, stats.maximum_absolute_error,
+                test::gross_error_limit(stats, kCriterion), pass ? "ok" : "FAIL");
     if (!pass) {
         std::cerr << label << ": criterion failed at index " << stats.maximum_error_index
                   << " actual=" << stats.actual_at_maximum
                   << " reference=" << stats.reference_at_maximum << '\n';
         ++failures;
+    }
+    if (!bf16.empty()) {
+        got.clear();
+        for (const int t : routed) {
+            const auto row = static_cast<std::size_t>(t) * kHidden;
+            for (std::size_t n = 0; n < kHidden; ++n) { got.push_back(bits_float(bf16[row + n])); }
+        }
+        const auto bf16_stats = test::compute_reduction_stats(
+            got.data(), reference.data(), static_cast<std::int64_t>(got.size()));
+        const bool bf16_pass = test::reduction_passes(
+            bf16_stats, static_cast<std::int64_t>(got.size()), kBf16Criterion);
+        std::printf("%-38s BF16 rel_l2=%.3e (limit %.3e) max_abs=%.3e (limit %.3e) %s\n",
+                    label.c_str(), bf16_stats.relative_l2, kBf16Criterion.relative_l2,
+                    bf16_stats.maximum_absolute_error,
+                    test::gross_error_limit(bf16_stats, kBf16Criterion), bf16_pass ? "ok" : "FAIL");
+        if (!bf16_pass) { ++failures; }
     }
     return failures;
 }
@@ -483,25 +563,29 @@ private:
     hipStream_t stream_ = nullptr;
 };
 
-// Calls of different extents sharing one workspace with no host synchronization between them:
-// queued back to back on one stream, then captured into one HIP graph replayed three times. Each
-// call must reproduce its standalone output bit for bit, so every call found the counters its
-// predecessor left zeroed.
+// Calls of different extents, decode-round and prefill, sharing one workspace with no host
+// synchronization between them: queued back to back on one stream, then captured into one HIP
+// graph replayed three times. Each call must reproduce its standalone output bit for bit, so every
+// call found the counters its predecessor left.
 int queued_calls(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
-                 ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank) {
+                 ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank,
+                 OutputDtype prefill_dtype) {
     const Inputs a = make_inputs(bank, 20, 20, Routing::Skewed, 31U);
     const Inputs b = make_inputs(bank, 48, 48, Routing::Mixed48, 32U);
     const Inputs c = make_inputs(bank, 1, 4, Routing::Skewed, 33U);
+    const Inputs d = make_inputs(bank, 200, 300, Routing::Skewed, 34U);
     std::vector<std::unique_ptr<Run>> runs;
     std::vector<std::vector<std::uint32_t>> expected;
-    for (const Inputs* inputs : {&a, &b, &c}) {
-        runs.push_back(std::make_unique<Run>(fixture, store, *inputs));
+    for (const Inputs* inputs : {&a, &b, &c, &d}) {
+        const auto dtype =
+            inputs->max_tokens > ops::kMoeHelperMaxTokens ? prefill_dtype : OutputDtype::Fp32;
+        runs.push_back(std::make_unique<Run>(fixture, store, *inputs, dtype));
         runs.back()->set_bank(bank);
         expected.push_back(runs.back()->invoke(workspace));
     }
     const Stream stream;
-    // a, b, c, a: the first a's output is overwritten by the last with the same bits.
-    const int order[]  = {0, 1, 2, 0};
+    // a, d, b, c, d, a: repeated calls overwrite their outputs with the same bits.
+    const int order[]  = {0, 3, 1, 2, 3, 0};
     const auto enqueue = [&] {
         for (const int r : order) {
             ops::moe_helper_experts(runs[static_cast<std::size_t>(r)]->args(), workspace,
@@ -540,6 +624,43 @@ int queued_calls(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
     return failures;
 }
 
+// At prefill extents a token's row depends only on its own inputs: reversing the tokens' order
+// (x rows and route rows) must reverse y's rows bit for bit.
+int order_independence(const Fixture& fixture, const DeviceArray<std::uint8_t>& store,
+                       ops::MoeHelperExpertsWorkspace& workspace, const BankState& bank,
+                       OutputDtype dtype) {
+    const Inputs forward = make_inputs(bank, 300, 300, Routing::Skewed, 41U);
+    Inputs reversed      = forward;
+    const int tokens     = forward.tokens;
+    for (int t = 0; t < tokens; ++t) {
+        const auto from = static_cast<std::size_t>(tokens - 1 - t);
+        const auto to   = static_cast<std::size_t>(t);
+        std::copy_n(forward.x.begin() + static_cast<std::ptrdiff_t>(from * kHidden), kHidden,
+                    reversed.x.begin() + static_cast<std::ptrdiff_t>(to * kHidden));
+        std::copy_n(forward.routes.begin() + static_cast<std::ptrdiff_t>(from * kRoutes), kRoutes,
+                    reversed.routes.begin() + static_cast<std::ptrdiff_t>(to * kRoutes));
+    }
+    Run a(fixture, store, forward, dtype);
+    Run b(fixture, store, reversed, dtype);
+    a.set_bank(bank);
+    b.set_bank(bank);
+    const std::vector<std::uint32_t> ya = a.invoke(workspace);
+    const std::vector<std::uint32_t> yb = b.invoke(workspace);
+    for (int t = 0; t < tokens; ++t) {
+        const auto row_a = static_cast<std::size_t>(t) * kHidden;
+        const auto row_b = static_cast<std::size_t>(tokens - 1 - t) * kHidden;
+        if (!std::equal(ya.begin() + static_cast<std::ptrdiff_t>(row_a),
+                        ya.begin() + static_cast<std::ptrdiff_t>(row_a + kHidden),
+                        yb.begin() + static_cast<std::ptrdiff_t>(row_b))) {
+            std::cerr << "order independence: token " << t << " differs after reversal\n";
+            return 1;
+        }
+    }
+    std::printf("%-38s tokens=%d rows bit-identical (%s)\n", "T300 reversed token order", tokens,
+                dtype == OutputDtype::Bf16 ? "BF16" : "FP32");
+    return 0;
+}
+
 int run() {
     if (!select_r9700()) {
         std::printf("SKIP: no gfx1201 device\n");
@@ -557,7 +678,9 @@ int run() {
         const auto& record = fixture->experts[r].record;
         store.upload(record.data(), record.size(), fixture->offsets[r]);
     }
+    // A decode-round workspace, and a prefill workspace that also serves decode-round extents.
     ops::MoeHelperExpertsWorkspace workspace(ops::kMoeHelperMaxTokens);
+    ops::MoeHelperExpertsWorkspace prefill(kPrefillCapacity);
     const BankState wide      = make_bank(RecordSet::Wide, 7U);
     const BankState subnormal = make_bank(RecordSet::Subnormal, 8U);
 
@@ -568,39 +691,70 @@ int run() {
         int max_tokens;
         Routing routing;
         std::uint32_t seed;
+        ops::MoeHelperExpertsWorkspace* workspace;
     };
 
     const Case cases[] = {
-        {"T1", &wide, 1, 1, Routing::Skewed, 11U},
-        {"T2 of max 4", &wide, 2, 4, Routing::Skewed, 12U},
-        {"T4", &wide, 4, 4, Routing::Skewed, 13U},
-        {"T20", &wide, 20, 20, Routing::Skewed, 14U},
-        {"T48 mixed ownership and sharing", &wide, 48, 48, Routing::Mixed48, 15U},
-        {"T4 subnormal scales", &subnormal, 4, 4, Routing::Skewed, 16U},
+        {"T1", &wide, 1, 1, Routing::Skewed, 11U, &workspace},
+        {"T2 of max 4", &wide, 2, 4, Routing::Skewed, 12U, &workspace},
+        {"T4", &wide, 4, 4, Routing::Skewed, 13U, &workspace},
+        {"T20", &wide, 20, 20, Routing::Skewed, 14U, &workspace},
+        {"T48 mixed ownership and sharing", &wide, 48, 48, Routing::Mixed48, 15U, &workspace},
+        {"T4 subnormal scales", &subnormal, 4, 4, Routing::Skewed, 16U, &workspace},
         // Tokens per expert: 2 and 3 (SIMT), 6 (WMMA at its threshold, one partial block), 17
         // (WMMA, a full block and one token), 40 (WMMA, blocks of 16, 16 and 8).
-        {"T2 concentrated", &wide, 2, 2, Routing::Concentrated, 18U},
-        {"T3 concentrated", &wide, 3, 3, Routing::Concentrated, 19U},
-        {"T6 concentrated", &wide, 6, 6, Routing::Concentrated, 23U},
-        {"T17 concentrated", &wide, 17, 17, Routing::Concentrated, 24U},
-        {"T40 concentrated", &wide, 40, 40, Routing::Concentrated, 20U},
-        {"T20 concentrated subnormal", &subnormal, 20, 20, Routing::Concentrated, 22U},
-        {"N0 of max 48", &wide, 0, 48, Routing::Skewed, 17U},
+        {"T2 concentrated", &wide, 2, 2, Routing::Concentrated, 18U, &workspace},
+        {"T3 concentrated", &wide, 3, 3, Routing::Concentrated, 19U, &workspace},
+        {"T6 concentrated", &wide, 6, 6, Routing::Concentrated, 23U, &workspace},
+        {"T17 concentrated", &wide, 17, 17, Routing::Concentrated, 24U, &workspace},
+        {"T40 concentrated", &wide, 40, 40, Routing::Concentrated, 20U, &workspace},
+        {"T20 concentrated subnormal", &subnormal, 20, 20, Routing::Concentrated, 22U, &workspace},
+        {"N0 of max 48", &wide, 0, 48, Routing::Skewed, 17U, &workspace},
+        // Prefill extents (max_tokens > 48) on the prefill workspace, after a decode-round call
+        // on it: the route boundary at max_tokens 48 / 49, specials (no helper route, only helper
+        // routes, a repeated expert, ids >= 512), jobs of 128 + 128 + 44 tokens per expert,
+        // subnormal scales, N below max_tokens, and N = 0.
+        {"T48 on the prefill workspace", &wide, 48, 48, Routing::Mixed48, 15U, &prefill},
+        {"T49 (prefill boundary)", &wide, 49, 49, Routing::Skewed, 25U, &prefill},
+        {"T64 mixed ownership and sharing", &wide, 64, 64, Routing::Mixed48, 26U, &prefill},
+        {"T300 concentrated", &wide, 300, 300, Routing::Concentrated, 27U, &prefill},
+        {"T200 subnormal scales", &subnormal, 200, 200, Routing::Skewed, 28U, &prefill},
+        {"T130 concentrated subnormal", &subnormal, 130, 130, Routing::Concentrated, 29U, &prefill},
+        {"T2000 of max 4096", &wide, 2000, kPrefillCapacity, Routing::Skewed, 30U, &prefill},
+        {"N0 of max 4096", &wide, 0, kPrefillCapacity, Routing::Skewed, 31U, &prefill},
     };
-    for (const Case& c : cases) {
+    const auto check_case = [&](const Case& c) {
         const Inputs inputs = make_inputs(*c.bank, c.tokens, c.max_tokens, c.routing, c.seed);
-        Run run(*fixture, store, inputs);
-        run.set_bank(*c.bank);
-        const std::vector<std::uint32_t> bits = run.invoke(workspace);
-        failures += verify(c.label, *fixture, *c.bank, inputs, bits);
-        // A second call on the same workspace must find its counters reset and reproduce y.
-        if (run.invoke(workspace) != bits) {
-            std::cerr << c.label << ": repeated call is not bit-identical\n";
-            ++failures;
+        std::vector<std::uint32_t> fp32;
+        std::vector<std::uint32_t> bf16;
+        for (const auto dtype : {OutputDtype::Fp32, OutputDtype::Bf16}) {
+            if (dtype == OutputDtype::Bf16 && c.max_tokens <= ops::kMoeHelperMaxTokens) {
+                continue;
+            }
+            Run run(*fixture, store, inputs, dtype);
+            run.set_bank(*c.bank);
+            auto& bits = dtype == OutputDtype::Bf16 ? bf16 : fp32;
+            bits       = run.invoke(*c.workspace);
+            // Every dtype must find reset counters and reproduce y, including at capacity.
+            if (run.invoke(*c.workspace) != bits) {
+                std::cerr << c.label << ": repeated call is not bit-identical\n";
+                ++failures;
+            }
         }
-    }
+        failures += verify(c.label, *fixture, *c.bank, inputs, fp32, bf16);
+    };
+    for (const Case& c : cases) { check_case(c); }
 
-    failures += queued_calls(*fixture, store, workspace, wide);
+    for (const auto dtype : {OutputDtype::Fp32, OutputDtype::Bf16}) {
+        failures += queued_calls(*fixture, store, prefill, wide, dtype);
+        failures += order_independence(*fixture, store, prefill, wide, dtype);
+    }
+    {
+        // The Op's capacity: every token routed, on a workspace of exactly that capacity.
+        ops::MoeHelperExpertsWorkspace full(ops::kMoeHelperExpertsMaxTokens);
+        check_case({"T16384 (capacity)", &wide, ops::kMoeHelperExpertsMaxTokens,
+                    ops::kMoeHelperExpertsMaxTokens, Routing::Skewed, 32U, &full});
+    }
 
     // Contract rejection before any work is queued.
     const Inputs inputs = make_inputs(wide, 4, 4, Routing::Skewed, 21U);
@@ -612,21 +766,34 @@ int run() {
         args.max_tokens = 0;
         ops::moe_helper_experts(args, workspace, nullptr);
     });
-    failures += expect_rejected("max_tokens 49", [&] {
+    failures += expect_rejected("max_tokens 16385", [&] {
         auto args       = valid.args();
-        args.max_tokens = 49;
+        args.max_tokens = ops::kMoeHelperExpertsMaxTokens + 1;
+        ops::moe_helper_experts(args, prefill, nullptr);
+    });
+    failures += expect_rejected("BF16 output on decode extent", [&] {
+        auto args         = valid.args();
+        args.output_dtype = OutputDtype::Bf16;
         ops::moe_helper_experts(args, workspace, nullptr);
     });
     failures += expect_rejected("workspace too small",
                                 [&] { ops::moe_helper_experts(valid.args(), small, nullptr); });
+    failures += expect_rejected("prefill extent on a decode-round workspace", [&] {
+        auto args       = valid.args();
+        args.max_tokens = 49;
+        ops::moe_helper_experts(args, workspace, nullptr);
+    });
+    failures += expect_rejected("workspace max_tokens 16385", [&] {
+        ops::MoeHelperExpertsWorkspace too_large(ops::kMoeHelperExpertsMaxTokens + 1);
+    });
     failures += expect_rejected("misaligned y", [&] {
         auto args = valid.args();
-        args.y += 1;
+        args.y    = static_cast<std::uint16_t*>(args.y) + 1;
         ops::moe_helper_experts(args, workspace, nullptr);
     });
     failures += expect_rejected("y aliases x", [&] {
         auto args = valid.args();
-        args.y    = reinterpret_cast<float*>(const_cast<std::uint16_t*>(args.x));
+        args.y    = const_cast<std::uint16_t*>(args.x);
         ops::moe_helper_experts(args, workspace, nullptr);
     });
 

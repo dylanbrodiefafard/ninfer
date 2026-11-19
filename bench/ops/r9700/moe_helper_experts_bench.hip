@@ -1,19 +1,28 @@
-// moe_helper_experts throughput on the R9700: GB/s of distinct record bytes per call, against a
-// plain coalesced read of the same records (the measured roof for that byte set).
+// moe_helper_experts throughput on the R9700: per call, GB/s of distinct record bytes against a
+// plain coalesced read of the same records (the measured roof for that byte set), and the
+// TFLOP/s of the routed SwiGLU work (2 x (2 x 640 x 2560 + 2560 x 640) FLOP per active entry).
 //
 // One layer bank owns 512 distinct records (every id has its own bytes, so no two experts share
 // cache lines). Each timed call uses one of kRouteSets route sets drawn with different expert
-// popularity, rotating between calls, so the 8 MiB L2 does not carry a call's records into the
-// next. Routing is moe_route-like: each token's ten experts are the top ten of biased random
-// logits, all owned by the helper. The concentrated mode routes every token to the same ten
-// experts, which sets the tokens per expert to T (the multi-token path).
+// popularity, rotating between calls, so neither the L2 nor the 64 MiB last-level cache carries a
+// call's records into the next. Every call has max_tokens = T and N = T. Routing modes:
+//   all           moe_route-like: each token's ten experts are the top ten of biased random
+//                 logits, all owned by the helper (a decode round of helper-only experts).
+//   concentrated  every token routes the same ten experts (T tokens per expert).
+//   helper        prefill split: the helper owns ids not divisible by 3 (341 experts); each route
+//                 slot is a helper route with probability 0.2, conditioned on at least one per
+//                 token (about 2.2 active entries per token), drawn without repetition in the
+//                 token by log-normal expert popularity (sigma 0.5); other slots are inactive.
+//   skewed        helper with popularity sigma 1.5: a few experts receive hundreds of tokens.
 //
-//   ninfer_moe_helper_experts_bench [--codec f3|nvfp4|mixed] [--concentrated] [--tokens T ...]
+//   ninfer_moe_helper_experts_bench [--codec f3|nvfp4|mixed]
+//       [--routing all|concentrated|helper|skewed] [--output fp32|bf16] [--tokens T ...]
 #include "ninfer/ops/moe_helper_experts.h"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -30,7 +39,7 @@ namespace {
 using namespace ninfer::ops;
 
 constexpr int kRouteSets  = 8;
-constexpr int kIterations = 40; // timed calls per route set
+constexpr int kIterations = 40; // timed calls per route set up to T = 256, fewer above
 
 void hip_check(hipError_t status, const char* what) {
     if (status != hipSuccess) {
@@ -95,26 +104,41 @@ struct RouteSet {
     std::vector<MoeHelperRoute> routes;
     std::vector<std::uint64_t> addresses; // distinct records
     std::vector<std::uint64_t> units;
-    double bytes = 0.0;
+    double bytes   = 0.0;
+    double entries = 0.0; // active route entries
 };
 
 int main_impl(int argc, char** argv) {
-    std::string codec_mode = "f3";
-    bool concentrated      = false;
+    std::string codec_mode            = "f3";
+    std::string routing               = "all";
+    MoeHelperOutputDtype output_dtype = MoeHelperOutputDtype::Fp32;
     std::vector<int> extents;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--codec" && i + 1 < argc) {
             codec_mode = argv[++i];
-        } else if (arg == "--concentrated") {
-            concentrated = true;
+        } else if (arg == "--routing" && i + 1 < argc) {
+            routing = argv[++i];
+        } else if (arg == "--output" && i + 1 < argc) {
+            const std::string dtype = argv[++i];
+            if (dtype != "fp32" && dtype != "bf16") {
+                throw std::invalid_argument("output must be fp32 or bf16");
+            }
+            output_dtype =
+                dtype == "bf16" ? MoeHelperOutputDtype::Bf16 : MoeHelperOutputDtype::Fp32;
         } else if (arg == "--tokens" && i + 1 < argc) {
             extents.push_back(std::stoi(argv[++i]));
         } else {
             std::cerr << "usage: " << argv[0]
-                      << " [--codec f3|nvfp4|mixed] [--concentrated] [--tokens T ...]\n";
+                      << " [--codec f3|nvfp4|mixed] [--routing all|concentrated|helper|skewed]"
+                         " [--output fp32|bf16] [--tokens T ...]\n";
             return 2;
         }
+    }
+    if (routing != "all" && routing != "concentrated" && routing != "helper" &&
+        routing != "skewed") {
+        std::cerr << "unknown routing " << routing << '\n';
+        return 2;
     }
     if (extents.empty()) { extents = {1, 4, 20, 48}; }
 
@@ -193,36 +217,73 @@ int main_impl(int argc, char** argv) {
     hip_check(hipGetDeviceProperties(&properties, device), "properties");
     const int read_grid = properties.multiProcessorCount * 16;
 
-    std::printf("codec=%s routing=%s\n", codec_mode.c_str(),
-                concentrated ? "concentrated" : "top-10");
-    std::printf("%4s %9s %12s %11s %10s %11s %10s %7s %9s\n", "T", "distinct", "MB/call", "op_us",
-                "op_GB/s", "read_us", "read_GB/s", "of_roof", "N0_us");
+    std::printf("codec=%s routing=%s output=%s\n", codec_mode.c_str(), routing.c_str(),
+                output_dtype == MoeHelperOutputDtype::Bf16 ? "bf16" : "fp32");
+    std::printf("%5s %8s %9s %10s %10s %9s %9s %10s %7s %9s\n", "T", "entries", "distinct",
+                "MB/call", "op_us", "TFLOP/s", "op_GB/s", "read_us", "of_roof", "N0_us");
     for (const int tokens : extents) {
         std::vector<RouteSet> sets(kRouteSets);
         std::mt19937 rng(1000U + static_cast<std::uint32_t>(tokens));
         std::normal_distribution<double> normal(0.0, 1.0);
         for (RouteSet& set : sets) {
-            std::vector<double> bias(kMoeHelperExperts);
-            for (auto& b : bias) { b = 0.45 * normal(rng); }
             std::set<int> distinct;
-            for (int t = 0; t < tokens; ++t) {
-                std::vector<int> order(kMoeHelperExperts);
-                std::iota(order.begin(), order.end(), 0);
-                if (!concentrated || t == 0) {
-                    std::vector<double> score(kMoeHelperExperts);
-                    for (std::size_t e = 0; e < score.size(); ++e) {
-                        score[e] = bias[e] + normal(rng);
-                    }
-                    std::partial_sort(order.begin(), order.begin() + 10, order.end(),
-                                      [&](int a, int b) { return score[a] > score[b]; });
-                } else {
-                    for (int j = 0; j < 10; ++j) {
-                        order[j] = set.routes[static_cast<std::size_t>(j)].expert;
+            if (routing == "helper" || routing == "skewed") {
+                const double sigma = routing == "helper" ? 0.5 : 1.5;
+                std::vector<int> owned;
+                std::vector<double> popularity;
+                for (int e = 0; e < kMoeHelperExperts; ++e) {
+                    if (e % 3 == 0) { continue; }
+                    owned.push_back(e);
+                    popularity.push_back(std::exp(sigma * normal(rng)));
+                }
+                std::discrete_distribution<int> pick(popularity.begin(), popularity.end());
+                std::bernoulli_distribution helper_slot(0.2);
+                for (int t = 0; t < tokens; ++t) {
+                    std::vector<bool> slots(kMoeHelperRoutesPerToken);
+                    do {
+                        for (int j = 0; j < kMoeHelperRoutesPerToken; ++j) {
+                            slots[static_cast<std::size_t>(j)] = helper_slot(rng);
+                        }
+                    } while (std::find(slots.begin(), slots.end(), true) == slots.end());
+                    std::set<int> chosen;
+                    for (int j = 0; j < kMoeHelperRoutesPerToken; ++j) {
+                        if (!slots[static_cast<std::size_t>(j)]) {
+                            set.routes.push_back({kMoeHelperInactiveExpert, 0.0F});
+                            continue;
+                        }
+                        int expert = 0;
+                        do {
+                            expert = owned[static_cast<std::size_t>(pick(rng))];
+                        } while (!chosen.insert(expert).second);
+                        set.routes.push_back({expert, 0.1F});
+                        distinct.insert(expert);
+                        ++set.entries;
                     }
                 }
-                for (int j = 0; j < kMoeHelperRoutesPerToken; ++j) {
-                    set.routes.push_back({order[j], 0.1F});
-                    distinct.insert(order[j]);
+            } else {
+                const bool concentrated = routing == "concentrated";
+                std::vector<double> bias(kMoeHelperExperts);
+                for (auto& b : bias) { b = 0.45 * normal(rng); }
+                for (int t = 0; t < tokens; ++t) {
+                    std::vector<int> order(kMoeHelperExperts);
+                    std::iota(order.begin(), order.end(), 0);
+                    if (!concentrated || t == 0) {
+                        std::vector<double> score(kMoeHelperExperts);
+                        for (std::size_t e = 0; e < score.size(); ++e) {
+                            score[e] = bias[e] + normal(rng);
+                        }
+                        std::partial_sort(order.begin(), order.begin() + 10, order.end(),
+                                          [&](int a, int b) { return score[a] > score[b]; });
+                    } else {
+                        for (int j = 0; j < 10; ++j) {
+                            order[j] = set.routes[static_cast<std::size_t>(j)].expert;
+                        }
+                    }
+                    for (int j = 0; j < kMoeHelperRoutesPerToken; ++j) {
+                        set.routes.push_back({order[j], 0.1F});
+                        distinct.insert(order[j]);
+                        ++set.entries;
+                    }
                 }
             }
             for (const int e : distinct) {
@@ -249,12 +310,17 @@ int main_impl(int argc, char** argv) {
         hip_check(hipMemcpy(n, &tokens, 4, hipMemcpyHostToDevice), "n");
         double bytes    = 0.0;
         double distinct = 0.0;
+        double entries  = 0.0;
         for (const auto& set : sets) {
             bytes += set.bytes;
             distinct += static_cast<double>(set.addresses.size());
+            entries += set.entries;
         }
         bytes /= kRouteSets;
         distinct /= kRouteSets;
+        entries /= kRouteSets;
+        constexpr double kFlopPerEntry =
+            2.0 * (2.0 * kMoeIntermediate * kMoeHidden + 1.0 * kMoeHidden * kMoeIntermediate);
 
         const auto op_call = [&](int s) {
             MoeHelperExpertsArgs args;
@@ -267,6 +333,7 @@ int main_impl(int argc, char** argv) {
             args.bank.matrix_scales = scales_device;
             args.bank.f3_books      = {0x76419CEFU, 0x76419CEFU, 0x76419CEFU};
             args.y                  = y;
+            args.output_dtype       = output_dtype;
             moe_helper_experts(args, workspace, nullptr);
         };
         const auto read_call = [&](int s) {
@@ -275,16 +342,17 @@ int main_impl(int argc, char** argv) {
                 static_cast<int>(sets[static_cast<std::size_t>(s)].addresses.size()), sink);
             hip_check(hipGetLastError(), "read kernel");
         };
-        const auto time_us = [&](const auto& call) {
+        const int iterations = std::max(5, kIterations * 256 / std::max(tokens, 256));
+        const auto time_us   = [&](const auto& call) {
             for (int s = 0; s < kRouteSets; ++s) { call(s); }
             hip_check(hipDeviceSynchronize(), "warmup");
             hip_check(hipEventRecord(start, nullptr), "record");
-            for (int i = 0; i < kIterations * kRouteSets; ++i) { call(i % kRouteSets); }
+            for (int i = 0; i < iterations * kRouteSets; ++i) { call(i % kRouteSets); }
             hip_check(hipEventRecord(stop, nullptr), "record");
             hip_check(hipEventSynchronize(stop), "sync");
             float ms = 0.0F;
             hip_check(hipEventElapsedTime(&ms, start, stop), "elapsed");
-            return 1000.0 * ms / (kIterations * kRouteSets);
+            return 1000.0 * ms / (iterations * kRouteSets);
         };
         const double op_us   = time_us(op_call);
         const double read_us = time_us(read_call);
@@ -292,9 +360,9 @@ int main_impl(int argc, char** argv) {
         const std::int32_t zero = 0;
         hip_check(hipMemcpy(n, &zero, 4, hipMemcpyHostToDevice), "n");
         const double empty_us = time_us(op_call);
-        std::printf("%4d %9.1f %12.2f %11.1f %10.1f %11.1f %10.1f %6.0f%% %9.1f\n", tokens,
-                    distinct, bytes / 1e6, op_us, bytes / op_us / 1e3, read_us,
-                    bytes / read_us / 1e3, 100.0 * read_us / op_us, empty_us);
+        std::printf("%5d %8.0f %9.1f %10.2f %10.1f %9.2f %9.1f %10.1f %6.0f%% %9.1f\n", tokens,
+                    entries, distinct, bytes / 1e6, op_us, entries * kFlopPerEntry / op_us / 1e6,
+                    bytes / op_us / 1e3, read_us, 100.0 * read_us / op_us, empty_us);
     }
     return 0;
 }
