@@ -403,6 +403,16 @@ public:
         }
     }
 
+    void refill_select(Tensor& state, Tensor& source, Tensor& destination, cudaStream_t stream,
+                       const Tensor* eligible) {
+        ops::moe_expert_cache_refill_select(host_view_, cache_, state, source, destination, stream,
+                                            eligible);
+    }
+
+    void refill_publish(Tensor& state, cudaStream_t stream) {
+        ops::moe_expert_cache_refill_publish(expert_view_, host_view_, cache_, state, stream);
+    }
+
     void commit(std::int32_t layer, cudaStream_t stream) {
         ops::moe_expert_cache_commit(expert_view_, fill_view_, layer, stream);
     }
@@ -796,12 +806,125 @@ int run_region_checks(std::uint32_t seed, cudaStream_t stream) {
     return failures;
 }
 
+// Independent exact oracle: enumerate candidates, sort by the stated frequency/code ordering,
+// and enumerate empty flex slots in reverse order. Synthetic addresses are never dereferenced;
+// the extent integration test checks actual host-record copies and reclaim fences.
+int run_refill(cudaStream_t stream) {
+    std::mt19937 rng(391);
+    int failures = 0;
+    for (const auto layers : {1, 48}) {
+        CacheModel model;
+        model.layers          = layers;
+        model.halving_lookups = 50000;
+        DeviceCache device(model, {{{5, 256}, {7, 256, 84, 84}}}, rng);
+        randomize_state(model, 0.2, 0.4, 0.5, rng);
+        std::vector<std::uint32_t> mask(static_cast<std::size_t>(layers) * 16, 0x55555555U);
+        GuardedDeviceBuffer mask_buffer(mask.size() * sizeof(std::uint32_t));
+        mask_buffer.copy_from_host(mask.data(), mask_buffer.bytes());
+        const Tensor eligible(mask_buffer.data(), DType::I32, {16, layers});
+        GuardedDeviceBuffer state_buffer(2 * sizeof(std::int32_t));
+        GuardedDeviceBuffer source_buffer(kExperts * sizeof(std::uint64_t));
+        GuardedDeviceBuffer destination_buffer(kExperts * sizeof(std::uint64_t));
+        Tensor state(state_buffer.data(), DType::I32, {2});
+        Tensor source(source_buffer.data(), DType::I64, {kExperts});
+        Tensor destination(destination_buffer.data(), DType::I64, {kExperts});
+        // Borrowed high slots must not be selected; equal frequencies exercise exact tie breaks.
+        model_lend(model, 1, ops::MoeCacheSlotRegion::Flex, 83, 1, true);
+        for (int step = 0; step < 95; ++step) {
+            device.upload(model);
+            const auto index = model_slot_index(model);
+            std::vector<int> candidates;
+            for (std::size_t code = 0; code < model.host.size(); ++code) {
+                if ((model.host[code] & 1U) != 0 && index[code] < 0 &&
+                    (mask[code / 32] & (1U << (code % 32))) != 0) {
+                    candidates.push_back(static_cast<int>(code));
+                }
+            }
+            std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
+                return model.counts[a] != model.counts[b] ? model.counts[a] > model.counts[b]
+                                                          : a < b;
+            });
+            int slot = -1;
+            for (int s = static_cast<int>(model.pools[1].owner.size()) - 1;
+                 s >= model.pools[1].fixed; --s) {
+                if (model.pools[1].owner[s] == ops::kMoeCacheEmptySlot) {
+                    slot = s;
+                    break;
+                }
+            }
+            const int code = slot >= 0 && !candidates.empty() ? candidates.front() : -1;
+            if (code < 0) { slot = -1; }
+            device.refill_select(state, source, destination, stream, &eligible);
+            cuda_synchronize(stream);
+            failures += verify_exact("refill selection", from_device<int>(state.data, 2),
+                                     std::vector<int>{code, slot});
+            std::vector<std::uint64_t> expected_source(kExperts, 0),
+                expected_destination(kExperts, 0);
+            if (code >= 0) {
+                expected_source[0]         = model.host[code];
+                expected_destination[0]    = model.pools[1].address(static_cast<std::size_t>(slot));
+                model.pools[1].owner[slot] = ops::kMoeCacheBorrowedSlot;
+                model.pools[1].referenced[slot] = 0;
+            }
+            failures +=
+                verify_exact("refill source", from_device<std::uint64_t>(source.data, kExperts),
+                             expected_source);
+            failures += verify_exact("refill destination",
+                                     from_device<std::uint64_t>(destination.data, kExperts),
+                                     expected_destination);
+            failures += device.compare(model, "unpublished refill");
+            if (code >= 0 && step % 3 == 0) {
+                // Demand can install the same candidate elsewhere while its refill slot is
+                // protected. Publication must discard the duplicate, not create two owners.
+                const std::vector<std::int32_t> ids(kTopK, code % kExperts);
+                GuardedDeviceBuffer routed(ids.size() * sizeof(std::int32_t));
+                routed.copy_from_host(ids.data(), routed.bytes());
+                const Tensor routes(routed.data(), DType::I32, {kTopK, 1});
+                device.admit(routes, code / kExperts, false, false, stream);
+                model_admit(model, ids, code / kExperts, false, false);
+                device.commit(code / kExperts, stream);
+                model_commit(model, code / kExperts);
+                cuda_synchronize(stream);
+            }
+            if (code >= 0) {
+                if (model_slot_index(model)[code] < 0) {
+                    model.pools[1].owner[slot]      = code;
+                    model.pools[1].referenced[slot] = 1;
+                    model.expert[code] =
+                        model.pools[1].address(static_cast<std::size_t>(slot)) | 1U;
+                } else {
+                    model.pools[1].owner[slot]      = ops::kMoeCacheEmptySlot;
+                    model.pools[1].referenced[slot] = 0;
+                }
+            }
+            device.refill_publish(state, stream);
+            cuda_synchronize(stream);
+            failures += device.compare(model, "published refill");
+            failures += verify_exact("cleared refill reservation", from_device<int>(state.data, 2),
+                                     std::vector<int>{-1, -1});
+            failures += state_buffer.verify_guards("refill state");
+            failures += source_buffer.verify_guards("refill source");
+            failures += destination_buffer.verify_guards("refill destination");
+            if (step == 90) {
+                // Every record excluded: even an empty slot must stay empty.
+                std::fill(mask.begin(), mask.end(), 0);
+                mask_buffer.copy_from_host(mask.data(), mask_buffer.bytes());
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (require_cuda() != 0) { return 1; }
     try {
         DeviceContext context;
+        if (argc == 2 && std::string_view(argv[1]) == "--refill") {
+            return run_refill(context.stream) == 0 ? 0 : 1;
+        }
+        if (argc != 1) { throw std::invalid_argument("expected no arguments or --refill"); }
         // Pool sizes: tiny pools are exhausted by one wide call (every slot protected), medium
         // pools churn, and pools above 1024 slots span several scan windows and wrap.
         // A saturated pool (every slot owned and referenced) makes its first miss sweep a whole
@@ -862,6 +985,7 @@ int main() {
         }
         failures += run_graph(seed++, context.stream);
         failures += run_region_checks(seed, context.stream);
+        failures += run_refill(context.stream);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " moe_expert_cache\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

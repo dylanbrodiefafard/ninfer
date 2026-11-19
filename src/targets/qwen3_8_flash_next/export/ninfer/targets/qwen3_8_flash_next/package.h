@@ -49,6 +49,7 @@
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -237,6 +238,16 @@ public:
     void retarget_plan_to_ram(RequestPlan& plan, std::uint64_t entry_id);
     [[nodiscard]] bool preserve_retained_lane(std::uint32_t lane, std::uint64_t& entry_id,
                                               bool may_block, bool& deferred);
+
+    // Scheduler-boundary maintenance. Capture retains the source and claims its complete RAM
+    // image; a later boundary closes only after its copy fence is ready and returns the lane to
+    // invalidate. Failed captures keep retention and retry a full timeout later. Disposable state
+    // releases without capture. No active request can own this lane.
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> idle_lane_deadline() const;
+    [[nodiscard]] std::optional<std::uint32_t> expire_idle_lane();
+    // Publishes completed refill copies and optionally starts one. Returns whether refill work
+    // remains, so an idle executor can arrange its next control boundary.
+    [[nodiscard]] bool service_expert_refill(bool allow_refill);
 
     void evict_retained_lane(std::uint32_t lane);
     void mark_turn_closed(std::uint32_t lane) noexcept;

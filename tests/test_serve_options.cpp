@@ -81,6 +81,20 @@ int main() {
     failures += check(mtp_rejected, "MTP execution was accepted");
 
 
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).kv_idle_timeout,
+                      "idle timeout default must be target-resolved");
+    for (const char* seconds : {"0", "15"}) {
+        failures += check(
+            parse({"ninfer-serve", "model.ninfer", "--kv-idle-timeout", seconds}).kv_idle_timeout ==
+                static_cast<std::uint32_t>(std::stoul(seconds)),
+            "server lost idle timeout seconds");
+    }
+    bool negative_idle_timeout = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-idle-timeout", "-1"});
+    } catch (const std::invalid_argument&) { negative_idle_timeout = true; }
+    failures += check(negative_idle_timeout, "server accepted negative idle timeout");
+
     const auto system_cache = parse({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1024",
                                      "--kv-ram-system-prompts", "3"});
     failures += check(system_cache.kv_ram_system_prompts == 3 &&

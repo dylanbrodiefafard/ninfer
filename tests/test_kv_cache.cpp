@@ -328,6 +328,23 @@ int main() {
     whole.materialize_pages(12);
     failures += expect_page_ids(whole.page_ids(), {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
                                 "free set stays sorted");
+    whole.release();
+    auto hole   = lend_pool.reserve(1);
+    auto middle = lend_pool.reserve(3);
+    auto upper  = lend_pool.reserve(2);
+    hole.materialize_pages(1);
+    middle.materialize_pages(3);
+    upper.materialize_pages(2);
+    hole.release();
+    auto relocated = lend_pool.reserve(3);
+    relocated.materialize_pages(3);
+    failures += expect_page_ids(relocated.page_ids(), {0, 6, 7},
+                                "admission/restore takes low holes before a higher contiguous run");
+    relocated.release();
+    middle.set_page_entitlement(6);
+    middle.materialize_pages(6);
+    failures += expect_page_ids(middle.page_ids(), {1, 2, 3, 0, 6, 7},
+                                "growth takes low holes without moving live prefix pages");
 
     return failures == 0 ? 0 : fail("kv cache test failed");
 }

@@ -87,8 +87,16 @@ memory behind a VRAM expert cache, and it requires its external 8-bit n-gram tab
 left plus whole extents of pool pages no request reserves, which the pool takes back before mapping
 them. It serves one to twelve requests under the same Engine scheduling, interrupts prefill only
 at 16,384-token super-chunk boundaries, and retains idle lanes for exact-prefix reuse at the current
-frontier or a complete saved rewrite/occupy checkpoint. Retention includes QSA pages, exact GDN and
-PLE state, raw n-gram history and committed tokens; disposable turns fork independent state and
+frontier or a complete saved rewrite/occupy checkpoint. With RAM enabled, Flash-Next evicts idle
+retention to complete-state RAM after `--kv-idle-timeout` seconds (default 30; 0 disables), exempting
+the most recently idle lane; disposable idle state is released without persistence. Ordinary
+expiry retains its source through asynchronous complete-state D2H and releases it only at a later
+completed-copy boundary. Failed RAM captures keep the lane and retry after a full timeout without
+changing idle recency. Lowest-free page allocation leaves whole top extents lendable, and returned
+flex slots refill from live cache frequencies, one unpublished copy at a time, only with zero local
+demand misses in the latest decode/verification round and no active prefill.
+Retention includes QSA pages, exact GDN and PLE state, raw n-gram history and committed tokens;
+disposable turns fork independent state and
 preserve their source. Shared RAM and inclusive SSD tiers transport its complete GDN/PLE/logit
 continuation and QSA pages; RAM-on execution uses funded output windows and secured live suspension.
 Its optional DFlash2 companion enables chain-only adaptive K0–3 speculation with the full shared

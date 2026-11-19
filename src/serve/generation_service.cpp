@@ -316,6 +316,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.device                    = options_.device;
     engine_options.max_context               = options_.max_context;
     engine_options.kv_capacity               = options_.kv_capacity;
+    engine_options.kv_idle_timeout           = options_.kv_idle_timeout;
     engine_options.kv_ram_capacity_bytes     = options_.kv_ram_capacity_bytes;
     engine_options.kv_ram_system_prompts     = options_.kv_ram_system_prompts;
     engine_options.kv_disk_capacity_bytes    = options_.kv_disk_capacity_bytes;

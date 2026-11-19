@@ -163,6 +163,94 @@ void program_parity(const Inputs& inputs) {
               << "-token prompt\n";
 }
 
+// --flex-refill ------------------------------------------------------------------------------
+
+void flex_refill_parity(const Inputs& inputs) {
+    ninfer::DeviceContext device(0);
+    const ninfer::artifact::Reader reader(inputs.artifact);
+    const fn::LoadedModel model(reader, device);
+    const Tokens prompt = prompt_tokens(128, 791);
+    const auto execute  = [&](bool refill) {
+        fn::ProgramOptions options;
+        options.ngram_table        = inputs.ngram_table;
+        options.context_tokens     = 32768;
+        options.kv_capacity_tokens = (40 + 2 * 244) * 64;
+        options.lanes              = 2;
+        fn::Program program(model, options, device);
+        const auto lane   = program.open_lane(33 * 64, fn::LaneSampling{}).value();
+        const auto filler = program.open_lane((40 + 2 * 244 - 33) * 64, fn::LaneSampling{}).value();
+        require(program.kv_free_tokens() == 0, "refill parity did not fill the QSA pool");
+        const auto first = program.prefill_step(lane, prompt);
+        require(first.complete, "refill parity prefill did not settle");
+        program.close_lane(filler);
+        require(program.extents().lent_extents() == 1,
+                "refill parity did not lend the highest extent with one spare");
+        const auto populated_flex = [&] {
+            const auto pool  = program.experts().cache().pools[1];
+            const auto total = static_cast<std::size_t>(pool.owner.ne[0]);
+            const auto fixed = total - static_cast<std::size_t>(program.experts().flex_slots());
+            std::vector<std::int32_t> owners(total);
+            CUDA_CHECK(cudaMemcpy(owners.data(), pool.owner.data,
+                                  owners.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+            return std::count_if(owners.begin() + static_cast<std::ptrdiff_t>(fixed), owners.end(),
+                                 [](std::int32_t owner) { return owner >= 0; });
+        };
+        require(populated_flex() == 0, "returned flex extent did not start empty");
+        if (refill) {
+            // Fill before the first decode, when there is no preceding demand-miss round.
+            while (program.service_expert_refill(true)) { device.synchronize_all(); }
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+            require(populated_flex() > 0, "refill parity never populated a returned flex slot");
+        }
+        Tokens generated{first.next_token};
+        std::vector<std::uint16_t> distributions;
+        bool miss_gate_exercised = false;
+        for (int step = 0; step < 32; ++step) {
+            if (refill) { (void)program.service_expert_refill(true); }
+            const std::array lanes{lane};
+            const std::array tokens{generated.back()};
+            std::array<ninfer::TokenId, 1> next{};
+            program.decode(lanes, tokens, next);
+            if (refill && !miss_gate_exercised &&
+                program.forward().last_round_had_demand_misses()) {
+                // Leave an actual empty CacheHeld extent with refill requested. The preceding
+                // round's miss counters must suppress issuance, not just find no empty slot.
+                const auto churn =
+                    program.open_lane(program.kv_free_tokens(), fn::LaneSampling{}).value();
+                program.close_lane(churn);
+                require(populated_flex() == 0, "miss-gate fixture did not return empty flex slots");
+                require(!program.service_expert_refill(true),
+                        "a demand-miss round issued a background refill");
+                // The next boundary ran no decode round, so the miss state is consumed and an
+                // idle boundary must issue the refill.
+                require(program.service_expert_refill(true),
+                        "an idle boundary after a demand-miss round did not issue refill");
+                device.synchronize_all();
+                miss_gate_exercised = true;
+            }
+            generated.push_back(next[0]);
+            const auto tensor = program.state().tail_logits(lane);
+            const auto offset = distributions.size();
+            distributions.resize(offset + fn::kTokenDomain);
+            CUDA_CHECK(cudaMemcpy(distributions.data() + offset, tensor.data,
+                                  std::size_t{fn::kTokenDomain} * sizeof(std::uint16_t),
+                                  cudaMemcpyDeviceToHost));
+        }
+        if (refill) {
+            require(miss_gate_exercised, "refill parity did not exercise demand-miss gating");
+            while (program.service_expert_refill(true)) { device.synchronize_all(); }
+        }
+        program.close_lane(lane);
+        return std::pair{generated, distributions};
+    };
+    const auto control  = execute(false);
+    const auto refilled = execute(true);
+    require_equal(refilled.first, control.first, "background flex refill greedy output");
+    require(refilled.second == control.second,
+            "background flex refill changed represented BF16 decode logits");
+    std::cout << "flex refill: 32 decode distributions and 33 tokens exactly equal\n";
+}
+
 // --reuse-parity -----------------------------------------------------------------------------
 
 std::vector<std::uint16_t> logits(fn::Program& program, fn::Lane lane) {
@@ -750,6 +838,33 @@ ninfer::GenerationResult reusable(ninfer::Engine& engine, const Tokens& prompt,
                                   std::uint32_t outputs = 1, bool cache_write = true) {
     return engine.generate(engine.prepare_tokens(prompt, true),
                            reuse_options(outputs, cache_write));
+}
+
+void idle_timeout_suite(const Inputs& inputs) {
+    auto options                  = engine_options(inputs, 3, 4096, 12288);
+    options.kv_ram_capacity_bytes = std::size_t{512} << 20;
+    options.kv_idle_timeout       = 1;
+    ninfer::Engine engine(options);
+    const Tokens prefix = prompt_tokens(512, 271);
+    const auto original = reusable(engine, prefix);
+    (void)reusable(engine, prompt_tokens(512, 272));
+    (void)reusable(engine, prompt_tokens(512, 273));
+    // No ingress wakes the worker: eviction must be driven by its idle deadline wait.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (engine.runtime_stats().gpu_kv_main_mapped_pages != 8 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const auto idle = engine.runtime_stats();
+    require(idle.gpu_kv_main_mapped_pages == 8 && idle.kv_ram_captures >= 2,
+            "idle deadline did not migrate all but the most recently idle lane");
+    const auto restored = reusable(engine, prefix);
+    require(restored.prefix_reuse_source == ninfer::PrefixReuseSource::HostRam &&
+                restored.reused_prompt_tokens == prefix.size(),
+            "timeout continuation did not restore from RAM");
+    require_equal(restored.generated_token_ids, original.generated_token_ids,
+                  "idle-timeout complete continuation restore");
+    std::cout << "idle timeout: no-ingress wake, latest-idle exemption and exact RAM restore\n";
 }
 
 void retained_suite(const Inputs& inputs) {
@@ -1484,6 +1599,10 @@ int main(int argc, char** argv) {
                 return 77;
             }
             helper_smoke(inputs, pci);
+        } else if (mode == "--idle-timeout") {
+            idle_timeout_suite(inputs);
+        } else if (mode == "--flex-refill") {
+            flex_refill_parity(inputs);
         } else if (mode == "--program-parity") {
             program_parity(inputs);
         } else if (mode == "--reuse-parity") {
@@ -1529,7 +1648,8 @@ int main(int argc, char** argv) {
                    "program|"
                    "--dflash-engine|--retained|--dflash-retained|--ram-tiers|--disk-tiers|"
                    "--live-tiers|--dflash-ram-tiers|--dflash-disk-tiers|--dflash-live-tiers|"
-                   "--conversation-bench|--conversation-ram-bench|--mixer-split-diagnostic]\n";
+                   "--conversation-bench|--conversation-ram-bench|--mixer-split-diagnostic|--flex-"
+                   "refill|--idle-timeout]\n";
             return 2;
         }
         return 0;

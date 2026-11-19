@@ -108,10 +108,11 @@ answers:
   n-gram history are fixed per-lane state. Admission reserves the pages of
   `prompt + effective output - 1` tokens at `open_lane` (RAM-off completion reservation, §6.2);
   a request that does not fit waits in the FIFO under the protected-head rules of §5.
-- **Lanes.** Executor lanes map to the Program lanes `open_lane` returns; a terminal, cancelled or
-  aborted request closes its Program lane, which unmaps its pages. No lane is retained, so every
-  turn is a cold prefill; the mapping keeps a retained Program lane bound to its executor lane once
-  lane retention is added.
+- **Lanes.** Executor lanes map to the Program lanes `open_lane` returns. Completed reusable
+  state remains bound to its idle executor lane at an exact current or saved rewrite/occupy
+  frontier. RAM-on retention has `--kv-idle-timeout` (default 30 seconds; 0 disables), exempting
+  the most recently idle retained lane. Expiry saves complete ordinary originals to RAM and
+  releases disposable state at a safe boundary; active requests keep their state unchanged.
 - **Prefill.** One prefill step appends one super-chunk (16,384 tokens, layer-major over
   `--prefill-chunk` sub-chunks); it is the target's only interruption unit. Shared pace (§7.3)
   interleaves `--mixed-forward-rounds` decode rounds between super-chunks, and a short prompt may
@@ -126,10 +127,16 @@ answers:
   `BatchedGeneratedRound::row_errors`; the executor fails that request alone
   (`invalid_output_constraint`) and commits the other rows. A prefill step that fails with a
   request-local error likewise ends only its request.
-- **Absent features.** Speculation, RAM/disk tiers, context checkpoints, live suspension and
-  Vision are rejected at startup; their executor queries return the empty answers (no retained
-  lane, copies always ready, index version 0, suspension credit refused) and their mutators are
-  unreachable and throw `std::logic_error`.
+- **Continuation and tiers.** Retained, RAM and SSD continuations carry complete QSA, GDN, PLE,
+  logits and raw n-gram/token history; optional DFlash2 includes cyclic context, pending features
+  and calibration. RAM-on funded windows and secured live suspension use the common executor.
+  Context checkpoints, Vision and the optimized proposal head remain unsupported.
+- **Flex maintenance.** Lowest-free physical page allocation applies to admission, growth and
+  tier restores. Returned whole top extents refill from live cache frequencies, one protected,
+  unpublished copy at a time, only at settled boundaries with zero local demand misses in the
+  latest decode/verification round and no active prefill. Counter readback shares the existing
+  round completion fence; it introduces no extra host synchronization.
+  Completed copies publish through stable cache tables; reclaim joins only that copy's event.
 
 ---
 
@@ -1159,6 +1166,32 @@ grant queue priority. It may conservatively shorten the service projection of §
 same protected-head qualification; whether or not it hits, the final active request enters the same
 prefill/decode schedule and compact batch formation.
 
+#### Flash-Next idle retention timeout
+
+`--kv-idle-timeout SECONDS` defaults to 30 for Flash-Next with RAM enabled and otherwise to 0;
+0 disables it. Explicit nonzero values require Flash-Next and a RAM tier. The timer starts when
+the request settles and its lane becomes retained-idle, never at admission. Any reattachment or
+disposable fork cancels it; becoming idle again starts a fresh timer and recency sequence. The
+most recently idle currently retained lane is always exempt, including equal clock ticks.
+
+At each safe scheduler boundary, expiry migrates an ordinary original through the complete-state
+RAM preservation path, bypassing preserve-off rewrite cutting, or releases disposable idle state.
+Expiry is two-phase: complete continuation and page D2H run on the copy stream while the
+original remains retained, with its RAM image claimed. Only a later boundary whose lane fence
+reports complete may close it and run `give_back`; decoding lanes never wait behind the capture
+on the compute stream. Any failed or deferred capture keeps the original resident and retries
+after another full timeout, without changing idle recency or the exempt lane. Preservation for
+admission is not activity and does not restart the timer. Successful eviction releases the RAM
+claim and invalidates cached lane plans. Deadline maintenance clears cache-idle before tier work. Admission copy-holds and live transfers protect their source and
+destination lanes from timeout maintenance. A condition-variable deadline wakes an otherwise idle
+executor; no polling thread or GPU-unit interruption is involved.
+
+Once every nonexempt idle owner has successfully migrated or released its disposable state,
+only active lanes and the exempt lane can pin top-region QSA pages. Unfunded RAM captures keep
+older idle owners resident until a later retry or admission-pressure eviction. Lowest-free allocation on new mappings and restores
+leaves whole free extents lendable, with one spare extent retained as hysteresis. Active high pages
+do not move; the bound does not promise one contiguous run per lane.
+
 #### Disposable cache reads
 
 `ExecutionOptions.cache_write` defaults to true. False selects a source-preserving fork, with
@@ -1223,8 +1256,9 @@ released. Host RAM is not a precondition for admission. A failed optional captur
 remove that lane from the reclaimable victim set or return `Overloaded`: this applies both
 to the selected dirty lane and to other free retained lanes needed for shared-pool capacity.
 
-Capture and retained-lane eviction run only after `find_admission_lane` has already selected a
-free lane for that request. A queued prompt that still cannot fit — because in-flight lanes occupy
+Admission-triggered capture and retained-lane eviction run only after `find_admission_lane` has
+already selected a free lane for that request. Flash-Next's idle timeout is the independent
+boundary-driven retention eviction described in §6.4. A queued prompt that still cannot fit — because in-flight lanes occupy
 enough shared pool pages that no free lane is feasible even after reclaiming every other free
 retained bundle — waits and does not dump any GPU lane. A later smaller backfill candidate that
 can fit may still admit and may capture other free retained lanes for itself.

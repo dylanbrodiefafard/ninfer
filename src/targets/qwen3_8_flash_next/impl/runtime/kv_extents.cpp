@@ -89,8 +89,12 @@ std::int32_t KvExpertExtents::lent_extents() const noexcept {
 }
 
 void KvExpertExtents::make_room(std::uint32_t pages, ExpertResidency& cache) {
+    bool borrowed = false;
     for (std::size_t x = 0; x < lent_.size() && pool_.free_pages() < pages; ++x) {
         if (lent_[x]) { continue; }
+        // A refill reserves an unpublished slot. Join only its bounded copy before borrow
+        // changes that reservation or KV overwrites its bytes; no host synchronization.
+        cache.join_refill(stream_);
         Tensor expert_table = cache.expert_table();
         ops::moe_expert_cache_borrow(expert_table, cache.host_table(), cache.cache(), kFlexCodec,
                                      ops::MoeCacheSlotRegion::Flex,
@@ -98,6 +102,13 @@ void KvExpertExtents::make_room(std::uint32_t pages, ExpertResidency& cache) {
                                      slots_per_extent_, stream_);
         pool_.restore_pages(extent_first_page(x), extent_pages_);
         lent_[x] = true;
+        borrowed = true;
+    }
+    // A scan can stop with every eligible record resident but high flex slots still empty.
+    // Borrowing a lower extent can evict those records while leaving those high slots lent to
+    // the cache. Retry only after a real borrow, and only when cache-held extents remain.
+    if (borrowed && std::ranges::any_of(lent_, [](bool lent) { return !lent; })) {
+        cache.request_refill();
     }
 }
 
@@ -119,6 +130,7 @@ void KvExpertExtents::give_back(ExpertResidency& cache) {
                                      slots_per_extent_, stream_);
         pool_.withhold_pages(extent_first_page(x), extent_pages_);
         lent_[x] = false;
+        cache.request_refill();
     }
 }
 

@@ -108,6 +108,8 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--kv-capacity-headroom MiB] "
+           "[--kv-idle-timeout SECONDS] "
+           "(Flash-Next RAM tier: default 30; 0 disables) "
            "[--kv-ram-capacity off|N] [--kv-ram-system-prompts N] "
            "[--kv-disk-capacity off|N] [--kv-disk-location PATH] [--kv-disk-compress off|zstd] "
            "[--max-concurrency N] [--no-generation-recovery] "
@@ -242,6 +244,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity-headroom") {
             kv_capacity_headroom_mib =
                 parse_u64(require_value("--kv-capacity-headroom"), "kv-capacity-headroom");
+        } else if (arg == "--kv-idle-timeout") {
+            const auto seconds = parse_u64(require_value("--kv-idle-timeout"), "kv-idle-timeout");
+            if (seconds > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("--kv-idle-timeout exceeds uint32 seconds");
+            }
+            options.kv_idle_timeout = static_cast<std::uint32_t>(seconds);
         } else if (arg == "--kv-ram-capacity") {
             options.kv_ram_capacity_bytes =
                 parse_kv_ram_capacity_bytes(require_value("--kv-ram-capacity"));
